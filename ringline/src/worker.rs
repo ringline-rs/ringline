@@ -3732,7 +3732,7 @@ mod worker_exit_tests {
     }
 }
 
-/// Worker exit and the fs and NVMe operations in flight (#824 on
+/// Worker exit and the fs, direct I/O and NVMe operations in flight (#824 on
 /// io_uring, #856 on mio).
 #[cfg(test)]
 mod disk_exit_tests {

@@ -288,10 +288,10 @@ pub(crate) struct Driver {
         std::collections::HashMap<crate::runtime::DiskIoKey, crate::disk_io_pool::PoolSubsystem>,
     /// Entries of `disk_io_in_flight` per subsystem, indexed by
     /// `PoolSubsystem`.
-    pub(crate) disk_io_counts: [u16; 1],
+    pub(crate) disk_io_counts: [u16; 2],
     /// Each subsystem's `max_commands_in_flight`, indexed by `PoolSubsystem`;
     /// `None` when it is not configured. A submit at the bound fails.
-    pub(crate) disk_io_limits: [Option<u16>; 1],
+    pub(crate) disk_io_limits: [Option<u16>; 2],
     /// The keys in `disk_io_in_flight` whose request reads or writes through
     /// a buffer address: `fs::read_into` and `fs::write_from`. Worker exit
     /// waits for these.
@@ -313,12 +313,21 @@ pub(crate) struct Driver {
     /// disk-I/O pool holds a clone, so closing a file leaves its fd open until
     /// those operations finish.
     pub(crate) fs_fds: Vec<Option<Arc<OwnedFd>>>,
-    /// Pending fs_open requests: maps disk-I/O key → file_index. On completion, the
-    /// opened fd (`DiskIoResponse::opened`) is stored in `fs_fds[file_index]`.
-    /// On failure, the file slot is released. If the open was abandoned
+    /// Pending opens of fs and direct I/O files: maps disk-I/O key → (kind,
+    /// file_index). On completion, the opened fd (`DiskIoResponse::opened`)
+    /// is stored in the kind's fd vector (`fs_fds` or `direct_io_fds`). On
+    /// failure, the file slot is released. If the open was abandoned
     /// (`Executor::take_abandoned_open` returns true), the fd is dropped and
     /// the slot released instead.
-    pub(crate) pending_fs_opens: std::collections::HashMap<crate::runtime::DiskIoKey, u16>,
+    pub(crate) pending_fs_opens:
+        std::collections::HashMap<crate::runtime::DiskIoKey, (crate::fs::FileKind, u16)>,
+
+    // ── Direct I/O file management ──────────────────────────────────
+    /// Direct I/O file table, in the same form as `fs_files`.
+    pub(crate) direct_io_files: Option<crate::fs::FsFileTable>,
+    /// Direct I/O fds, indexed by file slot, shared with queued pool
+    /// operations as `fs_fds` is.
+    pub(crate) direct_io_fds: Vec<Option<Arc<OwnedFd>>>,
 }
 
 impl Driver {
@@ -583,8 +592,11 @@ impl Driver {
             disk_io_tx,
             disk_io_pool,
             disk_io_in_flight: std::collections::HashMap::new(),
-            disk_io_counts: [0; 1],
-            disk_io_limits: [config.fs.as_ref().map(|f| f.max_commands_in_flight)],
+            disk_io_counts: [0; 2],
+            disk_io_limits: [
+                config.fs.as_ref().map(|f| f.max_commands_in_flight),
+                config.direct_io.as_ref().map(|d| d.max_commands_in_flight),
+            ],
             disk_io_borrowing: std::collections::HashSet::new(),
             write_orders: crate::disk_order::WriteOrders::default(),
             disk_io_outstanding: false,
@@ -598,6 +610,15 @@ impl Driver {
                 .map(|fs| vec![None; fs.max_files as usize])
                 .unwrap_or_default(),
             pending_fs_opens: std::collections::HashMap::new(),
+            direct_io_files: config
+                .direct_io
+                .as_ref()
+                .map(|d| crate::fs::FsFileTable::new(d.max_files)),
+            direct_io_fds: config
+                .direct_io
+                .as_ref()
+                .map(|d| vec![None; d.max_files as usize])
+                .unwrap_or_default(),
         })
     }
 
@@ -640,6 +661,8 @@ impl Driver {
             fs_files: &mut self.fs_files,
             fs_fds: &mut self.fs_fds,
             pending_fs_opens: &mut self.pending_fs_opens,
+            direct_io_files: &mut self.direct_io_files,
+            direct_io_fds: &mut self.direct_io_fds,
         }
     }
 

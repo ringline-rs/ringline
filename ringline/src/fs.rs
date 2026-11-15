@@ -1,8 +1,8 @@
 //! Async filesystem I/O.
 //!
-//! Provides file read/write, buffered or bypassing the page cache with
-//! [`OpenFlags::DIRECT`], and metadata operations (stat, symlink_metadata,
-//! rename, remove, mkdir). File operations do not block the worker thread:
+//! Provides buffered file read/write and metadata operations (stat,
+//! symlink_metadata, rename, remove, mkdir). Reads and writes that bypass the
+//! page cache are in [`crate::direct_io`]. File operations do not block the worker thread:
 //! on io_uring the kernel completes them inline or on its own threads (see
 //! below); on mio they run on a thread pool. On io_uring [`close`] does not
 //! wait for the file to close; on mio it closes the fd on the worker unless
@@ -55,8 +55,10 @@
 //!   ext4, XFS or btrfs waits for the page in task work rather than on the
 //!   pool.
 //!
-//! Reads and writes on a file opened with [`OpenFlags::DIRECT`] use the pool
-//! always on overlayfs and tmpfs, and elsewhere when they would block.
+//! [`direct_io`](crate::direct_io) uses the same pool: its fsync always, its
+//! reads and writes always on overlayfs and tmpfs and elsewhere when they
+//! would block, and its open when the kernel cannot finish it without
+//! blocking.
 //!
 //! The pool has `min(sq_entries, 4 × the host's online CPUs)` threads per
 //! worker; a container's CPU limit does not lower it. With the default
@@ -201,36 +203,13 @@ impl OpenFlags {
     /// `offset` argument of [`write_from()`] is then ignored, on
     /// both backends; on macOS `pwrite` writes at `offset` regardless.
     pub const APPEND: Self = Self(libc::O_APPEND);
-    /// Bypass the page cache: `O_DIRECT` on Linux, `F_NOCACHE` set after the
-    /// open on macOS.
-    ///
-    /// With `O_DIRECT` the buffer address, the length and the file offset of
-    /// a read or write must each be a multiple of the device's logical block
-    /// size (typically 512 or 4096 bytes), or the kernel returns `EINVAL`;
-    /// [`AlignedBuf`](crate::buf::AlignedBuf) provides the address. A
-    /// filesystem that does not support `O_DIRECT` refuses the open with
-    /// `EINVAL`. `F_NOCACHE` on macOS has no alignment requirement.
-    #[cfg(target_os = "linux")]
-    pub const DIRECT: Self = Self(libc::O_DIRECT);
-    /// Bypass the page cache: `O_DIRECT` on Linux, `F_NOCACHE` set after the
-    /// open on macOS.
-    ///
-    /// With `O_DIRECT` the buffer address, the length and the file offset of
-    /// a read or write must each be a multiple of the device's logical block
-    /// size (typically 512 or 4096 bytes), or the kernel returns `EINVAL`;
-    /// [`AlignedBuf`](crate::buf::AlignedBuf) provides the address. A
-    /// filesystem that does not support `O_DIRECT` refuses the open with
-    /// `EINVAL`. `F_NOCACHE` on macOS has no alignment requirement.
-    #[cfg(not(target_os = "linux"))]
-    pub const DIRECT: Self = Self(NOCACHE_FLAG);
     /// Open with `O_DSYNC`, so a write completes only once the kernel has
     /// sent its data to the device (on Linux, to stable storage).
     ///
-    /// On a Linux block device opened with [`DIRECT`](Self::DIRECT), io_uring
-    /// sends each write with the FUA bit set; when the device does not
-    /// support FUA, the kernel follows the write with a cache flush. The mio
-    /// backend writes with `pwrite(2)`, and for that call the kernel also
-    /// flushes the device's cache after every write. The kernel sends no FUA
+    /// On a Linux block device the kernel follows each write with a cache
+    /// flush of the device; for writes that bypass the page cache and carry
+    /// the FUA bit instead, see
+    /// [`DirectIoOpenOptions::dsync`](crate::direct_io::DirectIoOpenOptions::dsync). The kernel sends no FUA
     /// and no flush when the device reports a write-through cache
     /// (`/sys/block/<dev>/queue/write_cache`). On a file in a filesystem,
     /// each write also commits the metadata needed to read it back. On macOS
@@ -238,13 +217,6 @@ impl OpenFlags {
     /// as with `fsync(2)`.
     pub const DSYNC: Self = Self(libc::O_DSYNC);
 }
-
-/// The bit [`OpenFlags::DIRECT`] uses on macOS, where no `open(2)` flag
-/// bypasses the page cache: bit 31, which `OpenFlags` does not otherwise use
-/// (`<sys/fcntl.h>` names it `O_POPUP`, which the kernel ignores). The mio
-/// backend removes it before `open` and sets `F_NOCACHE` on the new fd.
-#[cfg(not(target_os = "linux"))]
-pub(crate) const NOCACHE_FLAG: i32 = i32::MIN;
 
 impl std::ops::BitOr for OpenFlags {
     type Output = Self;
@@ -441,6 +413,99 @@ pub(crate) enum FsOp {
     Rename,
     Unlink,
     Mkdir,
+}
+
+/// Which file table an operation uses: [`File`]s or
+/// [`DirectIoFile`](crate::direct_io::DirectIoFile)s. Both kinds run the same
+/// code, each with its own file table and in-flight bound, sized by its own
+/// config (`FsConfig`, `DirectIoConfig`): on io_uring also a command slab and
+/// fixed-file range, on mio an fd vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FileKind {
+    Fs,
+    DirectIo,
+}
+
+impl FileKind {
+    pub(crate) fn not_configured(self) -> io::Error {
+        io::Error::other(match self {
+            FileKind::Fs => "filesystem I/O not configured",
+            FileKind::DirectIo => "direct I/O not configured",
+        })
+    }
+
+    pub(crate) fn table_full(self) -> io::Error {
+        io::Error::other(match self {
+            FileKind::Fs => "filesystem file table full",
+            FileKind::DirectIo => "direct I/O file table full",
+        })
+    }
+
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn slab_exhausted(self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            match self {
+                FileKind::Fs => "filesystem command slab exhausted",
+                FileKind::DirectIo => "direct I/O command slab exhausted",
+            },
+        )
+    }
+
+    pub(crate) fn invalid_handle(self) -> io::Error {
+        io::Error::other(match self {
+            FileKind::Fs => "invalid filesystem file handle",
+            FileKind::DirectIo => "invalid direct I/O file handle",
+        })
+    }
+
+    pub(crate) fn stale_handle(self) -> io::Error {
+        io::Error::other(match self {
+            FileKind::Fs => "stale filesystem file handle",
+            FileKind::DirectIo => "stale direct I/O file handle",
+        })
+    }
+
+    #[cfg(not(has_io_uring))]
+    pub(crate) fn fd_not_found(self) -> io::Error {
+        io::Error::other(match self {
+            FileKind::Fs => "filesystem file fd not found",
+            FileKind::DirectIo => "direct I/O file fd not found",
+        })
+    }
+
+    #[cfg(has_io_uring)]
+    pub(crate) fn op_tag(self) -> crate::completion::OpTag {
+        match self {
+            FileKind::Fs => crate::completion::OpTag::Fs,
+            FileKind::DirectIo => crate::completion::OpTag::DirectIo,
+        }
+    }
+
+    #[cfg(has_io_uring)]
+    pub(crate) fn disk_io_kind(self) -> crate::handler::DiskIoKind {
+        match self {
+            FileKind::Fs => crate::handler::DiskIoKind::Fs,
+            FileKind::DirectIo => crate::handler::DiskIoKind::DirectIo,
+        }
+    }
+
+    /// The `FileClose` payload of this kind's fixed-file slots.
+    #[cfg(has_io_uring)]
+    pub(crate) fn file_close_payload(self) -> u32 {
+        match self {
+            FileKind::Fs => crate::completion::FILE_CLOSE_FS,
+            FileKind::DirectIo => crate::completion::FILE_CLOSE_DIRECT_IO,
+        }
+    }
+
+    #[cfg(not(has_io_uring))]
+    pub(crate) fn pool_subsystem(self) -> crate::disk_io_pool::PoolSubsystem {
+        match self {
+            FileKind::Fs => crate::disk_io_pool::PoolSubsystem::Fs,
+            FileKind::DirectIo => crate::disk_io_pool::PoolSubsystem::DirectIo,
+        }
+    }
 }
 
 /// Per-file state tracked by the driver.
@@ -671,11 +736,7 @@ pub fn open(
         let (key, (file_index, generation)) =
             submit_with_key(executor, |key| ctx.fs_open(path.as_ref(), flags, mode, key))?;
         Ok(OpenFuture {
-            key,
-            file_index,
-            generation,
-            done: false,
-            owner: crate::runtime::waker::current_worker(),
+            state: OpenState::new(FileKind::Fs, key, file_index, generation),
         })
     })
 }
@@ -699,28 +760,63 @@ pub fn create(path: impl AsRef<std::path::Path>) -> io::Result<OpenFuture> {
 
 /// Future that resolves to a [`File`] handle when the open completes.
 ///
-/// Dropping it before it resolves closes the file and frees its slot, on the
-/// event loop's next iteration if the open has completed, otherwise when it
-/// completes.
+/// Dropping it before it resolves closes the file: on the event loop's next
+/// iteration if the open has completed, otherwise when it completes. The slot
+/// is free once the close completes; on io_uring that is an
+/// `IORING_OP_CLOSE`, so an open right after the drop can find the table
+/// full.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
 /// owning worker drives it; polled outside the ringline executor it panics.
 /// Dropped on a thread other than the owning worker, it leaves the file open
 /// and its slot taken until the owning worker exits.
 pub struct OpenFuture {
-    key: crate::runtime::DiskIoKey,
-    file_index: u16,
-    generation: u32,
-    /// Set once `poll` has returned `Ready`: the caller owns the outcome.
-    done: bool,
-    /// The worker whose executor holds `key`.
-    owner: u32,
+    state: OpenState,
 }
 
 impl Future for OpenFuture {
     type Output = io::Result<File>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<File>> {
+        self.state
+            .poll_open(cx)
+            .map_ok(|(index, generation)| File::new(index, generation))
+    }
+}
+
+/// An open in flight, held by [`OpenFuture`] and
+/// [`direct_io::OpenFuture`](crate::direct_io::OpenFuture). Dropped before it
+/// resolves, it queues the open on `ORPHANED_OPENS`.
+pub(crate) struct OpenState {
+    kind: FileKind,
+    key: crate::runtime::DiskIoKey,
+    file_index: u16,
+    generation: u32,
+    /// Set once `poll_open` has returned `Ready`: the caller owns the outcome.
+    done: bool,
+    /// The worker whose executor holds `key`.
+    owner: u32,
+}
+
+impl OpenState {
+    pub(crate) fn new(
+        kind: FileKind,
+        key: crate::runtime::DiskIoKey,
+        file_index: u16,
+        generation: u32,
+    ) -> Self {
+        OpenState {
+            kind,
+            key,
+            file_index,
+            generation,
+            done: false,
+            owner: crate::runtime::waker::current_worker(),
+        }
+    }
+
+    /// Poll the open. Resolves to the file's `(slot, generation)`.
+    pub(crate) fn poll_open(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<(u16, u32)>> {
         assert!(!self.done, "OpenFuture polled after completion");
         let poll = with_state(|_driver, executor| {
             // On another worker `key` names that worker's entry, and the
@@ -733,7 +829,7 @@ impl Future for OpenFuture {
                 Some((result, _)) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
-                Some(_) => Poll::Ready(Ok(File::new(self.file_index, self.generation))),
+                Some(_) => Poll::Ready(Ok((self.file_index, self.generation))),
                 None => pending(cx),
             }
         });
@@ -744,7 +840,7 @@ impl Future for OpenFuture {
     }
 }
 
-impl Drop for OpenFuture {
+impl Drop for OpenState {
     fn drop(&mut self) {
         // Only the owning worker's executor holds `key`. Dropped elsewhere
         // (the future is `Send`), the file and its slot stay open there (#575).
@@ -758,15 +854,16 @@ impl Drop for OpenFuture {
         let _ = ORPHANED_OPENS.try_with(|orphans| {
             orphans
                 .borrow_mut()
-                .push((self.key, self.file_index, self.generation));
+                .push((self.kind, self.key, self.file_index, self.generation));
         });
     }
 }
 
 thread_local! {
-    // Opens whose `OpenFuture` was dropped before it resolved, as `(disk I/O
-    // key, file slot, generation)`. Nothing holds a handle to these files.
-    static ORPHANED_OPENS: std::cell::RefCell<Vec<(crate::runtime::DiskIoKey, u16, u32)>> =
+    // Opens whose future was dropped before it resolved, as `(file kind,
+    // disk I/O key, file slot, generation)`. Nothing holds a handle to these
+    // files.
+    static ORPHANED_OPENS: std::cell::RefCell<Vec<(FileKind, crate::runtime::DiskIoKey, u16, u32)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     // Disk-I/O keys of operations whose future (`DiskIoFuture`,
     // `StatFuture`) was dropped outside the executor, before it resolved.
@@ -840,10 +937,10 @@ pub(crate) fn release_orphans(
             std::mem::take(&mut *orphans)
         }
     });
-    for (key, index, generation) in orphans {
+    for (kind, key, index, generation) in orphans {
         match executor.take_disk_io_result(key) {
             Some(result) if result >= 0 => {
-                let _ = driver.make_ctx().fs_close(File::new(index, generation));
+                let _ = driver.make_ctx().file_close(kind, index, generation);
             }
             // The open failed, and its slot is already free.
             Some(_) => {}
@@ -888,7 +985,18 @@ pub(crate) fn release_orphans(
 ///
 /// Panics if called outside the ringline async executor, unless `buf` is
 /// refused before submission (the `InvalidInput` cases above).
-pub fn read_into<B: IoBufMut>(file: File, offset: u64, mut buf: B) -> ReadFuture<B> {
+pub fn read_into<B: IoBufMut>(file: File, offset: u64, buf: B) -> ReadFuture<B> {
+    read_into_file(FileKind::Fs, file.index, file.generation, offset, buf)
+}
+
+/// [`read_into`] on a file of `kind`.
+pub(crate) fn read_into_file<B: IoBufMut>(
+    kind: FileKind,
+    index: u16,
+    generation: u32,
+    offset: u64,
+    mut buf: B,
+) -> ReadFuture<B> {
     let (ptr, len, initial_len) = match spare_region(&mut buf) {
         Ok(region) => region,
         Err(e) => return ReadFuture::failed(e, buf),
@@ -899,7 +1007,7 @@ pub fn read_into<B: IoBufMut>(file: File, offset: u64, mut buf: B) -> ReadFuture
         // the kernel's use of it.
         let mut ctx = driver.make_ctx();
         match submit_with_key(executor, |key| unsafe {
-            ctx.fs_read(file, offset, ptr, len, key)
+            ctx.file_read(kind, index, generation, offset, ptr, len, key)
         }) {
             Ok((key, target)) => ReadFuture::new(key, target, initial_len, None, buf),
             Err(e) => ReadFuture::failed(e, buf),
@@ -936,6 +1044,17 @@ pub fn read_into<B: IoBufMut>(file: File, offset: u64, mut buf: B) -> ReadFuture
 /// Panics if called outside the ringline async executor, unless `buf` is
 /// refused before submission (the `InvalidInput` cases above).
 pub fn write_from<B: IoBuf>(file: File, offset: u64, buf: B) -> WriteFuture<B> {
+    write_from_file(FileKind::Fs, file.index, file.generation, offset, buf)
+}
+
+/// [`write_from`] on a file of `kind`.
+pub(crate) fn write_from_file<B: IoBuf>(
+    kind: FileKind,
+    index: u16,
+    generation: u32,
+    offset: u64,
+    buf: B,
+) -> WriteFuture<B> {
     let (ptr, len) = match init_region(&buf) {
         Ok(region) => region,
         Err(e) => return WriteFuture::failed(e, buf),
@@ -945,7 +1064,7 @@ pub fn write_from<B: IoBuf>(file: File, offset: u64, buf: B) -> WriteFuture<B> {
         // operation completes (`WriteFuture::drop`).
         let mut ctx = driver.make_ctx();
         match submit_with_key(executor, |key| unsafe {
-            ctx.fs_write(file, offset, ptr, len, key)
+            ctx.file_write(kind, index, generation, offset, ptr, len, key)
         }) {
             Ok((key, target)) => WriteFuture::new(key, target, None, buf),
             Err(e) => WriteFuture::failed(e, buf),
@@ -1318,9 +1437,15 @@ fn park_buffer(
 ///
 /// Panics if called outside the ringline async executor.
 pub fn fsync(file: File) -> io::Result<DiskIoFuture> {
+    fsync_file(FileKind::Fs, file.index, file.generation)
+}
+
+/// [`fsync`] on a file of `kind`.
+pub(crate) fn fsync_file(kind: FileKind, index: u16, generation: u32) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let (key, ()) = submit_with_key(executor, |key| ctx.fs_fsync(file, key))?;
+        let (key, ()) =
+            submit_with_key(executor, |key| ctx.file_fsync(kind, index, generation, key))?;
         Ok(DiskIoFuture::new(key, false))
     })
 }
@@ -1340,9 +1465,14 @@ pub fn fsync(file: File) -> io::Result<DiskIoFuture> {
 ///
 /// Panics if called outside the ringline async executor.
 pub fn close(file: File) -> io::Result<()> {
+    close_file(FileKind::Fs, file.index, file.generation)
+}
+
+/// [`close`] on a file of `kind`.
+pub(crate) fn close_file(kind: FileKind, index: u16, generation: u32) -> io::Result<()> {
     with_state(|driver, _| {
         let mut ctx = driver.make_ctx();
-        ctx.fs_close(file)
+        ctx.file_close(kind, index, generation)
     })
 }
 

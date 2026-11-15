@@ -138,8 +138,8 @@
 //! mio backend: works on Linux and macOS; forced on Linux with the
 //! `force-mio` cargo feature (`--features ringline/force-mio` from a
 //! dependent crate). NVMe passthrough and zero-copy sends are not
-//! available. Filesystem operations, `O_DIRECT` ones included, run on a
-//! dedicated thread pool.
+//! available. Filesystem and direct I/O operations run on a dedicated thread
+//! pool.
 
 // A stub-engine build (`RINGLINE_STUB_ENGINE=1`) only checks that the
 // driver compiles without `UringEngine`; nothing reads the operations it
@@ -169,6 +169,7 @@ pub(crate) mod chain;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod completion;
 pub(crate) mod connection;
+pub mod direct_io;
 #[cfg(not(has_io_uring))]
 pub(crate) mod disk_io_pool;
 pub(crate) mod disk_order;
@@ -292,7 +293,8 @@ pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
 /// Future that awaits a disk-I/O completion that carries no buffer
-/// (`fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `nvme_flush`).
+/// (`fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `direct_io::fsync`,
+/// `nvme_flush`).
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
@@ -463,6 +465,12 @@ pub use buffer::fixed::RegionId;
 pub use config::Config;
 /// Builder for [`Config`] with discoverable methods and `build()` validation.
 pub use config::ConfigBuilder;
+/// Direct I/O configuration.
+pub use direct_io::DirectIoConfig;
+/// Direct I/O file handle.
+pub use direct_io::DirectIoFile;
+/// Options for opening a direct I/O file.
+pub use direct_io::DirectIoOpenOptions;
 /// Runtime errors.
 pub use error::Error;
 /// Zero-copy send guard trait.

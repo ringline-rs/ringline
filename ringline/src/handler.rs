@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use crate::buffer::send_copy::SendCopyPool;
 #[cfg(has_io_uring)]
 use crate::buffer::send_slab::{InFlightSendSlab, MAX_GUARDS, MAX_IOVECS};
+use crate::fs::FileKind;
 use crate::guard::GuardBox;
 
 /// Per-connection send queue state.
@@ -400,6 +401,12 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) fs_cmd_slab: &'a mut Option<crate::fs::FsCmdSlab>,
     /// Base offset in the fixed file table for filesystem file fds.
     pub(crate) fs_fd_base: u32,
+    /// Direct I/O file table. `None` when direct I/O is not configured.
+    pub(crate) direct_io_files: &'a mut Option<crate::fs::FsFileTable>,
+    /// Direct I/O command slab. `None` when direct I/O is not configured.
+    pub(crate) direct_io_cmd_slab: &'a mut Option<crate::fs::FsCmdSlab>,
+    /// Base offset in the fixed file table for direct I/O file fds.
+    pub(crate) direct_io_fd_base: u32,
     /// Connections whose `close_pending` was set from this ctx (e.g.
     /// `DriverCtx::close`); the event loop re-drives `try_finalize_close`
     /// for each before the iteration ends. This keeps ctx-initiated closes
@@ -1652,93 +1659,144 @@ impl<'a> DriverCtx<'a> {
         Ok((dev.fd_index, dev.nsid))
     }
 
-    // ── Filesystem I/O methods ─────────────────────────────────────────────
+    // ── fs and direct I/O files ───────────────────────────────────────────
+    //
+    // fs files and direct I/O files run the same code, each kind with its own
+    // file table, command slab and fixed-file range (`FileKind`).
 
-    /// Open a file asynchronously via io_uring.
-    ///
-    /// Allocates a file table slot and command slab entry, submits an openat
-    /// SQE that installs the fd directly into the fixed file table.
+    fn file_table(&self, kind: FileKind) -> Option<&crate::fs::FsFileTable> {
+        match kind {
+            FileKind::Fs => self.fs_files.as_ref(),
+            FileKind::DirectIo => self.direct_io_files.as_ref(),
+        }
+    }
+
+    fn file_table_mut(&mut self, kind: FileKind) -> Option<&mut crate::fs::FsFileTable> {
+        match kind {
+            FileKind::Fs => self.fs_files.as_mut(),
+            FileKind::DirectIo => self.direct_io_files.as_mut(),
+        }
+    }
+
+    fn file_cmd_slab_mut(&mut self, kind: FileKind) -> Option<&mut crate::fs::FsCmdSlab> {
+        match kind {
+            FileKind::Fs => self.fs_cmd_slab.as_mut(),
+            FileKind::DirectIo => self.direct_io_cmd_slab.as_mut(),
+        }
+    }
+
+    fn file_fd_base(&self, kind: FileKind) -> u32 {
+        match kind {
+            FileKind::Fs => self.fs_fd_base,
+            FileKind::DirectIo => self.direct_io_fd_base,
+        }
+    }
+
+    /// Take a command slot for `op` on file slot `file_index`, completing to
+    /// `key`, and record the SQE's user_data in it. Returns
+    /// `(slab_idx, user_data)`.
+    fn file_command(
+        &mut self,
+        kind: FileKind,
+        file_index: u16,
+        op: crate::fs::FsOp,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<(u16, crate::completion::UserData)> {
+        let slab = self
+            .file_cmd_slab_mut(kind)
+            .ok_or_else(|| kind.not_configured())?;
+        let slab_idx = slab
+            .allocate(file_index, op, key)
+            .ok_or_else(|| kind.slab_exhausted())?;
+        let op_id = self.disk_op_id(kind.disk_io_kind(), slab_idx);
+        let ud = crate::completion::UserData::encode(kind.op_tag(), file_index as u32, op_id);
+        if let Some(slab) = self.file_cmd_slab_mut(kind) {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
+        Ok((slab_idx, ud))
+    }
+
+    /// Count a pushed read, write or fsync against its file, or release its
+    /// command slot if the push failed.
+    fn file_pushed(
+        &mut self,
+        kind: FileKind,
+        file_index: u16,
+        slab_idx: u16,
+        pushed: io::Result<()>,
+    ) -> io::Result<()> {
+        match pushed {
+            Ok(()) => {
+                if let Some(f) = self
+                    .file_table_mut(kind)
+                    .and_then(|files| files.get_mut(file_index))
+                {
+                    f.in_flight += 1;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(slab) = self.file_cmd_slab_mut(kind) {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Open `path` into a slot of `kind`'s table with an `OpenAt` that
+    /// installs the file directly in the fixed file table.
     ///
     /// Returns `(file_index, generation)`; the open completes to `key`.
-    pub(crate) fn fs_open(
+    fn file_open(
         &mut self,
+        kind: FileKind,
         path: &std::path::Path,
-        flags: crate::fs::OpenFlags,
+        flags: i32,
         mode: u32,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<(u16, u32)> {
+        let fd_base = self.file_fd_base(kind);
         let files = self
-            .fs_files
-            .as_mut()
-            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-
-        let file_index = files
-            .allocate()
-            .ok_or_else(|| io::Error::other("filesystem file table full"))?;
-
+            .file_table_mut(kind)
+            .ok_or_else(|| kind.not_configured())?;
+        // Convert the path before allocating, so a bad path holds no slot.
+        let c_path = crate::fs::path_to_cstring(path)?;
+        let file_index = files.allocate().ok_or_else(|| kind.table_full())?;
         let generation = files.get(file_index).map(|f| f.generation).unwrap_or(0);
-        let fd_index = self.fs_fd_base + file_index as u32;
-
-        // Store fd_index in file state.
+        let fd_index = fd_base + file_index as u32;
         if let Some(f) = files.get_mut(file_index) {
             f.fd_index = fd_index;
         }
 
-        let c_path = crate::fs::path_to_cstring(path).inspect_err(|_| {
-            self.fs_files.as_mut().unwrap().release(file_index);
-        })?;
-
-        let slab = self.fs_cmd_slab.as_mut().ok_or_else(|| {
-            self.fs_files.as_mut().unwrap().release(file_index);
-            io::Error::other("filesystem I/O not configured")
-        })?;
-
-        let slab_idx = slab
-            .allocate(file_index, crate::fs::FsOp::Open, key)
-            .ok_or_else(|| {
-                self.fs_files.as_mut().unwrap().release(file_index);
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "filesystem command slab exhausted",
-                )
-            })?;
-
-        // Store the CString in the slab entry so it lives until CQE.
-        if let Some(entry) = slab.get_mut(slab_idx) {
-            entry.path = Some(c_path);
-        }
-
-        let path_ptr = self
-            .fs_cmd_slab
-            .as_ref()
-            .unwrap()
-            .get(slab_idx)
-            .unwrap()
-            .path
-            .as_ref()
-            .unwrap()
-            .as_ptr();
-
-        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::Fs,
-            file_index as u32,
-            op_id,
-        );
-        if let Some(slab) = self.fs_cmd_slab.as_mut() {
-            slab.set_user_data(slab_idx, ud.raw());
-        }
+        let (slab_idx, ud) = match self.file_command(kind, file_index, crate::fs::FsOp::Open, key) {
+            Ok(command) => command,
+            Err(e) => {
+                if let Some(files) = self.file_table_mut(kind) {
+                    files.release(file_index);
+                }
+                return Err(e);
+            }
+        };
+        // The slab entry owns the path until the completion.
+        let path_ptr = match self
+            .file_cmd_slab_mut(kind)
+            .and_then(|slab| slab.get_mut(slab_idx))
+        {
+            Some(entry) => entry.path.insert(c_path).as_ptr(),
+            None => unreachable!("command slot {slab_idx} was allocated above"),
+        };
 
         match unsafe {
             self.ring
-                .submit_openat(fd_index, path_ptr, flags.0, mode, ud.raw())
+                .submit_openat(fd_index, path_ptr, flags, mode, ud.raw())
         } {
             Ok(()) => Ok((file_index, generation)),
             Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                if let Some(slab) = self.file_cmd_slab_mut(kind) {
                     slab.release(slab_idx);
                 }
-                if let Some(files) = self.fs_files.as_mut() {
+                if let Some(files) = self.file_table_mut(kind) {
                     files.release(file_index);
                 }
                 Err(e)
@@ -1746,190 +1804,90 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Submit a filesystem read that completes to `key`. Returns its user_data,
-    /// which a dropped future cancels.
+    /// Submit a read that completes to `key`. Returns its user_data, which a
+    /// dropped future cancels.
     ///
     /// # Safety
     /// `buf` must point to valid, writable memory of at least `len` bytes
     /// that remains valid until the completion fires.
-    pub(crate) unsafe fn fs_read(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn file_read(
         &mut self,
-        file: crate::fs::File,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
         offset: u64,
         buf: *mut u8,
         len: u32,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
-        let fd_index = self.validate_fs_file(file)?;
-
-        let slab = self
-            .fs_cmd_slab
-            .as_mut()
-            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(file.index, crate::fs::FsOp::Read, key)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "filesystem command slab exhausted",
-                )
-            })?;
-
-        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::Fs,
-            file.index as u32,
-            op_id,
-        );
-        if let Some(slab) = self.fs_cmd_slab.as_mut() {
-            slab.set_user_data(slab_idx, ud.raw());
-        }
-
-        match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
-            Ok(()) => {
-                if let Some(files) = self.fs_files.as_mut()
-                    && let Some(f) = files.get_mut(file.index)
-                {
-                    f.in_flight += 1;
-                }
-                Ok(ud.raw())
-            }
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                Err(e)
-            }
-        }
+        let fd_index = self.validate_file(kind, index, generation)?;
+        let (slab_idx, ud) = self.file_command(kind, index, crate::fs::FsOp::Read, key)?;
+        let pushed = unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) };
+        self.file_pushed(kind, index, slab_idx, pushed)?;
+        Ok(ud.raw())
     }
 
-    /// Submit a filesystem write that completes to `key`. Returns its user_data,
-    /// which a dropped future cancels.
+    /// Submit a write that completes to `key`. Returns its user_data, which a
+    /// dropped future cancels.
     ///
     /// # Safety
     /// `buf` must point to valid, readable memory of at least `len` bytes
     /// that remains valid until the completion fires.
-    pub(crate) unsafe fn fs_write(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn file_write(
         &mut self,
-        file: crate::fs::File,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
         offset: u64,
         buf: *const u8,
         len: u32,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
-        let fd_index = self.validate_fs_file(file)?;
-
-        let slab = self
-            .fs_cmd_slab
-            .as_mut()
-            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(file.index, crate::fs::FsOp::Write, key)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "filesystem command slab exhausted",
-                )
-            })?;
-
-        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::Fs,
-            file.index as u32,
-            op_id,
-        );
-        if let Some(slab) = self.fs_cmd_slab.as_mut() {
-            slab.set_user_data(slab_idx, ud.raw());
-        }
-
-        match unsafe {
+        let fd_index = self.validate_file(kind, index, generation)?;
+        let (slab_idx, ud) = self.file_command(kind, index, crate::fs::FsOp::Write, key)?;
+        let pushed = unsafe {
             self.ring
                 .submit_direct_write(fd_index, buf, len, offset, ud)
-        } {
-            Ok(()) => {
-                if let Some(files) = self.fs_files.as_mut()
-                    && let Some(f) = files.get_mut(file.index)
-                {
-                    f.in_flight += 1;
-                }
-                self.write_orders.begin_write(
-                    crate::disk_order::OrderKey {
-                        index: file.index,
-                        generation: file.generation,
-                    },
-                    key,
-                );
-                Ok(ud.raw())
-            }
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                Err(e)
-            }
-        }
+        };
+        self.file_pushed(kind, index, slab_idx, pushed)?;
+        self.write_orders.begin_write(
+            crate::disk_order::OrderKey {
+                kind,
+                index,
+                generation,
+            },
+            key,
+        );
+        Ok(ud.raw())
     }
 
-    /// Submit an fsync for a filesystem file.
-    pub(crate) fn fs_fsync(
+    /// Submit an fsync that completes to `key`.
+    pub(crate) fn file_fsync(
         &mut self,
-        file: crate::fs::File,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<()> {
-        let fd_index = self.validate_fs_file(file)?;
-
-        let slab = self
-            .fs_cmd_slab
-            .as_mut()
-            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(file.index, crate::fs::FsOp::Fsync, key)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "filesystem command slab exhausted",
-                )
-            })?;
-
-        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::Fs,
-            file.index as u32,
-            op_id,
-        );
-        if let Some(slab) = self.fs_cmd_slab.as_mut() {
-            slab.set_user_data(slab_idx, ud.raw());
-        }
-
+        let fd_index = self.validate_file(kind, index, generation)?;
+        let (slab_idx, ud) = self.file_command(kind, index, crate::fs::FsOp::Fsync, key)?;
         // Held until the writes submitted before it on the file complete
         // (#905); counted in flight either way, so a close waits for it.
         let order = crate::disk_order::OrderKey {
-            index: file.index,
-            generation: file.generation,
+            kind,
+            index,
+            generation,
         };
         let pushed = match self.write_orders.sync(order, (fd_index, ud.raw())) {
             Some(_) => self.ring.submit_direct_fsync(fd_index, ud),
             None => Ok(()),
         };
-        match pushed {
-            Ok(()) => {
-                if let Some(files) = self.fs_files.as_mut()
-                    && let Some(f) = files.get_mut(file.index)
-                {
-                    f.in_flight += 1;
-                }
-                Ok(())
-            }
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                Err(e)
-            }
-        }
+        self.file_pushed(kind, index, slab_idx, pushed)
     }
 
-    /// Close a filesystem file.
+    /// Close a file.
     ///
     /// The handle goes stale at once. The file's fixed-file slot is closed
     /// with `IORING_OP_CLOSE` once no read, write or fsync on it is in flight:
@@ -1938,13 +1896,17 @@ impl<'a> DriverCtx<'a> {
     /// the kernel resolves its fixed file then (#859). The table slot is free
     /// when the close completes (`AsyncEventLoop::handle_file_close`), so no
     /// open installs into the slot before the close has run.
-    pub(crate) fn fs_close(&mut self, file: crate::fs::File) -> io::Result<()> {
-        let fd_index = self.validate_fs_file(file)?;
+    pub(crate) fn file_close(
+        &mut self,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
+    ) -> io::Result<()> {
+        let fd_index = self.validate_file(kind, index, generation)?;
 
         let Some(f) = self
-            .fs_files
-            .as_mut()
-            .and_then(|files| files.get_mut(file.index))
+            .file_table_mut(kind)
+            .and_then(|files| files.get_mut(index))
         else {
             return Ok(());
         };
@@ -1954,12 +1916,101 @@ impl<'a> DriverCtx<'a> {
                 fd_index,
                 crate::completion::UserData::encode(
                     crate::completion::OpTag::FileClose,
-                    file.index as u32,
-                    crate::completion::FILE_CLOSE_FS,
+                    index as u32,
+                    kind.file_close_payload(),
                 ),
             );
         }
         Ok(())
+    }
+
+    /// Validate a file handle and return its fixed-file index.
+    fn validate_file(&self, kind: FileKind, index: u16, generation: u32) -> io::Result<u32> {
+        let files = self.file_table(kind).ok_or_else(|| kind.not_configured())?;
+        let f = files.get(index).ok_or_else(|| kind.invalid_handle())?;
+        if f.closing || f.generation != generation {
+            return Err(kind.stale_handle());
+        }
+        Ok(f.fd_index)
+    }
+
+    /// Open `path` for direct I/O: `O_RDWR | O_DIRECT` and the flags of
+    /// `options`.
+    ///
+    /// Returns `(file_index, generation)`; the open completes to `key`.
+    pub(crate) fn direct_io_open(
+        &mut self,
+        path: &std::path::Path,
+        options: crate::direct_io::DirectIoOpenOptions,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<(u16, u32)> {
+        let flags = libc::O_RDWR | libc::O_DIRECT | options.extra_flags();
+        self.file_open(FileKind::DirectIo, path, flags, 0, key)
+    }
+
+    // ── Filesystem I/O methods ─────────────────────────────────────────────
+
+    /// Open a file asynchronously via io_uring.
+    ///
+    /// Returns `(file_index, generation)`; the open completes to `key`.
+    pub(crate) fn fs_open(
+        &mut self,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        mode: u32,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<(u16, u32)> {
+        self.file_open(FileKind::Fs, path, flags.0, mode, key)
+    }
+
+    /// Submit a filesystem read; see [`file_read`](Self::file_read).
+    ///
+    /// # Safety
+    /// As for [`file_read`](Self::file_read).
+    #[cfg(test)]
+    pub(crate) unsafe fn fs_read(
+        &mut self,
+        file: crate::fs::File,
+        offset: u64,
+        buf: *mut u8,
+        len: u32,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
+        let (index, generation) = (file.index, file.generation);
+        unsafe { self.file_read(FileKind::Fs, index, generation, offset, buf, len, key) }
+    }
+
+    /// Submit a filesystem write; see [`file_write`](Self::file_write).
+    ///
+    /// # Safety
+    /// As for [`file_write`](Self::file_write).
+    #[cfg(test)]
+    pub(crate) unsafe fn fs_write(
+        &mut self,
+        file: crate::fs::File,
+        offset: u64,
+        buf: *const u8,
+        len: u32,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
+        let (index, generation) = (file.index, file.generation);
+        unsafe { self.file_write(FileKind::Fs, index, generation, offset, buf, len, key) }
+    }
+
+    /// Submit an fsync for a filesystem file.
+    #[cfg(test)]
+    pub(crate) fn fs_fsync(
+        &mut self,
+        file: crate::fs::File,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
+        self.file_fsync(FileKind::Fs, file.index, file.generation, key)
+    }
+
+    /// Close a filesystem file; see [`file_close`](Self::file_close).
+    #[cfg(test)]
+    pub(crate) fn fs_close(&mut self, file: crate::fs::File) -> io::Result<()> {
+        self.file_close(FileKind::Fs, file.index, file.generation)
     }
 
     /// Submit a statx via io_uring. With `nofollow`, a final symbolic link in
@@ -2188,21 +2239,6 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Validate a filesystem file handle and return the fd_index.
-    fn validate_fs_file(&self, file: crate::fs::File) -> io::Result<u32> {
-        let files = self
-            .fs_files
-            .as_ref()
-            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let f = files
-            .get(file.index)
-            .ok_or_else(|| io::Error::other("invalid filesystem file handle"))?;
-        if f.closing || f.generation != file.generation {
-            return Err(io::Error::other("stale filesystem file handle"));
-        }
-        Ok(f.fd_index)
-    }
-
     /// Arm a connect timeout on a connect that has already been submitted. Does
     /// not depend on the transport.
     ///
@@ -2284,9 +2320,9 @@ pub(crate) struct DriverCtx<'a> {
         crate::disk_io_pool::PoolSubsystem,
     >,
     /// See `Driver::disk_io_counts`.
-    pub(crate) disk_io_counts: &'a mut [u16; 1],
+    pub(crate) disk_io_counts: &'a mut [u16; 2],
     /// See `Driver::disk_io_limits`.
-    pub(crate) disk_io_limits: [Option<u16>; 1],
+    pub(crate) disk_io_limits: [Option<u16>; 2],
     /// See `Driver::disk_io_borrowing`.
     pub(crate) disk_io_borrowing: &'a mut std::collections::HashSet<crate::runtime::DiskIoKey>,
     /// See `Driver::write_orders`.
@@ -2297,7 +2333,12 @@ pub(crate) struct DriverCtx<'a> {
     /// Filesystem fds, indexed by file slot.
     pub(crate) fs_fds: &'a mut Vec<Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
     /// Pending fs_open requests: maps disk-I/O key → file_index.
-    pub(crate) pending_fs_opens: &'a mut std::collections::HashMap<crate::runtime::DiskIoKey, u16>,
+    pub(crate) pending_fs_opens:
+        &'a mut std::collections::HashMap<crate::runtime::DiskIoKey, (FileKind, u16)>,
+    /// Direct I/O file table.
+    pub(crate) direct_io_files: &'a mut Option<crate::fs::FsFileTable>,
+    /// Direct I/O fds, indexed by file slot.
+    pub(crate) direct_io_fds: &'a mut Vec<Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
 }
 
 #[cfg(not(has_io_uring))]
@@ -2912,105 +2953,132 @@ impl<'a> DriverCtx<'a> {
         Ok(())
     }
 
-    // ── Filesystem I/O methods ────────────────────────────────────────
+    // ── fs and direct I/O files ───────────────────────────────────────
+    //
+    // fs files and direct I/O files run the same code, each kind with its own
+    // file table, fd vector and pool bound (`FileKind`).
 
-    /// Open a file via the disk I/O pool.
+    fn file_table(&self, kind: FileKind) -> Option<&crate::fs::FsFileTable> {
+        match kind {
+            FileKind::Fs => self.fs_files.as_ref(),
+            FileKind::DirectIo => self.direct_io_files.as_ref(),
+        }
+    }
+
+    fn file_table_mut(&mut self, kind: FileKind) -> Option<&mut crate::fs::FsFileTable> {
+        match kind {
+            FileKind::Fs => self.fs_files.as_mut(),
+            FileKind::DirectIo => self.direct_io_files.as_mut(),
+        }
+    }
+
+    fn file_fds(&self, kind: FileKind) -> &[Option<std::sync::Arc<std::os::fd::OwnedFd>>] {
+        match kind {
+            FileKind::Fs => self.fs_fds,
+            FileKind::DirectIo => self.direct_io_fds,
+        }
+    }
+
+    fn file_fds_mut(
+        &mut self,
+        kind: FileKind,
+    ) -> &mut [Option<std::sync::Arc<std::os::fd::OwnedFd>>] {
+        match kind {
+            FileKind::Fs => self.fs_fds,
+            FileKind::DirectIo => self.direct_io_fds,
+        }
+    }
+
+    /// Open `path` into a slot of `kind`'s table on the disk I/O pool. With
+    /// `nocache` on macOS the pool also sets `F_NOCACHE` on the new fd.
     ///
-    /// The open is dispatched to the pool. On completion, the pool sends back
-    /// the opened fd in `DiskIoResult::opened`; the event loop moves it into
-    /// `fs_fds` when it drains the response.
+    /// On completion the pool sends back the opened fd in
+    /// `DiskIoResult::opened`; the event loop moves it into the kind's fd
+    /// vector when it drains the response.
     ///
     /// Returns `(file_index, generation)`.
-    pub(crate) fn fs_open(
+    fn file_open(
         &mut self,
+        kind: FileKind,
         path: &std::path::Path,
-        flags: crate::fs::OpenFlags,
+        flags: i32,
         mode: u32,
+        nocache: bool,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<(u16, u32)> {
         let files = self
-            .fs_files
-            .as_mut()
-            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-
-        let file_index = files
-            .allocate()
-            .ok_or_else(|| io::Error::other("filesystem file table full"))?;
-
+            .file_table_mut(kind)
+            .ok_or_else(|| kind.not_configured())?;
+        // Convert the path before allocating, so a bad path holds no slot.
+        let c_path = crate::fs::path_to_cstring(path)?;
+        let file_index = files.allocate().ok_or_else(|| kind.table_full())?;
         let generation = files.get(file_index).map(|f| f.generation).unwrap_or(0);
 
-        let c_path = crate::fs::path_to_cstring(path).inspect_err(|_| {
-            self.fs_files.as_mut().unwrap().release(file_index);
-        })?;
-
-        // `OpenFlags::DIRECT` is `O_DIRECT` on Linux; elsewhere it is a bit no
-        // `open(2)` flag uses, replaced by `F_NOCACHE` after the open.
-        #[cfg(target_os = "linux")]
-        let (open_flags, nocache) = (flags.0, false);
-        #[cfg(not(target_os = "linux"))]
-        let (open_flags, nocache) = (
-            flags.0 & !crate::fs::NOCACHE_FLAG,
-            flags.0 & crate::fs::NOCACHE_FLAG != 0,
-        );
+        #[cfg(not(target_os = "macos"))]
+        let _ = nocache;
         let work = Box::new(move || {
             let fd = unsafe {
                 libc::open(
                     c_path.as_ptr(),
-                    open_flags | libc::O_CLOEXEC,
+                    flags | libc::O_CLOEXEC,
                     mode as libc::c_int,
                 )
             };
-            #[cfg(target_os = "macos")]
-            if fd >= 0 && nocache {
-                unsafe {
-                    libc::fcntl(fd, libc::F_NOCACHE, 1);
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            let _ = nocache;
             if fd < 0 {
                 let errno = io::Error::last_os_error()
                     .raw_os_error()
                     .unwrap_or(libc::EIO);
-                crate::disk_io_pool::DiskIoResult {
+                return crate::disk_io_pool::DiskIoResult {
                     result: -errno,
                     metadata: None,
                     opened: None,
+                };
+            }
+            // macOS has no O_DIRECT; F_NOCACHE bypasses the page cache.
+            #[cfg(target_os = "macos")]
+            if nocache {
+                unsafe {
+                    libc::fcntl(fd, libc::F_NOCACHE, 1);
                 }
-            } else {
-                // Return the fd as the result (positive value), and as an
-                // owned fd so a result that reaches no worker closes it.
-                crate::disk_io_pool::DiskIoResult {
-                    result: fd,
-                    metadata: None,
-                    // SAFETY: `open` returned a fresh descriptor nothing else owns.
-                    opened: Some(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }),
-                }
+            }
+            // Return the fd as the result (positive value), and as an owned
+            // fd so a result that reaches no worker closes it.
+            crate::disk_io_pool::DiskIoResult {
+                result: fd,
+                metadata: None,
+                // SAFETY: `open` returned a fresh descriptor nothing else owns.
+                opened: Some(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }),
             }
         });
 
-        match self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false, key) {
+        match self.submit_disk_io(kind.pool_subsystem(), work, false, key) {
             Ok(()) => {
-                self.pending_fs_opens.insert(key, file_index);
+                self.pending_fs_opens.insert(key, (kind, file_index));
                 Ok((file_index, generation))
             }
             Err(e) => {
-                self.fs_files.as_mut().unwrap().release(file_index);
+                if let Some(files) = self.file_table_mut(kind) {
+                    files.release(file_index);
+                }
                 Err(e)
             }
         }
     }
 
-    /// Submit a filesystem read via the disk I/O pool.
-    pub(crate) unsafe fn fs_read(
+    /// Submit a `pread` of `len` bytes at `offset` into `buf` on the pool.
+    /// Nothing is cancelled on mio, so the returned cancel target is 0.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn file_read(
         &mut self,
-        file: crate::fs::File,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
         offset: u64,
         buf: *mut u8,
         len: u32,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
-        let fd = self.validate_fs_file(file)?;
+        let fd = self.validate_file(kind, index, generation)?;
         let buf_addr = buf as usize;
         let work = Box::new(move || {
             let result = unsafe {
@@ -3034,21 +3102,24 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        // Nothing is cancelled on mio, so the cancel target is unused.
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, true, key)?;
+        self.submit_disk_io(kind.pool_subsystem(), work, true, key)?;
         Ok(0)
     }
 
-    /// Submit a filesystem write via the disk I/O pool.
-    pub(crate) unsafe fn fs_write(
+    /// Submit a `pwrite` of `len` bytes from `buf` at `offset` on the pool.
+    /// Nothing is cancelled on mio, so the returned cancel target is 0.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn file_write(
         &mut self,
-        file: crate::fs::File,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
         offset: u64,
         buf: *const u8,
         len: u32,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
-        let fd = self.validate_fs_file(file)?;
+        let fd = self.validate_file(kind, index, generation)?;
         let buf_addr = buf as usize;
         let work = Box::new(move || {
             let result = unsafe {
@@ -3073,27 +3144,24 @@ impl<'a> DriverCtx<'a> {
             }
         });
         let order = DiskOrder::Write(crate::disk_order::OrderKey {
-            index: file.index,
-            generation: file.generation,
+            kind,
+            index,
+            generation,
         });
-        // Nothing is cancelled on mio, so the cancel target is unused.
-        self.submit_disk_io_ordered(
-            crate::disk_io_pool::PoolSubsystem::Fs,
-            work,
-            true,
-            Some(order),
-            key,
-        )?;
+        self.submit_disk_io_ordered(kind.pool_subsystem(), work, true, Some(order), key)?;
         Ok(0)
     }
 
-    /// Submit an fsync for a filesystem file via the disk I/O pool.
-    pub(crate) fn fs_fsync(
+    /// Submit an `fsync` on the pool, held until the writes submitted before
+    /// it on the file complete (#905).
+    pub(crate) fn file_fsync(
         &mut self,
-        file: crate::fs::File,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<()> {
-        let fd = self.validate_fs_file(file)?;
+        let fd = self.validate_file(kind, index, generation)?;
         let work = Box::new(move || {
             let result = unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&*fd)) };
             let r = if result < 0 {
@@ -3110,29 +3178,123 @@ impl<'a> DriverCtx<'a> {
             }
         });
         let order = DiskOrder::Sync(crate::disk_order::OrderKey {
-            index: file.index,
-            generation: file.generation,
+            kind,
+            index,
+            generation,
         });
-        self.submit_disk_io_ordered(
-            crate::disk_io_pool::PoolSubsystem::Fs,
-            work,
-            false,
-            Some(order),
+        self.submit_disk_io_ordered(kind.pool_subsystem(), work, false, Some(order), key)
+    }
+
+    /// Close a file and release its slot.
+    ///
+    /// The fd closes once the operations already queued on it have finished;
+    /// the handle is invalid at once.
+    pub(crate) fn file_close(
+        &mut self,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
+    ) -> io::Result<()> {
+        self.validate_file(kind, index, generation)?;
+        self.file_fds_mut(kind)[index as usize] = None;
+        if let Some(files) = self.file_table_mut(kind) {
+            files.release(index);
+        }
+        Ok(())
+    }
+
+    /// Validate a file handle and return a hold on its fd.
+    fn validate_file(
+        &self,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
+    ) -> io::Result<std::sync::Arc<std::os::fd::OwnedFd>> {
+        let files = self.file_table(kind).ok_or_else(|| kind.not_configured())?;
+        let f = files.get(index).ok_or_else(|| kind.invalid_handle())?;
+        if f.generation != generation {
+            return Err(kind.stale_handle());
+        }
+        self.file_fds(kind)[index as usize]
+            .clone()
+            .ok_or_else(|| kind.fd_not_found())
+    }
+
+    /// Open `path` for direct I/O on the disk I/O pool: `O_RDWR` and the
+    /// flags of `options`, with `O_DIRECT` on Linux and `F_NOCACHE` on macOS.
+    ///
+    /// Returns `(file_index, generation)`.
+    pub(crate) fn direct_io_open(
+        &mut self,
+        path: &std::path::Path,
+        options: crate::direct_io::DirectIoOpenOptions,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<(u16, u32)> {
+        #[cfg(target_os = "linux")]
+        let flags = libc::O_RDWR | libc::O_DIRECT;
+        #[cfg(not(target_os = "linux"))]
+        let flags = libc::O_RDWR;
+        self.file_open(
+            FileKind::DirectIo,
+            path,
+            flags | options.extra_flags(),
+            0,
+            true,
             key,
         )
     }
 
-    /// Close a filesystem file and release its slot.
+    // ── Filesystem I/O methods ────────────────────────────────────────
+
+    /// Open a file via the disk I/O pool.
     ///
-    /// The fd closes once the operations already queued on it have finished;
-    /// the handle is invalid at once.
-    pub(crate) fn fs_close(&mut self, file: crate::fs::File) -> io::Result<()> {
-        self.validate_fs_file(file)?;
-        self.fs_fds[file.index as usize] = None;
-        if let Some(files) = self.fs_files.as_mut() {
-            files.release(file.index);
-        }
-        Ok(())
+    /// Returns `(file_index, generation)`.
+    pub(crate) fn fs_open(
+        &mut self,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        mode: u32,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<(u16, u32)> {
+        self.file_open(FileKind::Fs, path, flags.0, mode, false, key)
+    }
+
+    /// Submit a filesystem read via the disk I/O pool.
+    #[cfg(test)]
+    pub(crate) unsafe fn fs_read(
+        &mut self,
+        file: crate::fs::File,
+        offset: u64,
+        buf: *mut u8,
+        len: u32,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
+        let (index, generation) = (file.index, file.generation);
+        unsafe { self.file_read(FileKind::Fs, index, generation, offset, buf, len, key) }
+    }
+
+    /// Submit a filesystem write via the disk I/O pool.
+    #[cfg(test)]
+    pub(crate) unsafe fn fs_write(
+        &mut self,
+        file: crate::fs::File,
+        offset: u64,
+        buf: *const u8,
+        len: u32,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
+        let (index, generation) = (file.index, file.generation);
+        unsafe { self.file_write(FileKind::Fs, index, generation, offset, buf, len, key) }
+    }
+
+    /// Submit an fsync for a filesystem file via the disk I/O pool.
+    #[cfg(test)]
+    pub(crate) fn fs_fsync(
+        &mut self,
+        file: crate::fs::File,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
+        self.file_fsync(FileKind::Fs, file.index, file.generation, key)
     }
 
     /// Submit a stat via the disk I/O pool; with `nofollow`, an lstat.
@@ -3251,26 +3413,6 @@ impl<'a> DriverCtx<'a> {
             }
         });
         self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false, key)
-    }
-
-    /// Validate a filesystem file handle and return a hold on its fd.
-    fn validate_fs_file(
-        &self,
-        file: crate::fs::File,
-    ) -> io::Result<std::sync::Arc<std::os::fd::OwnedFd>> {
-        let files = self
-            .fs_files
-            .as_ref()
-            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let f = files
-            .get(file.index)
-            .ok_or_else(|| io::Error::other("invalid filesystem file handle"))?;
-        if f.generation != file.generation {
-            return Err(io::Error::other("stale filesystem file handle"));
-        }
-        self.fs_fds[file.index as usize]
-            .clone()
-            .ok_or_else(|| io::Error::other("filesystem file fd not found"))
     }
 }
 
@@ -4479,6 +4621,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum DiskIoKind {
     Fs = 0,
+    DirectIo = 1,
     Nvme = 2,
 }
 
