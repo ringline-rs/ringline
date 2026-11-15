@@ -11,15 +11,24 @@
 # 01a1e10a-62e7-7120-3130-b055cec01169 at 4509097c, Linux 6.12, io_uring,
 # `docs/journal/2026-11-accept-queue-full-poll.md`): about 32,000 conns/s and
 # accept_queue_full = 0 at 1024 and 64; 4,474 to 5,150 at 4; 905 to 915 at 1.
+# The client is closed-loop with {threads} connections in flight at most, so
+# a capacity above {threads} cannot fill.
+#
+# The spec that produced that result embedded the patch as base64 at rev
+# 4509097c, ran `sudo prlimit` (which did not reach the payload's subshell)
+# and had no gate on the patch applying. This spec reads the patch from the
+# clone, uses `ulimit -Sn`, and fails the run when the patch does not apply.
+# The measurement does not depend on those differences.
 #
 #   systemslab submit experiments/accept-queue-poll-sweep.toml
-name = "ringline accept queue-full poll sweep"
+name = "ringline accept queue-full poll sweep, {threads} client threads"
 
 [params]
-repo   = "https://github.com/ringline-rs/ringline"
-rev    = "main"
-rounds = "4"
-caps   = "1024 64 4 1"
+repo    = "https://github.com/ringline-rs/ringline"
+rev     = "main"
+rounds  = "4"
+caps    = "1024 64 4 1"
+threads = "8"
 
 [[jobs]]
 name = "sweep"
@@ -50,9 +59,12 @@ mkdir -p runs
   echo "nofile=$(ulimit -n) memlock=$(ulimit -l)"
 
   git clone -q {repo} src && cd src && git checkout -q {rev} && git log --oneline -1
-  git apply experiments/accept-queue-poll.patch && git diff --stat
+  git apply experiments/accept-queue-poll.patch; prc=$?
+  echo "gate_patch=$prc"; git diff --stat
   cargo build --locked --release -p ringline-bench --bin bench-server --bin connect-bench > /home/anvil/build.log 2>&1; brc=$?
   echo "gate_build=$brc"; tail -2 /home/anvil/build.log
+  # An unapplied patch would measure capacity 1024 at every cell.
+  if [ "$prc" -ne 0 ]; then brc=1; fi
   got=$(./target/release/bench-server --print-backend)
   echo "backend=$got"
   if [ "$got" != "io_uring" ]; then brc=1; echo "gate_backend=1"; else echo "gate_backend=0"; fi
@@ -71,7 +83,7 @@ mkdir -p runs
           if (exec 3<>/dev/tcp/127.0.0.1/17878) 2>/dev/null; then break; fi
           sleep 0.1
         done
-        ./target/release/connect-bench --addr 127.0.0.1:17878 --threads 8 --duration 10 --warmup 2 \
+        ./target/release/connect-bench --addr 127.0.0.1:17878 --threads {threads} --duration 10 --warmup 2 \
           --out /home/anvil/runs/client-$tag.json > /home/anvil/runs/client-$tag.log 2>&1
         crc=$?
         kill -INT $spid 2>/dev/null; wait $spid 2>/dev/null
