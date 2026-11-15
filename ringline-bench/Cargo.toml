@@ -41,6 +41,16 @@ path = "src/bin/proxy-load.rs"
 name = "proxy-drain"
 path = "src/bin/proxy-drain.rs"
 
+# Experiment B's contended case (docs/send-admission-design.md, section 4):
+# its own server and load, so bench-server's echo loops stay as they are.
+[[bin]]
+name = "admission-server"
+path = "src/bin/admission-server.rs"
+
+[[bin]]
+name = "admission-load"
+path = "src/bin/admission-load.rs"
+
 # Mirrors ringline's own feature so `build.rs` sees CARGO_FEATURE_FORCE_MIO.
 # Building the mio arm as `--features ringline/force-mio` alone would leave
 # this crate's has_io_uring set while the runtime dropped it, and the
