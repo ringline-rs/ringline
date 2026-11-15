@@ -501,8 +501,8 @@ impl<'a> DriverCtx<'a> {
     /// rustls mutates turns that into the same refusal the plaintext path
     /// gives: `Other` while the pool is short, `InvalidInput` when it never
     /// could hold the message, nothing committed either way. A plain capacity
-    /// check is enough for the reason `send_bounded` gives: the worker is
-    /// single-threaded and nothing allocates between the check and the call.
+    /// check is enough: the worker is single-threaded and nothing allocates
+    /// between the check and the call.
     ///
     /// No bound is expressible for the unbuffered engine with a slot too small
     /// for one whole record. `Config::validate` rejects such a slot for every
@@ -552,8 +552,9 @@ impl<'a> DriverCtx<'a> {
             data,
         ) {
             Ok(sends) => {
-                // The same tripwire as `send_bounded`: a bound that was beaten
-                // is a bound that will one day close a connection it admitted.
+                // If encryption took more slots than the bound, the bound is
+                // wrong, and a later send it admits can run out of pool
+                // mid-encryption and close the connection.
                 if let Some(needed) = needed {
                     debug_assert!(
                         free_before.saturating_sub(self.send_copy_pool.free_count()) <= needed,
@@ -586,7 +587,7 @@ impl<'a> DriverCtx<'a> {
     /// which also names the one case that stays fatal). The user-facing
     /// contract lives on `SendHalf::send`.
     pub fn send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<()> {
-        self.send_inner(conn, data, None)
+        self.send_inner(conn, data, None, false)
     }
 
     /// [`send`](Self::send), with `id` attached to the send's final chunk:
@@ -598,14 +599,22 @@ impl<'a> DriverCtx<'a> {
         data: &[u8],
         id: crate::runtime::send_completion::SendId,
     ) -> io::Result<()> {
-        self.send_inner(conn, data, Some(id))
+        self.send_inner(conn, data, Some(id), false)
     }
 
+    /// The body of `send`, `send_awaited` and `send_bounded`. `id`, if any,
+    /// is attached to the send's final chunk. On a TLS connection `bounded`
+    /// adds a refusal with `InvalidInput` when no ciphertext bound is
+    /// expressible for the slot size, after the close_notify check, and gives
+    /// an oversize send `bounded_send_slots`' message. Both re-check what the
+    /// send's future already checked with `bounded_send_slots` on the same
+    /// inputs.
     fn send_inner(
         &mut self,
         conn: ConnId,
         data: &[u8],
         id: Option<crate::runtime::send_completion::SendId>,
+        bounded: bool,
     ) -> io::Result<()> {
         let conn_state = self
             .connections
@@ -625,22 +634,27 @@ impl<'a> DriverCtx<'a> {
             return Err(e);
         }
 
-        if !self.tls_table.is_null() {
-            let tls_table = unsafe { &mut *self.tls_table };
-            if tls_table.get_mut(conn.index).is_some() {
-                let sends = self.encrypt_tls_send(conn, data)?;
-                if let Some(id) = id {
-                    self.attach_send_id(sends.last(), id, data.len() as u32);
+        // SAFETY: read-only probe; see the `tls_table` field's contract.
+        if !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) } {
+            if bounded {
+                // SAFETY: as above.
+                if unsafe { (*self.tls_table).close_notify_sent(conn.index) } {
+                    return Err(close_notify_sent_error());
                 }
-                // Route every ciphertext chunk through the per-connection
-                // send queue: io_uring doesn't order independent SQEs, and
-                // a partial-send resubmit would interleave chunks on the
-                // wire (bad_record_mac at the peer). Infallible: rustls has
-                // already advanced its record sequence, so the ciphertext
-                // must reach the wire — SQ pressure parks it, never drops it.
-                self.queue_built_sends(conn.index, sends);
-                return Ok(());
+                bounded_send_slots(self.send_copy_pool, self.tls_table, conn.index, data.len())?;
             }
+            let sends = self.encrypt_tls_send(conn, data)?;
+            if let Some(id) = id {
+                self.attach_send_id(sends.last(), id, data.len() as u32);
+            }
+            // Route every ciphertext chunk through the per-connection
+            // send queue: io_uring doesn't order independent SQEs, and
+            // a partial-send resubmit would interleave chunks on the
+            // wire (bad_record_mac at the peer). Infallible: rustls has
+            // already advanced its record sequence, so the ciphertext
+            // must reach the wire — SQ pressure parks it, never drops it.
+            self.queue_built_sends(conn.index, sends);
+            return Ok(());
         }
 
         let slot_size = self.send_copy_pool.slot_size() as usize;
@@ -728,10 +742,10 @@ impl<'a> DriverCtx<'a> {
     /// Submit a bounded (`SendHalf::send_backpressured`) send, tagging the
     /// operation's identity onto the slot whose completion settles it.
     ///
-    /// Byte-for-byte `send` — the same generation check, the
-    /// same `closing_refusal`, the same two `reserve_slots` error
-    /// mappings, the same TLS branch, the same chunk loop — plus one thing:
-    /// `id` and the **logical (plaintext) length** are attached to the
+    /// `send_awaited` plus the bounded checks in `send_inner`'s TLS branch:
+    /// the same generation check, `closing_refusal`, `reserve_slots` error
+    /// mappings and chunk loop, with
+    /// `id` and the **logical (plaintext) length** attached to the
     /// final slot, so the completion handler can resolve exactly this
     /// operation with exactly the number the caller passed. The length
     /// travels because nothing downstream can recompute it: a TLS send's
@@ -767,191 +781,7 @@ impl<'a> DriverCtx<'a> {
         data: &[u8],
         id: crate::runtime::send_completion::SendId,
     ) -> io::Result<()> {
-        let conn_state = self
-            .connections
-            .get(conn.index)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
-        if conn_state.generation != conn.generation {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "stale connection",
-            ));
-        }
-        // Aborted, or the Close already submitted: the same refusal as
-        // `send` (`ConnSendState::closing_refusal`). Nothing was reserved
-        // yet, so the caller owns the failure and no completion for `id` is
-        // coming.
-        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
-            return Err(e);
-        }
-
-        // SAFETY: read-only probe; see the `tls_table` field's contract.
-        if !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) } {
-            // SAFETY: as above.
-            if unsafe { (*self.tls_table).close_notify_sent(conn.index) } {
-                return Err(close_notify_sent_error());
-            }
-            {
-                // Admission has to happen *before* rustls mutates: past the
-                // first record, departure 1 turns a shortfall into a closed
-                // connection rather than backpressure. The permit is sized by
-                // the ciphertext bound, not the plaintext length.
-                //
-                // A plain capacity check is enough here and a reservation is
-                // not: `encrypt_to_sends` allocates from this same pool, and
-                // an outstanding reservation would hide those slots from it.
-                // The worker is single-threaded and nothing allocates between
-                // this check and the first allocation inside the call.
-                //
-                // The same number `send_backpressured`'s future enqueued, by
-                // construction rather than by agreement. It is computed
-                // *before* the `&mut` below is created on purpose: taking a
-                // shared reborrow of `tls_table` while a `&mut` to it is live
-                // and used afterwards is aliasing UB, benign on today's
-                // codegen and exactly what this module's unsafe discipline
-                // exists to keep out.
-                let needed = bounded_send_slots(
-                    self.send_copy_pool,
-                    self.tls_table,
-                    conn.index,
-                    data.len(),
-                )?;
-                if self.send_copy_pool.free_count() < needed {
-                    crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
-                    return Err(io::Error::other("send copy pool exhausted"));
-                }
-                let free_before = self.send_copy_pool.free_count();
-                let tls_table = unsafe { &mut *self.tls_table };
-                let sends = match crate::tls::encrypt_to_sends(
-                    tls_table,
-                    self.send_copy_pool,
-                    conn.index,
-                    conn.generation,
-                    data,
-                ) {
-                    Ok(sends) => sends,
-                    Err(e) => {
-                        // Departure 1. `encrypt_to_sends` has already
-                        // released every slot it took, so there is nothing
-                        // to reclaim — but records it encrypted before the
-                        // failure consumed sequence numbers whose ciphertext
-                        // will never reach the wire, which is fatal for the
-                        // connection, not just for this send.
-                        self.close(conn);
-                        return Err(e);
-                    }
-                };
-                // The tripwire. Two hazards are modelled rather than measured
-                // — unbuffered record waste, and rustls draining a queued
-                // alert or key_update into the same destination — and a bound
-                // that is only checked by the tests written for it drifts. If
-                // either is ever beaten, a debug build says so here instead of
-                // closing a connection in production.
-                debug_assert!(
-                    free_before.saturating_sub(self.send_copy_pool.free_count()) <= needed,
-                    "TLS ciphertext bound beaten: reserved {needed} slots, encryption took {}",
-                    free_before.saturating_sub(self.send_copy_pool.free_count()),
-                );
-                // Only the final ciphertext chunk is tagged `OpTag::Send`;
-                // the rest are `OpTag::TlsSend` and are TLS-internal. That
-                // last chunk is the one whose completion ends the logical
-                // send, so it is the one that carries the id — with the
-                // *plaintext* length, which is what the caller asked to
-                // send and the only number meaningful to it (the chunk's
-                // own length is one TLS record's).
-                match sends.last() {
-                    Some(last) => {
-                        debug_assert_eq!(
-                            crate::completion::UserData(last.entry.user_data).tag(),
-                            Some(crate::completion::OpTag::Send),
-                            "encrypt_to_sends must tag its final chunk OpTag::Send",
-                        );
-                        debug_assert_ne!(last.pool_slot, u16::MAX);
-                        self.send_copy_pool
-                            .set_send_id(last.pool_slot, id, data.len() as u32);
-                    }
-                    // Empty plaintext produces no records and therefore no
-                    // CQE; nothing will ever settle the id but this call.
-                    None => {
-                        self.settled_sends_push(id, Ok(data.len() as u32));
-                        return Ok(());
-                    }
-                }
-                self.queue_built_sends(conn.index, sends);
-                return Ok(());
-            }
-        }
-
-        let slot_size = self.send_copy_pool.slot_size() as usize;
-        let needed = data.len().div_ceil(slot_size);
-        let mut reservation = match self.send_copy_pool.reserve_slots(needed) {
-            Ok(r) => r,
-            Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
-                return Err(io::Error::other("send copy pool exhausted"));
-            }
-            Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "send of {} bytes needs {needed} send-pool slots but the pool has \
-                         {capacity} (raise Config::send_pool)",
-                        data.len()
-                    ),
-                ));
-            }
-        };
-
-        // Queued together and submitted as one run, as in `send_inner`.
-        let several = needed >= 2;
-        let mut chunks = data.chunks(slot_size).peekable();
-        let mut attached = false;
-        while let Some(chunk) = chunks.next() {
-            let (slot, ptr, len) = self
-                .send_copy_pool
-                .copy_in_reserved(&mut reservation, chunk);
-            let end_of_send = chunks.peek().is_none();
-            if end_of_send {
-                // Exactly one slot per logical send carries the id, and the
-                // completion handlers take it from that slot before
-                // releasing it.
-                self.send_copy_pool.set_send_id(slot, id, data.len() as u32);
-                attached = true;
-            }
-
-            let user_data = crate::completion::UserData::encode(
-                crate::completion::OpTag::Send,
-                conn.index,
-                crate::completion::UserData::send_payload(slot, conn.generation),
-            );
-            let entry =
-                crate::backend::uring::sqe::Sqe::stream_send(conn.index, ptr, len, user_data.raw());
-
-            let built = BuiltSend {
-                entry,
-                pool_slot: slot,
-                slab_idx: u16::MAX,
-            };
-
-            if several {
-                self.send_queues[conn.index as usize].queue.push_back(built);
-            } else {
-                self.submit_or_queue(conn.index, built);
-            }
-        }
-        if several {
-            self.submit_queued_run(conn.index);
-        }
-
-        // Every promised slot was filled; this returns a zero remainder.
-        self.send_copy_pool.release_reservation(reservation);
-
-        if !attached {
-            // `[].chunks(n)` yields nothing, so a zero-length send queues no
-            // SQE and no CQE is coming. `send` silently does nothing here; a
-            // bounded send must still resolve, so settle it now.
-            self.settled_sends_push(id, Ok(0));
-        }
-        Ok(())
+        self.send_inner(conn, data, Some(id), true)
     }
 
     /// Record a bounded-send result that no completion will ever carry, and
