@@ -56,7 +56,55 @@ passed it.
 
 ## Results
 
-None yet.
+### C0 pilots
+
+Binaries: `experiments/send-admission-c-build.toml` at 81cc413c of
+`exp/send-admission-c-tools` (artifact `01a1e022-5ac7`). One run per cell,
+`experiments/send-admission-c0.toml`, one guest on hv03, Linux 6.12. W2 here:
+three drainers per episode asking for 2 MiB each and reading at 2 MiB/s with
+`SO_RCVBUF` 4096, `tcp_wmem` capped at 256 KiB, `--pipeline 16`, a 7 MiB head
+(S = 64 slots), slow readers asking for 4 KiB replies at 100/s each and
+reading 128 KiB/s with `SO_RCVBUF` 4096, ratio 1. "Fast p99" is the server's
+delay from scheduled time to admission for small replies to fast readers.
+
+| run (`01a1e022-`) | cell | fast p99 | heads admitted | head median / max | L / S |
+| --- | --- | --- | --- | --- | --- |
+| `a056` | W1, O0, N = 1 | 770.5 ms | 10 of 10 | 802.2 / 806.2 ms | 0 |
+| `a089` | W2, O0, no slow readers | 706.5 ms | 10 of 10 | 740.8 / 741.6 ms | 0 |
+| `a0b6` | W2, O0, 6 slow readers | 688.1 ms | 10 of 10 | 719.8 / 725.1 ms | 0.86 |
+| `a0e1` | W2, O0, 8 slow readers | 689.4 ms | 10 of 10 | 721.9 / 726.7 ms | 1.15 |
+| `a10b` | W2, O1, no slow readers | 11.5 ms | 10 of 10 | 740.3 / 741.6 ms | 0 |
+| `a135` | W2, O1, 6 slow readers | 11.6 ms | 0 of 10 (timed out) | - | 1.50 |
+| `a15f` | W2, O1, 8 slow readers | 11.6 ms | 0 of 10 (timed out) | - | 2.00 |
+
+- W1 under O0 reproduces Experiment B with the new instruments.
+- W2 is contended: under O1, six slow readers hold L / S = 1.50 and every head
+  times out, while O0 admits every head. Under O0 the same readers hold less
+  (0.86), because their later replies wait behind the head.
+- No slow reader was aborted (no reconnects).
+- The 11.5 ms under O1 with nothing waiting is the floor Experiment B saw at
+  the client. In `a10b` the delay was 5.75 ms at p50 and 11.5 ms at p99 while
+  the `send` call took at most 53 us, so the requests reached the server
+  late. The fast connections waited for their next send in a blocking read
+  under `SO_RCVTIMEO`, which the kernel rounds up to a timer tick. e550b661
+  waits with `ppoll` instead and records how late each request is written.
+
+With e550b661 (artifact `01a1e02c-28c0`):
+
+| run (`01a1e02c-`) | cell | fast p99 | send lateness p99 | heads admitted | head median / max |
+| --- | --- | --- | --- | --- | --- |
+| `8191` | W1, O1, N = 1 | 0.4 ms | 0.37 ms | 10 of 10 | 802.1 / 805.7 ms |
+| `815a` | W2, O1, no slow readers | 0.6 ms | 0.50 ms | 10 of 10 | 740.3 / 741.2 ms |
+| `81c0` | W2, O0, 6 slow readers, repetition 2 | 679.2 ms | - | 10 of 10 | 717.1 / 720.9 ms |
+
+- The floor is gone: the server's p99 under O1 is the load's lateness in
+  writing the request, about 0.4 to 0.6 ms. The design's 10 ms threshold for
+  small replies is above it.
+- Under O1 the pool refused 2 (W1) and 9 (W2) fast small replies in the
+  window, each aborting its connection, once requests arrived on time.
+- The second O0 repetition of W2 with six slow readers admitted its heads
+  within 4 ms of the first (717.1 / 720.9 against 719.8 / 725.1 ms), with
+  the same L / S.
 
 ## Outcome
 

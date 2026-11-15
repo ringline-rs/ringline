@@ -216,8 +216,15 @@ Runs, by cell and repetition 1 to 4 (all `01a1de11-`): `send_admitted` 0.5
 - The cost of FIFO order is latency: small replies sent with `send_admitted`
   wait behind the head until it is admitted or times out, p99 about 770 ms.
   `send`'s 11.5 ms is this setup's floor on loopback: the uncontended first
-  pilot had a small-reply p50 of 5.9 ms and a maximum of 15.0 ms. I do not
-  know the cause of that floor.
+  pilot had a small-reply p50 of 5.9 ms and a maximum of 15.0 ms.
+  Correction (2026-11-15, Experiment C): the floor was the load generator.
+  Its small connections waited for their next send in a blocking read under
+  `SO_RCVTIMEO`, which the kernel rounds up to a timer tick, so each request
+  was written up to a tick late and its latency, measured from the scheduled
+  time, carried that. With the wait moved to `ppoll`, the same server's
+  delay from scheduled time to admission under `send` was 0.4 ms at p99 in
+  this case (`2026-11-send-admission-c.md`, C0). Both arms ran the same
+  load generator, so both carried the lateness.
 
 ## Outcome
 
