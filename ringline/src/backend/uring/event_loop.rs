@@ -11087,6 +11087,35 @@ mod tests {
         );
     }
 
+    /// A worker advises its send pool `MADV_NOHUGEPAGE` unless it prefaults
+    /// the pool (#936). 64 MiB pools, so each is a fresh mapping.
+    #[test]
+    fn the_send_pool_avoids_huge_pages_unless_prefaulted() {
+        if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+            eprintln!("skipping: the kernel has no transparent huge pages");
+            return;
+        }
+        let nh = |el: &AsyncEventLoop<NoopHandler>| {
+            crate::buffer::prefault::vm_flags(el.driver.send_copy_pool.backing_mid())
+                .split_whitespace()
+                .any(|f| f == "nh")
+        };
+        let lazy = test_config_builder()
+            .send_pool(1024, 65536)
+            .build()
+            .expect("config");
+        let el = make_test_loop_with_config(lazy);
+        assert!(nh(&el), "a pool that is not prefaulted");
+        drop(el);
+        let prefaulted = test_config_builder()
+            .send_pool(1024, 65536)
+            .prefault_buffers(true)
+            .build()
+            .expect("config");
+        let el = make_test_loop_with_config(prefaulted);
+        assert!(!nh(&el), "a prefaulted pool");
+    }
+
     /// A new worker allocates no accumulator for its connection slots (#935).
     #[test]
     fn a_new_worker_allocates_no_accumulator() {

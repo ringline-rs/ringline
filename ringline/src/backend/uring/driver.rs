@@ -1121,6 +1121,8 @@ impl Driver {
             SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
         if config.prefault_buffers {
             send_copy_pool.prefault();
+        } else {
+            send_copy_pool.no_huge_pages();
         }
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
         let mut accumulators = AccumulatorTable::new_with_max(
