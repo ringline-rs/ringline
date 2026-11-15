@@ -1,6 +1,7 @@
 #![allow(clippy::manual_async_fn)]
 //! An open that fails on a path with an interior NUL leaves the file table as
-//! it was, for fs and for direct I/O: with two slots, three failed opens are followed by two that succeed.
+//! it was, for fs, direct I/O and (io_uring) NVMe: with two slots, three
+//! failed opens are followed by two that succeed.
 
 mod common;
 

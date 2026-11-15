@@ -217,9 +217,11 @@ pub fn open_with(
 
 /// Future that resolves to a [`DirectIoFile`] when the open completes.
 ///
-/// Dropping it before it resolves closes the file and frees its slot, on the
-/// event loop's next iteration if the open has completed, otherwise when it
-/// completes.
+/// Dropping it before it resolves closes the file: on the event loop's next
+/// iteration if the open has completed, otherwise when it completes. The slot
+/// is free once the close completes; on io_uring that is an
+/// `IORING_OP_CLOSE`, so an open right after the drop can find the table
+/// full.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
 /// owning worker drives it; polled outside the ringline executor it panics.

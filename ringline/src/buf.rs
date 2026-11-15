@@ -203,9 +203,9 @@ impl AlignedBuf {
     ///
     /// # Panics
     ///
-    /// Panics if `align` is not a power of two, if `capacity` rounded up to
-    /// the larger of `align` and [`DIRECT_IO_ALIGN`] overflows `isize`, or if
-    /// the allocation fails.
+    /// Panics if `align` is not a power of two or if `capacity` rounded up to
+    /// the larger of `align` and [`DIRECT_IO_ALIGN`] overflows `isize`. Aborts
+    /// if the allocation fails, as `Vec` does.
     pub fn with_capacity(capacity: usize, align: usize) -> Self {
         Self::allocate(capacity, align, false)
     }
@@ -231,7 +231,7 @@ impl AlignedBuf {
         // power of two, so raising `align` keeps the caller's guarantee.
         let align = align.max(DIRECT_IO_ALIGN);
         let layout = Layout::from_size_align(capacity, align)
-            .expect("AlignedBuf: align must be a power of two and the size must fit isize");
+            .expect("AlignedBuf: capacity rounded up to the alignment overflows isize");
         let ptr = if capacity == 0 {
             // A dangling pointer at the alignment: nothing is allocated.
             NonNull::new(align as *mut u8).expect("align is nonzero")

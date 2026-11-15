@@ -417,8 +417,9 @@ pub(crate) enum FsOp {
 
 /// Which file table an operation uses: [`File`]s or
 /// [`DirectIoFile`](crate::direct_io::DirectIoFile)s. Both kinds run the same
-/// code, each with its own file table, command slab, fixed-file range and
-/// in-flight bound, sized by its own config (`FsConfig`, `DirectIoConfig`).
+/// code, each with its own file table and in-flight bound, sized by its own
+/// config (`FsConfig`, `DirectIoConfig`): on io_uring also a command slab and
+/// fixed-file range, on mio an fd vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FileKind {
     Fs,
@@ -759,9 +760,11 @@ pub fn create(path: impl AsRef<std::path::Path>) -> io::Result<OpenFuture> {
 
 /// Future that resolves to a [`File`] handle when the open completes.
 ///
-/// Dropping it before it resolves closes the file and frees its slot, on the
-/// event loop's next iteration if the open has completed, otherwise when it
-/// completes.
+/// Dropping it before it resolves closes the file: on the event loop's next
+/// iteration if the open has completed, otherwise when it completes. The slot
+/// is free once the close completes; on io_uring that is an
+/// `IORING_OP_CLOSE`, so an open right after the drop can find the table
+/// full.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
 /// owning worker drives it; polled outside the ringline executor it panics.
