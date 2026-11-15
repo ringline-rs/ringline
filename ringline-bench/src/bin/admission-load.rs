@@ -440,6 +440,9 @@ struct Conn {
     latencies: Vec<u64>,
     reconnects: u64,
     bytes_read: u64,
+    /// For requests scheduled in the window, how late each was written, in
+    /// nanoseconds after its scheduled time. Fast connections only.
+    send_late: Vec<u64>,
 }
 
 /// The measurement window and the end of the drain after it.
@@ -522,6 +525,8 @@ fn fast_conn(
             }
             if window.contains(next) {
                 out.offered += 1;
+                out.send_late
+                    .push(Instant::now().saturating_duration_since(next).as_nanos() as u64);
             }
             pending.push_back((tag, next));
             tag = tag.wrapping_add(1);
@@ -533,8 +538,9 @@ fn fast_conn(
             } else {
                 window.drain.saturating_duration_since(Instant::now())
             };
-            conn.set_read_timeout(Some(wait.max(Duration::from_micros(100))))
-                .ok();
+            if !wait_readable(&conn, wait) {
+                continue;
+            }
             match conn.read(&mut buf[filled..]) {
                 Ok(0) => broken = true,
                 Ok(n) => {
@@ -786,6 +792,40 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 /// The fields Experiment B reports for its small connections, over `conns`.
+/// Wait until `conn` has data to read or `timeout` passes; true if it has.
+///
+/// The fast connections wait for their next send time here. A blocking read
+/// under `SO_RCVTIMEO` rounds its timeout up to the kernel's timer tick, so a
+/// connection that waited that way wrote its next request up to a tick late,
+/// and every delay measured from the scheduled time carried that lateness.
+/// `ppoll` takes a nanosecond timeout. Where there is no `ppoll` (macOS),
+/// `poll` waits whole milliseconds, rounded down, and the loop comes back
+/// early rather than late.
+fn wait_readable(conn: &TcpStream, timeout: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: conn.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    #[cfg(target_os = "linux")]
+    let n = {
+        let ts = libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+        // SAFETY: one valid `pollfd` and a valid `timespec` for the call; no
+        // signal mask is passed.
+        unsafe { libc::ppoll(&mut pfd, 1, &ts, std::ptr::null()) }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let n = {
+        let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: one valid `pollfd` for the call.
+        unsafe { libc::poll(&mut pfd, 1, ms) }
+    };
+    n > 0
+}
+
 fn summary(conns: &[Conn], within_ms: u64) -> serde_json::Map<String, Value> {
     let offered: u64 = conns.iter().map(|s| s.offered).sum();
     let lost: u64 = conns.iter().map(|s| s.lost).sum();
@@ -795,6 +835,11 @@ fn summary(conns: &[Conn], within_ms: u64) -> serde_json::Map<String, Value> {
         .flat_map(|s| s.latencies.iter().copied())
         .collect();
     lat.sort_unstable();
+    let mut send_late: Vec<u64> = conns
+        .iter()
+        .flat_map(|s| s.send_late.iter().copied())
+        .collect();
+    send_late.sort_unstable();
     let within_ns = within_ms * 1_000_000;
     let within = lat.iter().filter(|&&l| l <= within_ns).count() as u64;
     let late = lat.len() as u64 - within;
@@ -810,6 +855,11 @@ fn summary(conns: &[Conn], within_ms: u64) -> serde_json::Map<String, Value> {
         "p99_ns": percentile(&lat, 0.99),
         "p999_ns": percentile(&lat, 0.999),
         "max_ns": lat.last().copied().unwrap_or(0),
+        "send_late_ns": {
+            "p50": percentile(&send_late, 0.50),
+            "p99": percentile(&send_late, 0.99),
+            "max": send_late.last().copied().unwrap_or(0),
+        },
     }) else {
         unreachable!("a JSON object literal")
     };
