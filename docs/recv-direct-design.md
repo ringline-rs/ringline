@@ -463,10 +463,11 @@ without it.
 ### Buffers
 
 Each direct connection owns one buffer of `recv_direct_region` bytes
-(default 32 KiB). With nothing buffered, a receive goes into it, so an idle
-connection holds that much, or the initial accumulator capacity
-(`recv_accumulator_capacity`) if that is larger and at most twice the
-region. A message that does not fit borrows
+(default 32 KiB), allocated by its first receive. With nothing buffered, a
+receive goes into it, so an idle connection holds that much, or the
+accumulator capacity (`recv_accumulator_capacity`) if that is larger and at
+most twice the region. A connection slot with no connection holds no
+buffer. A message that does not fit borrows
 a larger buffer from the worker's pool (`DirectPool` in `accumulator.rs`):
 the part of the message received so far, at most `recv_direct_region` bytes,
 is copied into the borrowed buffer, and the rest of the message is received

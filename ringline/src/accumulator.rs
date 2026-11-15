@@ -77,8 +77,10 @@ pub struct RecvAccumulator {
     /// `buf` is the connection's own.
     #[cfg(has_io_uring)]
     own: Option<BytesMut>,
-    /// Capacity `buf` is allocated with, and returns to on
-    /// [`release`](Self::release).
+    /// Capacity of the first allocation after construction or
+    /// [`release`](Self::release), made by the first `append`, or by the
+    /// first `AccumulatorTable::detach_for_recv`, which sizes it from
+    /// `recv_direct_region`. Until then `buf` holds no allocation.
     initial_capacity: usize,
 }
 
@@ -92,12 +94,15 @@ impl RecvAccumulator {
     }
 
     /// Create a new accumulator with an initial capacity and an upper-bound
-    /// `max_size`. `append` rejects data that would push `buf.len()` past
-    /// `max_size`, leaving the existing contents intact so the caller can
-    /// fail the connection rather than OOM.
+    /// `max_size`. Nothing is allocated until the first `append`, which
+    /// allocates at least `capacity`, or the first
+    /// `AccumulatorTable::detach_for_recv`, which sizes it from
+    /// `recv_direct_region`. `append` rejects data that would push
+    /// `buf.len()` past `max_size`, leaving the existing contents intact so
+    /// the caller can fail the connection rather than OOM.
     pub fn new_with_max(capacity: usize, max_size: usize) -> Self {
         RecvAccumulator {
-            buf: BytesMut::with_capacity(capacity),
+            buf: BytesMut::new(),
             frozen: None,
             max_size,
             reserve_target: 0,
@@ -128,9 +133,16 @@ impl RecvAccumulator {
         let before = self.buf.as_ptr();
         let kept = self.buf.len();
         // When a growth is imminent and a reserve target was announced,
-        // size the allocation for the whole remaining message up front.
+        // size the allocation for the whole remaining message up front. The
+        // first append since construction, `reset` or `release` allocates at
+        // least `initial_capacity`; `grown` is 0 until then. An empty `buf`
+        // after `take_frozen` is the tail of an allocation and has `grown`
+        // set, so it grows by what the data needs.
         if self.buf.capacity() - self.buf.len() < data.len() {
-            let want = self.reserve_target.saturating_sub(total).max(data.len());
+            let mut want = self.reserve_target.saturating_sub(total).max(data.len());
+            if self.grown == 0 && self.frozen.is_none() {
+                want = want.max(self.initial_capacity);
+            }
             self.buf.reserve(want);
         }
         self.buf.extend_from_slice(data);
@@ -318,18 +330,21 @@ impl RecvAccumulator {
         }
     }
 
-    /// Discard all data and the allocation, and allocate the initial
-    /// capacity again. Called when a connection closes, since an accumulator
-    /// grows to the largest message its connection buffered. `Bytes` taken
-    /// with `take_frozen` (parser slices, an in-flight zero-copy forward's
-    /// guard) keep the old allocation until they drop.
+    /// Discard all data and the allocation. Called when a connection closes,
+    /// since an accumulator grows to the largest message its connection
+    /// buffered; the next connection's first `append` allocates
+    /// `initial_capacity` again, or its first
+    /// `AccumulatorTable::detach_for_recv` a buffer sized from
+    /// `recv_direct_region`. `Bytes` taken with `take_frozen` (parser
+    /// slices, an in-flight zero-copy forward's guard) keep the old
+    /// allocation until they drop.
     ///
-    /// The reallocation is unconditional: after `take_frozen`, `buf` is the
+    /// `buf` is replaced unconditionally: after `take_frozen`, `buf` is the
     /// tail of the old allocation, so a small `capacity()` does not mean a
     /// small allocation.
     pub fn release(&mut self) {
         self.frozen = None;
-        self.buf = BytesMut::with_capacity(self.initial_capacity);
+        self.buf = BytesMut::new();
         self.reserve_target = 0;
         self.largest_message = 0;
         self.grown = 0;
@@ -760,9 +775,17 @@ impl AccumulatorTable {
                 self.direct_pool.put(std::mem::take(&mut acc.buf));
             }
             if acc.buf.capacity() < region && !acc.buf.try_reclaim(region) {
-                // A new buffer of the region: `reserve` would double a
-                // buffer a little smaller than the region.
-                acc.buf = BytesMut::with_capacity(region);
+                // A new buffer of the region, or of `initial_capacity` when
+                // that is larger and at most twice the region: `reserve`
+                // would double a buffer a little smaller than the region.
+                let size = if acc.initial_capacity > region
+                    && acc.initial_capacity <= region.saturating_mul(2)
+                {
+                    acc.initial_capacity
+                } else {
+                    region
+                };
+                acc.buf = BytesMut::with_capacity(size);
             }
             let n = acc.buf.capacity().min(room).min(u32::MAX as usize);
             return Some((std::mem::take(&mut acc.buf), n, false));
@@ -1086,6 +1109,27 @@ mod tests {
         );
     }
 
+    /// A connection's first direct receive allocates the region, or the
+    /// initial capacity when that is larger and at most twice the region.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn the_first_direct_receive_allocates_the_region_or_the_initial_capacity() {
+        let region = 32 * 1024;
+        for (initial, expected) in [
+            (4096, region),
+            (region + 8192, region + 8192),
+            (2 * region, 2 * region),
+            (1 << 20, region),
+        ] {
+            let mut table = AccumulatorTable::new(1, initial);
+            assert_eq!(table.capacity(0), 0);
+            let (buf, n, _) = table.detach_for_recv(0, region, None).unwrap();
+            assert_eq!(buf.capacity(), expected, "initial {initial}");
+            assert_eq!(n, expected);
+            unsafe { table.attach_received(0, buf, 0) };
+        }
+    }
+
     /// An own buffer larger than twice the region goes to the pool when
     /// nothing is buffered, and the connection receives into a buffer of
     /// the region.
@@ -1230,14 +1274,52 @@ mod tests {
     }
 
     #[test]
-    fn release_returns_to_the_initial_capacity() {
+    fn release_drops_the_allocation_until_the_next_append() {
         let mut acc = RecvAccumulator::new(4096);
         acc.append(&vec![0u8; 1024 * 1024]);
         acc.reset();
         assert!(acc.capacity() >= 1024 * 1024, "reset keeps the allocation");
         acc.release();
         assert!(acc.is_empty());
+        assert_eq!(acc.capacity(), 0);
+        acc.append(b"x");
         assert_eq!(acc.capacity(), 4096);
+    }
+
+    /// A slot with no connection holds no allocation, whatever the initial
+    /// capacity (#935).
+    #[test]
+    fn a_new_table_allocates_no_accumulator() {
+        let table = AccumulatorTable::new(64, 1 << 20);
+        for i in 0..64 {
+            assert_eq!(table.capacity(i), 0);
+        }
+    }
+
+    /// The first append allocates the initial capacity, or what the data
+    /// needs when that is more.
+    #[test]
+    fn the_first_append_allocates_the_initial_capacity() {
+        let mut small = RecvAccumulator::new(4096);
+        small.append(b"x");
+        assert_eq!(small.capacity(), 4096);
+        let mut large = RecvAccumulator::new(4096);
+        large.append(&[0u8; 10_000]);
+        assert_eq!(large.capacity(), 10_000);
+    }
+
+    /// After `take_frozen` leaves an empty tail, an append allocates what the
+    /// data needs, not the initial capacity: `with_bytes` takes the
+    /// contents on every call.
+    #[test]
+    fn an_append_after_take_frozen_does_not_allocate_the_initial_capacity() {
+        let mut table = AccumulatorTable::new(1, 1 << 20);
+        table.append(0, &[0u8; 1 << 20]);
+        let frozen = table.take_frozen(0);
+        assert_eq!(table.capacity(0), 0, "the tail is empty");
+        table.append(0, b"next");
+        assert!(table.capacity(0) < 4096, "cap {}", table.capacity(0));
+        drop(frozen);
     }
 
     #[test]

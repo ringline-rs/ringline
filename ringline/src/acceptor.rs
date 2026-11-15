@@ -597,6 +597,13 @@ mod tests {
 
         let mut client = std::net::TcpStream::connect(addr).expect("connect");
         client.write_all(b"go").expect("write");
+        // `connect` returns once the kernel has queued the connection, which
+        // can be before the acceptor thread has accepted it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while queue_full_count() == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(queue_full_count() > before, "the wait was not counted");
         client
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("read timeout");
@@ -606,7 +613,6 @@ mod tests {
             matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
             "the connection was closed while the queue was full: {read:?}"
         );
-        assert!(queue_full_count() > before, "the wait was not counted");
 
         // Room appears: the held connection takes it, and the worker is woken.
         drop(rx.recv().expect("the filler"));

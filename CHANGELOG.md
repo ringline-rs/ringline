@@ -1272,6 +1272,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A connection slot no longer holds a recv accumulator allocation while no
+  connection uses it (#935). Every 0.6 release allocated an accumulator for
+  every slot at startup, `recv_accumulator_capacity` bytes on io_uring and
+  the `recv_buffer` size (16 KiB by default) on mio, so a worker held
+  `max_connections` of them however few connections it served. On io_uring
+  at 28 workers, `max_connections(4096)` and a capacity of 1 MiB, that was
+  about 113 GiB of address space and, with transparent huge pages off,
+  450 MiB of RSS. At 8 workers, RSS grew 1.6 MiB/s, khugepaged's scan rate,
+  for a whole 300 s run. The accumulator is now allocated at the
+  connection's first data, and dropped when the connection closes. On
+  io_uring a plaintext connection is allocated its buffer when its first
+  read arms a receive, at the size `recv_direct_region` documents.
 - io_uring, with `unstable-accept` in `AcceptMode::Merged`: a worker whose
   multishot accept ended with `EMFILE`, `ENFILE`, `ENOBUFS` or `ENOMEM`
   re-armed it at once, each re-arm failed at once, and the worker ran at

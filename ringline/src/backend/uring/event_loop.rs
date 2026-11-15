@@ -11082,9 +11082,20 @@ mod tests {
 
         assert_eq!(
             el.driver.accumulators.capacity(conn_index),
-            4096,
-            "the default recv_accumulator_capacity"
+            0,
+            "the slot holds no allocation until its next connection's data"
         );
+    }
+
+    /// A new worker allocates no accumulator for its connection slots (#935).
+    #[test]
+    fn a_new_worker_allocates_no_accumulator() {
+        let config = test_config();
+        let slots = config.max_connections;
+        let el = make_test_loop_with_config(config);
+        for i in 0..slots {
+            assert_eq!(el.driver.accumulators.capacity(i), 0, "slot {i}");
+        }
     }
 
     // ── Close path tests ───────────────────────────────────────────

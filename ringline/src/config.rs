@@ -1129,8 +1129,13 @@ impl ConfigBuilder {
 
     // ── Buffer settings ──────────────────────────────────────────────
 
-    /// Set the initial capacity for per-connection recv accumulators.
-    /// Defaults to 4 KiB.
+    /// Set the capacity a connection's recv accumulator is allocated with when
+    /// its first data arrives. A connection slot holds no accumulator
+    /// allocation until then, and none again after the connection closes.
+    /// On io_uring, a plaintext connection is allocated its buffer when its
+    /// first read arms a receive, at the size
+    /// [`recv_direct_region`](Self::recv_direct_region) gives. Defaults to
+    /// 4 KiB.
     pub fn recv_accumulator_capacity(mut self, n: usize) -> Self {
         self.config.recv_accumulator_capacity = n;
         self
@@ -1155,7 +1160,7 @@ impl ConfigBuilder {
     /// Set the size of the buffer that a plaintext connection (accepted, or
     /// from [`connect`](crate::connect) or
     /// [`connect_unix`](crate::connect_unix)) receives into on io_uring when
-    /// it has nothing buffered. An idle
+    /// it has nothing buffered. From its first receive, an idle
     /// connection of that kind holds a buffer of this size, or of
     /// [`recv_accumulator_capacity`](Self::recv_accumulator_capacity) if
     /// that is larger and at most twice this. A message that does not fit borrows a larger
