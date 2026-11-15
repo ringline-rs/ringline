@@ -73,7 +73,7 @@ Accumulator and buffers
 - RM41. `append` past the cap leaves the contents intact. `accumulator.rs:95` "`append` rejects data that would push `buf.len()` past `max_size`, leaving the existing contents intact" C
 - RM42. `compact_at_message_start` does not allocate and does nothing while a `Bytes` from the allocation is alive or a frozen remainder is held. `accumulator.rs:150` "`try_reclaim` does not allocate, and does nothing while a `Bytes` taken from the allocation (`take_frozen`, a forward's guard) is alive. Returns early while a frozen remainder is held." C
 - RM43. A compaction moves at most a quarter of the grown capacity. `CLAUDE.md:255` "at most a quarter of the capacity it has grown to" D
-- RM44. A closed connection's accumulator returns to its initial capacity. `accumulator.rs:321` "Discard all data and the allocation, and allocate the initial capacity again. Called when a connection closes" C
+- RM44. A closed connection's accumulator returns to its initial capacity (changed in #935: `release` now leaves no allocation). `accumulator.rs:321` "Discard all data and the allocation, and allocate the initial capacity again. Called when a connection closes" C
 - RM45. While a buffer is detached the accumulator is empty, and `detach_for_recv` returns `None` at the cap. `accumulator.rs:694`, `:698`. C
 - RM46. `recv_direct_held` is zero with no direct receive in flight. `connection.rs:138–142` (earlier read). C
 - RM47. A `with_bytes` view consumed whole gives its allocation back to the next receive when no slice is alive. `docs/recv-direct-design.md:449–453`. D, T (`recv_direct_alloc.rs:158`, `:172`)
