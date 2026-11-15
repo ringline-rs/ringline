@@ -478,6 +478,85 @@ pub(crate) enum AcceptArm {
     Stopped,
 }
 
+/// The connections whose handler offered them for parking (#443): membership
+/// in O(1), and the members as a list, so a scan visits the offers rather
+/// than every connection slot (#847).
+pub(crate) struct ParkOffers {
+    /// Whether each slot is offered. Read on every receive delivery
+    /// (`withdraw_park_offer`), so it stays one byte per slot.
+    member: Vec<bool>,
+    /// Each slot's position in `list`, or `ParkOffers::ABSENT`. Read and
+    /// written only on offer and withdrawal.
+    pos: Vec<u32>,
+    /// The offered slots, in no particular order.
+    list: Vec<u32>,
+}
+
+impl ParkOffers {
+    const ABSENT: u32 = u32::MAX;
+
+    pub(crate) fn new(slots: u32) -> Self {
+        ParkOffers {
+            member: vec![false; slots as usize],
+            pos: vec![Self::ABSENT; slots as usize],
+            list: Vec::new(),
+        }
+    }
+
+    /// Whether `conn_index` is offered. False for an index past the table.
+    pub(crate) fn contains(&self, conn_index: u32) -> bool {
+        self.member
+            .get(conn_index as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Offer `conn_index`. Offering it again changes nothing.
+    pub(crate) fn insert(&mut self, conn_index: u32) {
+        let pos = &mut self.pos[conn_index as usize];
+        if *pos == Self::ABSENT {
+            *pos = self.list.len() as u32;
+            self.list.push(conn_index);
+            self.member[conn_index as usize] = true;
+        }
+    }
+
+    /// Withdraw `conn_index`'s offer, if it has one. The last offer takes
+    /// its place in the list.
+    pub(crate) fn remove(&mut self, conn_index: u32) {
+        let pos = std::mem::replace(&mut self.pos[conn_index as usize], Self::ABSENT);
+        if pos == Self::ABSENT {
+            return;
+        }
+        self.member[conn_index as usize] = false;
+        let last = self.list.pop().expect("an offered slot is in the list");
+        if last != conn_index {
+            self.list[pos as usize] = last;
+            self.pos[last as usize] = pos;
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// How many connections are offered.
+    pub(crate) fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    /// The `i`th offered connection, in list order. `i < len()`.
+    pub(crate) fn get(&self, i: usize) -> u32 {
+        self.list[i]
+    }
+
+    /// The offered connections.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.list.iter().copied()
+    }
+}
+
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
@@ -552,7 +631,10 @@ pub(crate) struct Driver {
     /// at is gone — so the handler never has to remember to revoke. Set only
     /// through `offer_park`, which declines while bytes are unread or while
     /// the innermost running reader callback is this connection's.
-    pub(crate) park_offered: Vec<bool>,
+    ///
+    /// A set rather than a dense `Vec<bool>`, so `maybe_park_one` visits the
+    /// offered connections instead of every slot (#847).
+    pub(crate) park_offered: ParkOffers,
     /// Per connection: a park cancelled this connection's receive and hangup
     /// poll and is waiting for the handler to come back to a quiescent point.
     ///
@@ -585,7 +667,7 @@ pub(crate) struct Driver {
     /// slot — half a megabyte per worker at the default `max_connections`,
     /// tens of megabytes on a large box — for entries that only exist while a
     /// handler is actively offering. The hot path never reaches here anyway:
-    /// `park_offered` is the dense bool that gates it.
+    /// `park_offered` is the set that gates it.
     pub(crate) park_carry: std::collections::HashMap<u32, crate::park::ParkState>,
     /// Per connection: this slot is being adopted, so `spawn_accept_task`
     /// calls `on_adopt` rather than `on_accept`, with what the handler
@@ -1215,7 +1297,7 @@ impl Driver {
                 .collect(),
             recv_batch: crate::recv::arrival::BatchClock::new(),
             adopt_pending: std::collections::HashMap::new(),
-            park_offered: vec![false; config.max_connections as usize],
+            park_offered: ParkOffers::new(config.max_connections),
             park_drain: vec![None; config.max_connections as usize],
             park_drain_pending: Vec::new(),
             park_carry: std::collections::HashMap::new(),
@@ -1663,7 +1745,7 @@ impl Driver {
         // Release handler state here rather than waiting for the slot to be
         // reused: a `ParkState` is an arbitrary user value, and a slot that is
         // never reused would hold it for the life of the process.
-        self.park_offered[conn_index as usize] = false;
+        self.park_offered.remove(conn_index);
         self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
@@ -1819,14 +1901,13 @@ impl Driver {
         conn_index: u32,
         state: Option<crate::park::ParkState>,
     ) -> bool {
-        let idx = conn_index as usize;
         if self.holds_unread(conn_index) || crate::runtime::io::in_reader_callback(conn_index) {
-            self.park_offered[idx] = false;
+            self.park_offered.remove(conn_index);
             self.park_carry.remove(&conn_index);
             crate::metrics::PARK_DIAG.increment(crate::metrics::park_diag::OFFER_DECLINED);
             return false;
         }
-        self.park_offered[idx] = true;
+        self.park_offered.insert(conn_index);
         match state {
             Some(s) => {
                 self.park_carry.insert(conn_index, s);
@@ -1902,7 +1983,7 @@ impl Driver {
         // The handler's offer is the opt-in, and it is checked before any
         // mechanical term: a connection nobody offered is not "not yet
         // quiescent", it is simply never going to be parked.
-        if !self.park_offered[conn_index as usize] {
+        if !self.park_offered.contains(conn_index) {
             return Some(ParkBlocker::NotOffered);
         }
 
@@ -2075,7 +2156,7 @@ impl Driver {
         conn.lifecycle = Lifecycle::Closing;
         // Released here for the reasons `close_connection` gives.
         self.forward_zc_consumed[ci] = 0;
-        self.park_offered[ci] = false;
+        self.park_offered.remove(conn_index);
         self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
@@ -3601,6 +3682,69 @@ pub(crate) fn submit_coalesced_run(
         restore(p.send_copy_pool);
     }
     None
+}
+
+#[cfg(test)]
+mod park_offers_tests {
+    use super::ParkOffers;
+
+    fn members(o: &ParkOffers) -> Vec<u32> {
+        let mut m: Vec<u32> = o.iter().collect();
+        m.sort_unstable();
+        m
+    }
+
+    #[test]
+    fn insert_contains_remove() {
+        let mut o = ParkOffers::new(8);
+        assert!(o.is_empty());
+        o.insert(3);
+        o.insert(3);
+        o.insert(5);
+        assert!(o.contains(3) && o.contains(5) && !o.contains(4));
+        assert_eq!(members(&o), [3, 5], "a second offer adds nothing");
+        o.remove(4);
+        assert_eq!(members(&o), [3, 5], "withdrawing no offer changes nothing");
+        o.remove(3);
+        assert!(!o.contains(3) && o.contains(5));
+        o.remove(5);
+        assert!(o.is_empty());
+        assert!(!o.contains(100), "an index past the table is not offered");
+    }
+
+    /// Removing a member other than the last moves the last into its place,
+    /// and the moved member can still be found and removed.
+    #[test]
+    fn remove_keeps_the_moved_member_findable() {
+        let mut o = ParkOffers::new(8);
+        for i in [1, 2, 6, 7] {
+            o.insert(i);
+        }
+        o.remove(1);
+        assert_eq!(members(&o), [2, 6, 7]);
+        o.remove(7);
+        assert_eq!(members(&o), [2, 6]);
+        o.insert(1);
+        o.remove(6);
+        assert_eq!(members(&o), [1, 2]);
+        for i in 0..8 {
+            assert_eq!(o.contains(i), i == 1 || i == 2, "slot {i}");
+        }
+    }
+
+    /// `get` walks the same members `iter` yields.
+    #[test]
+    fn get_visits_every_member() {
+        let mut o = ParkOffers::new(8);
+        for i in [4, 0, 6] {
+            o.insert(i);
+        }
+        o.remove(0);
+        let mut by_index: Vec<u32> = (0..o.len()).map(|i| o.get(i)).collect();
+        by_index.sort_unstable();
+        assert_eq!(by_index, members(&o));
+        assert_eq!(by_index, [4, 6]);
+    }
 }
 
 #[cfg(test)]

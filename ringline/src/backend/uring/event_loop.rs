@@ -1964,13 +1964,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let idx = conn_index as usize;
         // Read first: the common case is no offer, and a predictable branch
         // beats two stores on every delivery.
-        if self.driver.park_offered.get(idx).copied().unwrap_or(false) {
+        if self.driver.park_offered.contains(conn_index) {
             // Data reached a connection whose recv was cancelled for a park.
             // If this tracks `not_offered`, the cancel is not stopping delivery.
             if self.driver.park_drain.get(idx).and_then(|d| *d).is_some() {
                 metrics::PARK_DIAG.increment(metrics::park_diag::WITHDRAW_WHILE_DRAINING);
             }
-            self.driver.park_offered[idx] = false;
+            self.driver.park_offered.remove(conn_index);
             self.driver.park_carry.remove(&conn_index);
         }
     }
@@ -2107,15 +2107,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // "prefer idle connections" guardrail — an offer is only made at a
         // quiescent point, and it is withdrawn the moment bytes arrive, so an
         // offered connection is idle by construction rather than by estimate.
+        // Visited by position, stopping once `PARK_PER_TICK` parks have
+        // started. `begin_park` does not change the offers, so the positions
+        // hold for the whole visit.
         let mut started = 0usize;
-        for conn_index in 0..self.driver.park_offered.len() as u32 {
-            if started >= PARK_PER_TICK {
-                break;
-            }
-            if !self.driver.park_offered[conn_index as usize] {
-                continue;
-            }
-            if self.begin_park(conn_index, target) {
+        let mut i = 0;
+        while started < PARK_PER_TICK && i < self.driver.park_offered.len() {
+            let conn_index = self.driver.park_offered.get(i);
+            i += 1;
+            let offers = self.driver.park_offered.len();
+            let began = self.begin_park(conn_index, target);
+            debug_assert_eq!(
+                self.driver.park_offered.len(),
+                offers,
+                "begin_park changed the park offers"
+            );
+            if began {
                 started += 1;
                 // Claim the slot on the target's behalf immediately. The load
                 // table is only refreshed when a worker publishes, so without
@@ -2463,7 +2470,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.reset_send_state(conn_index);
         // A slot is recycled by generation, so without this a new occupant
         // would inherit the previous one's park offer — and its state.
-        self.driver.park_offered[conn_index as usize] = false;
+        self.driver.park_offered.remove(conn_index);
         // Cleared, never re-armed here: on the handover path the fd has left
         // this worker, and on the adopt path the caller arms recv itself.
         self.driver.set_park_drain(conn_index, None);
@@ -3915,7 +3922,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.reset_send_state(conn_index);
         // A slot is recycled by generation, so without this a new occupant
         // would inherit the previous one's park offer — and its state.
-        self.driver.park_offered[conn_index as usize] = false;
+        self.driver.park_offered.remove(conn_index);
         // Cleared, never re-armed here: on the handover path the fd has left
         // this worker, and on the adopt path the caller arms recv itself.
         self.driver.set_park_drain(conn_index, None);
@@ -5647,7 +5654,7 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         // Offered: these cover the mechanical blockers, so the opt-in must
         // be out of the way or every one of them would report NotOffered.
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         assert_eq!(
             el.driver.park_blocker(conn_index),
             None,
@@ -5662,7 +5669,7 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         // Offered: these cover the mechanical blockers, so the opt-in must
         // be out of the way or every one of them would report NotOffered.
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         el.driver.send_queues[conn_index as usize].in_flight = true;
         assert_eq!(
             el.driver.park_blocker(conn_index),
@@ -5711,7 +5718,7 @@ mod tests {
             return; // the stub engine, or a kernel without the opcode: no park
         }
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
 
         // A standing imbalance: this worker well above the other. Faked,
         // because tier 1 exists to stop one forming — which is exactly why
@@ -5751,7 +5758,7 @@ mod tests {
             return;
         }
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
 
         let loads = std::sync::Arc::new(vec![AtomicU32::new(20), AtomicU32::new(20)]);
         el.driver.worker_loads = Some(loads);
@@ -5798,7 +5805,7 @@ mod tests {
             .get(conn_index)
             .unwrap()
             .recv_direct_slot;
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
 
         el.driver.ring.pushed_cancels.clear();
         assert!(el.begin_park(conn_index, 1), "the park starts");
@@ -5906,7 +5913,7 @@ mod tests {
         }
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         assert!(el.driver.submit_hangup_peek(conn_index));
         assert!(!el.begin_park(conn_index, 1), "no park behind a peek");
         assert!(el.driver.park_in_flight[conn_index as usize].is_none());
@@ -5965,7 +5972,7 @@ mod tests {
     fn a_connection_holding_a_hangup_error_is_not_parkable() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         assert!(el.driver.park_blocker(conn_index).is_none(), "precondition");
         el.driver
             .connections
@@ -7443,7 +7450,7 @@ mod tests {
             return;
         }
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         assert!(el.begin_park(conn_index, 1));
         assert!(el.driver.park_drain[conn_index as usize].is_none());
         assert!(el.driver.park_in_flight[conn_index as usize].is_some());
@@ -7476,7 +7483,7 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         el.driver
             .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         el.drive_park_drains();
         assert!(el.driver.park_in_flight[conn_index as usize].is_some());
         let ud = crate::completion::UserData::encode(
@@ -7645,7 +7652,7 @@ mod tests {
                 generation,
             });
         // Not offered: `park_blocker` refuses.
-        el.driver.park_offered[conn_index as usize] = false;
+        el.driver.park_offered.remove(conn_index);
         let probe = FdProbe::new();
         el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
         assert!(probe.was_closed(), "the installed fd was kept");
@@ -7756,7 +7763,7 @@ mod tests {
     fn the_policy_is_inert_without_worker_loads() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         assert!(el.driver.worker_loads.is_none(), "pool mode: no load table");
 
         el.maybe_park_one();
@@ -7810,7 +7817,7 @@ mod tests {
             Some(ParkBlocker::NotOffered),
             "park is opt-in: quiescent is not enough"
         );
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         assert_eq!(
             el.driver.park_blocker(conn_index),
             None,
@@ -7826,7 +7833,7 @@ mod tests {
     fn arriving_data_withdraws_the_park_offer() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         el.driver
             .park_carry
             .insert(conn_index, ParkState::new(7u32));
@@ -7836,7 +7843,7 @@ mod tests {
         deliver_direct(&mut el, conn_index, b"GET x");
 
         assert!(
-            !el.driver.park_offered[conn_index as usize],
+            !el.driver.park_offered.contains(conn_index),
             "new data means a new request: the offer must be withdrawn"
         );
         assert!(
@@ -7859,7 +7866,7 @@ mod tests {
 
         // Set a standing offer directly, so the assertions below need
         // `offer_for_park` to clear it.
-        el.driver.park_offered[idx] = true;
+        el.driver.park_offered.insert(idx as u32);
         el.driver.park_carry.insert(conn_index, ParkState::new(0u8));
 
         // The handler finishes response 1 and offers, through the public
@@ -7903,7 +7910,7 @@ mod tests {
 
             // A standing offer that only `offer_for_park` reaching
             // `offer_park` clears.
-            el.driver.park_offered[conn_index as usize] = true;
+            el.driver.park_offered.insert(conn_index);
             el.driver.park_carry.insert(conn_index, ParkState::new(0u8));
 
             let ctx = ConnCtx::new(conn_index, generation);
@@ -7989,7 +7996,7 @@ mod tests {
         el.driver.accumulators.append(conn_b, b"GET b");
         // A standing offer that only `offer_for_park` reaching `offer_park`
         // clears.
-        el.driver.park_offered[conn_a as usize] = true;
+        el.driver.park_offered.insert(conn_a);
         el.driver.park_carry.insert(conn_a, ParkState::new(0u8));
         let ctx_a = ConnCtx::new(conn_a, el.driver.connections.generation(conn_a));
         let ctx_b = ConnCtx::new(conn_b, el.driver.connections.generation(conn_b));
@@ -8006,7 +8013,7 @@ mod tests {
         });
         assert!(matches!(consumed, std::task::Poll::Ready(5)));
         assert!(
-            !el.driver.park_offered[conn_a as usize],
+            !el.driver.park_offered.contains(conn_a),
             "A's callback is still running once B's returns: the offer must not stand"
         );
         assert!(!el.driver.park_carry.contains_key(&conn_a));
@@ -8021,7 +8028,7 @@ mod tests {
         // Bytes reach the slot by a path that does not withdraw the offer.
         el.driver.accumulators.append(conn_index, b"GET w");
         assert!(!el.driver.offer_park(conn_index, None));
-        assert!(!el.driver.park_offered[conn_index as usize]);
+        assert!(!el.driver.park_offered.contains(conn_index));
         assert!(!el.driver.park_carry.contains_key(&conn_index));
     }
 
@@ -8033,7 +8040,7 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
         with_driver_state(&mut el, || ctx.offer_for_park(Some(ParkState::new(2u8))));
-        assert!(el.driver.park_offered[conn_index as usize]);
+        assert!(el.driver.park_offered.contains(conn_index));
         assert!(el.driver.park_carry.contains_key(&conn_index));
         assert_eq!(el.driver.park_blocker(conn_index), None);
     }
@@ -8045,7 +8052,7 @@ mod tests {
     fn a_recycled_slot_does_not_inherit_the_park_offer() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         el.driver.park_carry.insert(conn_index, ParkState::new(1u8));
 
         // Exercise the production clear, not a hand-written one: closing is
@@ -8055,7 +8062,7 @@ mod tests {
         el.driver.close_connection(conn_index);
 
         assert!(
-            !el.driver.park_offered[conn_index as usize],
+            !el.driver.park_offered.contains(conn_index),
             "close must clear the offer"
         );
         assert!(
@@ -8070,7 +8077,7 @@ mod tests {
     fn a_quiescent_tls_connection_is_parkable() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         install_handshaked_tls(&mut el, conn_index);
         assert_eq!(el.driver.park_blocker(conn_index), None);
     }
@@ -8082,7 +8089,7 @@ mod tests {
     fn stashed_tls_plaintext_blocks_the_park() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         install_handshaked_tls(&mut el, conn_index);
         let (_, _, stash, _) = el
             .driver
@@ -8110,7 +8117,7 @@ mod tests {
         let conn_index = accept_connection(el);
         let peer = install_handshaked_tls_with_peer(el, conn_index);
         let generation = el.driver.connections.generation(conn_index);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 0,
@@ -8141,7 +8148,7 @@ mod tests {
         let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         install_handshaked_tls(&mut el, conn_index);
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         let target = if el.driver.worker_index == 0 { 1 } else { 0 };
         assert!(el.begin_park(conn_index, target), "the park starts");
         assert!(
@@ -8178,7 +8185,7 @@ mod tests {
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
         let generation = el.driver.connections.generation(conn_index);
         install_handshaked_tls(&mut el, conn_index);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 0,
@@ -8209,7 +8216,7 @@ mod tests {
         let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         install_handshaked_tls(&mut el, conn_index);
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         let target = if el.driver.worker_index == 0 { 1 } else { 0 };
         assert!(el.begin_park(conn_index, target));
         let slot = el
@@ -8228,7 +8235,7 @@ mod tests {
         assert!(el.driver.park_in_flight[conn_index as usize].is_some());
         // The offer is withdrawn across the round trip, so the re-check
         // abandons the park.
-        el.driver.park_offered[conn_index as usize] = false;
+        el.driver.park_offered.remove(conn_index);
         let probe = FdProbe::new();
         el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
         assert!(probe.was_closed(), "the installed fd is closed");
@@ -8329,7 +8336,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         el.driver
             .park_carry
             .insert(conn_index, ParkState::new(String::from("session-7")));
@@ -8363,7 +8370,7 @@ mod tests {
     fn an_outbound_connection_is_never_parkable() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
             cs.listener = None;
         }
@@ -8382,7 +8389,7 @@ mod tests {
     fn unconsumed_bytes_block_the_park_even_with_a_stale_offer() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         assert_eq!(el.driver.park_blocker(conn_index), None, "precondition");
 
         // Data arrives by a path that forgot to withdraw.
@@ -8608,7 +8615,7 @@ mod tests {
             });
         // Offered, or `NotOffered` short-circuits ahead of the term this
         // test exists to exercise and it passes for the wrong reason.
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         // Quiesce breaks while the install is in flight.
         el.driver.send_queues[conn_index as usize].in_flight = true;
         assert!(el.driver.park_blocker(conn_index).is_some(), "precondition");
@@ -8650,7 +8657,7 @@ mod tests {
         // Deliberately no buffered bytes: `DataPending` refuses while
         // anything is unconsumed, so a connection that reaches a successful
         // park is idle by construction.
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 3,
@@ -8826,7 +8833,7 @@ mod tests {
             .register_files_update(conn_index, &[server.into_raw_fd()])
             .expect("register the server end");
 
-        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_offered.insert(conn_index);
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 3,
