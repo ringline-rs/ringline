@@ -1858,7 +1858,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::CloseCancel => {}
             OpTag::Disconnect => self.handle_disconnect(ud),
             OpTag::EventFdRead => self.handle_eventfd_read(),
-            OpTag::TlsSend => self.handle_tls_send(ud, result),
+            OpTag::TlsSend => self.handle_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
             OpTag::Cancel => {}
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result, flags),
@@ -2943,6 +2943,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Complete a copy send from a pool slot: `OpTag::Send`, and
+    /// `OpTag::TlsSend` for a TLS connection's handshake and alert records
+    /// and the ciphertext chunks of an application send before its last.
     fn handle_send(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let payload = ud.payload();
@@ -2985,7 +2988,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.chain_table.is_active(conn_index) {
             // A chain's SQEs are tagged `OpTag::Send` and bypass the send
             // queue, so while one is active this branch claims *every* Send
-            // CQE on the connection. Sends submitted while a chain is active
+            // CQE on the connection. A TLS connection never has one:
+            // `send_chain` on it encrypts and queues instead
+            // (`SendChainBuilder::finish_tls`). Sends submitted while a chain is active
             // are queued behind it, so no other send's CQE should land here;
             // if one does, its id must not be dropped on the floor: take it
             // (or `release` trips) and report this CQE's own outcome.
@@ -3207,7 +3212,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn fail_waiting_send(&mut self, ud: UserData, result: i32) {
         match ud.tag() {
             Some(OpTag::Send) => self.handle_send(ud, result),
-            Some(OpTag::TlsSend) => self.handle_tls_send(ud, result),
+            Some(OpTag::TlsSend) => self.handle_send(ud, result),
             Some(OpTag::SendMsgCoalesced) => self.handle_send_msg_coalesced(ud, result),
             _ => self.handle_send_msg_zc(ud, result, 0),
         }
@@ -4107,106 +4112,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.connections.release(conn_index);
     }
 
-    fn handle_tls_send(&mut self, ud: UserData, result: i32) {
-        let conn_index = ud.conn_index();
-        let payload = ud.payload();
-        let pool_slot = UserData::send_payload_slot(payload);
-
-        // Guard against stale CQE for an already-released pool slot, matching
-        // handle_send. Without this, try_advance on a released slot would
-        // wrap in release mode and resubmit a wild length.
-        if !self.driver.send_copy_pool.in_use(pool_slot) {
-            return;
-        }
-        // Identity guard, matching handle_send: a TlsSend CQE that outlived
-        // its connection slot must only release the slot it owns.
-        if self.driver.connections.generation(conn_index) & 0xFFFF
-            != u32::from(UserData::send_payload_gen(payload))
-        {
-            // Take-and-discard, as in `handle_send`'s identity guard.
-            if let Some((id, _len)) = self.driver.send_copy_pool.take_send_id(pool_slot) {
-                self.executor.forget_send(id);
-            }
-            self.release_pool_slot(pool_slot);
-            return;
-        }
-
-        if result > 0
-            && self
-                .driver
-                .send_copy_pool
-                .try_advance(pool_slot, result as u32)
-                .is_some()
-        {
-            if self.close_submitted(conn_index) {
-                // The send the slot carries, if any, fails with
-                // `ECANCELED`: the close is already submitted.
-                let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-                self.release_pool_slot(pool_slot);
-                if let Some((id, _logical_len)) = settles {
-                    self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-                }
-                return;
-            }
-            self.wait_for_room(conn_index, ud, false);
-            return;
-        }
-        // Socket send buffer full: keep the slot and resubmit the same chunk
-        // when there is room.
-        if result < 0 {
-            let errno = -result;
-            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                if self.close_submitted(conn_index) {
-                    // The send the slot carries, if any, fails with
-                    // `ECANCELED`: the close is already submitted.
-                    let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-                    self.release_pool_slot(pool_slot);
-                    if let Some((id, _logical_len)) = settles {
-                        self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-                    }
-                    return;
-                }
-                self.wait_for_room(conn_index, ud, true);
-                metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
-                return;
-            }
-        }
-
-        let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-        self.release_pool_slot(pool_slot);
-        // By construction no id reaches this handler: an awaited TLS send
-        // carries it on the *final* ciphertext chunk, which `encrypt_to_sends` tags
-        // `OpTag::Send`, so the id-carrying slot completes in `handle_send`.
-        // Taking it anyway is what keeps `SendCopyPool::release`'s tripwire
-        // honest if that ever changes, and settling it is what keeps the
-        // caller from hanging on the `drain_conn_send_queue` path below.
-        if let Some((id, logical_len)) = settles {
-            let settled = if result > 0 {
-                Ok(logical_len)
-            } else {
-                Err(Self::send_error(result))
-            };
-            self.settle_send(id, settled);
-        }
-
-        // Intermediate TLS chunks are serialized through the per-connection
-        // send queue, so a completion must pop the next queued send and let
-        // a deferred close finalize, exactly like handle_send.
-        if result >= 0 {
-            self.driver.submit_next_queued(conn_index);
-            self.driver.defer_finalize_close(conn_index);
-            return;
-        }
-
-        // On error, fail the connection so the owning task unblocks: drain
-        // the queued sibling chunks (their slots are released by the drain),
-        // close, and tell the reader why.
-        if result < 0 {
-            self.driver.drain_conn_send_queue(conn_index);
-            self.abort_connection(conn_index, Self::send_error(result));
-        }
-    }
-
     fn fire_chain_complete(&mut self, conn_index: u32) {
         let chain = match self.driver.chain_table.take(conn_index) {
             Some(c) => c,
@@ -4892,10 +4797,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
-            // Resubmit with the entry's original OpTag. Choosing by
-            // tls_table membership here re-tagged the *final* chunk of a TLS
-            // send (OpTag::Send, so `handle_send` settles its id) as TlsSend,
-            // which leaves the send unsettled.
+            // Resubmit with the entry's original OpTag. Both tags complete in
+            // `handle_send`; keeping the tag keeps `CQE_BY_TAG` counting the
+            // chunk as it was submitted.
             let result = if matches!(op, OpTag::TlsSend) {
                 self.driver
                     .ring
@@ -12671,6 +12575,51 @@ mod tests {
         );
     }
 
+    /// A `TlsSend` completion of zero bytes closes the connection, as a
+    /// plaintext one does (#846). Continuing the queue would send the next
+    /// record after a gap.
+    #[test]
+    fn handle_tls_send_zero_bytes_closes_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"ciphertext";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "the slot is released"
+        );
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || conn.unwrap().close_requested(),
+            "a zero-byte TLS send completion closes the connection"
+        );
+    }
+
+    /// A completed `TlsSend` chunk counts in `bytes/sent`, as a plaintext
+    /// send does (#846).
+    #[test]
+    fn handle_tls_send_counts_sent_bytes() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"ciphertext";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let before = metrics::BYTES.value(metrics::bytes::SENT).unwrap_or(0);
+        let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
+        let after = metrics::BYTES.value(metrics::bytes::SENT).unwrap_or(0);
+        assert!(
+            after >= before + data.len() as u64,
+            "bytes/sent rose by {} for a {}-byte chunk",
+            after - before,
+            data.len()
+        );
+    }
+
     /// What every failed send leaves for the reader: the read half records
     /// the failure, the reader parked on `with_data_result` is handed the
     /// send's error, and the connection is closing.
@@ -16785,11 +16734,10 @@ mod tests {
         );
     }
 
-    /// `handle_tls_send`'s `close_submitted` returns are silent — they leave
-    /// `send().await` hanging, a pre-existing hole this PR does not fix —
-    /// but a bounded send must not reproduce it. No id reaches this handler
-    /// by construction today (the id-carrying chunk is tagged `OpTag::Send`);
-    /// the settle is what keeps that from becoming a hang if it ever does.
+    /// A `TlsSend` completion after the close is submitted settles the send
+    /// its slot carries with `ECANCELED`. No id reaches a `TlsSend` slot by
+    /// construction today (the id-carrying chunk is tagged `OpTag::Send`);
+    /// the settle keeps that from becoming a hang if it ever does.
     #[test]
     fn tls_send_close_submitted_settles_instead_of_returning_silently() {
         let mut el = bounded_test_loop();
@@ -17077,7 +17025,7 @@ mod tests {
     }
 
     /// A TLS-internal ciphertext chunk that fails closes the connection
-    /// (`handle_tls_send`); coalesced with a following chunk, it still does.
+    /// (`handle_send`); coalesced with a following chunk, it still does.
     #[test]
     fn coalesced_tls_chunk_error_closes_connection() {
         let mut el = bounded_test_loop();
@@ -18457,8 +18405,8 @@ mod tests {
         );
     }
 
-    /// `handle_tls_send`'s `close_submitted` gate settles rather than
-    /// returning silently.
+    /// `handle_send`'s `close_submitted` gate settles a `TlsSend` slot's send
+    /// rather than returning silently.
     ///
     /// `tls_send_close_submitted_settles_instead_of_returning_silently` pins
     /// the rule by calling the handler directly; this pins that a real CQE

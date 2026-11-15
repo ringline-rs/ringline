@@ -1272,6 +1272,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: the `ringline/bytes` counter with `op=sent` now counts every
+  TLS record a connection sends, handshake and alert records and every
+  ciphertext chunk of an application send (#846). Every 0.6 release counted
+  only the last chunk of each TLS application send there, and no handshake
+  or alert bytes. The mio backend counts the same records, except the
+  close_notify it writes as a connection closes.
 - Linux, transparent huge pages `always`: the send copy pool no longer
   becomes resident in 2 MiB huge pages around the slots small sends write
   (#936). In every 0.6 release a send's first write to a slot could fault

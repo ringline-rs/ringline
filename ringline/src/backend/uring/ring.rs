@@ -518,9 +518,10 @@ impl Ring {
         unsafe { self.push_sqe(&entry) }
     }
 
-    /// Submit a TLS-internal send (handshake, alert). Uses OpTag::TlsSend:
-    /// no send id is attached to such a slot, the CQE handler releases it,
-    /// and the handler's settle arms are defensive.
+    /// Submit a TLS-internal send (handshake, alert, or a ciphertext chunk
+    /// of an application send before its last). Uses OpTag::TlsSend: no
+    /// send id is attached to such a slot, and `handle_send` completes it as
+    /// it does a plain copy send.
     pub fn submit_tls_send(
         &mut self,
         conn_index: u32,
