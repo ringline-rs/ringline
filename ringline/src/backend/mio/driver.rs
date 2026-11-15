@@ -515,6 +515,8 @@ impl Driver {
                 // pre-allocated buffer memory here.
                 if config.prefault_buffers {
                     pool.prefault();
+                } else {
+                    pool.no_huge_pages();
                 }
                 pool
             },
@@ -2131,6 +2133,41 @@ pub(crate) mod tests {
         // The slot holds no allocation until its next connection's first
         // data (#935).
         assert_eq!(driver.accumulators.capacity(conn_index), 0);
+    }
+
+    /// A driver advises its send pool `MADV_NOHUGEPAGE` unless it prefaults
+    /// the pool (#936). 64 MiB pools, so each is a fresh mapping.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_send_pool_avoids_huge_pages_unless_prefaulted() {
+        if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+            eprintln!("skipping: the kernel has no transparent huge pages");
+            return;
+        }
+        let nh = |driver: &Driver| {
+            crate::buffer::prefault::vm_flags(driver.send_copy_pool.backing_mid())
+                .split_whitespace()
+                .any(|f| f == "nh")
+        };
+        let lazy = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(1024, 65536)
+            .build()
+            .expect("config");
+        let (driver, _wake) = test_driver(&lazy);
+        assert!(nh(&driver), "a pool that is not prefaulted");
+        let prefaulted = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(1024, 65536)
+            .prefault_buffers(true)
+            .build()
+            .expect("config");
+        let (driver, _wake) = test_driver(&prefaulted);
+        assert!(!nh(&driver), "a prefaulted pool");
     }
 
     /// A new driver allocates no accumulator for its connection slots (#935).

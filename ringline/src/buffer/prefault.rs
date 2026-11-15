@@ -1,4 +1,6 @@
-//! Fault buffer pages in before traffic arrives.
+//! Fault buffer pages in before traffic arrives, or, for a buffer that is
+//! not prefaulted, advise the kernel not to back it with transparent huge
+//! pages (`no_huge_pages`).
 //!
 //! `vec![0u8; n]` goes through `alloc_zeroed`, which for a large allocation
 //! hands back mapped-but-untouched pages: the mapping exists, but every page is
@@ -62,6 +64,66 @@ pub(crate) fn prefault(buf: &mut [u8]) {
     // touch the last byte so a partial trailing page is not left cold.
     // SAFETY: `len > 0`, so `len - 1` is a valid offset.
     unsafe { std::ptr::write_volatile(ptr.add(len - 1), 0) };
+}
+
+/// Advise the kernel not to back `buf` with transparent huge pages
+/// (`MADV_NOHUGEPAGE`), over the whole pages inside it.
+///
+/// Under THP `always`, the first write to a 2 MiB-aligned range of an
+/// anonymous mapping can fault in a whole huge page, and khugepaged can
+/// collapse a range with one touched page into one. A send writes the first
+/// bytes of a slot, so a pool of large slots used for small sends becomes
+/// resident in 2 MiB pieces (#936 has measurements). The advice is ignored
+/// where it fails, as on a kernel built without THP. No-op off Linux.
+///
+/// The advice applies to the memory, not to the allocation. A buffer that
+/// the allocator served from its heap rather than a mapping of its own
+/// leaves the advice on that heap range after it is freed, for whatever
+/// the allocator puts there next. On 64-bit glibc, an allocation below
+/// 32 MiB comes from the heap only after glibc has freed a mapped
+/// allocation of at least that size; one of 32 MiB or more is always
+/// mapped on its own.
+pub(crate) fn no_huge_pages(buf: &mut [u8]) {
+    #[cfg(target_os = "linux")]
+    {
+        let page = page_size();
+        let addr = buf.as_mut_ptr() as usize;
+        let start = addr.next_multiple_of(page);
+        let end = (addr + buf.len()) / page * page;
+        if end > start {
+            // SAFETY: `start..end` is whole pages inside `buf`'s allocation;
+            // `MADV_NOHUGEPAGE` changes no contents.
+            unsafe {
+                libc::madvise(
+                    start as *mut libc::c_void,
+                    end - start,
+                    libc::MADV_NOHUGEPAGE,
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = buf;
+}
+
+/// The `VmFlags` line of the mapping in `/proc/self/smaps` that holds `addr`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn vm_flags(addr: usize) -> String {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").expect("read smaps");
+    let mut inside = false;
+    for line in smaps.lines() {
+        if let Some((range, _)) = line.split_once(' ')
+            && let Some((lo, hi)) = range.split_once('-')
+            && let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+        {
+            inside = (lo..hi).contains(&addr);
+            continue;
+        }
+        if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+            return flags.to_owned();
+        }
+    }
+    panic!("no mapping holds {addr:#x}");
 }
 
 #[cfg(test)]
