@@ -1,8 +1,9 @@
 # Send admission a server can bound
 
 Status: sections 1 to 3 are built; section 3 was specified from Experiment
-A's results (`docs/journal/2026-11-abort-close.md`). Section 4 names the
-experiment that decides it and the constraints already found.
+A's results (`docs/journal/2026-11-abort-close.md`). Section 4 records
+Experiment B's result and names Experiment C, which chooses the admission
+order the fast-path specification uses; Experiment C has not run.
 "What exists" describes the code before section 1, at 07dd0f56; section 3's
 specification cites the code at 03628fee.
 
@@ -469,8 +470,208 @@ none. Contended, at ratios of 1 and 2, `send_admitted` delivered every small
 reply within `admit_limit`; `send` missed 4 in one of eight runs, to pool
 refusals. The rule does not count latency: small replies sent with
 `send_admitted` waited behind the head, p99 about 770 ms, where `send`'s p99 was
-11.5 ms, the setup's floor. Whether a server can accept that, or needs tries, is
-not yet decided.
+11.5 ms, the setup's floor. The owner decided (2026-11-15) that a server
+cannot accept that wait. The specification needs an admission order that lets
+a reply past a waiting head without starving the head, and Experiment C
+chooses it.
+
+### Admission orders
+
+Terms, for one worker: P is the pool's slots, F the free slots, H the slots
+the FIFO's head needs, and S = P - H the slots other sends can hold while the
+head still fits. A passing send is one admitted while an older waiter's
+message did not fit. B is the slots passing sends hold. Line numbers in this
+subsection and in Experiment C are at 18a20526.
+
+Every order except O1 admits a reply only once no earlier reply on its
+connection waits, so each connection's replies keep their order.
+
+- O0, strict FIFO, today's order: only the head is admitted, when F >= H.
+- O1, small replies outside the FIFO: they are sent with `send`, and large
+  replies wait in the FIFO. This is Experiment B's `send` arm. It is a
+  control and cannot be chosen: `send` does not read the FIFO
+  (io.rs:1409-1423), so a small reply can pass a large reply waiting on its
+  own connection.
+- O2, first fit: while the head does not fit, each waiter behind it that fits
+  in F is admitted, oldest first.
+- O3, bounded overtaking: as O2, but a send passes only while F + B < H.
+  F + B is P less the slots held by sends that did not pass, so O3 lets sends
+  pass while those other sends hold more than S, whatever the passing sends
+  hold. A send outside the FIFO lowers F + B without passing. So once
+  F + B >= H has held during a head's wait, nothing passes until that head
+  is admitted or leaves. B counts a passing send's slots until they return,
+  across changes of head. Under O3 the head waits about as long as under O0,
+  plus at most the time the passing sends take to return their slots. A send to a
+  peer that reads slowly holds its slots until the peer reads, or until the
+  server aborts the connection after `settle_limit`.
+- O4, bounded overtaking from idle connections: as O3, and a reply passes
+  only if its connection has no send queued or in flight
+  (`ConnSendState`'s `queue` and `in_flight`, handler.rs:16-18) and its last
+  send did not wait for room in the socket (`wait_for_room`,
+  uloop.rs:3089). The first condition alone always holds in a server that
+  awaits each reply's settlement before reading the next request, as
+  `admission-server` and the pattern under Non-goals do. The completion that
+  settles a reply has already called `submit_next_queued`, which clears
+  `in_flight` when the queue is empty (uloop.rs:3024-3034).
+- O5, two pools. This is the author's reading of the owner's suggestion of
+  parallel send rings, which the owner has not confirmed. A reply that fits
+  one slot of a pool of small slots takes one. Every other reply takes slots
+  of a second pool of large slots. The two pools together have the bytes of
+  O0's single pool.
+  - Each pool has its own FIFO, in strict order. A waiter whose connection
+    has an earlier waiter in either pool joins neither FIFO until that waiter
+    is admitted, so it never becomes a pool's head.
+  - A small reply never waits behind a large head, and never takes its
+    slots.
+  - Neither pool takes the other's free slots, and a medium reply waits
+    behind a large head in the large pool.
+  - No TLS reply fits one slot, because its bound is the plaintext's records
+    plus one (tls/mod.rs:665). Every TLS reply takes the large pool.
+  - Which pool handshake and close_notify records take is left to the
+    specification.
+  - The send payload has 16 bits for the slot (completion.rs:296-298), so the
+    two pools share one index space or take a bit from it.
+  - A 7 MiB reply takes 448 slots of 16 KiB, or 7 of 1 MiB.
+- O6, overtaking for a bounded time: as O2 for the first half of the head's
+  `admit_limit`, then as O0 until the head changes. `send_admitted` does not
+  take a deadline today.
+- O7, a fixed budget: a send passes only while B plus its own slots is at
+  most min(R, S), where R is a configured number of slots. The head is
+  admitted no later than when the sends that did not pass hold S - R or
+  fewer. That bound does not depend on how long the passing sends hold their
+  slots.
+
+Earliest deadline first is not an order here. Every reply waits under the
+same `admit_limit`, so deadlines sort the waiters in arrival order, as the
+FIFO does.
+
+What each order adds to the runtime:
+
+| order | beyond O0 |
+| --- | --- |
+| O2 | a search behind the head (`turn` reads only the front, sc.rs:444-446); each connection's earliest waiter (`by_conn` keeps no order, sc.rs:198-204); a wake for a waiter that is not the head (`wake_send_capacity` wakes only the head, sc.rs:915-923) |
+| O3 | O2's, and a mark on each slot a passing send takes, cleared in `SendCopyPool::release` (send_copy.rs:325), since an abort returns slots without `release_pool_slot`; a latch per head |
+| O4 | O3's, and one bit per connection set in `wait_for_room` |
+| O5 | a second pool, its configuration, and a pool bit in the send payload |
+| O6 | O2's, and a deadline argument to `send_admitted` |
+| O7 | O3's marks, without the latch, and R in the configuration |
+
+`mark_submitted` already admits an id that is not the head
+(sc.rs:457-470).
+
+### Experiment C
+
+Run after Experiment B. It chooses the order the fast-path specification
+uses, in three stages.
+
+- C0, on the rack, with today's code. `admission-server` and
+  `admission-load` gain the instruments and the starvation case below, and
+  run W1 and W2 under O0 and O1. C0 shows whether W2 reaches contention, and
+  gives the floor between O0 runs for the head's delay. Its W2 runs are also
+  C1's second validation.
+- C1, a model. A discrete-event model of one worker's pool and its
+  connections' socket buffers, a `ringline-bench` binary, sweeps every order
+  over many more cells than the rack can run. It is validated against
+  Experiment B's contended runs, which test little of it, since B's figures
+  follow from the schedule (journal, Prediction). It is also validated
+  against C0's W2 runs, which exercise draining. The model is used to reject
+  orders and to choose the cells C2 runs, not to choose the order.
+- C2, on the rack: the orders C1 does not reject, with O0 and O1, built on a
+  work branch behind a hidden configuration option. O2, O3 and O7 are small
+  changes to the FIFO, so C2 builds them whatever C1 finds.
+
+Instruments, in `admission-server` and `admission-load`:
+
+- A request carries its scheduled send time (`CLOCK_MONOTONIC`, which client
+  and server share on loopback). The server records each reply's delay from
+  that time to its admission. Measured from the first poll of
+  `send_admitted`, a reply on a connection that answers one request at a
+  time would not include the time its request waited unread behind the
+  connection's previous reply. The client still records end-to-end latency,
+  as in Experiment B.
+- Every 10 ms the server samples the slots held by unsettled small replies.
+  L is their mean over a head's wait, from its request to its admission or
+  removal.
+- Per head: its admission delay, or a timeout, which is counted apart from
+  the delays.
+- C2 only: each send admitted past a head, with its slots and the time it
+  held them.
+- `--pipeline N`: up to N unsettled replies per connection. Each is timed
+  from when it was queued or, if later, from when the reply before it
+  settled, and the connection is aborted when the oldest has been unsettled
+  for `settle_limit`. This is the shape of the cache server this design is
+  for. With N = 1 the server is Experiment B's.
+
+Workloads, each cell one experiment in its own guest, as in Experiment B's
+contended runs, four repetitions:
+
+- W1: Experiment B's contended case: three stalled peers asking for 3 MiB
+  each, a 7 MiB head 200 ms later, and 256 B small replies to fast readers at
+  2,000/s on 16 connections. The pool is 512 x 16 KiB, `tcp_wmem` is capped at
+  1 MiB, `settle_limit` is 1 s, the ratio of `admit_limit` to it is 1 or 2,
+  and N is 1 or 16. One further cell adds sends outside the FIFO
+  (`send_nowait`, 1,000/s on four connections).
+- W2, the starvation case, with no stalled peers. Each episode, connections
+  that read at a fixed rate ask for 2 MiB replies and hold most of the pool
+  for a drain time below `settle_limit`. The head needs 448 or 256 slots and
+  waits for them. N is 16, `tcp_wmem` is capped at 256 KiB, and the ratio is
+  1 or 2. Slow readers on small-reply connections pipeline 4 KiB requests and
+  read slowly enough to hold L slots: L / S of 0, 0.5 and 1.5. L / S of 0 is
+  the negative control, where every order must admit every head. The read
+  rates and the number of slow readers are set by C0's pilots under O1, so
+  that L reaches each target; the pilots are recorded in the journal.
+- Two extra repetitions of O0 in each cell give the floor between O0 runs.
+
+Statistics:
+
+- small replies to fast readers: the p99 of the delay from scheduled time to
+  admission, and the count beyond `admit_limit`;
+- the head: the median and maximum admission delay (a cell has about 40
+  heads, so its p99 is the maximum), and its timeouts;
+- L, and in C2 the hold times of passing sends.
+
+Prediction (the author's, written before C0 runs):
+
+- O2 times heads out in W2 at L / S of 1.5, as O1 does.
+- O3 times heads out in W2 at L / S of 1.5 at a ratio of 1, and not at a
+  ratio of 2. Passing sends to slow readers hold their slots for up to
+  `settle_limit`, and only a ratio of 2 covers O0's wait plus that.
+- O4's maximum head delay is within 10 ms of O0's in every contended cell,
+  and its small-reply p99 in W1 is at most 10 ms.
+- O5 admits heads as O0 does, and small replies as O1 does while the small
+  pool has free slots.
+- O7's maximum head delay exceeds O0's by at most the time the large holders
+  take to return R slots. In W2 its small replies wait behind the head once
+  slow readers hold R.
+
+The owner's prediction, which names no cell, is that O3 starves a large head.
+C tests it in every contended cell. It is refuted if, in every one, O3 has no
+more head timeouts than O0, and its maximum head delay exceeds O0's by at most
+the longest hold of a send that passed it.
+
+Decision:
+
+- A W2 cell is contended if O1 timed out at least one head in it. If no W2
+  cell with L / S of 1.5 is contended, the experiment stops, and its result
+  goes to the owner before anything is decided.
+- An order passes when, in every W1 cell and every contended W2 cell:
+  - it has no more head timeouts than O0;
+  - its maximum head delay exceeds O0's by at most the larger of 10% and the
+    spread between O0 runs;
+  - its count of small replies beyond `admit_limit` is no more than O0's;
+  - in W1, its small-reply p99 is at most 10 ms.
+
+  It must also admit every head at L / S of 0, and its uncontended CPU per
+  operation must be within the floor of O0's, in Experiment B's echo
+  comparison.
+- The specification uses the passing order that adds least, by the table
+  above. O1 cannot be chosen. If no order passes, the result goes to the
+  owner.
+
+If Experiment C chooses an order other than O0, a waiting form covers the
+fast path: `send_admitted` resolves on its first poll whenever the order
+admits it, and tries are not needed. The constraints on tries apply if it
+does not.
 
 Constraints already found for each outcome:
 
@@ -492,7 +693,11 @@ Constraints already found for each outcome:
     it. While stalled peers hold the pool, that refusal lasts until the head
     is admitted or times out, and the head's need can be the whole pool
     (`bounded_send_slots` refuses only `needed > capacity`, handler.rs:284).
-    The specification sets the result that would drop this rule.
+    The specification sets the result that would drop this rule. In
+    Experiment B's contended case the head needed 448 of 512 slots and the
+    stalled peers held most of the pool, so the free slots stayed below the
+    head's need, and a try under this rule would have been refused until the
+    head was admitted or timed out.
   - A refused batch's error is `#[non_exhaustive]`, carries an `io::Error`
     case, returns the parts on every refusal, and converts to an `io::Error`
     whose pool and slab refusals are `WouldBlock`. Nothing wakes a caller after
@@ -556,7 +761,8 @@ Constraints already found for each outcome:
    problem 1.
 3. Section 3, `abort`, as specified from Experiment A. Its tests run on the
    rack's 6.8, 6.12 and 7.2 images through `experiments/abort-verify.toml`.
-4. Experiment B, then the fast-path specification and its PR.
+4. Experiment B, then Experiment C, then the fast-path specification and its
+   PR.
 
 ## What a caller can no longer do
 
