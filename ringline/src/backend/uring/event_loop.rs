@@ -4498,7 +4498,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let file_index = ud.conn_index() as u16;
         let close_payload = kind.file_close_payload();
 
-        let driver = &mut *self.driver;
+        let driver = &mut self.driver;
         let (cmd_slab, files, fd_base) = match kind {
             crate::fs::FileKind::Fs => (
                 &mut driver.fs_cmd_slab,
