@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871), F8 fixed (#872), F9 fixed (#873), F10 fixed (#874), P1 fixed (#875), P2 fixed (#876), P3 documented (#877), P4 documented (#878), fixed (#906); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations: L1 to L5 decided 2026-11-12 (L1 fixed (#905), L2 accepted, L3 fixed (#906), L4 per worker, L5 #825 and #845), L6 answered in #862
+- **Status:** closed — every finding fixed or documented. 10 findings: F1 fixed (#859), F2 (#861), F3 (#862), F4 (#863), F5 (#864), F6 (#870), F7 (#871), F8 (#872), F9 (#873), F10 (#874). 4 performance findings: P1 fixed (#875), P2 fixed (#876, by #885), P3 documented (#877), P4 documented (#878) and its limit removed (#906). 3 known issues confirmed and fixed: #824 (#854), #825 (#929), #845 (#933, #937, then #957). 6 design limitations: L1 fixed (#905), L2 accepted, L3 fixed (#906), L4 per worker, L5 fixed (#957, revised 2026-11-15), L6 answered in #862
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
