@@ -1458,10 +1458,13 @@ impl ConnCtx {
     {
         with_state(|driver, executor| {
             let id = executor.register_send(self.conn_index);
+            let unwinding = WithdrawUnlessDisarmed(Some(id));
             let mut ctx = driver.make_ctx();
             let token = ConnId::new(self.conn_index, self.generation);
             let builder = ctx.send_chain_awaited(token, id);
-            if let Err(e) = f(builder) {
+            let built = f(builder);
+            unwinding.disarm();
+            if let Err(e) = built {
                 executor.withdraw_send(id);
                 return Err(e);
             }
@@ -1721,9 +1724,12 @@ impl AsyncSendBuilder {
         with_state(|driver, executor| {
             let conn_index = self.token.index;
             let id = executor.register_send(conn_index);
+            let unwinding = WithdrawUnlessDisarmed(Some(id));
             let mut ctx = driver.make_ctx();
             let builder = ctx.send_parts_awaited(self.token, id);
-            if let Err(e) = f(builder) {
+            let built = f(builder);
+            unwinding.disarm();
+            if let Err(e) = built {
                 executor.withdraw_send(id);
                 return Err(e);
             }
@@ -1798,6 +1804,35 @@ impl AsyncSendBuilder {
                 SendCompletion::pending(conn_index, self.token.generation, id),
             ))
         })
+    }
+}
+
+/// Withdraws a registered send id when dropped, unless disarmed.
+///
+/// `AsyncSendBuilder::build` and `ConnCtx::send_chain` register the id
+/// before their closure runs. A closure that panics unwinds past the
+/// withdrawal that follows it, and the entry would stay in the completion
+/// table for the life of the worker: nothing submitted it, so no completion
+/// frees it. Dropped while unwinding, this withdraws it, as
+/// `SendCompletion`'s `Drop` cancels its entry, through the thread-local
+/// driver state.
+#[cfg(has_io_uring)]
+struct WithdrawUnlessDisarmed(Option<SendId>);
+
+#[cfg(has_io_uring)]
+impl WithdrawUnlessDisarmed {
+    /// The closure returned: its caller withdraws the id if it must.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for WithdrawUnlessDisarmed {
+    fn drop(&mut self) {
+        if let Some(id) = self.0 {
+            let _ = try_with_state(|_, executor| executor.withdraw_send(id));
+        }
     }
 }
 

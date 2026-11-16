@@ -16278,6 +16278,7 @@ mod tests {
     /// in the completion table: no completion would ever free it.
     #[test]
     fn a_refused_awaited_send_leaves_no_entry() {
+        use crate::handler::SendPart;
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
@@ -16285,21 +16286,98 @@ mod tests {
         // Another send is in flight, so every chain is refused.
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let huge = vec![0u8; 1 << 24];
+        let kind = |r: io::Result<crate::SendCompletion>| r.err().map(|e| e.kind());
         for _ in 0..10 {
             with_driver_state(&mut el, || {
                 let refused = conn.send_chain(|chain| chain.copy(b"x").finish());
-                assert_eq!(
-                    refused.err().map(|e| e.kind()),
-                    Some(io::ErrorKind::WouldBlock)
-                );
+                assert_eq!(kind(refused), Some(io::ErrorKind::WouldBlock));
                 let empty = conn.send_chain(|_chain| Ok(()));
                 assert!(empty.is_ok());
-                let too_big = conn.send(&huge);
+                assert_eq!(kind(conn.send(&huge)), Some(io::ErrorKind::InvalidInput));
+
+                // `build`: an empty batch, a closure that never submits, and
+                // a copy batch wider than one pool slot.
+                let empty = conn.send_parts().build(|b| b.submit());
+                assert_eq!(kind(empty), Some(io::ErrorKind::InvalidInput));
+                let unsubmitted = conn.send_parts().build(|b| {
+                    let _unsubmitted = b.copy(b"x");
+                    Ok(())
+                });
+                assert_eq!(kind(unsubmitted), Some(io::ErrorKind::InvalidInput));
+                let oversize = conn.send_parts().build(|b| b.copy(&huge).submit());
+                assert_eq!(kind(oversize), Some(io::ErrorKind::InvalidInput));
+
+                // `submit_batch`: an empty batch, and an oversize copy batch.
+                let empty = conn.send_parts().submit_batch(Vec::new());
                 assert_eq!(
-                    too_big.err().map(|e| e.kind()),
+                    empty.err().map(|e| e.kind()),
+                    Some(io::ErrorKind::InvalidInput)
+                );
+                let oversize = conn.send_parts().submit_batch(vec![SendPart::Copy(&huge)]);
+                assert_eq!(
+                    oversize.err().map(|e| e.kind()),
                     Some(io::ErrorKind::InvalidInput)
                 );
             });
+        }
+        assert_eq!(el.executor.send_completions.live(), 0);
+
+        // A whole-accumulator forward, which goes out zero-copy at this
+        // size, refused because the send slab is full.
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        while el
+            .driver
+            .send_slab
+            .allocate(
+                conn_index,
+                generation,
+                &iovecs,
+                u16::MAX,
+                [const { None }; crate::buffer::send_slab::MAX_GUARDS],
+                0,
+                100,
+            )
+            .is_some()
+        {}
+        let message = vec![9u8; 5000];
+        assert!(el.driver.accumulators.append(conn_index, &message));
+        let data = el.driver.accumulators.data(conn_index);
+        // SAFETY: the accumulator is not touched before the call below.
+        let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+        let refused = with_driver_state(&mut el, || conn.forward_recv_buf(view).map(drop));
+        assert_eq!(
+            refused.err().map(|e| e.kind()),
+            Some(io::ErrorKind::Other),
+            "the slab is full"
+        );
+        assert_eq!(el.driver.accumulators.data(conn_index), &message[..]);
+        assert_eq!(el.executor.send_completions.live(), 0);
+    }
+
+    /// A `build` or `send_chain` closure that panics leaves no entry in the
+    /// completion table: the id was registered before the closure ran.
+    #[test]
+    fn a_panicking_build_or_chain_closure_leaves_no_entry() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        for _ in 0..10 {
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_driver_state(&mut el, || {
+                    conn.send_parts()
+                        .build(|_b| -> io::Result<()> { panic!("a build closure panics") })
+                })
+            }));
+            assert!(built.is_err(), "the panic reached the caller");
+            let chained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_driver_state(&mut el, || {
+                    conn.send_chain(|_c| -> io::Result<()> { panic!("a chain closure panics") })
+                })
+            }));
+            assert!(chained.is_err(), "the panic reached the caller");
         }
         assert_eq!(el.executor.send_completions.live(), 0);
     }
