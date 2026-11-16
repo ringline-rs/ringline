@@ -1,8 +1,8 @@
 # Experiment D: large replies in pieces gated on socket room
 
-- **Status:** open. The design is at 618149b4; the model has run (C1-D,
-  below); the runtime gate and the harness are being built; nothing has run
-  on the rack.
+- **Status:** open. The design is at 618149b4; the model (C1-D) and the
+  calibration have run; the runtime gate is in its second round of review
+  fixes; the matrix has not run.
 - **Span:** Nov 2026 · follows Experiment C (`2026-11-send-admission-c.md`)
   · SystemsLab context `send-admission-expC`
 
@@ -125,6 +125,35 @@ The rack's W4 k values either side of the ungated limit: 56 and 72, with 4
 and 128. The model's step is between 63 and 64 at 8 slots per stalled peer;
 if calibration measures h_p slots per stalled peer, the limit is
 floor(504 / h_p).
+
+### Calibration
+
+Binaries: ba3cec47 of `exp/send-admission-d-run` (artifact `01a1e2b3-f183`),
+the gate before its second round of fixes; the calibration's arms do not use
+the gate. hv03, `debian-13-6.12`, one run per cell, all `success`
+(`01a1e2b4-9fb8` to `01a1e2b4-a2c1`). The fewest free slots of 512, and the
+stalled peers' sockets from `ss -tmi` every 100 ms:
+
+| stalled peers | whole 3 MiB replies | ungated 128 KiB pieces |
+| --- | --- | --- |
+| 1 | 384 free: 128 held | 504 free: 8 held |
+| 2 | 256 free: 256 held | 496 free: 16 held |
+| 3 | 128 free: 384 held | 488 free: 24 held |
+
+- h = 128 slots (2 MiB) per stalled whole reply: the socket took 1 MiB of
+  the 3 MiB. h_p = 8 slots per stalled ungated piece, the whole run, as the
+  model had it. The ungated limit is floor(504 / 8) = 63, so W4 runs k = 4,
+  56, 72 and 128 as planned.
+- A stalled peer's socket: `sk_sndbuf` (tb) 1,048,576 and `wmem_queued`
+  1,078,336, one segment past the buffer, as `tcp_sendmsg`'s unchecked last
+  segment allows. Its MSS is 32,768, the case in which the model predicts
+  that 128 KiB gated pieces pass W4 at 256 KiB (they fail at 4 and 8 KiB).
+- The drainer (CAL-DRAIN, 3 MiB at 512 KiB/s, 4 KiB receive window): MSS
+  2,048 and `snd_wnd` 4,096, as derived. Whole replies aborted its three
+  replies at `settle_limit`; ungated pieces completed all three, 30 of 72
+  pieces waiting for room.
+- The image's own `rmem_max` and `wmem_max` are 212,992. No run recorded
+  TCP memory pressure.
 
 ## Outcome
 
