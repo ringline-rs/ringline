@@ -28,7 +28,8 @@
 # write (128 for 64), not one: by reading the kernel, one for the stripped FUA
 # and one from generic_write_sync. The same on both kernels. The dsync docs
 # need no change: they say a device without FUA gets a flush after the write
-# and that pwrite also flushes. The counts are in custom-skills' lab skill, references/nvme.md.
+# and that pwrite also flushes. The counts are in custom-skills' lab skill,
+# references/nvme.md.
 name = "ringline dsync FUA/flush probe ({image})"
 
 [params]
