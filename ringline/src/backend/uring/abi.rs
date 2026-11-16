@@ -34,7 +34,6 @@ pub(crate) mod cqueue {
 
     /// The socket still had data queued after this receive completed
     /// (`IORING_CQE_F_SOCK_NONEMPTY`).
-    #[cfg_attr(not(test), allow(dead_code))] // no driver use; #840 proposes one
     pub(crate) fn sock_nonempty(flags: u32) -> bool {
         flags & F_SOCK_NONEMPTY != 0
     }

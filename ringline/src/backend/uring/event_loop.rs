@@ -1221,7 +1221,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// contents, including on EOF and errors, so the bytes received before
     /// stay readable. The arrival is recorded before the bytes are placed,
     /// while `recv_direct_held` still counts the bytes the buffer held.
-    fn handle_recv_direct(&mut self, ud: UserData, result: i32) {
+    fn handle_recv_direct(&mut self, ud: UserData, result: i32, flags: u32) {
         let slot = ud.payload() as usize;
         let Some(entry) = self
             .driver
@@ -1240,6 +1240,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && cs.generation == entry.generation
         {
             cs.recv_direct_armed = false;
+            cs.recv_direct_drained = result > 0 && !cqueue::sock_nonempty(flags);
         }
         let buf = match entry.buf {
             crate::backend::uring::driver::DirectRecvBuf::Accumulator(buf) => buf,
@@ -1315,9 +1316,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.wake_recv(conn_index);
             return;
         }
-        if -result == libc::ECANCELED {
-            // Cancelled with the connection open: the task re-arms when it
-            // parks again.
+        if -result == libc::ECANCELED || -result == libc::EAGAIN {
+            // Cancelled with the connection open, or a `POLL_FIRST` receive
+            // the kernel could not arm a poll for, which io-wq completes with
+            // `-EAGAIN` instead of receiving: the task re-arms when it parks
+            // again, without `POLL_FIRST` (`recv_direct_drained` is clear).
             self.executor.wake_recv(conn_index);
             return;
         }
@@ -1457,6 +1460,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if -result == libc::ECANCELED {
                 // Cancelled with the connection open, by a park: the task re-arms when it
                 // parks again.
+                self.executor.wake_recv(conn_index);
+                return;
+            }
+            if -result == libc::EAGAIN {
+                // A `POLL_FIRST` receive the kernel could not arm a poll for
+                // (io-wq completes it with `-EAGAIN`). Receive again without
+                // `POLL_FIRST`: now, while the handshake runs or after a
+                // hangup, when no task parks to arm it; otherwise when the
+                // task parks again.
+                if self.driver.rearms_after_completion(conn_index) {
+                    let _ = self.arm_direct_recv(conn_index, None);
+                }
                 self.executor.wake_recv(conn_index);
                 return;
             }
@@ -1838,7 +1853,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         match tag {
             OpTag::AcceptMulti => self.handle_accept_multi(ud, result, flags),
             OpTag::ParkInstall => self.handle_park_install(ud, result),
-            OpTag::RecvDirect => self.handle_recv_direct(ud, result),
+            OpTag::RecvDirect => self.handle_recv_direct(ud, result, flags),
             OpTag::HangupPoll => self.handle_hangup_poll(ud, result),
             OpTag::HangupPeek => self.handle_hangup_peek(ud, result),
             OpTag::Send => self.handle_send(ud, result),
@@ -5233,6 +5248,204 @@ mod tests {
         assert!(!state.close_pending, "the end requested a close");
         assert!(!state.close_submitted);
         assert!(!el.driver.pending_finalize_closes.contains(&conn_index));
+    }
+
+    /// Whether the last SQE the ring took is `conn_index`'s direct receive,
+    /// armed with `IORING_RECVSEND_POLL_FIRST`. Panics if it is not a direct
+    /// receive on that connection.
+    fn last_receive_polls_first(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) -> bool {
+        let sqe = el.driver.ring.last_pushed.expect("an SQE was pushed");
+        let ud = UserData(sqe.user_data);
+        assert_eq!(ud.tag(), Some(OpTag::RecvDirect), "{:?}", sqe.op);
+        assert_eq!(ud.conn_index(), conn_index);
+        match sqe.op {
+            crate::backend::uring::sqe::Op::Recv { poll_first, .. } => poll_first,
+            op => panic!("a direct receive is a Recv, not {op:?}"),
+        }
+    }
+
+    /// Arm a direct receive on `conn_index`, complete it with `result` and
+    /// `flags`, arm the next one, and return whether that one was armed with
+    /// `IORING_RECVSEND_POLL_FIRST`.
+    fn next_receive_polls_first(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+        result: i32,
+        flags: u32,
+    ) -> bool {
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert!(
+            !last_receive_polls_first(el, conn_index),
+            "a connection's first receive tries the socket first"
+        );
+        let first = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, first).raw(),
+            result,
+            flags,
+        );
+        el.driver.ring.last_pushed = None;
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        last_receive_polls_first(el, conn_index)
+    }
+
+    const SOCK_NONEMPTY: u32 = 1 << 2;
+
+    /// A receive that returned bytes and left the socket empty (no
+    /// `IORING_CQE_F_SOCK_NONEMPTY`) arms the connection's next receive with
+    /// `IORING_RECVSEND_POLL_FIRST` (#840).
+    #[test]
+    fn a_receive_that_empties_the_socket_arms_the_next_with_poll_first() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert!(next_receive_polls_first(&mut el, conn_index, 5, 0));
+    }
+
+    /// A receive whose completion says bytes are still queued arms the next
+    /// receive without `POLL_FIRST`, so it takes them at once.
+    #[test]
+    fn a_receive_that_leaves_bytes_queued_arms_the_next_without_poll_first() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert!(!next_receive_polls_first(
+            &mut el,
+            conn_index,
+            5,
+            SOCK_NONEMPTY
+        ));
+    }
+
+    /// A Unix-domain connection always tries the socket first: only TCP is
+    /// relied on to report `IORING_CQE_F_SOCK_NONEMPTY`.
+    #[test]
+    fn a_unix_connection_never_polls_first() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.connections.get_mut(conn_index).unwrap().peer_addr =
+            Some(crate::connection::PeerAddr::Unix(std::path::PathBuf::new()));
+        assert!(!next_receive_polls_first(&mut el, conn_index, 5, 0));
+    }
+
+    /// A `POLL_FIRST` receive that completes with `-EAGAIN` (the kernel could
+    /// not arm its poll, and io-wq returned instead of receiving) leaves the
+    /// connection open with its read half open, and the receive the task
+    /// arms next tries the socket first.
+    #[test]
+    fn an_eagain_poll_first_receive_keeps_the_connection_and_receives_plainly() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert!(next_receive_polls_first(&mut el, conn_index, 5, 0));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            -libc::EAGAIN,
+            0,
+        );
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(cs.read, ReadHalf::Open);
+        assert!(!cs.close_requested(), "EAGAIN closed the connection");
+        assert!(!cs.recv_direct_armed);
+        el.driver.ring.last_pushed = None;
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert!(!last_receive_polls_first(&el, conn_index));
+    }
+
+    /// An established TLS connection whose receive completes with `-EAGAIN`
+    /// stays open with its read half open; nothing is re-armed until the
+    /// task's read parks again.
+    #[test]
+    fn an_eagain_receive_on_an_established_tls_connection_keeps_it_open() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        assert!(!el.driver.rearms_after_completion(conn_index));
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_direct_drained = true;
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert!(last_receive_polls_first(&el, conn_index));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            -libc::EAGAIN,
+            0,
+        );
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(cs.read, ReadHalf::Open);
+        assert!(!cs.close_requested(), "EAGAIN closed the connection");
+        assert!(!cs.recv_direct_armed, "the task's next read arms");
+    }
+
+    /// On a TLS connection whose handshake has not completed, no task parks
+    /// to re-arm, so a `-EAGAIN` receive is re-armed at once, without
+    /// `POLL_FIRST`.
+    #[test]
+    fn an_eagain_tls_handshake_receive_is_rearmed_plainly() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .established = false;
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_direct_drained = true;
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert!(last_receive_polls_first(&el, conn_index));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            -libc::EAGAIN,
+            0,
+        );
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(!cs.close_requested(), "EAGAIN closed the connection");
+        assert!(cs.recv_direct_armed, "the handshake's receive was re-armed");
+        assert!(!last_receive_polls_first(&el, conn_index));
+        // End the re-armed receive, so the TLS state is not dropped with a
+        // receive in flight (`CiphertextBuf`'s drop asserts against that).
+        let slot = cs.recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            -libc::ECANCELED,
+            0,
+        );
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_direct_armed
+        );
     }
 
     /// The peer's FIN, read by a direct receive, finishes the read half and

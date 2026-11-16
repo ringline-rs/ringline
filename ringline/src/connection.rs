@@ -151,6 +151,12 @@ pub struct ConnectionState {
     /// `recv_direct_armed`.
     #[cfg(has_io_uring)]
     pub recv_direct_slot: u32,
+    /// The last direct receive returned bytes and its completion did not
+    /// carry `IORING_CQE_F_SOCK_NONEMPTY`: the socket was empty after it, so
+    /// the next direct receive on a TCP connection is armed with
+    /// `IORING_RECVSEND_POLL_FIRST` (#840).
+    #[cfg(has_io_uring)]
+    pub recv_direct_drained: bool,
     /// A `forward_to_conn` from this connection is running; another gets
     /// `EBUSY`.
     #[cfg(has_io_uring)]
@@ -227,6 +233,8 @@ impl ConnectionState {
             recv_direct_held: 0,
             #[cfg(has_io_uring)]
             recv_direct_slot: 0,
+            #[cfg(has_io_uring)]
+            recv_direct_drained: false,
             #[cfg(has_io_uring)]
             direct_forwarding: false,
             #[cfg(has_io_uring)]
@@ -310,6 +318,7 @@ impl ConnectionState {
             self.recv_direct_armed = false;
             self.recv_direct_held = 0;
             self.recv_direct_slot = 0;
+            self.recv_direct_drained = false;
             self.direct_forwarding = false;
             self.hangup_poll_armed = false;
             self.hangup_peek_armed = false;
@@ -573,6 +582,18 @@ mod tests {
         assert!(!cs.connect_timed_out);
         assert!(cs.peer_addr.is_none());
         assert!(cs.lifecycle == Lifecycle::Inactive);
+    }
+
+    #[cfg(has_io_uring)]
+    #[test]
+    fn deactivate_clears_recv_direct_drained() {
+        let mut table = ConnectionTable::new(4);
+        let idx = table.allocate().unwrap();
+        table.get_mut(idx).unwrap().recv_direct_drained = true;
+        table.release(idx);
+        let reused = table.allocate().unwrap();
+        assert_eq!(reused, idx, "the freed slot is reused");
+        assert!(!table.get(reused).unwrap().recv_direct_drained);
     }
 
     #[cfg(has_io_uring)]

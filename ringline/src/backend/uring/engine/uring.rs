@@ -1303,7 +1303,24 @@ impl Sqe {
                 buf,
                 len,
                 flags,
-            } => on!(fd, |t| opcode::Recv::new(t, buf, len).flags(flags).build()),
+                poll_first,
+            } => {
+                let mut e = on!(fd, |t| opcode::Recv::new(t, buf, len).flags(flags).build());
+                if poll_first {
+                    // `opcode::Recv` has no `ioprio`, where a receive takes
+                    // `IORING_RECVSEND_POLL_FIRST` (1 << 0). `Entry` is a
+                    // `repr(C)` `io_uring_sqe`, and `ioprio` is its `u16` at
+                    // byte offset 2 (opcode 1, flags 1, ioprio 2).
+                    const RECVSEND_POLL_FIRST: u16 = 1 << 0;
+                    let ptr = &mut e as *mut Entry as *mut u8;
+                    // SAFETY: offset 2..4 lies inside the 64-byte entry.
+                    unsafe {
+                        let prio = ptr.add(2) as *mut u16;
+                        prio.write_unaligned(prio.read_unaligned() | RECVSEND_POLL_FIRST);
+                    }
+                }
+                e
+            }
             Op::AcceptMulti { fd, flags } => {
                 on!(fd, |t| opcode::AcceptMulti::new(t).flags(flags).build())
             }
@@ -1477,6 +1494,7 @@ mod encode_tests {
                         buf: p,
                         len: 77,
                         flags: libc::MSG_PEEK,
+                        poll_first: false,
                     },
                     ud,
                 ),
@@ -1767,6 +1785,32 @@ mod encode_tests {
         for (i, (sqe, want)) in cases.iter().enumerate() {
             assert_eq!(bytes(&sqe.encode()), bytes(want), "case {i}: {:?}", sqe.op);
         }
+    }
+
+    /// A receive with `poll_first` encodes as the same receive without it,
+    /// plus `IORING_RECVSEND_POLL_FIRST` (bit 0) in `ioprio`, the `u16` at
+    /// byte offset 2, where the kernel's `io_recvmsg_prep` reads a receive's
+    /// flags (`sr->flags = READ_ONCE(sqe->ioprio)`).
+    #[test]
+    fn a_poll_first_receive_sets_only_ioprio_bit_zero() {
+        let recv = |poll_first| {
+            Sqe::new(
+                Op::Recv {
+                    fd: Fd::Fixed(9),
+                    buf: 0x1000 as *mut u8,
+                    len: 77,
+                    flags: 0,
+                    poll_first,
+                },
+                0x42,
+            )
+            .encode()
+        };
+        let plain = bytes(&recv(false));
+        let mut want = plain.clone();
+        assert_eq!(u16::from_ne_bytes([want[2], want[3]]), 0, "plain ioprio");
+        want[2..4].copy_from_slice(&1u16.to_ne_bytes());
+        assert_eq!(bytes(&recv(true)), want);
     }
 
     /// `MAX_FILE_INDEX` is the largest slot the crate's `DestinationSlot`
