@@ -3,8 +3,7 @@
 //! the runtime opens is inherited across `exec`.
 //!
 //! Its own test binary, because it counts the process's open fds. Linux only:
-//! it reads `/proc/self/fd`, and on macOS a shut-down listener keeps its port
-//! until its acceptor exits, within about 100 ms.
+//! it reads `/proc/self/fd`.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::manual_async_fn)]
@@ -238,7 +237,7 @@ fn shutdown_releases_the_port_while_the_runtime_lives() {
 }
 
 /// Every listener socket closes once the `Runtime` is dropped and its threads
-/// have exited. The pool-mode acceptor is detached, so its exit is waited for.
+/// have exited.
 #[test]
 fn listener_sockets_close_after_shutdown() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

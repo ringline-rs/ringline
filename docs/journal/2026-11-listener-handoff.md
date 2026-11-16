@@ -1,7 +1,7 @@
 # 2026-11 — Handing a listening socket to the next process
 
-- **Status:** open — intent; nothing built
-- **Span:** Nov 2026 · tree 911e0497 (`main`)
+- **Status:** open — PR 1 (the acceptor) built and GO; PRs 2 to 4 not started
+- **Span:** Nov 2026 · tree 911e0497 (`main`) · intent #970 · PR 1 · SystemsLab experiments listed under "What happened"
 
 ## Goal
 
@@ -187,6 +187,49 @@ backend uses the same acceptor and is not measured.
   stops the other pool listeners with `SHUT_RD`.
 - PRs 2 to 4 add API. PR 3 adds a counter to the accept drain; the others
   change no path a server without the new calls takes.
+
+## What happened
+
+### PR 1: the acceptor
+
+Built as planned, with two differences from the plan text: there is no
+`stopping` flag yet (PR 3 adds it with `stop_accepting`), and `EAGAIN` is
+handled in `run_acceptor` before `classify_accept_error`. Review found that a
+second `shutdown()` made while the first was joining returned early, because
+the first had taken the list of acceptor threads; the lock is now held across
+the joins.
+
+Connect rate, one io_uring worker, pool mode, `caps=1024`, 8 client threads,
+Linux 6.12.116 x86_64 (`debian-13-6.12`), an 8 vCPU guest, four 10 s rounds
+per experiment, submitted alternately, four a side, then two more at `main`,
+all on hv01 (measured):
+
+| arm | experiment | median of 4 rounds, conns/s |
+| --- | --- | --- |
+| main a943cf56 | 01a1e6a8-85b3-714a-cab4-b41394868871 | 19,173 |
+| PR 1 e8f77626 | 01a1e6a8-8778-7162-ad4c-ebe26f926b30 | 19,251 |
+| main | 01a1e6a8-87f1-7166-d754-a28e9fa6eaa2 | 19,357 |
+| PR 1 | 01a1e6a8-886d-71f6-3e6a-11ed52fcc336 | 19,284 |
+| main | 01a1e6a8-88e9-7171-0b2e-50385097df4c | 19,472 |
+| PR 1 | 01a1e6a8-8972-712e-102d-3ff2391dbe6b | 19,298 |
+| main | 01a1e6a8-89f8-71c4-d16f-03e1bd4cfd57 | 19,382 |
+| PR 1 | 01a1e6a8-8a75-71fe-2d8c-6c17c33a76a9 | 19,305 |
+| main | 01a1e6a8-8af1-71b1-f2b0-4496f6211db9 | 19,421 |
+| main | 01a1e6a8-8b69-71f3-cc98-ae7193d3cd30 | 19,270 |
+
+The six `main` medians span 19,173 to 19,472 (300 conns/s); the four PR 1
+medians span 19,251 to 19,305. The median of the PR 1 medians, 19,291, is 79
+below that of `main`'s, 19,370 (0.4%), inside the `main` spread: GO under the
+rule above. Mean connection latency was 397 to 408 µs in every round, and
+`accept_queue_full` and connect errors were 0. The two commits after these
+runs change the shutdown join, tests, docs and one constant's name, not the
+accept path. The mio
+backend was not measured.
+
+The rate is lower than the 32,000 conns/s the queue-full poll entry measured
+at 4509097c with the same image. That run had a 16 vCPU guest on hv03; these
+ran in an 8 vCPU guest on hv01 (`nproc` in each log). They did not test which
+difference lowers the rate, and both arms share it.
 
 ## Tests planned
 
