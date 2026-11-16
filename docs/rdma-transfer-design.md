@@ -9,12 +9,12 @@ cachecannon/cachecannon#201, which adds an RDMA path to the cachecannon load
 generator, and says what ringline would need to support the same design as a
 library feature.
 
-Everything about #201 below was read at its head `ae75869`; line references
-are to that head. Bare file names from #201 are in `src/dma/`, except
-`endpoint.rs`, `buffer.rs`, `handle.rs`, `config.rs` and `progress.rs`, which
-are in `src/dma/fabric/`, and `worker.rs` and `config/mod.rs`, which are in
-`src/`. The server side of #201 is not in that PR, so claims about server
-behaviour are inferences and are marked as such.
+Everything about #201 below was read at a head of #201 earlier than the one
+merged; line references are to that head. Bare file names from #201 are in
+`src/dma/`, except `endpoint.rs`, `buffer.rs`, `handle.rs`, `config.rs` and
+`progress.rs`, which are in `src/dma/fabric/`, and `worker.rs` and
+`config/mod.rs`, which are in `src/`. The server side of #201 is not in that
+PR, so claims about server behaviour are inferences and are marked as such.
 
 ## The client as a passive RMA target
 

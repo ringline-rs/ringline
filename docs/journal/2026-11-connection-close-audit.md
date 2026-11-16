@@ -242,10 +242,10 @@ cancel push refused by a full SQ left the slot `Closing` until the kernel's own
 connect timeout (about 127 s at the default `tcp_syn_retries`). Verified by
 `experiments/connect-identity-verify.toml` (SystemsLab experiment
 `01a1bc34-4f45-7153-842b-ffa04d3156c4`, Debian 13, Linux 6.12): at the
-tests-only commit 7b719b82 the four pinning tests that exist there fail (4
+tests-only commit of #774 the four pinning tests that exist there fail (4
 passed; 4 failed), among them
 `a_stale_connect_cqe_leaves_the_reused_slot_alone`, whose stale success CQE
-opens the new occupant; at 173cb83a ten pass, and the uring gate (fmt, clippy
+opens the new occupant; at #774's head ten pass, and the uring gate (fmt, clippy
 on three builds, rustdoc, `cargo test --all`) passes. The trigger itself (a
 Connect CQE dispatched after the Close CQE) was not reproduced on a kernel.
 
@@ -309,19 +309,19 @@ Shutdown is in flight, and a repeat `shutdown_write` in that window.
 Fix: reset only `ShutdownPending` to `Open`; add `|| cs.close_requested()`
 to the io_uring guard, matching mio (`handler.rs:2915`).
 
-Disposition: fixed in #776, as proposed:
-`force_finalize_close` resets the write half to `Open` only from
-`ShutdownPending`, whose queued sends it released, and the io_uring
-`shutdown_write` returns when `close_requested()`, as the mio one does. Pinned
-by `a_forced_close_keeps_an_in_flight_shutdown_recorded` and
+Disposition: fixed in #776, as proposed: `force_finalize_close` resets the
+write half to `Open` only from `ShutdownPending`, whose queued sends it
+released, and the io_uring `shutdown_write` returns when `close_requested()`,
+as the mio one does. Pinned by
+`a_forced_close_keeps_an_in_flight_shutdown_recorded` and
 `shutdown_write_after_a_requested_close_submits_nothing`; verified by
 `experiments/force-close-write-half-verify.toml` (SystemsLab experiment
 `01a1bc3b-0b66-7125-1396-0547f875c73f`, Debian 13, Linux 6.12): at the
-tests-only commit 0bea7c16 both fail (1 passed; 2 failed), at the branch head
-8fd4e34d (the fix b8883058 plus the spec and the alpha bump) three pass, and the uring gate (fmt, clippy on three builds, rustdoc, `cargo test
---all`, lib 780 passed) passes. The trigger (a repeat `shutdown_write` in the
-window between the deadline and the Shutdown CQE) was not reproduced from
-outside the event loop.
+tests-only commit of #776 both fail (1 passed; 2 failed), at its head (the fix
+plus the spec and the alpha bump) three pass, and the uring gate (fmt, clippy
+on three builds, rustdoc, `cargo test --all`, lib 780 passed) passes. The
+trigger (a repeat `shutdown_write` in the window between the deadline and the
+Shutdown CQE) was not reproduced from outside the event loop.
 
 ### F8 — worker exit leaves `CONNECTIONS_ACTIVE` inflated and abandons mio closing connections (invariants 15, 3). Traced.
 
@@ -348,10 +348,10 @@ do. The mio abandonment is documented rather than replaced by a drain pass:
 no longer list worker exit as an exception. Pinned by
 `worker_exit_counts_open_connections_out` in
 `ringline/tests/connection_metrics.rs`: on mio it fails at the tests-only
-commit 0ef26fb2 (gauge 3, expected 0) and passes at the fix; on io_uring,
+commit of #779 (gauge 3, expected 0) and passes at the fix; on io_uring,
 verified by `experiments/exit-closes-count-down-verify.toml` (SystemsLab
 experiment `01a1bc48-5b3e-718d-e469-71f2b93528e2`, Debian 13, Linux 6.12): 0
-passed, 1 failed at 0ef26fb2, 1 passed at the branch head 4ba14ccf, and the
+passed, 1 failed at that commit, 1 passed at #779's head, and the
 uring gate (fmt, clippy on three builds, rustdoc, `cargo test --all`) passes. A
 connection whose Close has not completed when `run_shutdown`'s 10 s bound
 runs out is not counted out: one holding a zero-copy entry whose

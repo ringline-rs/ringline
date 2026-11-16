@@ -37,15 +37,15 @@ decision 15 extends it to accepted connections.
 
 ## Evidence
 
-All runs below are cachecannon with 16 client workers and 1,000 connections
-(62 or 63 per worker) against Valkey (RESP) and memcached, on two VMs, at a
-fixed request rate per cell, in `experiments/segviews-screen.toml` on branch
+All runs below are cachecannon with 16 client workers and 1,000 connections (62
+or 63 per worker) against Valkey (RESP) and memcached, on two VMs, at a fixed
+request rate per cell, in `experiments/segviews-screen.toml` on branch
 `feat/segment-clients`. Client CPU is the cachecannon process's user plus
 system time for the run. Each build runs in every cell of a SystemsLab
 experiment, and the three experiments rotate the build order. The ringline
-commits named below (06c6c43, ff61e77, c67d328) are the measured builds,
-from before this branch was rebased onto main; they are on branch
-`exp/segviews-c8-ringline` of `brayniac/ringline`.
+builds C3 to C8 below are from before this change was rebased onto main, and
+are not in the repository; each is identified by its SystemsLab binaries or
+experiments.
 
 ### What the ring path copies
 
@@ -67,11 +67,10 @@ and the incremental ring added about 1 GiB of peak RSS
 
 ### Direct receive (build C)
 
-Build C is cachecannon `exp/segviews-c2` on ringline `exp/segviews-c2`
-(`feat/recv-direct` on the commit build A used), binaries
+Build C is cachecannon `exp/segviews-c2` on the ringline build A used, binaries
 `01a154c2-7be1-7364-667e-192b469e7a14`. In the screen, `c` connects with
-`recv_direct(true)`, `c0` is the same binary on the multishot ring, and `c1`
-is the same binary with one-shot ring receives (`recv_multishot(false)`).
+`recv_direct(true)`, `c0` is the same binary on the multishot ring, and `c1` is
+the same binary with one-shot ring receives (`recv_multishot(false)`).
 Experiments `01a154c2-aff0-713a-2088-c31a3277e2ed`,
 `01a154c2-b062-71ec-499e-2eb343075ee1` and
 `01a154c2-b0c7-718f-7432-8370282733f8`.
@@ -106,7 +105,7 @@ received:
   and glibc trimmed the thread's heap on the free (see "Reusing a consumed
   buffer"). Counted on loopback with an `LD_PRELOAD` allocator shim: 92,594
   allocations of 32 KiB or more in 66,315 direct receives, against 641 on the
-  ring. Commit 06c6c43 fixed it: in build C3, `c` at memcache 64 B was 1.004
+  ring. A later commit fixed it: in build C3, `c` at memcache 64 B was 1.004
   of `c0`'s CPU, mean of three runs (`01a1556b-604f-710c-e4bc-1f4aaa2ee165`,
   `01a1556b-60d2-716b-893f-80d6a1500614`,
   `01a1556b-6146-7100-d5c4-9bfde714bafe`).
@@ -119,7 +118,7 @@ received:
 
 ### The pool (builds C5 to C8)
 
-Build C5 is ringline ff61e77: the per-worker pool, a 32 KiB own buffer, no
+Build C5 is the per-worker pool, a 32 KiB own buffer, no
 `MSG_WAITALL`. Its screen adds two cells: 1 MiB values at 100 requests per
 second, which leaves most connections idle after a large value, and mixed
 values, where all 400 keys hold 1 MiB and then the first 300 are rewritten at
@@ -160,10 +159,10 @@ holds. The client hosts run THP in mode `always` with `defrag` `madvise`.
   the whole receive size with `BytesMut::reserve`, which doubles the
   allocation. A few buffers of about 5 MiB filled each worker's 16 MiB of
   free buffers, no borrow could use them, and every buffer given back after
-  that was freed. Commit c67d328 sizes a grown buffer to the receive size and
+  that was freed. A later commit sizes a grown buffer to the receive size and
   evicts the largest free buffers (see Buffers).
 
-Build C7 is c67d328 with the diagnostic counters (experiments
+Build C7 is that commit with the diagnostic counters (experiments
 `01a159d3-e857-71bf-0a65-6c6903c6bb6e`,
 `01a159d3-e8ce-718e-c651-340efa5fda70`,
 `01a159d3-e946-7148-afb8-545333526581`). At mixed depth 16, CPU is 0.936 of
@@ -174,7 +173,7 @@ a borrow accepts a free buffer up to twice the size it needs, so those
 buffers stay in use. Moving partial messages raised copies there from 0.19 to
 0.74 bytes per byte. The other C7 cells match C5 within 1%.
 
-Build C8 is c67d328 without the counters (binaries
+Build C8 is that commit without the counters (binaries
 `01a159f3-e054-73af-bc3f-8b6ea08f60b1`).
 
 - Throughput with no rate limit (`01a159f3-edbf-7115-c5dd-6d420d46108d`,
@@ -282,14 +281,14 @@ stayed (`recv-buffering-approaches.md`).
 
 ### Accepted connections (RESP server, 1,000 and 8,000 connections)
 
-These runs used a prototype of this change (brayniac/ringline d960afe; specs
-at 060260f) that had neither the hangup poll nor the single-`sendmsg`
-multi-slot send (#697). The poll's cost is not measured. #697 changes only
-the GET 4 KiB depth-16 cells at 16 KiB send slots, where a flush spans up to
-5 slots. Both ringline arms send through the same path, so #697 is expected
-to affect them alike; this is not measured.
+These runs used a prototype of this change (not in the repository) that had
+neither the hangup poll nor the single-`sendmsg` multi-slot send (#697). The
+poll's cost is not measured. #697 changes only the GET 4 KiB depth-16 cells at
+16 KiB send slots, where a flush spans up to 5 slots. Both ringline arms send
+through the same path, so #697 is expected to affect them alike; this is not
+measured.
 
-A RESP server (`ringline-bench` `resp-server` at d960afe, bins
+A RESP server (`ringline-bench` `resp-server` on that prototype, bins
 `01a164ab-e6aa-73c2-fd0b-2feb02733191`) ran with 8 workers on one VM and
 cachecannon with 16 threads on another, no rate limit, at 1,000 and 8,000
 connections. Arms: `ring` (one-shot receives from the provided-buffer ring),
@@ -564,7 +563,7 @@ its `capacity()` leaves out the bytes before it. `put` moves its start back
 to the start of the allocation (`try_reclaim`) before keeping it; without
 that, a buffer that had held several messages measured under 64 KiB and was
 freed, and every batch of 16 × 4 KiB allocated a new one (C5's 1.94 million
-allocations per run before ff61e77, 0 after).
+allocations per run before the pool, 0 after).
 
 A receive that ends inside a message leaves that part to be moved to the
 front of the buffer at the next growth. Sizing receives to several messages

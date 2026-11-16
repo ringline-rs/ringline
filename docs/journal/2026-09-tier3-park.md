@@ -1,8 +1,8 @@
 # 2026-09 — Tier 3 park: does it repair a standing imbalance?
 
 - **Status:** shipped — mechanism validated; policy metric measured as count-based (2026-09-26)
-- **Span:** Sep 2026 · PRs #464–#469 (mechanism), this PR (rig + measurement) ·
-  commits `cea2726`, `ee70863`
+- **Span:** Sep 2026 · PRs #464–#469 (mechanism), #470 (rig +
+  measurement)
 
 ## Goal
 
@@ -25,7 +25,7 @@ The hypothesis and the scoring were fixed before any run:
 
 The control is the load-bearing arm. A healthy merged-mode fleet is balanced at
 accept by tier 1, so measuring there produces a confident null that says tier 1
-works, not that tier 3 does. So the imbalance is manufactured (`ee70863`): steer
+works, not that tier 3 does. So the imbalance is manufactured (#470): steer
 the upper half of the workers out of the accept rotation, let the client
 establish every connection on the lower half, readmit with no new arrivals.
 Tier 1 cannot touch that, because tier 1 only acts at accept time.
