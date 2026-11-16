@@ -395,5 +395,6 @@ By the decision rule, applied as written:
   the order for TLS connections, and for plaintext if D's gated pieces do not
   pass.
 - `send_nowait` against `send`: the measured cost of a completion is about
-  1.3% of worker CPU per 256 B operation, at the floor. Whether that keeps
-  `send_nowait` in the API is the owner's decision.
+  1.3% of worker CPU per 256 B operation, at the floor. The owner decided on
+  2026-11-15 to remove `send_nowait` and `send_chain_nowait` in 0.7.0,
+  without a deprecation release.
