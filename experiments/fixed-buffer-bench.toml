@@ -16,6 +16,16 @@
 # Refuted if fixed submits any READ, or if fixed and plain differ by no more
 # than plain and plain do.
 #
+# Result (2026-11-16, SystemsLab 01a1e30f-34f0, debian-13-6.12 on delta, qd
+# 32, 6 rounds of 5 s): the traced second submitted 62,692 READ_FIXED for
+# fixed and 42,453 READ for plain, nothing else but the close. Median CPU per
+# read 1.054 us fixed against 1.257 us plain (0.20 us less); fixed was lower
+# in every round, by 15.0% to 18.7% (median 16.6%), while the two plain arms
+# differed by a median of 1.3% and at most 7.7%. Process CPU equalled wall
+# time in every run (one saturated worker), so CPU per read is the inverse of
+# throughput here: fixed also read about 20% more per second. One run of the
+# spec, on one kernel.
+#
 #   systemslab submit experiments/fixed-buffer-bench.toml [-p image=debian-13-7.1]
 name = "ringline fixed-buffer direct I/O read cost ({image}, qd {qd})"
 
