@@ -4,8 +4,15 @@
 Each argument is a directory made by `systemslab artifact download-all <id>`
 for one run of send-admission-c0.toml. Runs are parsed by
 send-admission-c0-report.py's `one`. A cell is a workload configuration
-(workload, slow readers, admit_ms, pipeline, sends outside the FIFO); an arm
-is an order (O1 is small_send=send).
+(workload, slow readers, admit_ms, pipeline, sends outside the FIFO, host,
+TLS); runs over TLS are never compared with plaintext runs. An arm is an
+order: order=strict is O0, order=budget is O7w, and small_send=send is O1
+whatever the order.
+
+Runs of the experiment branch's harness named seven orders, and there
+`budget` was O7, not O7w. A run whose RUN line has no `tls` came from that
+harness or from C0 before it, and its order is named as that harness named
+it.
 
 Per cell and arm, over its repetitions:
 - heads: admitted, timed out, the median of the per-run median admission
@@ -38,7 +45,13 @@ spec = importlib.util.spec_from_file_location("c0", here / "send-admission-c0-re
 c0 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(c0)
 
+# The orders admission-server names, for runs whose RUN line has `tls`.
 NAMES = {
+    "strict": "O0",
+    "budget": "O7w",
+}
+# The experiment branch's names, for runs whose RUN line has no `tls`.
+LEGACY_NAMES = {
     "strict": "O0",
     "first-fit": "O2",
     "bounded": "O3",
@@ -47,14 +60,18 @@ NAMES = {
     "budget": "O7",
     "budget-idle": "O7w",
 }
-CELL_KEYS = ("workload", "slow_conns", "admit_ms", "pipeline", "outside_conns", "host")
+CELL_KEYS = ("workload", "slow_conns", "admit_ms", "pipeline", "outside_conns", "host", "tls")
+# For runs before a cell key existed: they ran on hv03, over plaintext.
+CELL_DEFAULTS = {"host": "hv03", "tls": "0"}
 ARM_ORDER = ["O0", "O1", "O2", "O3", "O4", "O5", "O7", "O7w"]
 
 
-def arm(run):
+def arm(run, raw_run):
     if run.get("small_send") == "send":
         return "O1"
-    return NAMES.get(run.get("order", "strict"), run.get("order"))
+    names = NAMES if "tls" in raw_run else LEGACY_NAMES
+    order = run.get("order", "strict")
+    return names.get(order, order)
 
 
 def fmt(x, spec=".1f"):
@@ -92,9 +109,8 @@ def main():
             print(f"skipped: {e}", file=sys.stderr)
     cells = defaultdict(lambda: defaultdict(list))
     for r in rows:
-        # Runs before the host parameter existed ran on hv03.
-        key = tuple((k, r["run"].get(k, "hv03" if k == "host" else "-")) for k in CELL_KEYS)
-        cells[key][arm(r["run"])].append(r)
+        key = tuple((k, r["run"].get(k, CELL_DEFAULTS.get(k, "-"))) for k in CELL_KEYS)
+        cells[key][arm(r["run"], r["raw_run"])].append(r)
 
     verdict = defaultdict(list)  # arm -> reasons it fails
     seen_arms = set()

@@ -1,6 +1,6 @@
-# Experiment C, stage C0 (docs/send-admission-design.md, section 4): today's
-# runtime under order O0 or O1, in workload W1 or W2, measured with the
-# instruments of Experiment C.
+# Experiment C, stage C0 (docs/send-admission-design.md, section 4): the
+# runtime under order O0, O1 or O7w, in workload W1 or W2, over plaintext or
+# TLS, measured with the instruments of Experiment C.
 #
 # One cell and one repetition per experiment, in one guest on hv03:
 # admission-server (one worker, pinned to CPU 0) and admission-load (CPUs 2
@@ -13,8 +13,19 @@
 # Parameters:
 #   bins_artifact   bench-bins.tgz from send-admission-c-build.toml
 #   workload        a label carried into the RUN line; it changes nothing
-#   small_send      admitted (O0: replies of at most 4096 B wait in the FIFO
-#                   with send_admitted) or send (O1: they are sent with send)
+#   small_send      admitted (replies of at most 4096 B wait in the FIFO
+#                   with send_admitted, under order) or send (O1: they are
+#                   sent with send)
+#   order           the runtime's admission order for send_admitted: strict
+#                   (O0 with small_send=admitted) or budget (O7w)
+#   budget          for order=budget, the most slots sends admitted past a
+#                   waiting head may hold at once
+#   tls             1 runs both ends over TLS: the server generates a
+#                   self-signed certificate and writes it to
+#                   results/cert.pem, which the load trusts. It needs
+#                   slot_size of at least 16413 (one whole TLS record); the
+#                   server refuses a smaller one and the job fails. 0 is
+#                   plaintext.
 #   admit_ms        the server's bound on a wait for admission, and the
 #                   latency the load counts as delivered within the limit
 #   settle_ms       the server's bound on a reply's time unsettled
@@ -64,15 +75,23 @@
 # within admit_ms, each episode's head and drainer times, and the outside
 # connections' counts.
 #
+# Under order=budget the server also counts, per class, the replies admitted
+# past a waiting head and how long each held its slots, samples B (the slots
+# such sends hold) with the held slots, and prints the runtime's admission
+# counters.
+#
 # The job prints a RUN line with every parameter that varies between cells,
 # then the LOAD and SERVER JSON lines; results.tgz holds load.json,
 # server.json and both logs. send-admission-c0-report.py reads them.
-name = "send-admission C0 {workload} {small_send} admit{admit_ms} n{pipeline} rep{rep}"
+name = "send-admission C0 {workload} {small_send} {order} tls{tls} admit{admit_ms} n{pipeline} rep{rep}"
 
 [params]
 bins_artifact  = "REPLACE-WITH-ARTIFACT-ID"
 workload       = "W1"
 small_send     = "admitted"
+order          = "strict"
+budget         = "32"
+tls            = "0"
 admit_ms       = "1000"
 settle_ms      = "1000"
 pipeline       = "1"
@@ -131,13 +150,19 @@ ulimit -n 65536
 sudo sysctl -w net.ipv4.tcp_wmem="4096 16384 {tcp_wmem_max}"
 sysctl net.ipv4.tcp_rmem
 last=$(($(nproc) - 1))
-./out/admission-server --addr 127.0.0.1:7979 --small-send {small_send} --admit-limit-ms {admit_ms} --settle-limit-ms {settle_ms} --pipeline {pipeline} --pool-slots {pool_slots} --slot-size {slot_size} --cpu 0 > results/server.json 2> results/server.log &
+case "{tls}" in
+  0) srv_tls=""; load_tls="" ;;
+  1) srv_tls="--tls --tls-cert-out /home/anvil/results/cert.pem"; load_tls="--tls --tls-ca /home/anvil/results/cert.pem" ;;
+  *) echo "tls must be 0 or 1, not {tls}"; exit 1 ;;
+esac
+./out/admission-server --addr 127.0.0.1:7979 --small-send {small_send} --order {order} --budget {budget} $srv_tls --admit-limit-ms {admit_ms} --settle-limit-ms {settle_ms} --pipeline {pipeline} --pool-slots {pool_slots} --slot-size {slot_size} --cpu 0 > results/server.json 2> results/server.log &
 srv=$!
-for i in $(seq 1 100); do (exec 3<>/dev/tcp/127.0.0.1/7979) 2>/dev/null && { exec 3>&-; break; }; sleep 0.1; done
-taskset -c 2-$last ./out/admission-load --addr 127.0.0.1:7979 --duration {duration} --warmup {warmup} --within-ms {admit_ms} --episode-ms {episode_ms} --small-conns {small_conns} --small-rate {small_rate} --small-size {small_size} --stall-peers {stall_peers} --stall-size {stall_size} --large-size {large_size} --large-delay-ms {large_delay_ms} --slow-conns {slow_conns} --slow-rate {slow_rate} --slow-size {slow_size} --slow-read-bps {slow_read_bps} --slow-rcvbuf {slow_rcvbuf} --drainers {drainers} --drain-size {drain_size} --drain-read-bps {drain_read_bps} --drain-rcvbuf {drain_rcvbuf} --outside-conns {outside_conns} --outside-rate {outside_rate} --outside-size {outside_size} > results/load.json 2> results/load.log
+for i in $(seq 1 100); do kill -0 $srv 2>/dev/null || break; (exec 3<>/dev/tcp/127.0.0.1/7979) 2>/dev/null && { exec 3>&-; break; }; sleep 0.1; done
+kill -0 $srv 2>/dev/null || { echo "admission-server exited before the load started"; cat results/server.log; tar czf results.tgz results; exit 1; }
+taskset -c 2-$last ./out/admission-load --addr 127.0.0.1:7979 --duration {duration} --warmup {warmup} --within-ms {admit_ms} --episode-ms {episode_ms} --small-conns {small_conns} --small-rate {small_rate} --small-size {small_size} --stall-peers {stall_peers} --stall-size {stall_size} --large-size {large_size} --large-delay-ms {large_delay_ms} --slow-conns {slow_conns} --slow-rate {slow_rate} --slow-size {slow_size} --slow-read-bps {slow_read_bps} --slow-rcvbuf {slow_rcvbuf} --drainers {drainers} --drain-size {drain_size} --drain-read-bps {drain_read_bps} --drain-rcvbuf {drain_rcvbuf} --outside-conns {outside_conns} --outside-rate {outside_rate} --outside-size {outside_size} $load_tls > results/load.json 2> results/load.log
 rc=$?
 kill -INT $srv; wait $srv
-echo "RUN workload={workload} small_send={small_send} admit_ms={admit_ms} settle_ms={settle_ms} pipeline={pipeline} tcp_wmem_max={tcp_wmem_max} small_conns={small_conns} small_rate={small_rate} small_size={small_size} stall_peers={stall_peers} stall_size={stall_size} large_size={large_size} slow_conns={slow_conns} slow_rate={slow_rate} slow_size={slow_size} slow_read_bps={slow_read_bps} slow_rcvbuf={slow_rcvbuf} drainers={drainers} drain_size={drain_size} drain_read_bps={drain_read_bps} drain_rcvbuf={drain_rcvbuf} outside_conns={outside_conns} outside_rate={outside_rate} outside_size={outside_size} pool_slots={pool_slots} slot_size={slot_size} rep={rep} load_rc=$rc"
+echo "RUN workload={workload} small_send={small_send} order={order} budget={budget} tls={tls} admit_ms={admit_ms} settle_ms={settle_ms} pipeline={pipeline} tcp_wmem_max={tcp_wmem_max} small_conns={small_conns} small_rate={small_rate} small_size={small_size} stall_peers={stall_peers} stall_size={stall_size} large_size={large_size} slow_conns={slow_conns} slow_rate={slow_rate} slow_size={slow_size} slow_read_bps={slow_read_bps} slow_rcvbuf={slow_rcvbuf} drainers={drainers} drain_size={drain_size} drain_read_bps={drain_read_bps} drain_rcvbuf={drain_rcvbuf} outside_conns={outside_conns} outside_rate={outside_rate} outside_size={outside_size} pool_slots={pool_slots} slot_size={slot_size} rep={rep} load_rc=$rc"
 echo "LOAD $(cat results/load.json)"
 echo "SERVER $(cat results/server.json)"
 tail -3 results/server.log results/load.log
