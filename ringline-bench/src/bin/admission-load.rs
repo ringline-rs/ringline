@@ -94,6 +94,32 @@
 //! 4096 bytes or 10 ms of the rate, whichever is less. The thread sleeps at
 //! most 1 ms between checks.
 //!
+//! # TLS
+//!
+//! With `--tls`, every connection runs a rustls client session over its TCP
+//! socket, trusting only the certificate in `--tls-ca` (which
+//! `admission-server --tls-cert-out` writes) for the name `localhost`. The
+//! handshake completes before the connection's first request; a request
+//! scheduled while its connection is reconnecting keeps its scheduled time,
+//! so the handshake counts in the latencies. The session reads and writes
+//! the socket itself, not through `rustls::Stream`, so the socket sees the
+//! same calls as without TLS:
+//!
+//! - `SO_RCVBUF` is set on the TCP socket as above, before the connect where
+//!   it is set before the connect without TLS.
+//! - A paced reader's token bucket counts the bytes read from the socket,
+//!   which are ciphertext, and each read takes at most 4096 bytes of them as
+//!   before. The plaintext rustls has decrypted is taken without waiting for
+//!   tokens. Other reads take at most 16384 bytes of ciphertext at a time, so
+//!   rustls' buffer of decrypted plaintext never overflows.
+//! - The fast connections wait for the socket to be readable only when rustls
+//!   holds no decrypted plaintext.
+//! - A slow connection's requests are encrypted as they are written; the
+//!   ciphertext the socket did not take is written before more requests are
+//!   encrypted.
+//!
+//! The reply bytes, latencies and `bytes_read` count plaintext.
+//!
 //! # Output
 //!
 //! One JSON object: for the fast small connections, the replies offered after
@@ -109,7 +135,8 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -190,6 +217,13 @@ struct Args {
     outside_rate: u64,
     #[arg(long, default_value_t = 256)]
     outside_size: u32,
+    /// Speak TLS to the server, which must run with `--tls`.
+    #[arg(long, requires = "tls_ca")]
+    tls: bool,
+    /// The certificate (PEM) to trust for `--tls`, as `admission-server
+    /// --tls-cert-out` writes it.
+    #[arg(long, requires = "tls")]
+    tls_ca: Option<PathBuf>,
 }
 
 const REQUEST_LEN: usize = 24;
@@ -202,6 +236,197 @@ const DRAIN_TAG: u32 = 0x8000_0000;
 const READ_CHUNK: usize = 4096;
 /// The longest a paced reader sleeps between checks.
 const PACE_SLEEP: Duration = Duration::from_millis(1);
+/// The most ciphertext one TLS read takes from the socket: rustls' default
+/// limit on the decrypted plaintext it holds unread.
+const TLS_READ: usize = 16384;
+/// Handshake attempts before the load gives up.
+const HANDSHAKE_TRIES: u32 = 100;
+
+/// The client config for `--tls`, set once in `main` before any connection.
+static TLS: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+
+fn tls_config() -> Option<&'static Arc<rustls::ClientConfig>> {
+    TLS.get().and_then(Option::as_ref)
+}
+
+/// A client config that trusts only the certificates in `ca`.
+fn client_config(ca: &std::path::Path) -> Arc<rustls::ClientConfig> {
+    use rustls_pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    let certs = CertificateDer::pem_file_iter(ca).unwrap_or_else(|e| {
+        eprintln!("admission-load: read {}: {e}", ca.display());
+        std::process::exit(2);
+    });
+    for cert in certs {
+        let cert = cert.unwrap_or_else(|e| {
+            eprintln!("admission-load: parse {}: {e}", ca.display());
+            std::process::exit(2);
+        });
+        roots.add(cert).expect("a valid CA certificate");
+    }
+    if roots.is_empty() {
+        eprintln!("admission-load: no certificate in {}", ca.display());
+        std::process::exit(2);
+    }
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// A client TLS session and what it holds decrypted and unread.
+struct Session {
+    conn: rustls::ClientConnection,
+    /// Decrypted plaintext not yet read.
+    plain: usize,
+    /// The server sent `close_notify`.
+    closed: bool,
+}
+
+/// One connection to the server: a TCP socket, with a TLS session over it
+/// under `--tls`. See the module docs, TLS.
+struct Wire {
+    sock: TcpStream,
+    tls: Option<Box<Session>>,
+}
+
+impl Wire {
+    /// Wrap `sock`, a blocking socket just connected, and complete the TLS
+    /// handshake on it if `--tls` is set.
+    fn new(mut sock: TcpStream) -> std::io::Result<Wire> {
+        let Some(cfg) = tls_config() else {
+            return Ok(Wire { sock, tls: None });
+        };
+        let name = rustls_pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut conn =
+            rustls::ClientConnection::new(Arc::clone(cfg), name).map_err(std::io::Error::other)?;
+        while conn.is_handshaking() {
+            conn.complete_io(&mut sock)?;
+        }
+        Ok(Wire {
+            sock,
+            tls: Some(Box::new(Session {
+                conn,
+                plain: 0,
+                closed: false,
+            })),
+        })
+    }
+
+    fn sock(&self) -> &TcpStream {
+        &self.sock
+    }
+
+    /// Whether rustls holds decrypted plaintext, or the server's
+    /// `close_notify`, that a read returns without touching the socket.
+    fn buffered(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.plain > 0 || t.closed)
+    }
+
+    /// Whether ciphertext waits to be written.
+    fn wants_write(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.conn.wants_write())
+    }
+
+    /// Write all of `data`, on a blocking socket.
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        let Some(t) = self.tls.as_mut() else {
+            return self.sock.write_all(data);
+        };
+        t.conn.writer().write_all(data)?;
+        while t.conn.wants_write() {
+            t.conn.write_tls(&mut self.sock)?;
+        }
+        Ok(())
+    }
+
+    /// Write ciphertext waiting to be written, on a non-blocking socket.
+    /// True if none is left.
+    fn flush(&mut self) -> std::io::Result<bool> {
+        let Some(t) = self.tls.as_mut() else {
+            return Ok(true);
+        };
+        while t.conn.wants_write() {
+            match t.conn.write_tls(&mut self.sock) {
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Write some of `data` on a non-blocking socket, as `TcpStream::write`
+    /// does. Under TLS, `WouldBlock` while earlier ciphertext waits; otherwise
+    /// the plaintext rustls takes, encrypted and written as far as the
+    /// socket takes it.
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.tls.is_none() {
+            return self.sock.write(data);
+        }
+        if !self.flush()? {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let t = self.tls.as_mut().expect("a TLS session");
+        let n = t.conn.writer().write(data)?;
+        self.flush()?;
+        Ok(n)
+    }
+
+    /// Read into `buf`, taking at most `cap` bytes from the socket. Returns
+    /// the bytes taken from the socket and the reply bytes put in `buf`;
+    /// `(0, 0)` is the end of the connection. Under TLS the first is
+    /// ciphertext, and either can be 0 alone: a read of part of a record
+    /// yields no plaintext, and plaintext rustls holds is returned without
+    /// reading the socket. Errors as the socket's read, `WouldBlock` among
+    /// them.
+    fn read(&mut self, buf: &mut [u8], cap: usize) -> std::io::Result<(usize, usize)> {
+        let Some(t) = self.tls.as_mut() else {
+            let len = cap.min(buf.len());
+            let n = self.sock.read(&mut buf[..len])?;
+            return Ok((n, n));
+        };
+        if t.plain == 0 && !t.closed {
+            let mut cipher = [0u8; TLS_READ];
+            let n = self.sock.read(&mut cipher[..cap.min(TLS_READ)])?;
+            if n == 0 {
+                return Ok((0, 0));
+            }
+            let mut rest = &cipher[..n];
+            while !rest.is_empty() {
+                t.conn.read_tls(&mut rest)?;
+                let state = t
+                    .conn
+                    .process_new_packets()
+                    .map_err(std::io::Error::other)?;
+                t.plain = state.plaintext_bytes_to_read();
+                t.closed = state.peer_has_closed();
+            }
+            if t.plain == 0 && !t.closed {
+                return Ok((n, 0));
+            }
+            let got = Self::take_plain(t, buf)?;
+            return Ok((n, got));
+        }
+        Ok((0, Self::take_plain(t, buf)?))
+    }
+
+    /// Read decrypted plaintext into `buf`. 0 once the server has closed
+    /// and nothing is left.
+    fn take_plain(t: &mut Session, buf: &mut [u8]) -> std::io::Result<usize> {
+        match t.conn.reader().read(buf) {
+            Ok(n) => {
+                t.plain -= n.min(t.plain);
+                Ok(n)
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
 
 /// Converts an `Instant` to nanoseconds of `CLOCK_MONOTONIC`, the clock the
 /// server reads.
@@ -244,16 +469,39 @@ fn request(len: u32, tag: u32, flags: u32, scheduled_ns: u64) -> [u8; REQUEST_LE
     r
 }
 
-fn connect(addr: SocketAddr) -> TcpStream {
+/// Connect to `addr`, retrying until it accepts, and complete the TLS
+/// handshake under `--tls`. An `rcvbuf` above 0 is set as `SO_RCVBUF` before
+/// the connect (`connect_with_rcvbuf`). A handshake that fails `HANDSHAKE_TRIES` times in a row ends the
+/// process, since it would otherwise retry forever on a bad `--tls-ca`.
+fn connect_wire(addr: SocketAddr, rcvbuf: i32) -> Wire {
+    let mut failures = 0;
     loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => {
-                s.set_nodelay(true).ok();
-                return s;
+        let sock = if rcvbuf > 0 {
+            try_connect_with_rcvbuf(addr, rcvbuf)
+        } else {
+            TcpStream::connect(addr)
+        };
+        let Ok(sock) = sock else {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        };
+        sock.set_nodelay(true).ok();
+        match Wire::new(sock) {
+            Ok(w) => return w,
+            Err(e) => {
+                failures += 1;
+                if failures >= HANDSHAKE_TRIES {
+                    eprintln!("admission-load: TLS handshake failed {failures} times: {e}");
+                    std::process::exit(1);
+                }
+                thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => thread::sleep(Duration::from_millis(5)),
         }
     }
+}
+
+fn connect(addr: SocketAddr) -> Wire {
+    connect_wire(addr, 0)
 }
 
 fn set_rcvbuf(s: &TcpStream, size: i32) {
@@ -276,19 +524,8 @@ fn set_rcvbuf(s: &TcpStream, size: i32) {
 /// connection's receive buffer to a few hundred KiB within about 50 ms of the
 /// connect, whether the size was set before or just after it, so on macOS
 /// this does not limit the buffer.
-fn connect_with_rcvbuf(addr: SocketAddr, rcvbuf: i32) -> TcpStream {
-    if rcvbuf <= 0 {
-        return connect(addr);
-    }
-    loop {
-        match try_connect_with_rcvbuf(addr, rcvbuf) {
-            Ok(s) => {
-                s.set_nodelay(true).ok();
-                return s;
-            }
-            Err(_) => thread::sleep(Duration::from_millis(5)),
-        }
-    }
+fn connect_with_rcvbuf(addr: SocketAddr, rcvbuf: i32) -> Wire {
+    connect_wire(addr, rcvbuf)
 }
 
 fn try_connect_with_rcvbuf(addr: SocketAddr, rcvbuf: i32) -> std::io::Result<TcpStream> {
@@ -538,12 +775,12 @@ fn fast_conn(
             } else {
                 window.drain.saturating_duration_since(Instant::now())
             };
-            if !wait_readable(&conn, wait) {
+            if !conn.buffered() && !wait_readable(conn.sock(), wait) {
                 continue;
             }
-            match conn.read(&mut buf[filled..]) {
-                Ok(0) => broken = true,
-                Ok(n) => {
+            match conn.read(&mut buf[filled..], usize::MAX) {
+                Ok((0, 0)) => broken = true,
+                Ok((_, n)) => {
                     out.bytes_read += n as u64;
                     filled += n;
                     let at = Instant::now();
@@ -572,9 +809,9 @@ fn fast_conn(
     out
 }
 
-fn slow_connect(args: &Args) -> TcpStream {
+fn slow_connect(args: &Args) -> Wire {
     let s = connect_with_rcvbuf(args.addr, args.slow_rcvbuf);
-    s.set_nonblocking(true).expect("non-blocking socket");
+    s.sock().set_nonblocking(true).expect("non-blocking socket");
     s
 }
 
@@ -613,8 +850,9 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
             tag = tag.wrapping_add(1);
             next += stream.interval;
         }
-        let mut broken = false;
-        while !unsent.is_empty() {
+        // Under TLS, ciphertext the socket did not take last time goes first.
+        let mut broken = conn.flush().is_err();
+        while !broken && !unsent.is_empty() {
             let (head, _) = unsent.as_slices();
             match conn.write(head) {
                 Ok(0) => {
@@ -633,13 +871,13 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
         let mut starved = false;
         while !broken {
             let allow = pacer.allowance(Instant::now()).min(buf.len() - filled);
-            if allow == 0 {
+            if allow == 0 && !conn.buffered() {
                 break;
             }
-            match conn.read(&mut buf[filled..filled + allow]) {
-                Ok(0) => broken = true,
-                Ok(n) => {
-                    pacer.take(n);
+            match conn.read(&mut buf[filled..], allow) {
+                Ok((0, 0)) => broken = true,
+                Ok((wire, n)) => {
+                    pacer.take(wire);
                     out.bytes_read += n as u64;
                     filled += n;
                     let at = Instant::now();
@@ -669,7 +907,7 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
             continue;
         }
         let now = Instant::now();
-        let mut sleep = if starved || !unsent.is_empty() {
+        let mut sleep = if starved || !unsent.is_empty() || conn.wants_write() {
             PACE_SLEEP
         } else {
             pacer.wait()
@@ -705,16 +943,16 @@ fn drainer(args: &Args, index: usize, until: Instant, clock: Clock) -> Option<Du
             return None;
         }
         let allow = pacer.allowance(now).min(left);
-        if allow == 0 {
+        if allow == 0 && !s.buffered() {
             thread::sleep(pacer.wait().min(until - now));
             continue;
         }
-        s.set_read_timeout(Some(PACE_SLEEP)).ok();
-        match s.read(&mut buf[..allow]) {
-            Ok(0) => return None,
-            Ok(n) => {
-                pacer.take(n);
-                left -= n;
+        s.sock().set_read_timeout(Some(PACE_SLEEP)).ok();
+        match s.read(&mut buf[..left.min(READ_CHUNK)], allow) {
+            Ok((0, 0)) => return None,
+            Ok((wire, n)) => {
+                pacer.take(wire);
+                left = left.saturating_sub(n);
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(_) => return None,
@@ -743,7 +981,7 @@ fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
         let mut stalled = Vec::new();
         for i in 0..args.stall_peers {
             let mut s = connect(args.addr);
-            set_rcvbuf(&s, args.stall_rcvbuf);
+            set_rcvbuf(s.sock(), args.stall_rcvbuf);
             let r = request(
                 args.stall_size,
                 i as u32,
@@ -756,6 +994,7 @@ fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
         thread::sleep(Duration::from_millis(args.large_delay_ms));
         let mut large = connect(args.addr);
         large
+            .sock()
             .set_read_timeout(Some(Duration::from_millis(args.episode_ms)))
             .ok();
         let began = Instant::now();
@@ -764,9 +1003,9 @@ fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
             let mut left = args.large_size as usize;
             let mut buf = vec![0u8; 1 << 20];
             while left > 0 {
-                match large.read(&mut buf) {
-                    Ok(0) | Err(_) => return None,
-                    Ok(n) => left = left.saturating_sub(n),
+                match large.read(&mut buf, usize::MAX) {
+                    Ok((0, 0)) | Err(_) => return None,
+                    Ok((_, n)) => left = left.saturating_sub(n),
                 }
             }
             Some(began.elapsed())
@@ -872,6 +1111,12 @@ fn millis(d: Option<Duration>) -> Option<u64> {
 
 fn main() {
     let args = Args::parse();
+    let _ = TLS.set(
+        args.tls_ca
+            .as_deref()
+            .filter(|_| args.tls)
+            .map(client_config),
+    );
     if args.slow_conns > 0 && args.slow_rate == 0 {
         eprintln!("admission-load: --slow-conns needs --slow-rate");
         std::process::exit(2);
