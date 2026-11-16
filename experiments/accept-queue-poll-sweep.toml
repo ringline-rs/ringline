@@ -1,0 +1,129 @@
+# Does the acceptor's 1 ms queue-full poll (`send_when_room`, #817) bound the
+# connect rate? One ringline worker, a connect storm (one 64-byte request per
+# connection), accept queue capacity 1024 (default), 64, 4 and 1, four rounds
+# interleaved. The capacity comes from `experiments/accept-queue-poll.patch`,
+# a diagnostic that reads BENCH_ACCEPT_QUEUE in bench-server; it is applied in
+# the guest and is not merged into bench-server.
+#
+# Model: a worker drains its whole queue on every wake, and the acceptor
+# sleeps 1 ms whenever every queue is full, so the accepted rate is about
+# min(R_worker, capacity x 1000/s) at least. Results
+# (`docs/journal/2026-11-accept-queue-full-poll.md`; Linux 6.12, io_uring, at
+# 4509097c): with 8 client threads (experiment
+# 01a1e10a-62e7-7120-3130-b055cec01169) about 32,000 conns/s and
+# accept_queue_full = 0 at 1024 and 64, 4,474 to 5,150 at 4, 905 to 915 at 1;
+# with 256 threads and capacities 1024, 64, 16, 4 (experiment
+# 01a1e19c-bfd0-7194-4e4c-59ccf9630106) the 64-deep queue filled about 440 to
+# 450 times a second with the rate and latency not worse than at 1024, and
+# the rate at 16 was 10 to 14% lower. The client is closed-loop with
+# {threads} connections in flight at most, so a capacity above {threads}
+# cannot fill.
+#
+# The specs that produced those results embedded the patch as base64 at rev
+# 4509097c; the first also ran `sudo prlimit` (which did not reach the
+# payload's subshell) and had no gate on the patch applying. This spec reads
+# the patch from the clone, uses `ulimit -Sn`, and fails the run when the
+# patch does not apply. The measurement does not depend on those differences.
+#
+#   systemslab submit experiments/accept-queue-poll-sweep.toml
+name = "ringline accept queue-full poll sweep, {threads} client threads"
+
+[params]
+repo    = "https://github.com/ringline-rs/ringline"
+rev     = "main"
+rounds  = "4"
+caps    = "1024 64 4 1"
+threads = "8"
+
+[[jobs]]
+name = "sweep"
+tags = ["hypervisor", "x86_64"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "auto.c"
+image = "debian-13-6.12"
+slots = 1
+ports = 0
+gpu = false
+boot_timeout = 300
+payload_timeout = 3600
+artifacts = ["/home/anvil/sweep.log", "/home/anvil/runs.tar.gz", "/home/anvil/status"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+echo 1 > status
+mkdir -p runs
+{
+  uname -srm; nproc; cargo --version
+  # The loopback client opens tens of thousands of connections in 12 s: widen
+  # the port range and reuse TIME_WAIT ports.
+  sudo sysctl -w net.ipv4.ip_local_port_range="1024 65000" net.ipv4.tcp_tw_reuse=1
+  ulimit -Sn 65536 || true
+  echo "nofile=$(ulimit -n) memlock=$(ulimit -l)"
+
+  git clone -q {repo} src && cd src && git checkout -q {rev} && git log --oneline -1
+  git apply experiments/accept-queue-poll.patch; prc=$?
+  echo "gate_patch=$prc"; git diff --stat
+  cargo build --locked --release -p ringline-bench --bin bench-server --bin connect-bench > /home/anvil/build.log 2>&1; brc=$?
+  echo "gate_build=$brc"; tail -2 /home/anvil/build.log
+  # An unapplied patch would measure capacity 1024 at every cell.
+  if [ "$prc" -ne 0 ]; then brc=1; fi
+  got=$(./target/release/bench-server --print-backend)
+  echo "backend=$got"
+  if [ "$got" != "io_uring" ]; then brc=1; echo "gate_backend=1"; else echo "gate_backend=0"; fi
+  sccache --stop-server >/dev/null 2>&1 || true
+
+  n=0
+  if [ "$brc" -eq 0 ]; then
+    for r in $(seq {rounds}); do
+      for cap in {caps}; do
+        tag=cap$cap-r$r
+        BENCH_ACCEPT_QUEUE=$cap ./target/release/bench-server --runtime ringline --echo-mode copy --workers 1 \
+          --addr 127.0.0.1:17878 --metrics-out /home/anvil/runs/metrics-$tag.json \
+          > /home/anvil/runs/server-$tag.log 2>&1 &
+        spid=$!
+        for _ in $(seq 50); do
+          if (exec 3<>/dev/tcp/127.0.0.1/17878) 2>/dev/null; then break; fi
+          sleep 0.1
+        done
+        ./target/release/connect-bench --addr 127.0.0.1:17878 --threads {threads} --duration 10 --warmup 2 \
+          --out /home/anvil/runs/client-$tag.json > /home/anvil/runs/client-$tag.log 2>&1
+        crc=$?
+        kill -INT $spid 2>/dev/null; wait $spid 2>/dev/null
+        rate=$(grep -o '"conns_per_sec": [0-9.]*' /home/anvil/runs/client-$tag.json | grep -o '[0-9.]*$')
+        cerr=$(grep -o '"connect_errors": [0-9]*' /home/anvil/runs/client-$tag.json | grep -o '[0-9]*$')
+        mean=$(grep -o '"mean_ns": [0-9]*' /home/anvil/runs/client-$tag.json | grep -o '[0-9]*$')
+        full=$(python3 -c 'import json,sys
+v="na"
+for e in json.load(open(sys.argv[1])):
+    if e.get("op")=="accept_queue_full": v=e["value"]
+print(v)' /home/anvil/runs/metrics-$tag.json 2>/dev/null)
+        acc=$(python3 -c 'import json,sys
+v="na"
+for e in json.load(open(sys.argv[1])):
+    if e.get("op")=="accepted": v=e["value"]
+print(v)' /home/anvil/runs/metrics-$tag.json 2>/dev/null)
+        echo "RESULT round=$r cap=$cap conns_per_sec=$rate mean_us=$((mean / 1000)) connect_errors=$cerr accepted=$acc accept_queue_full=$full client_rc=$crc"
+        n=$((n + 1))
+        sleep 1
+      done
+    done
+  fi
+  echo "sweep results=$n"
+  tar czf /home/anvil/runs.tar.gz -C /home/anvil runs
+  if [ "$brc" -eq 0 ] && [ "$n" -gt 0 ]; then echo 0 > /home/anvil/status; fi
+} 2>&1 | tee /home/anvil/sweep.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+set +e
+grep -E '^(gate_|backend=|nofile=|RESULT |sweep results=)' sweep.log
+rc=$(cat status)
+echo "status $rc"
+exit $rc
+'''
