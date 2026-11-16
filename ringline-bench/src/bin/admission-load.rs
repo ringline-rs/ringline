@@ -791,7 +791,6 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[i]
 }
 
-/// The fields Experiment B reports for its small connections, over `conns`.
 /// Wait until `conn` has data to read or `timeout` passes; true if it has.
 ///
 /// The fast connections wait for their next send time here. A blocking read
@@ -826,6 +825,7 @@ fn wait_readable(conn: &TcpStream, timeout: Duration) -> bool {
     n > 0
 }
 
+/// The fields Experiment B reports for its small connections, over `conns`.
 fn summary(conns: &[Conn], within_ms: u64) -> serde_json::Map<String, Value> {
     let offered: u64 = conns.iter().map(|s| s.offered).sum();
     let lost: u64 = conns.iter().map(|s| s.lost).sum();

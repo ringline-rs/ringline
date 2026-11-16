@@ -12,8 +12,8 @@
 name = "send-admission C build ({ref})"
 
 [params]
-repo = "https://github.com/brayniac/ringline"
-ref  = "exp/send-admission-c-tools"
+repo = "https://github.com/ringline-rs/ringline"
+ref  = "main"
 
 [[jobs]]
 name = "build"

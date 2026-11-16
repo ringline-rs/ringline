@@ -5,6 +5,10 @@
   per byte in loopback's receive path, mostly waking the reader.
 - **Span:** Nov 2026 · follows Experiment C (`2026-11-send-admission-c.md`)
   · SystemsLab context `send-admission-expC`
+- **Commits:** commits cited here that are not on main are on
+  brayniac/ringline: the `exp/send-admission-*` branches, and
+  `docs/send-admission-expC`, which holds this entry's commits as they were
+  before they were squashed into main.
 
 ## Goal
 
@@ -230,8 +234,8 @@ Fast small replies' p99, median over runs and the largest run in brackets
   128 every slot was taken and fast small p99 was 957 to 994 ms, with 18 to
   1,136 fast small replies per run past `admit_limit`. The step falls between
   the calibrated limit's sides, 56 and 72 (floor(504 / 8) = 63).
-- O0 whole: fast small p99 1,112 to 1,169 ms in W4 and W5, with 3,905 to
-  4,375 fast small replies per run past `admit_limit`; no 7 MiB reply
+- O0 whole: fast small p99 1,112 to 1,169 ms in W4 and W5, with 3,905 to 4,375
+  fast small replies per run (cell means) past `admit_limit`; no 7 MiB reply
   completed in W4 or W5, and every W5 slow reader was aborted at
   `settle_limit`.
 - O7w whole: fast small replies 0.4 to 0.5 ms in W4 up to k = 72, 2.0 to
@@ -412,8 +416,9 @@ By the decision rule, applied as written:
 - O0 gated 64 KiB, O0 gated 128 KiB and O7w gated 128 KiB each pass in W1,
   W2, W4 at 1 MiB and W5: every 7 MiB reply and every W5 slow reader's reply
   completed, fast small p99 at most 3.0 ms, and no fast small reply past
-  `admit_limit` (O0 whole had 3,905 to 4,329 per run in W4 and W5). W4 at
-  256 KiB is not one of the rule's cells.
+  `admit_limit` (O0 whole had 3,905 to 4,329 per run in the rule's W4 and W5
+  cells, and 4,375 in W4 at 256 KiB). W4 at 256 KiB is not one of the rule's
+  cells.
 - The rule picks the larger passing p, 128 KiB, under O0, or under O7w where
   TLS on the same worker uses it.
 - U's CPU per byte is 1.42 times whole replies for 128 KiB pieces (1.46

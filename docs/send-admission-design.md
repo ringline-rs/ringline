@@ -476,12 +476,13 @@ operation. That is inside the floor, which cannot tell a cost of 1 to 2% from
 none. Contended, at ratios of 1 and 2, `send_admitted` delivered every small
 reply within `admit_limit`; `send` missed 4 in one of eight runs, to pool
 refusals. The rule does not count latency: small replies sent with
-`send_admitted` waited behind the head, p99 about 770 ms, where `send`'s p99 was
-11.5 ms, the setup's floor. The owner decided (2026-11-15) that a server
-cannot accept that wait. Experiment C compares admission orders that let a
-reply past a waiting head without starving the head. Experiment D tests the
-design the owner chose for plaintext instead, which bounds what one send
-holds.
+`send_admitted` waited behind the head, p99 about 770 ms, where `send`'s p99
+was 11.5 ms. The 11.5 ms was the load generator writing requests up to a timer
+tick late; with requests written on time, Experiment C's C0 measured `send`'s
+delay to admission at 0.4 ms at p99. The owner decided (2026-11-15) that a
+server cannot accept that wait. Experiment C compares admission orders that let
+a reply past a waiting head without starving the head. Experiment D tests the
+design the owner chose for plaintext instead, which bounds what one send holds.
 
 ### Admission orders
 
@@ -548,6 +549,8 @@ connection waits, so each connection's replies keep their order.
   admitted no later than when the sends that did not pass hold S - R or
   fewer. That bound does not depend on how long the passing sends hold their
   slots.
+- O7w: as O7, and a send passes only onto a connection that O4 would pass
+  onto and whose last settled send did not wait for room in the socket.
 
 Earliest deadline first is not an order here. Every reply waits under the
 same `admit_limit`, so deadlines sort the waiters in arrival order, as the
@@ -563,6 +566,7 @@ What each order adds to the runtime:
 | O5 | a second pool, its configuration, and a pool bit in the send payload |
 | O6 | O2's, and a deadline argument to `send_admitted` |
 | O7 | O3's marks, without the latch, and R in the configuration |
+| O7w | O7's, and O4's bit per connection |
 
 `mark_submitted` already admits an id that is not the head
 (sc.rs:457-470).
@@ -584,9 +588,10 @@ uses, in three stages.
   follow from the schedule (journal, Prediction). It is also validated
   against C0's W2 runs, which exercise draining. The model is used to reject
   orders and to choose the cells C2 runs, not to choose the order.
-- C2, on the rack: the orders C1 does not reject, with O0 and O1, built on a
-  work branch behind a hidden configuration option. O2, O3 and O7 are small
-  changes to the FIFO, so C2 builds them whatever C1 finds.
+- C2, on the rack: the orders C1 does not reject, with O0 and O1, built on
+  `exp/send-admission-c-orders` (eb956201) behind a hidden configuration
+  option. O2, O3 and O7 are small changes to the FIFO, so C2 builds them
+  whatever C1 finds.
 
 Instruments, in `admission-server` and `admission-load`:
 
@@ -677,12 +682,17 @@ Decision:
   pieces do not pass. O1 cannot be chosen. If no order passes, the result
   goes to the owner.
 
+Result (`docs/journal/2026-11-send-admission-c.md`): the rule passed O4, O5
+and O7w. The owner chose O7w for TLS, and Experiment D's design for
+plaintext.
+
 If Experiment C chooses an order other than O0, a waiting form covers the
 fast path: `send_admitted` resolves on its first poll whenever the order
 admits it, and tries are not needed. The constraints on tries apply if it
 does not.
 
-Constraints already found for each outcome:
+Constraints already found for each outcome (line numbers in this list are at
+07dd0f56):
 
 - Guarded batches, in either outcome. A waiting form waits only for the
   batch's own pool cost (at most one slot on a plain connection, the
@@ -738,8 +748,8 @@ What holds slots today:
   the fourth waits at the head. Small replies wait behind it under O0 and pass
   it under O7w, whatever the number of stalled peers.
 
-Pieces, as `admission-server` sends them (`--stream-piece p`, with
-`--stream-gate` for the gate):
+Pieces, as `admission-server` on `exp/send-admission-d-run` sends them
+(`--stream-piece p`, with `--stream-gate` for the gate):
 
 - A reply of more than p bytes is sent as ceil(n / p) pieces, one unsettled at
   a time. The pieces count as one reply against `--pipeline N`.
@@ -747,26 +757,27 @@ Pieces, as `admission-server` sends them (`--stream-piece p`, with
   then waits in `send_admitted` for its slots, under `admit_limit`. Gating only
   the pieces that follow a send that waited for room would let each stalled
   peer's first piece into a full socket.
-- The gate is `SendHalf::writable`, a hidden method on the work branch. On
-  io_uring it uses the connection's `SendPollOut`, the poll the wait for room
-  uses, so the cancel that `close` and `abort` already issue covers it, and a
-  pending poll cannot hold the socket past its `Close`. With no poll armed, the
-  gate arms it one-shot; today a `POLLOUT` that arrives with no send waiting is
-  dropped, and `handle_send_pollout` instead wakes a waiting gate. The gate
-  resolves on `POLLOUT`, fails on `POLLERR` or `POLLHUP`, and is failed by
-  `abort` as a parked reader is. After the peer half-closes, a one-shot poll
-  completes at once with `POLLRDHUP`, so the connection's poll becomes
-  multishot, as for the wait for room. A multishot poll reports only edges, so
-  on such a connection the gate first arms a one-shot probe with its own tag.
-  The probe completes at once, with `POLLOUT` only if the socket is writable
-  now, so it never stays pending. When the socket is not writable, `tcp_poll`
-  sets `SOCK_NOSPACE`, and the multishot poll reports the next `POLLOUT`. The
-  gate resolves on the probe's `POLLOUT`, or else on the multishot poll's next
-  one. On mio the gate polls with a zero timeout, then waits for the
-  connection's next writable event. Its tests cover a socket already writable,
-  a full socket that drains, a half-closed peer with a full socket, filled by a
-  short send and filled by whole sends, an abort and a peer reset while
-  waiting, and a connection whose multishot poll is already armed.
+- The gate is `SendHalf::writable`, a hidden method on
+  `exp/send-admission-d-gate` (7f0b245a), not in ringline. On io_uring it uses
+  the connection's `SendPollOut`, the poll the wait for room uses, so the
+  cancel that `close` and `abort` already issue covers it, and a pending poll
+  cannot hold the socket past its `Close`. With no poll armed, the gate arms it
+  one-shot; today a `POLLOUT` that arrives with no send waiting is dropped, and
+  `handle_send_pollout` instead wakes a waiting gate. The gate resolves on
+  `POLLOUT`, fails on `POLLERR` or `POLLHUP`, and is failed by `abort` as a
+  parked reader is. After the peer half-closes, a one-shot poll completes at
+  once with `POLLRDHUP`, so the connection's poll becomes multishot, as for the
+  wait for room. A multishot poll reports only edges, so on such a connection
+  the gate first arms a one-shot probe with its own tag. The probe completes at
+  once, with `POLLOUT` only if the socket is writable now, so it never stays
+  pending. When the socket is not writable, `tcp_poll` sets `SOCK_NOSPACE`, and
+  the multishot poll reports the next `POLLOUT`. The gate resolves on the
+  probe's `POLLOUT`, or else on the multishot poll's next one. On mio the gate
+  polls with a zero timeout, then waits for the connection's next writable
+  event. Its tests cover a socket already writable, a full socket that drains,
+  a half-closed peer with a full socket, filled by a short send and filled by
+  whole sends, an abort and a peer reset while waiting, and a connection whose
+  multishot poll is already armed.
 - TCP reports `POLLOUT` when `wmem_queued` is at most two thirds of
   `sk_sndbuf` (`sk_stream_is_writeable`), and `tcp_sendmsg` queues while
   `wmem_queued` is below `sk_sndbuf`, checking only before it starts a new
@@ -850,7 +861,8 @@ Workloads, four repetitions, with two extra repetitions of O0 whole:
   and an 80 s duration, so that a 3 MiB reply (6 s) completes within an
   episode.
 
-Statistics, beyond Experiment C's:
+Statistics, beyond Experiment C's, from instruments on the experiment
+branches:
 
 - per 7 MiB reply, and in W5 per slow reader's 3 MiB reply: whether it
   completed, and the time from its request to its last byte at the client, in
@@ -988,7 +1000,7 @@ Not tested here:
   can hold many admitted replies. A caller bounds this by awaiting a reply's
   `SendCompletion` before admitting the next on the same connection.
 - Slab use by coalesced runs and forwards.
-- Changes to `send`, `send_nowait`, `submit_batch` and `close()`.
+- Changes to `send`, `submit_batch` and `close()`.
 
 ## Order of work
 

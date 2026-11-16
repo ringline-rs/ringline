@@ -4,6 +4,11 @@
   O7w, and for plaintext chose Experiment D's design instead.
 - **Span:** Nov 2026 · follows #945 (Experiment B) · SystemsLab context
   `send-admission-expC`
+- **Commits:** commits cited here that are not on main are on
+  brayniac/ringline: the `exp/send-admission-*` branches, and
+  `docs/send-admission-expC`, which holds this entry's commits as they were
+  before they were squashed into main. The files under `experiments/` that
+  are cited here and are not on main are on `exp/send-admission-c-run`.
 
 ## Goal
 

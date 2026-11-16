@@ -15,9 +15,7 @@
 //! - bit 1: send the reply with `send` and drop its `SendCompletion`, outside
 //!   the send-capacity FIFO. The reply is neither small nor large. A refusal
 //!   is counted and the request dropped, the connection stays open, and
-//!   nothing waits for the reply to settle. Experiment C ran this arm with
-//!   `send_nowait`, which 0.7.0-alpha.141 removed; `send` returns the same
-//!   refusals.
+//!   nothing waits for the reply to settle.
 //! - bit 2: the client scheduled the request inside its measurement window.
 //!   The statistics below count only these, except the samples of held
 //!   slots; the counters count every request.
@@ -580,7 +578,8 @@ async fn serve(conn: Connection) {
 /// Send a small or large reply and watch it in `unsettled`. Returns false if
 /// the connection should end.
 ///
-/// This is the one place that chooses the call, and so the admission order:
+/// This chooses the call for small and large replies, and so the admission
+/// order (flag bit 1's replies are sent with `send` in `serve`):
 /// `--small-send send` sends a small reply with `send`, and every other reply
 /// waits in the FIFO in `send_admitted`. The wait for admission also watches
 /// the connection's earlier replies, as the cache server's does: a reply
