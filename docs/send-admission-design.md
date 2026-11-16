@@ -490,7 +490,8 @@ Terms, for one worker: P is the pool's slots, F the free slots, H the slots
 the FIFO's head needs, and S = P - H the slots other sends can hold while the
 head still fits. A passing send is one admitted while an older waiter's
 message did not fit. B is the slots passing sends hold. Line numbers in this
-subsection and in Experiment C are at 18a20526.
+subsection and in Experiment C, except its list of constraints for each
+outcome, are at 18a20526.
 
 Every order except O1 admits a reply only once no earlier reply on its
 connection waits, so each connection's replies keep their order.
@@ -550,7 +551,8 @@ connection waits, so each connection's replies keep their order.
   fewer. That bound does not depend on how long the passing sends hold their
   slots.
 - O7w: as O7, and a send passes only onto a connection that O4 would pass
-  onto and whose last settled send did not wait for room in the socket.
+  onto: no send queued or in flight, and its last settled send did not wait
+  for room in the socket.
 
 Earliest deadline first is not an order here. Every reply waits under the
 same `admit_limit`, so deadlines sort the waiters in arrival order, as the
@@ -608,7 +610,7 @@ Instruments, in `admission-server` and `admission-load`:
 - Per head: its admission delay, or a timeout, which is counted apart from
   the delays.
 - C2 only: each send admitted past a head, with its slots and the time it
-  held them.
+  held them (on `exp/send-admission-c-run`).
 - `--pipeline N`: up to N unsettled replies per connection. Each is timed
   from when it was queued or, if later, from when the reply before it
   settled, and the connection is aborted when the oldest has been unsettled
@@ -683,7 +685,8 @@ Decision:
   goes to the owner.
 
 Result (`docs/journal/2026-11-send-admission-c.md`): the rule passed O4, O5
-and O7w. The owner chose O7w for TLS, and Experiment D's design for
+and O7w. Its tie-break did not rank them, since the table had no O7w row when
+it was applied. The owner chose O7w for TLS, and Experiment D's design for
 plaintext.
 
 If Experiment C chooses an order other than O0, a waiting form covers the
@@ -758,26 +761,26 @@ Pieces, as `admission-server` on `exp/send-admission-d-run` sends them
   the pieces that follow a send that waited for room would let each stalled
   peer's first piece into a full socket.
 - The gate is `SendHalf::writable`, a hidden method on
-  `exp/send-admission-d-gate` (7f0b245a), not in ringline. On io_uring it uses
-  the connection's `SendPollOut`, the poll the wait for room uses, so the
-  cancel that `close` and `abort` already issue covers it, and a pending poll
-  cannot hold the socket past its `Close`. With no poll armed, the gate arms it
-  one-shot; today a `POLLOUT` that arrives with no send waiting is dropped, and
-  `handle_send_pollout` instead wakes a waiting gate. The gate resolves on
-  `POLLOUT`, fails on `POLLERR` or `POLLHUP`, and is failed by `abort` as a
-  parked reader is. After the peer half-closes, a one-shot poll completes at
-  once with `POLLRDHUP`, so the connection's poll becomes multishot, as for the
-  wait for room. A multishot poll reports only edges, so on such a connection
-  the gate first arms a one-shot probe with its own tag. The probe completes at
-  once, with `POLLOUT` only if the socket is writable now, so it never stays
-  pending. When the socket is not writable, `tcp_poll` sets `SOCK_NOSPACE`, and
-  the multishot poll reports the next `POLLOUT`. The gate resolves on the
-  probe's `POLLOUT`, or else on the multishot poll's next one. On mio the gate
-  polls with a zero timeout, then waits for the connection's next writable
-  event. Its tests cover a socket already writable, a full socket that drains,
-  a half-closed peer with a full socket, filled by a short send and filled by
-  whole sends, an abort and a peer reset while waiting, and a connection whose
-  multishot poll is already armed.
+  `exp/send-admission-d-gate` (7f0b245a), not on ringline's main. On io_uring
+  it uses the connection's `SendPollOut`, the poll the wait for room uses, so
+  the cancel that `close` and `abort` already issue covers it, and a pending
+  poll cannot hold the socket past its `Close`. With no poll armed, the gate
+  arms it one-shot; today a `POLLOUT` that arrives with no send waiting is
+  dropped, and `handle_send_pollout` instead wakes a waiting gate. The gate
+  resolves on `POLLOUT`, fails on `POLLERR` or `POLLHUP`, and is failed by
+  `abort` as a parked reader is. After the peer half-closes, a one-shot poll
+  completes at once with `POLLRDHUP`, so the connection's poll becomes
+  multishot, as for the wait for room. A multishot poll reports only edges, so
+  on such a connection the gate first arms a one-shot probe with its own tag.
+  The probe completes at once, with `POLLOUT` only if the socket is writable
+  now, so it never stays pending. When the socket is not writable, `tcp_poll`
+  sets `SOCK_NOSPACE`, and the multishot poll reports the next `POLLOUT`. The
+  gate resolves on the probe's `POLLOUT`, or else on the multishot poll's next
+  one. On mio the gate polls with a zero timeout, then waits for the
+  connection's next writable event. Its tests cover a socket already writable,
+  a full socket that drains, a half-closed peer with a full socket, filled by a
+  short send and filled by whole sends, an abort and a peer reset while
+  waiting, and a connection whose multishot poll is already armed.
 - TCP reports `POLLOUT` when `wmem_queued` is at most two thirds of
   `sk_sndbuf` (`sk_stream_is_writeable`), and `tcp_sendmsg` queues while
   `wmem_queued` is below `sk_sndbuf`, checking only before it starts a new
@@ -861,8 +864,9 @@ Workloads, four repetitions, with two extra repetitions of O0 whole:
   and an 80 s duration, so that a 3 MiB reply (6 s) completes within an
   episode.
 
-Statistics, beyond Experiment C's, from instruments on the experiment
-branches:
+Statistics, beyond Experiment C's, from instruments on
+`exp/send-admission-d-gate` (the runtime counters) and
+`exp/send-admission-d-run` (the bins):
 
 - per 7 MiB reply, and in W5 per slow reader's 3 MiB reply: whether it
   completed, and the time from its request to its last byte at the client, in

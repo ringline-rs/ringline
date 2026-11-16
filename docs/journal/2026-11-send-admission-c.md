@@ -388,7 +388,7 @@ By the decision rule, applied as written:
 - O7 passes the contended conditions, with a fast small p99 of 274 ms in W2
   that the rule does not count, and has no echo figure.
 - The rule's tie-break, the passing order that adds least by the design's
-  table, does not rank O4, O5 and O7w (the table has no row for O7w). The
+  table, does not rank O4, O5 and O7w (the table had no row for O7w). The
   owner chose O7w on 2026-11-15: it matched O4 in every cell, caps what
   passing sends hold at R, and has no latch, where every bug the orders'
   reviews found was.

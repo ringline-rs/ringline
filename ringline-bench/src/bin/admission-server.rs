@@ -118,8 +118,8 @@ struct Args {
     addr: SocketAddr,
     /// How replies of at most `--small-max` bytes are sent: `admitted` is
     /// order O0, `send` is O1. The other orders need a runtime option; a flag
-    /// that selects one belongs beside this one, and `send_reply` is the one
-    /// place that chooses the call.
+    /// that selects one belongs beside this one, and `send_reply` chooses the
+    /// call for small and large replies.
     #[arg(long, value_enum)]
     small_send: SmallSend,
     #[arg(long, default_value_t = 4096)]
