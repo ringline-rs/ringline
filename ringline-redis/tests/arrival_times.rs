@@ -63,7 +63,7 @@ impl AsyncEventHandler for StubServer {
                         let len = bytes.len();
                         match Value::parse_bytes(bytes) {
                             Ok((Value::Array(items), consumed)) => {
-                                let _ = tx.send_nowait(reply(&items));
+                                let _ = tx.send(reply(&items));
                                 ParseResult::Consumed(consumed)
                             }
                             Ok((_, consumed)) => ParseResult::Consumed(consumed),

@@ -60,9 +60,9 @@
 //! |------|--------|-------|
 //! | **H2 recv headers** | 1 | `with_data` feeds `h2.recv()` which copies into `recv_buf`. Headers decoded from owned `Vec<u8>`. |
 //! | **H2 recv body** | 1 | `h2.recv()` copies into `recv_buf`. `H2Event::Data` contains `Vec<u8>`. |
-//! | **H2 send** | 2 | Headers encoded into `h2.send_buf`, then `send_nowait()` copies to pool. |
+//! | **H2 send** | 2 | Headers encoded into `h2.send_buf`, then `send()` copies to pool. |
 //! | **H1 recv** | 1 | `with_data` provides borrowed slice, headers parsed in-place, body copied out. |
-//! | **H1 send** | 1 | Serialize to `Vec<u8>`, `send_nowait()` copies to pool. |
+//! | **H1 send** | 1 | Serialize to `Vec<u8>`, `send()` copies to pool. |
 
 pub mod body;
 pub mod client;

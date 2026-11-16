@@ -46,7 +46,7 @@ impl AsyncEventHandler for ReplyAfterAll {
                 })
                 .await;
             assert_eq!(n, 2 * EACH_SIDE);
-            let _ = conn.send_nowait(b"done");
+            let _ = conn.send(b"done");
             ringline::sleep(Duration::from_millis(50)).await;
             let _ = ringline::request_shutdown();
         }

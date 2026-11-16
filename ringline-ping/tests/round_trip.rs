@@ -62,10 +62,10 @@ impl AsyncEventHandler for PingServer {
                             return ParseResult::NeedMore;
                         }
                         if data.starts_with(b"PING\r\n") {
-                            let _ = tx.send_nowait(b"PONG\r\n");
+                            let _ = tx.send(b"PONG\r\n");
                             ParseResult::Consumed(6)
                         } else {
-                            let _ = tx.send_nowait(b"-ERR\r\n");
+                            let _ = tx.send(b"-ERR\r\n");
                             ParseResult::Consumed(data.len())
                         }
                     })
@@ -259,7 +259,7 @@ impl AsyncEventHandler for BadPingServer {
                         return ParseResult::NeedMore;
                     }
                     // Respond with malformed data instead of PONG\r\n.
-                    let _ = tx.send_nowait(b"GARBAGE_NOT_A_PONG\r\n");
+                    let _ = tx.send(b"GARBAGE_NOT_A_PONG\r\n");
                     ParseResult::Consumed(data.len())
                 })
                 .await;

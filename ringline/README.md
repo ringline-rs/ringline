@@ -35,7 +35,7 @@ impl AsyncEventHandler for Echo {
             let (mut tx, mut rx) = conn.split();
             loop {
                 let n = rx.with_data(|data| {
-                    tx.send_nowait(data).ok();
+                    let _ = tx.send(data);
                     ParseResult::Consumed(data.len())
                 }).await;
                 if n == 0 { break; }
@@ -113,7 +113,7 @@ io_uring backend, each worker also owns:
 | Type | Description |
 |------|-------------|
 | `AsyncEventHandler` | Trait: `on_accept(Connection) -> Future` — one task per connection |
-| `Connection` | An owned connection: `send()`, `send_nowait()`, `with_data()`; `split()` gives `SendHalf` and `RecvHalf` |
+| `Connection` | An owned connection: `send()`, `with_data()`; `split()` gives `SendHalf` and `RecvHalf` |
 | `WithDataFuture` | Future that resolves when recv data is available |
 | `SendCompletion` | Future that resolves when a send completes |
 | `Admission` | Future from `send_admitted` that resolves to a `SendCompletion` once the send-capacity FIFO admits the send |

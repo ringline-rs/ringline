@@ -19,7 +19,7 @@ impl AsyncEventHandler for TlsEcho {
                 let consumed = rx
                     .with_data(|data| {
                         // Handler sees plaintext — TLS is transparent.
-                        if let Err(e) = tx.send_nowait(data) {
+                        if let Err(e) = tx.send(data) {
                             eprintln!("[worker {worker_id}] send error: {e}");
                         }
                         ParseResult::Consumed(data.len())

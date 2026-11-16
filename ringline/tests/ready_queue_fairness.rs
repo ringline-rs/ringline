@@ -54,7 +54,7 @@ impl AsyncEventHandler for SpinOrPong {
                 return;
             }
 
-            let _ = conn.send_nowait(b"pong");
+            let _ = conn.send(b"pong");
 
             loop {
                 let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;

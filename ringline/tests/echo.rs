@@ -28,7 +28,7 @@ impl AsyncEventHandler for AsyncEcho {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -61,7 +61,7 @@ impl AsyncEventHandler for BurstSender {
             for i in 0..BURST_N {
                 let msg = [(i % 251) as u8; BURST_MSG];
                 // Retry only if the copy pool is transiently exhausted.
-                while conn.send_nowait(&msg).is_err() {
+                while conn.send(&msg).is_err() {
                     ringline::sleep(Duration::from_micros(50)).await;
                 }
             }
@@ -96,7 +96,7 @@ impl AsyncEventHandler for SplitEcho {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -648,7 +648,7 @@ impl AsyncEventHandler for ShutdownWriteEcho {
             let (mut tx, mut rx) = conn.split();
             let n = rx
                 .with_data(|data| {
-                    let _ = tx.send_nowait(data);
+                    let _ = tx.send(data);
                     ParseResult::Consumed(data.len())
                 })
                 .await;
@@ -722,7 +722,7 @@ impl AsyncEventHandler for RequestShutdownHandler {
             let (mut tx, mut rx) = conn.split();
             rx.with_data(|data| {
                 // Echo back, then request shutdown.
-                let _ = tx.send_nowait(data);
+                let _ = tx.send(data);
                 ringline::request_shutdown().unwrap();
                 ParseResult::Consumed(data.len())
             })
@@ -780,7 +780,7 @@ impl AsyncEventHandler for SpawnTestHandler {
             let (mut tx, mut rx) = conn.split();
             let n = rx
                 .with_data(|data| {
-                    let _ = tx.send_nowait(data);
+                    let _ = tx.send(data);
                     ParseResult::Consumed(data.len())
                 })
                 .await;
@@ -848,7 +848,7 @@ impl AsyncEventHandler for SleepEchoHandler {
             let (outbox, drain) = ringline::mpsc::channel::<Vec<u8>>(8);
             ringline::spawn(async move {
                 while let Some(msg) = drain.recv().await {
-                    let _ = tx.send_nowait(&msg);
+                    let _ = tx.send(&msg);
                 }
             })
             .unwrap();
@@ -922,7 +922,7 @@ impl AsyncEventHandler for TimeoutTestHandler {
             let (outbox, drain) = ringline::mpsc::channel::<&'static [u8]>(4);
             ringline::spawn(async move {
                 while let Some(msg) = drain.recv().await {
-                    let _ = tx.send_nowait(msg);
+                    let _ = tx.send(msg);
                 }
             })
             .unwrap();
@@ -1074,7 +1074,7 @@ impl AsyncEventHandler for ForwarderHandler {
             let backend = match ringline::connect(backend_addr).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    let _ = client.send_nowait(format!("-ERR connect: {e}\r\n").as_bytes());
+                    let _ = client.send(format!("-ERR connect: {e}\r\n").as_bytes());
                     return;
                 }
             };
@@ -1095,7 +1095,7 @@ impl AsyncEventHandler for ForwarderHandler {
                 }
 
                 // Forward to backend.
-                if backend_tx.send_nowait(&data_copy).is_err() {
+                if backend_tx.send(&data_copy).is_err() {
                     break;
                 }
 
@@ -1117,7 +1117,7 @@ impl AsyncEventHandler for ForwarderHandler {
                 }
 
                 // Send back to client.
-                if client.send_nowait(&echo).is_err() {
+                if client.send(&echo).is_err() {
                     break;
                 }
             }
@@ -1203,7 +1203,7 @@ impl AsyncEventHandler for ConnectRefusedHandler {
                 Err(e) => format!("ERR:{}", e.kind()),
             };
 
-            let _ = client.send_nowait(result.as_bytes());
+            let _ = client.send(result.as_bytes());
             // Keep connection alive so the send completes.
             ringline::sleep(Duration::from_secs(5)).await;
         }
@@ -1286,7 +1286,7 @@ impl AsyncEventHandler for MultiOutboundHandler {
             let backend1 = match ringline::connect(backend_addr).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    let _ = client.send_nowait(format!("ERR1:{e}").as_bytes());
+                    let _ = client.send(format!("ERR1:{e}").as_bytes());
                     return;
                 }
             };
@@ -1296,7 +1296,7 @@ impl AsyncEventHandler for MultiOutboundHandler {
             let backend2 = match ringline::connect(backend_addr).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    let _ = client.send_nowait(format!("ERR2:{e}").as_bytes());
+                    let _ = client.send(format!("ERR2:{e}").as_bytes());
                     return;
                 }
             };
@@ -1304,8 +1304,8 @@ impl AsyncEventHandler for MultiOutboundHandler {
             let (mut backend2_tx, mut backend2_rx) = backend2.split();
 
             // Send "AA" through backend1, "BB" through backend2.
-            if backend1_tx.send_nowait(b"AA").is_err() {
-                let _ = client.send_nowait(b"SEND_ERR1");
+            if backend1_tx.send(b"AA").is_err() {
+                let _ = client.send(b"SEND_ERR1");
                 return;
             }
             let mut echo1 = Vec::new();
@@ -1323,8 +1323,8 @@ impl AsyncEventHandler for MultiOutboundHandler {
                 }
             }
 
-            if backend2_tx.send_nowait(b"BB").is_err() {
-                let _ = client.send_nowait(b"SEND_ERR2");
+            if backend2_tx.send(b"BB").is_err() {
+                let _ = client.send(b"SEND_ERR2");
                 return;
             }
             let mut echo2 = Vec::new();
@@ -1345,7 +1345,7 @@ impl AsyncEventHandler for MultiOutboundHandler {
             // Combine and send back.
             let mut result = echo1;
             result.extend_from_slice(&echo2);
-            let _ = client.send_nowait(&result);
+            let _ = client.send(&result);
             // Keep connection alive so the send completes.
             ringline::sleep(Duration::from_secs(5)).await;
         }
@@ -1441,7 +1441,7 @@ impl AsyncEventHandler for SelectTwoHandler {
             let backend1 = match ringline::connect(addr1).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    let _ = client.send_nowait(format!("ERR1:{e}").as_bytes());
+                    let _ = client.send(format!("ERR1:{e}").as_bytes());
                     return;
                 }
             };
@@ -1450,7 +1450,7 @@ impl AsyncEventHandler for SelectTwoHandler {
             let backend2 = match ringline::connect(addr2).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    let _ = client.send_nowait(format!("ERR2:{e}").as_bytes());
+                    let _ = client.send(format!("ERR2:{e}").as_bytes());
                     return;
                 }
             };
@@ -1460,8 +1460,8 @@ impl AsyncEventHandler for SelectTwoHandler {
             let (_unused_tx, mut backend2_rx) = backend2.split();
 
             // Send data to backend1 only.
-            if backend1_tx.send_nowait(b"HELLO").is_err() {
-                let _ = client.send_nowait(b"SEND_ERR");
+            if backend1_tx.send(b"HELLO").is_err() {
+                let _ = client.send(b"SEND_ERR");
                 return;
             }
 
@@ -1482,12 +1482,12 @@ impl AsyncEventHandler for SelectTwoHandler {
             .await
             {
                 ringline::Either::Left(_) => {
-                    let _ = client.send_nowait(b"LEFT:");
-                    let _ = client.send_nowait(&buf1);
+                    let _ = client.send(b"LEFT:");
+                    let _ = client.send(&buf1);
                 }
                 ringline::Either::Right(_) => {
-                    let _ = client.send_nowait(b"RIGHT:");
-                    let _ = client.send_nowait(&buf2);
+                    let _ = client.send(b"RIGHT:");
+                    let _ = client.send(&buf2);
                 }
             }
 
@@ -1591,7 +1591,7 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
             let backend1 = match ringline::connect(addr1).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    let _ = client.send_nowait(format!("ERR:{e}").as_bytes());
+                    let _ = client.send(format!("ERR:{e}").as_bytes());
                     return;
                 }
             };
@@ -1602,7 +1602,7 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
             let backend2 = match ringline::connect(addr2).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    let _ = client.send_nowait(format!("ERR:{e}").as_bytes());
+                    let _ = client.send(format!("ERR:{e}").as_bytes());
                     return;
                 }
             };
@@ -1610,8 +1610,8 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
             let (mut backend2_tx, mut backend2_rx) = backend2.split();
 
             // Send data to backend2 only.
-            if backend2_tx.send_nowait(b"WORLD").is_err() {
-                let _ = client.send_nowait(b"SEND_ERR");
+            if backend2_tx.send(b"WORLD").is_err() {
+                let _ = client.send(b"SEND_ERR");
                 return;
             }
 
@@ -1630,12 +1630,12 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
             .await
             {
                 ringline::Either::Left(_) => {
-                    let _ = client.send_nowait(b"LEFT:");
-                    let _ = client.send_nowait(&buf1);
+                    let _ = client.send(b"LEFT:");
+                    let _ = client.send(&buf1);
                 }
                 ringline::Either::Right(_) => {
-                    let _ = client.send_nowait(b"RIGHT:");
-                    let _ = client.send_nowait(&buf2);
+                    let _ = client.send(b"RIGHT:");
+                    let _ = client.send(&buf2);
                 }
             }
 
@@ -1741,7 +1741,7 @@ impl AsyncEventHandler for SelectSleepHandler {
             for _ in 0..300 {
                 match ringline::select(
                     rx.with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     }),
                     ringline::sleep(Duration::from_secs(60)),
@@ -1757,12 +1757,12 @@ impl AsyncEventHandler for SelectSleepHandler {
                     }
                     ringline::Either::Right(()) => {
                         // Timeout — shouldn't happen with 60s timeout.
-                        let _ = tx.send_nowait(b"TIMEOUT");
+                        let _ = tx.send(b"TIMEOUT");
                         break;
                     }
                 }
             }
-            let _ = tx.send_nowait(b"DONE");
+            let _ = tx.send(b"DONE");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -1834,7 +1834,7 @@ impl AsyncEventHandler for Select3Handler {
             let backend = match ringline::connect(backend_addr).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    let _ = client.send_nowait(format!("ERR:{e}").as_bytes());
+                    let _ = client.send(format!("ERR:{e}").as_bytes());
                     return;
                 }
             };
@@ -1842,8 +1842,8 @@ impl AsyncEventHandler for Select3Handler {
             let (mut backend_tx, mut backend_rx) = backend.split();
 
             // Send data to backend so it echoes.
-            if backend_tx.send_nowait(b"ECHO3").is_err() {
-                let _ = client.send_nowait(b"SEND_ERR");
+            if backend_tx.send(b"ECHO3").is_err() {
+                let _ = client.send(b"SEND_ERR");
                 return;
             }
 
@@ -1865,14 +1865,14 @@ impl AsyncEventHandler for Select3Handler {
             .await
             {
                 ringline::Either3::First(_) => {
-                    let _ = client.send_nowait(b"FIRST");
+                    let _ = client.send(b"FIRST");
                 }
                 ringline::Either3::Second(_) => {
-                    let _ = client.send_nowait(b"SECOND:");
-                    let _ = client.send_nowait(&backend_buf);
+                    let _ = client.send(b"SECOND:");
+                    let _ = client.send(&backend_buf);
                 }
                 ringline::Either3::Third(()) => {
-                    let _ = client.send_nowait(b"THIRD");
+                    let _ = client.send(b"THIRD");
                 }
             }
 
@@ -1971,15 +1971,15 @@ impl AsyncEventHandler for TrySpawnHandler {
 
             match (result1, result2) {
                 (Ok(task_id), Err(_)) => {
-                    let _ = conn.send_nowait(b"OK");
+                    let _ = conn.send(b"OK");
                     // Clean up: cancel the first task.
                     task_id.cancel();
                 }
                 (Ok(_), Ok(_)) => {
-                    let _ = conn.send_nowait(b"BOTH_OK");
+                    let _ = conn.send(b"BOTH_OK");
                 }
                 _ => {
-                    let _ = conn.send_nowait(b"FAIL");
+                    let _ = conn.send(b"FAIL");
                 }
             }
 
@@ -2068,10 +2068,10 @@ impl AsyncEventHandler for CancelTaskHandler {
 
             match result {
                 Ok(_) => {
-                    let _ = conn.send_nowait(b"OK");
+                    let _ = conn.send(b"OK");
                 }
                 Err(_) => {
-                    let _ = conn.send_nowait(b"FAIL");
+                    let _ = conn.send(b"FAIL");
                 }
             }
 
@@ -2156,7 +2156,7 @@ impl AsyncEventHandler for CancelCompletedHandler {
             // Cancel after completion — should not panic.
             task_id.cancel();
 
-            let _ = conn.send_nowait(b"OK");
+            let _ = conn.send(b"OK");
             ringline::sleep(Duration::from_secs(5)).await;
         }
     }
@@ -2313,14 +2313,14 @@ impl AsyncEventHandler for SendAwaitHandler {
                 Ok(fut) => match fut.await {
                     Ok(bytes) => {
                         let msg = format!("OK:{bytes}");
-                        let _ = conn.send_nowait(msg.as_bytes());
+                        let _ = conn.send(msg.as_bytes());
                     }
                     Err(e) => {
-                        let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                        let _ = conn.send(format!("ERR:{e}").as_bytes());
                     }
                 },
                 Err(e) => {
-                    let _ = conn.send_nowait(format!("SUBMIT_ERR:{e}").as_bytes());
+                    let _ = conn.send(format!("SUBMIT_ERR:{e}").as_bytes());
                 }
             }
             ringline::sleep(Duration::from_secs(5)).await;
@@ -2410,14 +2410,14 @@ impl AsyncEventHandler for SendChainAwaitHandler {
                 Ok(fut) => match fut.await {
                     Ok(bytes) => {
                         let msg = format!("OK:{bytes}");
-                        let _ = conn.send_nowait(msg.as_bytes());
+                        let _ = conn.send(msg.as_bytes());
                     }
                     Err(e) => {
-                        let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                        let _ = conn.send(format!("ERR:{e}").as_bytes());
                     }
                 },
                 Err(e) => {
-                    let _ = conn.send_nowait(format!("SUBMIT_ERR:{e}").as_bytes());
+                    let _ = conn.send(format!("SUBMIT_ERR:{e}").as_bytes());
                 }
             }
             ringline::sleep(Duration::from_secs(5)).await;
@@ -2522,9 +2522,9 @@ impl AsyncEventHandler for TrySleepHandler {
             };
 
             if exhausted {
-                let _ = conn.send_nowait(b"EXHAUSTED");
+                let _ = conn.send(b"EXHAUSTED");
             } else {
-                let _ = conn.send_nowait(b"NOT_EXHAUSTED");
+                let _ = conn.send(b"NOT_EXHAUSTED");
             }
 
             ringline::sleep(Duration::from_secs(5)).await;
@@ -2614,9 +2614,9 @@ impl AsyncEventHandler for TryTimeoutHandler {
             };
 
             if exhausted {
-                let _ = conn.send_nowait(b"EXHAUSTED");
+                let _ = conn.send(b"EXHAUSTED");
             } else {
-                let _ = conn.send_nowait(b"NOT_EXHAUSTED");
+                let _ = conn.send(b"NOT_EXHAUSTED");
             }
 
             ringline::sleep(Duration::from_secs(5)).await;
@@ -2710,7 +2710,7 @@ impl AsyncEventHandler for JoinHandler {
             };
             let (a, b) = ringline::join(fut_a, fut_b).await;
             let msg = format!("JOIN:{}:{}", a.unwrap_or(0), b.unwrap_or(0));
-            let _ = tx.send_nowait(msg.as_bytes());
+            let _ = tx.send(msg.as_bytes());
 
             // Wait for send to drain before closing.
             ringline::sleep(Duration::from_millis(20)).await;
@@ -2896,7 +2896,7 @@ impl AsyncEventHandler for AdmittedBeforeSettledHandler {
             let (mut tx, _rx) = conn.split();
             let chunk = vec![b'B'; ADMIT_CHUNK];
             for _ in 0..ADMIT_BACKLOG / ADMIT_CHUNK {
-                tx.send_nowait(&chunk).expect("the pool holds the backlog");
+                tx.send(&chunk).expect("the pool holds the backlog");
             }
             let outcome = async {
                 let admitted =
@@ -3503,7 +3503,7 @@ impl AsyncEventHandler for Join3Handler {
 
             let (a, b, c) = ringline::join3(fut_a, fut_b, fut_c).await;
             let msg = format!("JOIN3:{a}:{b}:{c}");
-            let _ = tx.send_nowait(msg.as_bytes());
+            let _ = tx.send(msg.as_bytes());
 
             ringline::sleep(Duration::from_millis(20)).await;
         }
@@ -3982,7 +3982,7 @@ impl AsyncEventHandler for SleepUntilHandler {
             } else {
                 "SLEEP_UNTIL_TOO_FAST"
             };
-            let _ = conn.send_nowait(msg.as_bytes());
+            let _ = conn.send(msg.as_bytes());
             ringline::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -4059,7 +4059,7 @@ impl AsyncEventHandler for TimeoutAtHandler {
                 Err(_elapsed) => "TIMEOUT_AT_EXPIRED",
                 Ok(()) => "TIMEOUT_AT_NOT_EXPIRED",
             };
-            let _ = conn.send_nowait(msg.as_bytes());
+            let _ = conn.send(msg.as_bytes());
             ringline::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -4212,7 +4212,7 @@ impl AsyncEventHandler for StandaloneConnectHandler {
                 let backend = match ringline::connect(backend_addr).await {
                     Ok(ctx) => ctx,
                     Err(e) => {
-                        let _ = client.send_nowait(format!("CONNECT_ERR:{e}").as_bytes());
+                        let _ = client.send(format!("CONNECT_ERR:{e}").as_bytes());
                         return;
                     }
                 };
@@ -4220,7 +4220,7 @@ impl AsyncEventHandler for StandaloneConnectHandler {
                 let (mut backend_tx, mut backend_rx) = backend.split();
 
                 // Send data to backend, read echo.
-                if backend_tx.send_nowait(b"STANDALONE").is_err() {
+                if backend_tx.send(b"STANDALONE").is_err() {
                     return;
                 }
 
@@ -4240,7 +4240,7 @@ impl AsyncEventHandler for StandaloneConnectHandler {
                 }
 
                 // Report to client.
-                let _ = client.send_nowait(&echo);
+                let _ = client.send(&echo);
             })
             .unwrap();
 
@@ -4324,7 +4324,7 @@ struct GreetingServer;
 impl AsyncEventHandler for GreetingServer {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let _ = conn.send_nowait(b"WELCOME!");
+            let _ = conn.send(b"WELCOME!");
             // Keep the connection open until the peer disconnects.
             loop {
                 let n = conn
@@ -4452,7 +4452,7 @@ impl AsyncEventHandler for OnStartClientHandler {
             // Reading an outbound connection goes through its read half.
             let (mut backend_tx, mut backend_rx) = backend.split();
 
-            if backend_tx.send_nowait(b"ON_START").is_err() {
+            if backend_tx.send(b"ON_START").is_err() {
                 ON_START_RESULT.set("SEND_ERR".to_string()).ok();
                 ringline::request_shutdown().ok();
                 return;
@@ -4543,7 +4543,7 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
                     Err(e) => format!("ERR:{}", e.kind()),
                 };
 
-                let _ = client.send_nowait(result.as_bytes());
+                let _ = client.send(result.as_bytes());
             })
             .unwrap();
 
@@ -4628,7 +4628,7 @@ impl AsyncEventHandler for PeerCloseHandler {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -4696,7 +4696,7 @@ fn async_peer_close_delivers_eof() {
 // ── Send pool exhaustion ────────────────────────────────────────────
 
 #[cfg(has_io_uring)]
-/// Handler that fires many send_nowait calls to exhaust the send pool.
+/// Handler that fires many `send` calls to exhaust the send pool.
 struct PoolExhaustionHandler;
 
 #[cfg(has_io_uring)]
@@ -4717,12 +4717,13 @@ impl AsyncEventHandler for PoolExhaustionHandler {
                 return;
             }
 
-            // Fire many send_nowait calls rapidly. With a tiny pool, this
-            // should eventually return `Other`, the pool admission error.
+            // Fire many `send` calls rapidly, dropping each completion. With
+            // a tiny pool, this should eventually return `Other`, the pool
+            // admission error.
             let payload = [0xABu8; 512];
             let mut result = "NO_ERROR".to_string();
             for _ in 0..1000 {
-                if let Err(e) = conn.send_nowait(&payload) {
+                if let Err(e) = conn.send(&payload) {
                     result = if e.kind() == io::ErrorKind::Other {
                         "OK".to_string()
                     } else {
@@ -4783,7 +4784,7 @@ const MULTI_SLOT_FILLERS: usize = 3;
 const MULTI_SLOT_PAYLOAD_LEN: usize = 3000;
 const MULTI_SLOT_MAX_ATTEMPTS: u32 = 500;
 
-/// How many `send_nowait` attempts `RetryAfterPoolPressure` needed for its
+/// How many `send` attempts `RetryAfterPoolPressure` needed for its
 /// 3000-byte response, and the final outcome (`Err` if the fillers were
 /// refused or the retry budget ran out).
 static MULTI_SLOT_RETRY_ATTEMPTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -4806,7 +4807,7 @@ impl AsyncEventHandler for RetryAfterPoolPressure {
 
             let filler = [0xCDu8; MULTI_SLOT_FILLER_LEN];
             for _ in 0..MULTI_SLOT_FILLERS {
-                if let Err(e) = conn.send_nowait(&filler) {
+                if let Err(e) = conn.send(&filler) {
                     MULTI_SLOT_RETRY_ATTEMPTS.set(0).ok();
                     MULTI_SLOT_RETRY_RESULT
                         .set(Err(format!("one-slot filler send refused: {e}")))
@@ -4820,8 +4821,8 @@ impl AsyncEventHandler for RetryAfterPoolPressure {
             let mut result: Result<(), String> = Err("retry budget exhausted".into());
             while attempts < MULTI_SLOT_MAX_ATTEMPTS {
                 attempts += 1;
-                match conn.send_nowait(&payload) {
-                    Ok(()) => {
+                match conn.send(&payload) {
+                    Ok(_) => {
                         result = Ok(());
                         break;
                     }
@@ -4991,9 +4992,9 @@ impl AsyncEventHandler for SendPartsHandler {
                 .send_parts()
                 .build(|b| b.copy(part1).copy(part2).copy(part3).submit())
             {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(e) => {
-                    let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                    let _ = conn.send(format!("ERR:{e}").as_bytes());
                 }
             }
             ringline::sleep(Duration::from_secs(5)).await;
@@ -5075,7 +5076,7 @@ impl AsyncEventHandler for OutboundEofClient {
             let (mut conn_tx, mut conn_rx) = conn.split();
 
             // Send data and read echo, with a timeout.
-            let _ = conn_tx.send_nowait(b"hello");
+            let _ = conn_tx.send(b"hello");
             let mut echoed = Vec::new();
             let echo_fut = conn_rx.with_data(|data| {
                 echoed.extend_from_slice(data);
@@ -5267,7 +5268,7 @@ impl AsyncEventHandler for JoinHandleHandler {
 
             let value = handle.await.expect("task completed");
             JOIN_RESULT.store(value, Ordering::SeqCst);
-            let _ = conn.send_nowait(b"done");
+            let _ = conn.send(b"done");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5319,7 +5320,7 @@ impl AsyncEventHandler for ImmediateJoinHandler {
             ringline::sleep(Duration::from_millis(1)).await;
             let value = handle.await.expect("task completed");
             IMMEDIATE_RESULT.store(value, Ordering::SeqCst);
-            let _ = conn.send_nowait(b"ok");
+            let _ = conn.send(b"ok");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5374,7 +5375,7 @@ impl AsyncEventHandler for DetachHandler {
 
             // Give the detached task a tick to run.
             ringline::sleep(Duration::from_millis(20)).await;
-            let _ = conn.send_nowait(b"ok");
+            let _ = conn.send(b"ok");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5427,7 +5428,7 @@ impl AsyncEventHandler for AbortHandler {
 
             // Verify we can spawn another task (slot was freed).
             let ok = ringline::spawn(async {}).is_ok();
-            let _ = conn.send_nowait(if ok { b"ok" as &[u8] } else { b"fail" });
+            let _ = conn.send(if ok { b"ok" as &[u8] } else { b"fail" });
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5477,7 +5478,7 @@ impl AsyncEventHandler for MultiJoinHandler {
             let (a, b) = (a.expect("task completed"), b.expect("task completed"));
             let c = h3.await.expect("task completed");
             MULTI_SUM.store(a + b + c, Ordering::SeqCst);
-            let _ = conn.send_nowait(b"ok");
+            let _ = conn.send(b"ok");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5535,7 +5536,7 @@ impl AsyncEventHandler for OneshotHandler {
                 Ok(val) => ONESHOT_RESULT.store(val, Ordering::SeqCst),
                 Err(_) => ONESHOT_RESULT.store(999, Ordering::SeqCst),
             }
-            let _ = conn.send_nowait(b"done");
+            let _ = conn.send(b"done");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5592,7 +5593,7 @@ impl AsyncEventHandler for OneshotClosedHandler {
                 Ok(_) => ONESHOT_CLOSED.store(0, Ordering::SeqCst),
                 Err(_) => ONESHOT_CLOSED.store(1, Ordering::SeqCst),
             }
-            let _ = conn.send_nowait(b"done");
+            let _ = conn.send(b"done");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5659,7 +5660,7 @@ impl AsyncEventHandler for MpscHandler {
                 sum += val;
             }
             MPSC_SUM.store(sum, Ordering::SeqCst);
-            let _ = conn.send_nowait(b"done");
+            let _ = conn.send(b"done");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5721,7 +5722,7 @@ impl AsyncEventHandler for MpscBackpressureHandler {
                 sum += val;
             }
             MPSC_BACKPRESSURE.store(sum, Ordering::SeqCst);
-            let _ = conn.send_nowait(b"done");
+            let _ = conn.send(b"done");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5775,14 +5776,14 @@ impl AsyncEventHandler for ResolveHandler {
                         if addr.ip().is_loopback() && addr.port() == 80 {
                             RESOLVE_RESULT.store(1, Ordering::SeqCst);
                         }
-                        let _ = conn.send_nowait(b"ok");
+                        let _ = conn.send(b"ok");
                     }
                     Err(_) => {
-                        let _ = conn.send_nowait(b"err");
+                        let _ = conn.send(b"err");
                     }
                 },
                 Err(_) => {
-                    let _ = conn.send_nowait(b"no-resolver");
+                    let _ = conn.send(b"no-resolver");
                 }
             }
         }
@@ -5832,15 +5833,15 @@ impl AsyncEventHandler for ResolveErrorHandler {
             match ringline::resolve("nonexistent.invalid", 80) {
                 Ok(fut) => match fut.await {
                     Ok(_) => {
-                        let _ = conn.send_nowait(b"unexpected-ok");
+                        let _ = conn.send(b"unexpected-ok");
                     }
                     Err(_) => {
                         RESOLVE_ERR.store(1, Ordering::SeqCst);
-                        let _ = conn.send_nowait(b"ok");
+                        let _ = conn.send(b"ok");
                     }
                 },
                 Err(_) => {
-                    let _ = conn.send_nowait(b"no-resolver");
+                    let _ = conn.send(b"no-resolver");
                 }
             }
         }
@@ -5902,10 +5903,10 @@ impl AsyncEventHandler for ResolveDisabledHandler {
 
             match ringline::resolve("localhost", 80) {
                 Ok(_) => {
-                    let _ = conn.send_nowait(b"unexpected");
+                    let _ = conn.send(b"unexpected");
                 }
                 Err(_) => {
-                    let _ = conn.send_nowait(b"ok");
+                    let _ = conn.send(b"ok");
                 }
             }
         }
@@ -5973,7 +5974,7 @@ fn an_excluded_worker_stops_receiving_connections() {
                                 .unwrap()
                                 .push(worker);
                         }
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -6083,7 +6084,7 @@ fn merged_accept_mode_serves_connections_across_workers() {
                                 SAW_PEER.fetch_add(1, Ordering::SeqCst);
                             }
                         }
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -6169,7 +6170,7 @@ fn mixed_tcp_and_unix_listeners_are_distinguishable() {
                             Some(b'U') => UNIX_LISTENER.store(id, Ordering::SeqCst),
                             _ => {}
                         }
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -6335,7 +6336,7 @@ fn peer_addr_unix_regression() {
                 }
                 let _ = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -6408,7 +6409,7 @@ fn peer_addr_tcp_regression() {
                         {
                             TCP_PEER_PORT.store(u32::from(peer.port()), Ordering::SeqCst);
                         }
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -6481,7 +6482,7 @@ impl AsyncEventHandler for CancellationHandler {
             // The spawned task should now complete.
             let val = handle.await.expect("task completed");
             CANCEL_RESULT.store(val, Ordering::SeqCst);
-            let _ = conn.send_nowait(b"done");
+            let _ = conn.send(b"done");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -6539,7 +6540,7 @@ impl AsyncEventHandler for SelectCancelHandler {
                 ringline::Either::Right(()) => SELECT_CANCEL.store(1, Ordering::SeqCst),
                 _ => SELECT_CANCEL.store(99, Ordering::SeqCst),
             }
-            let _ = conn.send_nowait(b"done");
+            let _ = conn.send(b"done");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -6836,7 +6837,7 @@ impl AsyncEventHandler for PanickingThenEcho {
                         if data.starts_with(b"die") {
                             panic!("intentional panic in connection task");
                         }
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -7070,7 +7071,7 @@ impl AsyncEventHandler for EchoUntilEof {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -7095,7 +7096,7 @@ impl AsyncEventHandler for EchoThenClose {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -7432,7 +7433,7 @@ impl AsyncEventHandler for RespondThenHalfClose {
                 return;
             }
             let response = vec![b'x'; HALF_CLOSE_RESPONSE_LEN];
-            conn.send_nowait(&response).expect("queue response");
+            conn.send(&response).expect("queue response");
             conn.shutdown_write();
             HALF_CLOSE_PROGRESS.store(1, Ordering::Release);
             loop {
@@ -7757,7 +7758,7 @@ impl AsyncEventHandler for DroppedForwardProxy {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -7887,7 +7888,7 @@ impl AsyncEventHandler for BusyForwardProxy {
             let _ = BUSY_FORWARD_ERRNO.set(errno);
             // Report it on the wire so the test sees it without shared state
             // timing games.
-            let _ = client.send_nowait(&errno.to_be_bytes());
+            let _ = client.send(&errno.to_be_bytes());
         }
     }
 

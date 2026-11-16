@@ -18,7 +18,7 @@
 //!             let (mut tx, mut rx) = conn.split();
 //!             loop {
 //!                 let n = rx.with_data(|data| {
-//!                     tx.send_nowait(data).ok();
+//!                     let _ = tx.send(data);
 //!                     ParseResult::Consumed(data.len())
 //!                 }).await;
 //!                 if n == 0 { break; }
@@ -89,7 +89,7 @@
 //!   returns a future that runs for the connection's lifetime.
 //!
 //! - **[`Connection`]** — An owned connection, from `on_accept` or [`connect`].
-//!   `with_data()`/`with_bytes()` for recv, `send()`/`send_nowait()` for send, and
+//!   `with_data()`/`with_bytes()` for recv, `send()` for send, and
 //!   `split()` for independently borrowable halves. Internally indexes into the driver's
 //!   connection table via `(conn_index, generation)`.
 //!

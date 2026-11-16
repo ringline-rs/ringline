@@ -53,7 +53,8 @@ HEADER = '''# Experiment B, uncontended (docs/send-admission-design.md, section 
 # connections.
 #
 # Arms (label: bench-server --echo-mode and flags):
-#   bytes-nowait            with_bytes, then send_nowait
+#   bytes-nowait            with_bytes, then send, completion dropped
+#                           (send_nowait before 0.7.0-alpha.141)
 #   bytes-admitted          with_bytes, then send_admitted, completion dropped
 #   bytes-admitted-timeout  with_bytes, then section 2's example: send_admitted
 #                           under timeout(1 s), then the completion under

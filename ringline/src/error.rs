@@ -102,7 +102,6 @@ pub enum Error {
     ///
     /// All send buffer slots are in flight. This is a backpressure signal:
     /// - Await pending `send()` futures before sending more
-    /// - Use `send_nowait()` for fire-and-forget with explicit error handling
     /// - Increase via `ConfigBuilder::send_pool(count, slot_size)` (default count: 1024)
     #[error("send pool exhausted")]
     SendPoolExhausted,

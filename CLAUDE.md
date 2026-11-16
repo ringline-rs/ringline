@@ -199,7 +199,7 @@ The mio loop is epoll-shaped (poll with timer-heap-derived timeout → readable/
 
 **`AsyncEventHandler` trait** — Users implement this. `on_accept(Connection)` returns a future that runs for the connection's lifetime. Uses RPITIT (`-> impl Future + 'static`), so implementations must use `async move {}` blocks (not `async fn`, which would borrow `&self`).
 
-**`Connection`** — An owned connection, from `on_accept` or `connect`; `split()` gives a `SendHalf` and a `RecvHalf`, neither `Copy`. `with_data(|&[u8]| -> ParseResult)` / `with_bytes(|Bytes| -> ParseResult)` for recv (`with_data_result` is the `io::Result` form that separates a clean close from a transport error); `send()`/`send_nowait()`/`send_parts()` for send; `eof_truncated()` distinguishes a peer FIN mid-message from a clean close. Internally indexes into the driver's connection table via `(conn_index, generation)`, in the `pub(crate)` `ConnCtx`.
+**`Connection`** — An owned connection, from `on_accept` or `connect`; `split()` gives a `SendHalf` and a `RecvHalf`, neither `Copy`. `with_data(|&[u8]| -> ParseResult)` / `with_bytes(|Bytes| -> ParseResult)` for recv (`with_data_result` is the `io::Result` form that separates a clean close from a transport error); `send()`/`send_parts()` for send; `eof_truncated()` distinguishes a peer FIN mid-message from a clean close. Internally indexes into the driver's connection table via `(conn_index, generation)`, in the `pub(crate)` `ConnCtx`.
 
 **`Driver`** — Owns all I/O state: the ring (or mio poll), `ConnectionTable`, buffer pools (the UDP `ProvidedBufRing`, `SendCopyPool`, `InFlightSendSlab`), `AccumulatorTable`.
 
@@ -288,7 +288,7 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 
 | Method | What happens | Copies |
 |--------|-------------|--------|
-| `send()` / `send_nowait()` | User data → `SendCopyPool` slot | 1 |
+| `send()` | User data → `SendCopyPool` slot | 1 |
 | `send_parts()` with `.copy()` only | All copy parts gathered into one `SendCopyPool` slot | 1 |
 | `send_parts()` with `.guard()` only | Guard memory used in-place via `SendMsgZc` iovec. On a Unix-domain connection, which refuses `SENDMSG_ZC`, a plain `sendmsg` of the same iovecs: the kernel copies the guard's bytes into the socket, as it does for a copy send (#829) | 0 |
 | `send_parts()` mixed `.copy()` + `.guard()` | Copy parts → pool; guard parts zero-copy via iovec (on a Unix-domain connection, a plain `sendmsg`, as above) | 1 (copy parts only) |
@@ -337,7 +337,7 @@ On the mio backend all of these degrade to copy sends (guards are consumed by co
 | Path | Copies | Mechanism |
 |------|--------|-----------|
 | **Recv (values)** | **0** | `with_bytes()` + `resp-proto`'s Bytes-based parser. Bulk strings are `Bytes::slice()` into the accumulator — no allocation, O(1) refcount. Returned `Bytes` stays valid after accumulator advances. |
-| **Send (commands)** | 1 | RESP encoded into a **reused** scratch buffer (`encode_buf`/`write_buf` — no per-op allocation), then `send_nowait()` copies into pool. |
+| **Send (commands)** | 1 | RESP encoded into a **reused** scratch buffer (`encode_buf`/`write_buf` — no per-op allocation), then `send()` copies into pool. |
 | **Send (SET value, standard)** | 1 | All parts gathered into one pool slot. |
 | **Send (SET value, guard)** | 1 (metadata only) | `set_with_guard()` / `set_ex_with_guard()`: prefix+suffix copied to pool, value stays in-place via `SendGuard` — if the value is ≥ the client `zc_threshold`; smaller guarded values fold into the copy/coalescing buffer. |
 | **Pipeline** | 1 | All commands accumulated into one buffer, single send to pool. |
@@ -439,7 +439,7 @@ These reflect deliberate owner decisions — follow them for any public-surface 
 
 - **No `pub` fields on public config/value structs.** Everything is opaque: `pub(crate)` fields + builder or accessor methods (`Config`/`ConfigBuilder`, `TlsInfo`, `TlsConfig::builder`). Do not split `Config` into sub-structs; it stays an opaque flat struct.
 - **Public error enums are `#[non_exhaustive]`.**
-- **Don't merge or prune send-path entry points casually.** The surviving set is deliberate: `with_data` vs `with_bytes`, `send` vs `send_nowait`, `.copy()` vs `.guard()`, `send_chain` (IO_LINK), `submit_batch` (dynamic part assembly) vs `build` (static) all carry distinct semantics.
+- **Don't merge or prune send-path entry points casually.** The surviving set is deliberate: `with_data` vs `with_bytes`, `.copy()` vs `.guard()`, `send_chain` (IO_LINK), `submit_batch` (dynamic part assembly) vs `build` (static) all carry distinct semantics.
 - **Breaking changes are batched into coordinated major releases** (see Release Process), not dribbled out.
 
 ## Performance Work

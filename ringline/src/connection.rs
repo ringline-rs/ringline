@@ -73,8 +73,8 @@ pub enum WriteHalf {
     /// `ENOTCONN` on a socket already closed, is counted in
     /// `connections{op="shutdown_failed"}` and leaves this state as it is.
     /// `send_backpressured` refuses with
-    /// `BrokenPipe` in this state and in `ShutdownPending`; `send`,
-    /// `send_nowait` and `send_parts` are accepted: after an accepted Shutdown
+    /// `BrokenPipe` in this state and in `ShutdownPending`; `send` and
+    /// `send_parts` are accepted: after an accepted Shutdown
     /// they fail at the socket (`EPIPE`), which closes the connection and
     /// reports the error to a reader parked on `with_data_result`, on both
     /// backends; one pushed while the SQE is parked is usually submitted

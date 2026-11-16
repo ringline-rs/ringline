@@ -90,7 +90,7 @@ async fn read_line(conn: &mut Connection) -> Option<Vec<u8>> {
 /// inside it however long the server took to read the first line.
 async fn wait_then_read(conn: &mut Connection) -> Seen {
     read_line(conn).await.expect("the first line");
-    conn.send_nowait(b"+").expect("acknowledge");
+    conn.send(b"+").expect("acknowledge");
     if let Either::Left(()) = ringline::select(conn.recv_ready(), ringline::sleep(QUIET)).await {
         return Seen::Early;
     }

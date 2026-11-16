@@ -1,13 +1,12 @@
 #![allow(clippy::manual_async_fn)]
-//! Integration tests: `AsyncSendBuilder::submit_batch_await` delivers the
-//! batch byte-exactly *and* resolves its `SendCompletion`.
+//! Integration tests: `AsyncSendBuilder::submit_batch` delivers the batch
+//! byte-exactly *and* resolves its `SendCompletion`.
 //!
-//! The awaited variant exists so a caller can pace itself against send
-//! completion instead of firing and forgetting. Awaiting `yield_now` is not
-//! a substitute: the task resumes without waiting for the send to complete.
-//! These tests pin the two properties a caller depends on:
-//! the wire bytes are unchanged from `submit_batch`, and awaiting the future
-//! actually returns (with the full byte count) rather than hanging.
+//! The completion lets a caller pace itself against the send. Awaiting
+//! `yield_now` is not a substitute: the task resumes without waiting for the
+//! send to complete. These tests pin the two properties a caller depends on:
+//! the wire bytes are the batch's, and awaiting the future actually returns
+//! (with the full byte count) rather than hanging.
 //!
 //! Both backends are covered: on io_uring the future is woken by the send
 //! CQE, on the mio fallback by the event loop once the bytes reach the
@@ -79,17 +78,17 @@ impl AsyncEventHandler for AwaitedBatchSender {
                 SendPart::Copy(SUFFIX),
             ];
 
-            match conn.send_parts().submit_batch_await(parts) {
+            match conn.send_parts().submit_batch(parts) {
                 Ok((count, fut)) => match fut.await {
                     Ok(sent) => {
-                        let _ = conn.send_nowait(format!("OK:{count}:{sent}").as_bytes());
+                        let _ = conn.send(format!("OK:{count}:{sent}").as_bytes());
                     }
                     Err(e) => {
-                        let _ = conn.send_nowait(format!("AWAIT_ERR:{e}").as_bytes());
+                        let _ = conn.send(format!("AWAIT_ERR:{e}").as_bytes());
                     }
                 },
                 Err(e) => {
-                    let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                    let _ = conn.send(format!("ERR:{e}").as_bytes());
                 }
             }
 
@@ -121,11 +120,11 @@ impl AsyncEventHandler for EmptyBatchSender {
                 return;
             }
 
-            let reply = match conn.send_parts().submit_batch_await(Vec::new()) {
+            let reply = match conn.send_parts().submit_batch(Vec::new()) {
                 Ok(_) => "UNEXPECTED_OK".to_string(),
                 Err(e) => format!("KIND:{:?}", e.kind()),
             };
-            let _ = conn.send_nowait(reply.as_bytes());
+            let _ = conn.send(reply.as_bytes());
 
             loop {
                 let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
@@ -211,7 +210,7 @@ fn run_case<H: AsyncEventHandler + 'static>(want: usize) -> Vec<u8> {
 /// logical byte count -- not a short count from one chunk of a multi-chunk
 /// send, and not never.
 #[test]
-fn submit_batch_await_delivers_and_resolves() {
+fn submit_batch_delivers_and_resolves() {
     let payload = expected_payload();
     let trailer = format!("OK:3:{}", payload.len());
     let want = payload.len() + trailer.len();
@@ -240,7 +239,7 @@ fn submit_batch_await_delivers_and_resolves() {
 /// An empty batch is rejected rather than handing back a future that can
 /// never be woken.
 #[test]
-fn submit_batch_await_rejects_empty_batch() {
+fn submit_batch_rejects_empty_batch() {
     let expected = format!("KIND:{:?}", io::ErrorKind::InvalidInput);
     let buf = run_case::<EmptyBatchSender>(expected.len());
     assert_eq!(String::from_utf8_lossy(&buf), expected);

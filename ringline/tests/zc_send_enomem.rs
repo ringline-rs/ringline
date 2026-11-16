@@ -51,7 +51,7 @@ impl SendGuard for VecGuard {
 }
 
 /// Waits for one byte, then sends `SENDS` messages of a copied prefix, a
-/// guarded body and a copied suffix, fire-and-forget, and keeps the
+/// guarded body and a copied suffix, dropping each completion, and keeps the
 /// connection open until the peer closes it.
 struct GuardSender;
 

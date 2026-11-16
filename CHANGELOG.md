@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `SendCompletion` (`SendFuture` in 0.6) implements `Debug`, showing the
+  connection the send targets and whether its result is known.
 - `ringline::buf`: the buffer traits the disk reads and writes take by
   value (#825). `IoBuf` (a write's source) is implemented for `Vec<u8>`,
   `BytesMut`, `Bytes`, `AlignedBuf` and `AlignedBytes`; `IoBufMut` (a read's destination)
@@ -179,7 +181,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   socket refused, usually `ENOTCONN` on a socket already in `TCP_CLOSE`
   after a reset or a retransmission timeout.
 - `yield_now()` wakes the calling task and returns `Pending` once, so a task
-  that makes many `send_nowait` calls without awaiting anything lets the
+  that makes many `send` calls without awaiting anything lets the
   worker poll its other queued tasks and process I/O between batches. Callers
   had each written this future themselves. Tasks woken by I/O or timers
   processed during the yield are polled after the yielding task resumes, and
@@ -363,6 +365,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` (on
+  `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`, resolving with
+  `data.len()`, instead of `io::Result<()>`. `send_parts().build(f)`
+  (`send_parts` on `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`,
+  resolving with the total length of the parts; `f` still ends with
+  `submit()`. `submit_batch_await` is renamed `submit_batch` and returns
+  `io::Result<(usize, SendCompletion)>` (`SendFuture` in 0.6). Drop the
+  completion where the caller does not wait for the send; dropping it does not
+  cancel the send. A `build` whose parts carry no bytes is refused with
+  `InvalidInput`; in 0.6 on an io_uring plaintext connection one with at least
+  one part took a pool slot and broke the queue (see Fixed); one with no
+  parts, one on TLS, and any on mio sent nothing and returned `Ok`. So is a
+  `build` closure that returns `Ok` without a successful `submit`, including
+  one that discards `submit`'s error; mio used to send the parts of one that
+  never called `submit`.
 - **Breaking:** the direct I/O API is the `direct_io` module, with the same
   shapes as `fs` (#845): `direct_io::open(path)` and
   `open_with(path, options)` return an `OpenFuture` that resolves to a
@@ -726,7 +743,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tested) move 0.04-0.07 more per value byte. On mio, pipelined frames gain
   in some runs and not others. `with_bytes` readers are unchanged.
 - ringline requires `ringline-tls` 0.1.2. On the unbuffered engine (the
-  default), a TLS 1.3 send through `send`, `send_nowait` or
+  default), a TLS 1.3 send through `send` or
   `send_backpressured` costs 1 copy instead of 2 with the ring provider, and
   with aws-lc-rs on ChaCha20-Poly1305 or in FIPS mode: rustls seals the
   record in the send-pool slot (io_uring) or the queued buffer (mio). With
@@ -885,7 +902,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which a plaintext connection (`H2AsyncConn::from_conn` over `connect`)
   needs. Over TLS it copies as many bytes as before and allocates less.
 - On io_uring, a copy send wider than one send-pool slot (`send`,
-  `send_nowait`, `send_backpressured`), and TLS ciphertext from one send
+  `send_backpressured`), and TLS ciphertext from one send
   that fills two or more slots, go to the kernel as one `sendmsg` over up to
   32 of their slots when nothing else is in flight on the connection; with
   the send slab full, the first slot goes alone, as before. Before, the
@@ -1254,7 +1271,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   did nothing. On mio `forward_held` worked on every connection and
   `set_recv_sink` on every plaintext one (`enable_recv_forward` did nothing),
   and code that used them there no longer compiles. Echo or forward with
-  `with_data` and `send_nowait` or `forward_recv_buf`, or with
+  `with_data` and `send` or `forward_recv_buf`, or with
   `forward_to_conn`. A recv sink is replaced by copying out of `with_data`
   into the caller's buffer, which on mio is one copy more than the sink.
   On io_uring every replacement for `run_direct_echo` wakes a task per
@@ -1298,6 +1315,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ones. UDP `recv_batch_timed` is unchanged. Client latency is timed with
   `Instant`. Remove `.timestamps(..)` and `.kernel_timestamps(..)` calls and
   the `timestamps` feature from `Cargo.toml`.
+- **Breaking:** `send_nowait` and `send_chain_nowait` on `Connection` and
+  `SendHalf` (on `ConnCtx` in 0.6), and the `AsyncSendBuilder::submit_batch`
+  that returned no completion. Replace `send_nowait(data)` with `send(data)`
+  and drop the `SendCompletion` it returns: dropping it does not cancel the
+  send, and `send` returns the same errors at the call. Drop it at once: a
+  `SendCompletion` kept alive, in a `let _sent =` binding or a `match` arm
+  `Ok(_)`, wakes its task when the send completes. `Ok(())` patterns become
+  `Ok(_)`. Replace `send_chain_nowait(f)` (io_uring only) with
+  `send_chain(f)`, whose closure returns `io::Result<()>`; a closure that
+  returned another value passes it out through a variable it captures.
+  `submit_batch_await` is now `submit_batch` (see Changed): drop its
+  completion where the caller does not wait for the send. A batch that carries
+  no bytes is refused with `InvalidInput`. The old `submit_batch` returned
+  `Ok(0)` for one with no parts; in 0.6 on an io_uring plaintext connection
+  one with at least one part took a pool slot and broke the queue (see Fixed),
+  and on TLS or mio it sent nothing.
 
 ### Fixed
 
@@ -1701,17 +1734,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
   F8).
 
-- Docs: `SendHalf::send` and `send_nowait` name the `NotConnected` errors
-  and both backends' pool behaviour; `send_parts` states the 32-part and
-  8-guard limits, the small-guard fold, the send-slab error and the TLS
-  path; `ConfigBuilder::send_slab_slots` says coalesced copy runs hold an entry
-  too, and `max_chain_length` that it bounds `send_chain` only;
-  `WriteHalf::Shutdown` says `send_backpressured` refuses in that state.
-  The four backpressured-sends design docs say the TLS ciphertext bound
-  gates plain TLS sends on io_uring, the series design docs carry a note
-  pointing at the renames since, and the 2026-09 journal entries list their
-  closed follow-ups as closed. The dead `ConnSendState::close_send_count`
-  field is removed. Found by the send-path audit
+- Docs: `SendHalf::send` names the `NotConnected` errors and both backends'
+  pool behaviour; `send_parts` states the 32-part and 8-guard limits, the
+  small-guard fold, the send-slab error and the TLS path;
+  `ConfigBuilder::send_slab_slots` says coalesced copy runs hold an entry too,
+  and `max_chain_length` that it bounds `send_chain` only;
+  `WriteHalf::Shutdown` says `send_backpressured` refuses in that state. The
+  four backpressured-sends design docs say the TLS ciphertext bound gates
+  plain TLS sends on io_uring, the series design docs carry a note pointing at
+  the renames since, and the 2026-09 journal entries list their closed
+  follow-ups as closed. The dead `ConnSendState::close_send_count` field is
+  removed. Found by the send-path audit
   (`docs/journal/2026-11-send-path-audit.md`, F9, F12, F14).
 
 - io_uring: on a plaintext connection, a copy-only `send_parts` batch, a
@@ -1726,17 +1759,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
   F13).
 
-- io_uring: a `send_parts` batch whose parts carry no bytes (through
-  `build` or `submit_batch`; `submit_batch_await` already rejected it)
-  queues nothing, as a `send` of an empty buffer does on a plaintext
-  connection. It took a send-pool slot and pushed a zero-length Send SQE,
-  whose result 0 the completion handler read as a failed send: every send
-  queued behind it on the connection was discarded with `ConnectionAborted`,
-  the connection stayed open, and later sends reached the peer after the
-  gap. mio sent nothing for such a batch already. No in-tree caller sends
-  such a batch; `ringline-redis` sends an empty value as an empty part
-  beside a non-empty prefix and suffix, which was unaffected. Found by the
-  send-path audit (`docs/journal/2026-11-send-path-audit.md`, F7).
+- io_uring: a `send_parts` batch whose parts carry no bytes is refused with
+  `InvalidInput` (see Changed). On a plaintext connection, one with at least
+  one part took a send-pool slot and pushed a zero-length Send SQE, whose
+  result 0 the completion handler read as a failed send: every send queued
+  behind it on the connection was discarded with `ConnectionAborted`, the
+  connection stayed open, and later sends reached the peer after the gap. One
+  with no parts sent nothing, and mio sent nothing for either already. No
+  in-tree caller sends such a batch; `ringline-redis` sends an empty value as
+  an empty part beside a non-empty prefix and suffix, which was unaffected.
+  Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
+  F7).
 
 - io_uring: a TLS close that finds the send pool exhausted no longer drops
   its close_notify and records it as sent. The alert needs one pool slot;
@@ -1759,7 +1792,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ciphertext queued for it, so the next send would be rejected by the peer
   as `bad_record_mac`; the reachable failure is the traffic keys exhausted
   on TLS 1.2 AES-GCM (on by default) after 2^24 records, which TLS 1.2
-  cannot rekey. `SendHalf::send` and `send_nowait` document the rule. Found
+  cannot rekey. `SendHalf::send` documents the rule. Found
   by the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F4).
 
 - io_uring: `shutdown_write` while a `send_chain` is active defers the FIN
@@ -2098,14 +2131,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - On io_uring, an awaited send could resolve with another send's result. A
   connection had one send waiter, and any send completion on it woke the
   waiter: a `send().await` behind a `send_nowait`, an unawaited chain, a
-  `forward_recv_buf` or a `send_backpressured` resolved with
-  that send's byte count, and the awaited send's own completion then found no
-  waiter. Two awaited sends in flight at once on one connection could hang;
-  on mio they resolved with each other's lengths.
-  Every awaited send (`send`, `submit_batch_await`, `send_chain`) now owns
-  an entry in the worker's send completion table,
-  and only its own completion settles it, on both backends. Two awaited sends
-  in flight at once each resolve with their own result (#617).
+  `forward_recv_buf` or a `send_backpressured` resolved with that send's byte
+  count, and the awaited send's own completion then found no waiter. Two
+  awaited sends in flight at once on one connection could hang; on mio they
+  resolved with each other's lengths. Every send (`send`, `submit_batch`,
+  `send_chain`) owns an entry in the worker's send completion table, and only
+  its own completion settles it, on both backends. Two awaited sends in flight
+  at once each resolve with their own result (#617).
 
 - `send_chain` with a closure that submits nothing, and an awaited `send` of
   no bytes, resolve `Ok(0)`. With no other send in flight on the connection

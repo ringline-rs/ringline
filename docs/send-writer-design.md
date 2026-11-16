@@ -9,7 +9,7 @@ Status: proposal. Prototype and measurement pending (see "Measurement").
 
 An application that builds its response bytes pays one copy more on
 ringline than on a readiness runtime. It encodes into its own buffer, and
-`send` / `send_nowait` copy that buffer into `SendCopyPool` slots. A tokio
+`send` copies that buffer into `SendCopyPool` slots. A tokio
 server writes from its own buffer, and the only copy is the kernel's.
 
 The profile that showed this ran a RESP server benchmark
@@ -125,7 +125,7 @@ A RESP response loop changes from
 ```rust
 let mut out = Vec::new();
 encode_responses(&requests, &mut out);
-tx.send_nowait(&out)?;
+tx.send(&out)?;
 ```
 
 to
@@ -311,7 +311,7 @@ which stays at a fixed address for the life of the worker
 goes through `with_state`, once per slot.
 
 A `send_with` inside a `with_data` closure reaches the driver from inside
-that closure's `with_state`, as `send_nowait` already does in the
+that closure's `with_state`, as `send` already does in the
 documented split-echo pattern (`Connection::split`). Whether that nesting
 is sound under Rust's aliasing rules has not been checked; `send_with`
 nests the same way.
@@ -389,7 +389,7 @@ with nothing queued, and the closure's `R` is dropped.
 ## Protocol clients
 
 `ringline-redis` and `ringline-memcache` encode a request into a reused
-scratch buffer and copy it into the pool with `send_nowait`. With
+scratch buffer and copy it into the pool with `send`. With
 `max_batch_size` 1 (the default), `fire_*` can encode with `send_with`,
 which removes that copy.
 
@@ -404,7 +404,7 @@ client's recovery path (`pending.truncate`).
 
 ## Relation to the other send methods
 
-`send`, `send_nowait`, `send_backpressured`, `send_parts`, `send_chain`,
+`send`, `send_backpressured`, `send_parts`, `send_chain`,
 `forward_recv_buf` and `forward_to_conn` are unchanged. The writer is for
 bytes the application produces. Bytes that already exist in memory the
 application owns go through `send` (one copy) or a guard (no copy, at or

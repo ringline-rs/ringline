@@ -749,7 +749,7 @@ impl Client {
         // awaiting a response that will never come.
         let send_outcome: Result<(), Error> = if self.write_guards.is_empty() {
             self.tx
-                .send_nowait(&self.write_buf)
+                .send(&self.write_buf)
                 .map(|_| ())
                 .map_err(Error::from)
         } else {
@@ -841,7 +841,7 @@ impl Client {
             self.encode_buf.clear();
             append_get(self.binary, key, &mut self.encode_buf)?;
             tx_bytes = self.encode_buf.len() as u32;
-            self.tx.send_nowait(&self.encode_buf)?;
+            self.tx.send(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             append_get(self.binary, key, &mut self.write_buf)?;
@@ -890,7 +890,7 @@ impl Client {
                 &mut self.encode_buf,
             )?;
             tx_bytes = self.encode_buf.len() as u32;
-            self.tx.send_nowait(&self.encode_buf)?;
+            self.tx.send(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             append_set(self.binary, key, value, flags, exptime, &mut self.write_buf)?;
@@ -985,7 +985,7 @@ impl Client {
             self.encode_buf.clear();
             append_delete(self.binary, key, &mut self.encode_buf)?;
             tx_bytes = self.encode_buf.len() as u32;
-            self.tx.send_nowait(&self.encode_buf)?;
+            self.tx.send(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             append_delete(self.binary, key, &mut self.write_buf)?;
@@ -1635,8 +1635,8 @@ impl Client {
         });
 
         // A send error is recorded too, with nothing read.
-        let (response, rx_bytes, arrival) = match sent {
-            Ok(_) => self.read_reply().await,
+        let (response, rx_bytes, arrival) = match sent.map(drop) {
+            Ok(()) => self.read_reply().await,
             Err(e) => (Err(e.into()), 0, None),
         };
         let latency_ns = elapsed_ns(start);
@@ -1769,7 +1769,7 @@ impl Client {
         len: usize,
         mut src: impl SegmentSource,
     ) -> Result<McResponseBytes, Error> {
-        self.tx.send_nowait(&self.encode_buf)?;
+        self.tx.send(&self.encode_buf)?;
 
         // Stream the value body, enforcing the length contract.
         let mut sent = 0usize;
@@ -1793,7 +1793,7 @@ impl Client {
         }
 
         // Trailing `\r\n`, then the `STORED\r\n` reply.
-        self.tx.send_nowait(b"\r\n")?;
+        self.tx.send(b"\r\n")?;
         self.read_response().await
     }
 }

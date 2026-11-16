@@ -642,15 +642,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // This means the drain_completions() below sees those CQEs
             // inline, eliminating the "dead" submit_and_wait(1) iteration
             // that would otherwise burn a full event-loop cycle just to
-            // process send CQEs that wake no tasks (`send_nowait` sends
-            // settle nothing).
+            // process send CQEs that wake no tasks (a send whose
+            // `SendCompletion` was dropped wakes nothing).
             let _ = self.driver.ring.flush();
 
             // Non-blocking drain: consume the CQEs (primarily send completions)
             // that flush()'s GETEVENTS step posted to the CQ ring.
-            // For send_nowait the pool slot is freed here and nothing is
-            // settled. Draining inline collapses the two-iteration
-            // pattern (dead send-CQE iter + live recv-CQE iter) down to one.
+            // For a send whose completion was dropped, the pool slot and
+            // the abandoned table entry are freed here. Draining inline
+            // collapses the two-iteration pattern (dead send-CQE iter + live
+            // recv-CQE iter) down to one.
             self.drain_completions();
             diag_cqes_2nd += self.driver.cqe_batch.len() as u64;
 
@@ -4127,7 +4128,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.submit_next_queued(conn_index);
         }
 
-        // `send_chain` attached an id; `send_chain_nowait` did not.
+        // `SendHalf::send_chain` attaches an id; a chain built through
+        // `DriverCtx::send_chain` has none.
         if let Some(id) = chain.send_id {
             let result = match failure {
                 Some(error) => Err(error),
@@ -4137,8 +4139,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // The bytes of the chain and the queue behind it are gone, and a dropped
-        // `send_chain` future or a nowait chain reports that to nobody but the
-        // reader. Later sends must not reach the peer after that gap.
+        // `send_chain` future reports that to nobody but the reader. Later sends
+        // must not reach the peer after that gap.
         if let Some(err) = chain.failure() {
             self.abort_connection(conn_index, err);
         }
@@ -5452,7 +5454,7 @@ mod tests {
     }
 
     /// Register an awaited send on `conn_index` and attach it to slab entry
-    /// `slab_idx` with `len`, as `submit_batch_await` does.
+    /// `slab_idx` with `len`, as `submit_batch` does.
     fn await_slab(
         el: &mut AsyncEventLoop<NoopHandler>,
         conn_index: u32,
@@ -8836,7 +8838,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
-        // Allocate a pool slot (simulating send_nowait).
+        // Allocate a pool slot (simulating a copy send).
         let data = b"hello";
         let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
@@ -10232,10 +10234,11 @@ mod tests {
     }
 
     /// A `send_parts` batch whose parts carry no bytes queues nothing: no
-    /// SQE, no pool slot, and an awaited one resolves `Ok(0)`, as a `send`
-    /// of an empty buffer does. A zero-length Send SQE would complete with
-    /// 0, which `handle_send` treats as a failed send and drains the queue
-    /// behind it.
+    /// SQE and no pool slot. Without an id (crate-internal) it returns `Ok`;
+    /// with one, as every public batch has, it is refused with
+    /// `InvalidInput` and settles nothing. A zero-length Send SQE would
+    /// complete with 0, which `handle_send` treats as a failed send and
+    /// drains the queue behind it.
     #[test]
     fn a_zero_length_send_parts_batch_queues_nothing() {
         let mut el = make_test_loop();
@@ -10259,24 +10262,23 @@ mod tests {
         );
 
         let id = el.executor.register_send(conn_index);
-        el.driver
+        let err = el
+            .driver
             .make_ctx()
             .send_parts(token)
             .copy(b"")
             .copy(b"")
             .submit_awaited(id)
-            .expect("nothing to send is not an error");
+            .expect_err("an awaited empty batch is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
         assert!(!el.driver.send_queues[idx].in_flight);
         assert_eq!(el.driver.send_copy_pool.free_count(), free);
         el.drain_settled_sends();
-        assert_eq!(
-            el.executor
-                .take_send_result(id)
-                .expect("settled")
-                .expect("ok"),
-            0,
-            "the awaited batch resolves with its length"
+        assert!(
+            el.executor.take_send_result(id).is_none(),
+            "the refused batch settled its id"
         );
+        el.executor.withdraw_send(id);
     }
 
     /// A `Shutdown` SQE the ring refuses is kept and pushed later, as a
@@ -11605,7 +11607,7 @@ mod tests {
         assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
 
         let current = ConnCtx::new(conn_index, generation);
-        with_driver_state(&mut el, || current.forward_recv_buf(view))
+        with_driver_state(&mut el, || current.forward_recv_buf(view).map(drop))
             .expect("the current handle forwards its accumulator");
         assert!(el.driver.accumulators.data(conn_index).is_empty());
         assert_eq!(
@@ -11653,7 +11655,8 @@ mod tests {
             let data = el.driver.accumulators.data(conn_index);
             // SAFETY: the accumulator is not touched before the call below.
             let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-            if let Err(e) = with_driver_state(&mut el, || current.forward_recv_buf(view)) {
+            if let Err(e) = with_driver_state(&mut el, || current.forward_recv_buf(view).map(drop))
+            {
                 refused = Some((attempt, e));
                 break;
             }
@@ -16276,6 +16279,7 @@ mod tests {
     /// in the completion table: no completion would ever free it.
     #[test]
     fn a_refused_awaited_send_leaves_no_entry() {
+        use crate::handler::SendPart;
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
@@ -16283,23 +16287,186 @@ mod tests {
         // Another send is in flight, so every chain is refused.
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let huge = vec![0u8; 1 << 24];
+        let kind = |r: io::Result<crate::SendCompletion>| r.err().map(|e| e.kind());
         for _ in 0..10 {
             with_driver_state(&mut el, || {
                 let refused = conn.send_chain(|chain| chain.copy(b"x").finish());
-                assert_eq!(
-                    refused.err().map(|e| e.kind()),
-                    Some(io::ErrorKind::WouldBlock)
-                );
+                assert_eq!(kind(refused), Some(io::ErrorKind::WouldBlock));
                 let empty = conn.send_chain(|_chain| Ok(()));
                 assert!(empty.is_ok());
-                let too_big = conn.send(&huge);
+                assert_eq!(kind(conn.send(&huge)), Some(io::ErrorKind::InvalidInput));
+
+                // `build`: an empty batch, a closure that never submits, and
+                // a copy batch wider than one pool slot.
+                let empty = conn.send_parts().build(|b| b.submit());
+                assert_eq!(kind(empty), Some(io::ErrorKind::InvalidInput));
+                let unsubmitted = conn.send_parts().build(|b| {
+                    let _unsubmitted = b.copy(b"x");
+                    Ok(())
+                });
+                assert_eq!(kind(unsubmitted), Some(io::ErrorKind::InvalidInput));
+                let oversize = conn.send_parts().build(|b| b.copy(&huge).submit());
+                assert_eq!(kind(oversize), Some(io::ErrorKind::InvalidInput));
+
+                // `submit_batch`: an empty batch, and an oversize copy batch.
+                let empty = conn.send_parts().submit_batch(Vec::new());
                 assert_eq!(
-                    too_big.err().map(|e| e.kind()),
+                    empty.err().map(|e| e.kind()),
+                    Some(io::ErrorKind::InvalidInput)
+                );
+                let oversize = conn.send_parts().submit_batch(vec![SendPart::Copy(&huge)]);
+                assert_eq!(
+                    oversize.err().map(|e| e.kind()),
                     Some(io::ErrorKind::InvalidInput)
                 );
             });
         }
         assert_eq!(el.executor.send_completions.live(), 0);
+
+        // A whole-accumulator forward, which goes out zero-copy at this
+        // size, refused because the send slab is full.
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        while el
+            .driver
+            .send_slab
+            .allocate(
+                conn_index,
+                generation,
+                &iovecs,
+                u16::MAX,
+                [const { None }; crate::buffer::send_slab::MAX_GUARDS],
+                0,
+                100,
+            )
+            .is_some()
+        {}
+        let message = vec![9u8; 5000];
+        assert!(el.driver.accumulators.append(conn_index, &message));
+        let data = el.driver.accumulators.data(conn_index);
+        // SAFETY: the accumulator is not touched before the call below.
+        let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+        let refused = with_driver_state(&mut el, || conn.forward_recv_buf(view).map(drop));
+        assert_eq!(
+            refused.err().map(|e| e.kind()),
+            Some(io::ErrorKind::Other),
+            "the slab is full"
+        );
+        assert_eq!(el.driver.accumulators.data(conn_index), &message[..]);
+        assert_eq!(el.executor.send_completions.live(), 0);
+    }
+
+    /// A `build` or `send_chain` closure that panics leaves no entry in the
+    /// completion table: the id was registered before the closure ran.
+    #[test]
+    fn a_panicking_build_or_chain_closure_leaves_no_entry() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        for _ in 0..10 {
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_driver_state(&mut el, || {
+                    conn.send_parts()
+                        .build(|_b| -> io::Result<()> { panic!("a build closure panics") })
+                })
+            }));
+            assert!(built.is_err(), "the panic reached the caller");
+            let chained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_driver_state(&mut el, || {
+                    conn.send_chain(|_c| -> io::Result<()> { panic!("a chain closure panics") })
+                })
+            }));
+            assert!(chained.is_err(), "the panic reached the caller");
+        }
+        assert_eq!(el.executor.send_completions.live(), 0);
+    }
+
+    /// A `submit_batch` whose guard panics while the batch is built leaves no
+    /// entry: the id was registered before the guard's code ran.
+    #[test]
+    fn a_panicking_guard_in_submit_batch_leaves_no_entry() {
+        struct PanickingRegion(Vec<u8>);
+        impl crate::SendGuard for PanickingRegion {
+            fn as_ptr_len(&self) -> (*const u8, u32) {
+                (self.0.as_ptr(), self.0.len() as u32)
+            }
+            fn region(&self) -> crate::RegionId {
+                panic!("a guard's region panics")
+            }
+        }
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        for _ in 0..10 {
+            let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_driver_state(&mut el, || {
+                    // At or above `send_zc_threshold`, so `build_with_guards`
+                    // reads the guard's region.
+                    let guard = crate::GuardBox::new(PanickingRegion(vec![7; 8192]));
+                    conn.send_parts()
+                        .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+                })
+            }));
+            assert!(submitted.is_err(), "the panic reached the caller");
+        }
+        assert_eq!(el.executor.send_completions.live(), 0);
+    }
+
+    /// A `build` or `send_chain` closure that panics after its send was
+    /// submitted leaves no entry, and the send's completion, when it arrives,
+    /// settles nothing: not the withdrawn id, and not a later send that took
+    /// its slot in the table.
+    #[test]
+    fn a_panic_after_a_submitted_build_or_chain_settles_nothing() {
+        let mut el = make_test_loop();
+        for chain in [false, true] {
+            let conn_index = accept_connection(&mut el);
+            let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_driver_state(&mut el, || {
+                    if chain {
+                        let _ = conn.send_chain(|c| -> io::Result<()> {
+                            c.copy(b"x").finish()?;
+                            panic!("a chain closure panics after finish")
+                        });
+                    } else {
+                        let _ = conn.send_parts().build(|b| -> io::Result<()> {
+                            b.copy(b"x").submit()?;
+                            panic!("a build closure panics after submit")
+                        });
+                    }
+                })
+            }));
+            assert!(
+                panicked.is_err(),
+                "the panic reached the caller (chain: {chain})"
+            );
+            assert_eq!(el.executor.send_completions.live(), 0, "chain: {chain}");
+            let ud = el
+                .driver
+                .ring
+                .last_pushed
+                .as_ref()
+                .expect("the send was pushed")
+                .user_data;
+
+            // A later send takes the withdrawn id's slot in the table.
+            let later = el.executor.register_send(conn_index);
+            el.test_dispatch_cqe(ud, 1, 0);
+            assert!(
+                !el.driver.send_queues[conn_index as usize].in_flight
+                    && !el.driver.chain_table.is_active(conn_index),
+                "the completion was handled (chain: {chain})"
+            );
+            assert!(
+                el.executor.take_send_result(later).is_none(),
+                "the completion settled a later send (chain: {chain})"
+            );
+            el.executor.withdraw_send(later);
+            assert_eq!(el.executor.send_completions.live(), 0, "chain: {chain}");
+        }
     }
 
     /// A send owned by its connection's own task is abandoned when the
@@ -17797,7 +17964,7 @@ mod tests {
     }
 
     /// A forced close that abandons a queued send no caller waits on
-    /// (`send_nowait`) still reports the slot it returned to the pool, or a
+    /// (one with no send id) still reports the slot it returned to the pool, or a
     /// bounded send parked on the pool waits for an unrelated release.
     #[test]
     fn a_forced_close_abandoning_an_unawaited_send_releases_capacity() {

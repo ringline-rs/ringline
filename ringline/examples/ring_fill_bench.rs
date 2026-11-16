@@ -120,7 +120,7 @@ impl AsyncEventHandler for Bench {
                     while Instant::now() < deadline {
                         let want = size_for_round(&mode, rounds, msg, small, large);
                         let req = (want as u32).to_le_bytes();
-                        if conn_tx.send_nowait(&req).is_err() {
+                        if conn_tx.send(&req).is_err() {
                             break;
                         }
                         let got = match mode.as_str() {
