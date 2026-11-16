@@ -173,6 +173,27 @@ fn fill(conn: &mut Connection) {
         .expect("guard send accepted");
 }
 
+/// [`fill`], returning the completion of its last send, so that a test can
+/// await the send that met the full socket: on io_uring only a send whose
+/// own submission came back short or with `EAGAIN` counts as having waited
+/// (`SendAdmissionOrder::Budget`).
+#[cfg(has_io_uring)]
+fn fill_awaited(conn: &mut Connection) -> ringline::SendCompletion {
+    let guard = ringline::GuardBox::new(VecGuard(vec![7; GUARD_LEN]));
+    conn.send_parts()
+        .build(|b| b.guard(guard).submit())
+        .expect("guard send accepted")
+}
+
+/// [`fill`], returning the completion of its last send.
+#[cfg(not(has_io_uring))]
+fn fill_awaited(conn: &mut Connection) -> ringline::SendCompletion {
+    for _ in 0..255 {
+        let _ = conn.send(&[1; 1 << 16]).expect("queued");
+    }
+    conn.send(&[1; 1 << 16]).expect("queued")
+}
+
 /// On mio: 16 MiB of plain sends, which take no send-pool slot. macOS grows
 /// loopback socket buffers to 4 MiB a side, and a smaller fill let the bounded
 /// sends behind it complete before the abort.
@@ -899,10 +920,9 @@ async fn wake_the_parked(conn: &mut Connection, idle: bool) -> Woken {
         let mut drained = ringline::connect(drainer_addr)
             .await
             .expect("connect the drainer");
-        // (c) More than the socket takes, so a write returns WouldBlock,
-        // then an awaited send behind it; the peer then reads it all.
-        fill(&mut drained);
-        let last = drained.send(b"end").expect("queued");
+        // (c) More than the socket takes, so the send meets a full socket;
+        // the peer then reads it all.
+        let last = fill_awaited(&mut drained);
         let _ = drain.send(());
         let _ = last.await;
         let waiter = park(drained.send_admitted(&ONE)).await;
