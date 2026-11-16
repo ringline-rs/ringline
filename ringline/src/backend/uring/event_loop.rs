@@ -292,13 +292,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let udp_queue_capacity = config
             .udp_recv_queue_capacity
             .min(config.udp_recv_buffer.ring_size as usize);
-        let executor = Executor::new(
+        let mut executor = Executor::new(
             config.max_connections,
             config.standalone_task_capacity,
             crate::runtime::TIMER_SLOTS,
             config.udp_bind.len() as u32,
             udp_queue_capacity,
         );
+        executor.set_send_admission_order(config.send_admission_order);
         // A waker woken off this thread rings the worker's own wake fd.
         if let Some(handle) = config
             .wake_keep_alive
@@ -3138,6 +3139,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // *logical* (plaintext) length its caller passed. The wire bytes
             // differ under TLS.
             if let Some((id, logical_len)) = settles {
+                self.driver.end_logical_send(conn_index);
                 self.settle_send(id, Ok(logical_len));
             }
             return;
@@ -3204,6 +3206,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let generation = self.driver.connections.generation(conn_index);
         let state = &mut self.driver.send_queues[conn_index as usize];
         state.waiting_send = Some(ud.raw());
+        // Under `SendAdmissionOrder::Budget` this send, and so the
+        // connection's most recent one, waited for room
+        // (`ConnSendState::room_waited`).
+        if self.driver.track_room_waits {
+            state.room_waited = true;
+            state.send_waited = true;
+        }
         if !state.on_send_backstop {
             state.on_send_backstop = true;
             self.driver
@@ -3659,11 +3668,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// run loop; see the call site for why that point.
     ///
     /// Separate from the loop body so tests can drive it directly.
+    ///
+    /// Under `SendAdmissionOrder::Budget` it also runs when the admission
+    /// queue asks for a scan (`Executor::send_scan_due`): a waiter can become
+    /// able to pass the head without any slot coming back.
     fn wake_capacity_if_released(&mut self) {
-        if self.driver.capacity_released {
+        if self.driver.capacity_released || self.executor.send_scan_due() {
             self.driver.capacity_released = false;
+            let driver = &self.driver;
             self.executor
-                .wake_send_capacity(self.driver.send_copy_pool.free_count());
+                .wake_send_capacity_in(&driver.send_copy_pool, |conn| driver.send_idle(conn));
         }
     }
 
@@ -3737,7 +3751,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // A run can span several sends (#628). Those whose bytes are
                 // all on the wire settle now with their own length; only the
                 // rest wait for, or fail with, the remainder.
+                // One completion ends one wait, however many sends it
+                // settles: a second `end_logical_send` would clear what the
+                // first recorded.
+                let mut ended = false;
                 for (id, len) in self.driver.send_slab.take_sent_sends(slab_idx) {
+                    if !std::mem::replace(&mut ended, true) {
+                        self.driver.end_logical_send(conn_index);
+                    }
                     self.settle_send(id, Ok(len));
                 }
                 if self.close_submitted(conn_index) {
@@ -3763,7 +3784,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.defer_finalize_close(conn_index);
             // The carried logical (plaintext) length, not `acked` — see
             // `handle_send`'s success path.
+            let mut ended = false;
             for (id, logical_len) in settles {
+                if !std::mem::replace(&mut ended, true) {
+                    self.driver.end_logical_send(conn_index);
+                }
                 self.settle_send(id, Ok(logical_len));
             }
             return;
@@ -3821,10 +3846,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Settle the awaited send slab entry `slab_idx` carries, if any, with
-    /// the length it carries. Call before releasing the entry, which clears
-    /// the id.
-    fn settle_slab_ok(&mut self, slab_idx: u16) {
+    /// the length it carries, which ends the logical send on `conn_index`
+    /// (`Driver::end_logical_send`). Call before releasing the entry, which
+    /// clears the id.
+    fn settle_slab_ok(&mut self, conn_index: u32, slab_idx: u16) {
+        let mut ended = false;
         for (id, len) in self.driver.send_slab.take_sends(slab_idx) {
+            if !std::mem::replace(&mut ended, true) {
+                self.driver.end_logical_send(conn_index);
+            }
             self.settle_send(id, Ok(len));
         }
     }
@@ -4071,7 +4101,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // the notification lands.
         let errno = -result;
         if result > 0 {
-            self.settle_slab_ok(slab_idx);
+            self.settle_slab_ok(conn_index, slab_idx);
         } else if self.close_submitted(conn_index)
             && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOMEM)
         {
@@ -4401,7 +4431,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if let Some(id) = chain.send_id {
             let result = match failure {
                 Some(error) => Err(error),
-                None => Ok(chain.bytes_sent),
+                None => {
+                    self.driver.end_logical_send(conn_index);
+                    Ok(chain.bytes_sent)
+                }
             };
             self.settle_send(id, result);
         }
@@ -17558,6 +17591,36 @@ mod tests {
         assert_eq!(el.executor.take_send_result(first).unwrap().unwrap(), 2);
         assert_eq!(el.executor.take_send_result(second).unwrap().unwrap(), 3);
         assert!(!el.driver.send_slab.in_use(slab_idx));
+    }
+
+    /// Under `Budget` a coalesced run that settles two awaited sends
+    /// ends one wait: when the run came back short and waited for room, the
+    /// connection is not idle once both have settled. Calling
+    /// `end_logical_send` once per settled send, the second call would clear
+    /// what the first recorded, and this would fail.
+    #[test]
+    fn a_coalesced_run_that_waited_leaves_its_connection_not_idle() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .send_admission_order(crate::SendAdmissionOrder::Budget { slots: 32 })
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (first, second, slab_idx) = two_pipelined_sends(&mut el, conn_index, generation);
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, slab_idx as u32);
+        // One byte of five: the run waits for room.
+        el.test_dispatch_cqe(ud.raw(), 1, 0);
+        assert!(el.driver.send_queues[conn_index as usize].room_waited);
+        // Room: the rest is resubmitted and goes out whole.
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        el.test_dispatch_cqe(ud.raw(), 4, 0);
+        assert_eq!(el.executor.take_send_result(first).unwrap().unwrap(), 2);
+        assert_eq!(el.executor.take_send_result(second).unwrap().unwrap(), 3);
+        assert!(!el.driver.send_idle(conn_index), "the run waited for room");
     }
 
     /// A partial write that covers the first send settles it at once; an

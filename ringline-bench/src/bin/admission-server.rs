@@ -844,6 +844,9 @@ fn main() {
         .core_offset(args.cpu)
         .max_connections(4096)
         .send_pool(args.pool_slots, args.slot_size)
+        // The cases above are O0 and O1, which admit in strict order; the
+        // runtime's default order lets a send pass a waiting head.
+        .send_admission_order(ringline::SendAdmissionOrder::Strict)
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)

@@ -7,8 +7,10 @@
 //! [`SendId`] its future keeps. The driver settles the entry when that send
 //! completes, and the future resolves with the result of that one send. A
 //! bounded send (`SendHalf::send_admitted`, `send_backpressured`) is also
-//! admission-controlled: it may only reserve copy-pool slots once it is the
-//! *oldest* waiter on the worker and the pool can admit its whole message.
+//! admission-controlled: it reserves copy-pool slots once it is the
+//! *oldest* waiter on the worker and the pool can admit its whole message,
+//! or, under [`SendAdmissionOrder::Budget`], once it may pass an older
+//! waiter that does not fit (see "Admission orders" below).
 //!
 //! The table is plain worker-local state owned by the [`Executor`]. Every
 //! entry holds a slot indexed by its id, and is also listed under its target
@@ -83,11 +85,175 @@
 //! completion time is the owner that will be polled.
 //!
 //! Admission design: `docs/send-capacity-fifo-design.md`.
+//!
+//! **Admission orders.** The worker's [`SendAdmissionOrder`] is set once,
+//! when the event loop creates the executor. Under `Strict` only the head
+//! is admitted, through [`turn`](SendCompletions::turn) and
+//! [`head_ready`](SendCompletions::head_ready). The entry points `Budget`
+//! shares with it (`Executor::wake_send_capacity_in`,
+//! `Executor::send_scan_due`, `set_order`, `order`) test the order or a flag
+//! only `Budget` sets and take the `Strict` path; the rest of what this
+//! paragraph describes does not run under `Strict`. Under `Budget`, while
+//! the head does not fit, a waiter behind it is also admitted
+//! ([`admit`](SendCompletions::admit)). A waiter admitted that way leaves its
+//! id in `waiting`, as a cancelled waiter does, so the rule above still
+//! holds: each id is pushed once and leaves once. A waiter can become able to
+//! pass without its own poll noticing: when capacity comes back, when the
+//! head changes, when an earlier waiter on its connection leaves, or when its
+//! connection goes idle. The first is the release hook's wake; for the
+//! others the queue sets `scan_due`, or the driver sets `capacity_released`,
+//! and the event loop's end-of-iteration capacity wake then runs
+//! [`scan`](SendCompletions::scan), which wakes the waiters behind the head
+//! that could pass. Those polls check again with `admit`. A poll whose
+//! `admit` says wait also sets `scan_due`, so a scan that woke a waiter which
+//! then could not pass (the pool changed in between) is followed by another.
 
 use std::collections::VecDeque;
 use std::io;
 
 use super::Executor;
+use crate::buffer::send_copy::SendCopyPool;
+
+/// The order in which a worker admits bounded sends
+/// ([`SendHalf::send_admitted`](crate::SendHalf::send_admitted),
+/// [`send_backpressured`](crate::SendHalf::send_backpressured)) to its send
+/// copy pool. Set with
+/// [`ConfigBuilder::send_admission_order`](crate::ConfigBuilder::send_admission_order).
+///
+/// Bounded sends that do not fit the pool's free slots wait in one FIFO per
+/// worker. In both orders the FIFO's head is admitted when the free slots
+/// cover its whole message, and a send is admitted only once no earlier
+/// bounded send on its own connection still waits, so the sends on one
+/// connection keep their order. The orders differ in what happens while the
+/// head does not fit.
+///
+/// The default is `Budget { slots: 32 }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SendAdmissionOrder {
+    /// Only the head is admitted. A send that fits waits behind a head that
+    /// does not, however small it is.
+    Strict,
+    /// A waiter behind a head that does not fit is also admitted, ahead of
+    /// the head (it passes the head), when three conditions hold:
+    ///
+    /// - its message fits in the free slots;
+    /// - the slots held by sends that passed a head, plus its own, are at
+    ///   most L = min(`slots`, P - H), where P is the pool's slot count and H
+    ///   the slots the head needs;
+    /// - its connection has no send queued or in flight, and the
+    ///   connection's last settled send did not wait for room in the socket.
+    ///
+    /// The second condition bounds how long the head waits on passing
+    /// sends: once the sends that did not pass hold at most P - H - L slots,
+    /// the head fits whatever the passing sends hold. The third keeps a send
+    /// from passing onto a connection whose peer is not reading, where its
+    /// slots could stay held until the peer reads. Waiters that may pass are
+    /// admitted oldest first. A `slots` above the pool's slot count admits as
+    /// the pool's slot count does.
+    Budget {
+        /// The most slots sends that passed a head may hold at once. At
+        /// least 1; `ConfigBuilder::build` refuses 0.
+        slots: u16,
+    },
+}
+
+impl Default for SendAdmissionOrder {
+    fn default() -> Self {
+        SendAdmissionOrder::Budget { slots: 32 }
+    }
+}
+
+impl SendAdmissionOrder {
+    /// Whether the order lets a waiter pass a head that does not fit: so the
+    /// pool keeps the passing marks B counts, and the drivers keep each
+    /// connection's room-wait flags (`track_room_waits`).
+    pub(crate) fn lets_pass(self) -> bool {
+        !matches!(self, SendAdmissionOrder::Strict)
+    }
+}
+
+/// The copy-pool figures `Budget` reads, taken from the pool when an
+/// admission check or a wake scan runs. Terms, as in
+/// `docs/send-admission-design.md`, section 4: P is the pool's slots, F the
+/// free slots, H the slots the head needs, and B the slots held by sends that
+/// passed a head, counted until each slot returns to the pool, across changes
+/// of head.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoolView {
+    /// Slots available to a new allocation (F).
+    pub(crate) free: usize,
+    /// Slots held by sends that passed a head (B).
+    pub(crate) passing: usize,
+    /// Slots in the pool (P).
+    pub(crate) slots: usize,
+}
+
+impl PoolView {
+    /// The figures of `pool` now.
+    pub(crate) fn of(pool: &SendCopyPool) -> Self {
+        PoolView {
+            free: pool.free_count(),
+            passing: pool.passing_held(),
+            slots: pool.slot_count(),
+        }
+    }
+}
+
+/// What [`SendCompletions::admit`] decided for one waiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admit {
+    /// Not now; the future parks.
+    Wait,
+    /// The waiter is the head and fits.
+    Head,
+    /// The waiter passes the head, which does not fit. `slots` is the
+    /// waiter's `required_slots`.
+    Pass { slots: usize },
+}
+
+/// What admission did on one worker. Read with
+/// [`send_admission_counters`]. Every count starts at zero when the worker
+/// starts and only grows, except `passing_held` and `main_free`, which are
+/// figures of now; under `Strict` all but `main_free` stay zero.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SendAdmissionCounters {
+    /// Sends admitted past a waiting head.
+    pub passing_admissions: u64,
+    /// The copy-pool slots those sends were admitted against (each one's
+    /// worst-case cost, as the FIFO counts it), summed.
+    pub passing_slots: u64,
+    /// The slots sends that passed a head hold now (B).
+    pub passing_held: u64,
+    /// The largest `passing_held` has been.
+    pub passing_held_max: u64,
+    /// Wake scans that looked behind a head that did not fit.
+    pub wake_scans: u64,
+    /// The waiters those scans woke.
+    pub scan_wakes: u64,
+    /// Slots of the copy pool free now.
+    pub main_free: u64,
+}
+
+/// The admission counters of the worker this runs on: see
+/// [`SendAdmissionCounters`].
+///
+/// # Panics
+///
+/// Outside a task or handler callback on a ringline worker.
+#[doc(hidden)]
+pub fn send_admission_counters() -> SendAdmissionCounters {
+    super::io::with_state(|driver, executor| {
+        executor.send_admission_counters(&driver.send_copy_pool)
+    })
+}
+
+/// Whether arrival number `a` came before `b`. Arrival numbers wrap; the
+/// waiters in the FIFO at any one time span far fewer than 2^31 of them.
+fn arrived_before(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
 
 /// Identity of one send operation on its worker: a slot in
 /// [`SendCompletions`]'s table and that slot's generation.
@@ -118,6 +284,14 @@ enum Completion {
         /// Copy-pool slots the whole message needs; `turn` admits the head
         /// only when at least this many are free.
         required_slots: usize,
+        /// Arrival number, which orders the waiters of one connection: under
+        /// `Budget` a waiter passes only if no waiter on its connection
+        /// arrived before it. 0 under `Strict`, which never reads it.
+        seq: u32,
+        /// The scan (`scan_epoch`) that last woke this waiter to pass, if it
+        /// has not polled since; 0 if none. A waiter woken and not polled by
+        /// the next scan loses its claim on the room it was woken for.
+        woken_in: u32,
     },
     /// Submitted to the driver; no completion yet.
     InFlight,
@@ -168,8 +342,9 @@ pub(crate) struct SendCompletions {
     slots: Vec<Slot>,
     /// Indices of the slots no operation holds.
     free: Vec<u32>,
-    /// Waiting operations in arrival order. Only the head may be admitted.
-    /// Also holds ids that no longer name a waiting entry, which
+    /// Waiting operations in arrival order. Under `Strict` only the head may
+    /// be admitted; `Budget` also admits waiters behind it. Also
+    /// holds ids that no longer name a waiting entry, which
     /// [`front`](Self::front) pops when they reach the head and
     /// [`compact`](Self::compact) drops when they number more than the live
     /// ones plus 64.
@@ -187,6 +362,29 @@ pub(crate) struct SendCompletions {
     /// [`NO_OWNER`] are not indexed: [`remove_task`](Self::remove_task) and
     /// [`remove_connection`](Self::remove_connection) never look them up.
     by_task: Vec<VecDeque<u32>>,
+    /// The worker's admission order, set when the executor is created.
+    order: SendAdmissionOrder,
+    /// The arrival number the next waiter gets, under `Budget`.
+    next_seq: u32,
+    /// The number of the latest scan that looked behind the head, under
+    /// `Budget`; 0 until the first such scan, and never 0 after it,
+    /// since `woken_in` uses 0 for none.
+    scan_epoch: u32,
+    /// A [`scan`](Self::scan) is due at the end of the event-loop iteration.
+    /// Set only under `Budget`: when a waiter leaves the
+    /// waiting state, when a later poll of a waiter is told to wait, when any
+    /// poll is told to wait because an older waiter takes the room
+    /// ([`admit`](Self::admit)), and by a scan that woke passers, for the
+    /// scan after it.
+    scan_due: bool,
+    /// The task ids a scan wakes, kept between scans by
+    /// [`Executor::wake_send_capacity_in`] so that a scan allocates only
+    /// when it wakes more tasks than any scan before it.
+    wake_scratch: Vec<u32>,
+    /// The counts the FIFO keeps; `passing_held` and `passing_held_max`
+    /// stay zero here and are read from the pool
+    /// ([`Executor::send_admission_counters`]).
+    counters: SendAdmissionCounters,
 }
 
 // List entries `index_remove` compared, for the tests that bound it. Per
@@ -245,9 +443,34 @@ fn is_connection_task(task_id: u32) -> bool {
 }
 
 impl SendCompletions {
-    /// Empty queue. Called once per worker from `Executor::new`.
+    /// Empty queue, in the `Strict` order. Called once per worker from
+    /// `Executor::new`; the event loops then set the configured order
+    /// ([`set_order`](Self::set_order)).
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            order: SendAdmissionOrder::Strict,
+            ..Self::default()
+        }
+    }
+
+    /// Empty queue in `order`.
+    #[cfg(test)]
+    fn with_order(order: SendAdmissionOrder) -> Self {
+        let mut q = Self::new();
+        q.set_order(order);
+        q
+    }
+
+    /// Set the admission order. Called once, before any waiter is enqueued,
+    /// by [`Executor::set_send_admission_order`].
+    pub(crate) fn set_order(&mut self, order: SendAdmissionOrder) {
+        debug_assert_eq!(self.waiting_live, 0, "the order changed under waiters");
+        self.order = order;
+    }
+
+    /// The admission order.
+    pub(crate) fn order(&self) -> SendAdmissionOrder {
+        self.order
     }
 
     /// Put `entry` in a free slot and return its id.
@@ -349,8 +572,25 @@ impl SendCompletions {
     /// per entry that left the waiting state.
     fn left_waiting(&mut self) {
         self.waiting_live -= 1;
+        self.waiter_left();
+        self.compact_if_mostly_stale();
+    }
+
+    /// [`compact`](Self::compact) once the stale ids in `waiting` number
+    /// more than the live ones plus 64.
+    fn compact_if_mostly_stale(&mut self) {
         if self.waiting.len() > 2 * self.waiting_live + 64 {
             self.compact();
+        }
+    }
+
+    /// A waiter left the waiting state. Under `Budget`
+    /// that can let a waiter behind the head pass: the head may have changed,
+    /// or the waiter that left was the earliest of its connection. The scan
+    /// at the end of the iteration wakes whoever can.
+    fn waiter_left(&mut self) {
+        if self.order != SendAdmissionOrder::Strict {
+            self.scan_due = true;
         }
     }
 
@@ -392,12 +632,21 @@ impl SendCompletions {
         required_slots: usize,
         task_id: u32,
     ) -> SendId {
+        let seq = if self.order == SendAdmissionOrder::Strict {
+            0
+        } else {
+            let seq = self.next_seq;
+            self.next_seq = seq.wrapping_add(1);
+            seq
+        };
         let id = self.insert(Entry {
             conn_index,
             task_id,
             state: Completion::Waiting {
                 generation,
                 required_slots,
+                seq,
+                woken_in: 0,
             },
             waited_for_room: false,
         });
@@ -529,8 +778,11 @@ impl SendCompletions {
     ///
     /// Returns the new head's task id, so the caller can wake it (it
     /// re-checks [`turn`](Self::turn) on its next poll). Returns `None` if
-    /// `id` is not the head, which [`turn`](Self::turn) has just checked it
-    /// is, or if there is no new head.
+    /// `id` is not the head, which under `Strict` [`turn`](Self::turn) has
+    /// just checked it is and under `Budget` means it passed the
+    /// head ([`admit`](Self::admit)), or if there is no new head. A waiter
+    /// that passed leaves its id in `waiting`, for `front` or `compact` to
+    /// drop.
     ///
     /// Called by `Admission` right after it reserved its slots and submitted
     /// the send.
@@ -543,6 +795,14 @@ impl SendCompletions {
         if at_front {
             self.waiting.pop_front();
             self.waiting_live -= 1;
+            self.waiter_left();
+            // Under `Budget`, waiters behind this head can have left
+            // already, and the scan's cost rests on `waiting` holding at most
+            // twice the live ids plus 64. `Strict` never scans, and keeps the
+            // pop it always had.
+            if self.order != SendAdmissionOrder::Strict {
+                self.compact_if_mostly_stale();
+            }
             self.head_task()
         } else {
             self.left_waiting();
@@ -664,6 +924,327 @@ impl SendCompletions {
             }
             _ => None,
         }
+    }
+
+    /// Under `Budget`, whether `id` may reserve slots
+    /// now: as the head, when `pool.free` covers its `required_slots`, or
+    /// past a head that does not fit, when the order lets it
+    /// ([`may_pass`](Self::may_pass)) with what is left once the older
+    /// waiters that could pass have taken their room
+    /// ([`left_after_older_passers`](Self::left_after_older_passers)), so
+    /// passers go oldest first whichever polls first. An older waiter that a
+    /// scan woke keeps that claim only until the next scan; one its task does
+    /// not poll then stops holding the newer ones back
+    /// ([`could_pass`](Self::could_pass)). `idle` says, for a
+    /// connection index, whether the connection has no send queued or in
+    /// flight and its most recent send did not wait for room; it is called
+    /// for `id` once it passes every other test, and for the older waiters.
+    ///
+    /// An answer of wait on any poll but the first sets `scan_due`: the
+    /// poll may have come from a scan that counted on this waiter's slots,
+    /// or the head may have stopped fitting because a send outside the FIFO
+    /// took slots, and either way another waiter may now be able to pass.
+    /// So does a wait because an older waiter takes the room, on any poll,
+    /// so that the scan wakes the older one.
+    ///
+    /// Cost, for a waiter that would pass on its own: one visit per id ahead
+    /// of it in `waiting`, and the operations of each older waiter's
+    /// connection that fits. A rejection on its own test costs nothing more.
+    ///
+    /// Called by `Admission` on each poll while waiting, in place of
+    /// [`turn`](Self::turn).
+    pub(crate) fn admit(
+        &mut self,
+        id: SendId,
+        pool: PoolView,
+        first_poll: bool,
+        idle: impl Fn(u32) -> bool,
+    ) -> Admit {
+        debug_assert_ne!(self.order, SendAdmissionOrder::Strict);
+        // This is the poll a scan's wake asked for, if one did.
+        if let Some(Entry {
+            state: Completion::Waiting { woken_in, .. },
+            ..
+        }) = self.entry_mut(id)
+        {
+            *woken_in = 0;
+        }
+        let admit = self.admit_inner(id, pool, idle);
+        if admit == Admit::Wait && !first_poll {
+            self.scan_due = true;
+        }
+        admit
+    }
+
+    /// [`admit`](Self::admit) without its effect on `scan_due`.
+    fn admit_inner(&mut self, id: SendId, pool: PoolView, idle: impl Fn(u32) -> bool) -> Admit {
+        let Some((head, head_needs)) = self.head_and_need() else {
+            return Admit::Wait;
+        };
+        if pool.free >= head_needs {
+            return if head == id { Admit::Head } else { Admit::Wait };
+        }
+        if head == id {
+            return Admit::Wait;
+        }
+        let Some(Entry {
+            conn_index,
+            state:
+                Completion::Waiting {
+                    required_slots,
+                    seq,
+                    ..
+                },
+            ..
+        }) = self.entry(id)
+        else {
+            return Admit::Wait;
+        };
+        let (conn_index, required_slots, seq) = (*conn_index, *required_slots, *seq);
+        if !self.may_pass(head_needs, conn_index, required_slots, seq, pool) {
+            return Admit::Wait;
+        }
+        if !idle(conn_index) {
+            return Admit::Wait;
+        }
+        // Passers go oldest first, as the scan wakes them: an older waiter
+        // that could pass takes its room before this one, even when this
+        // poll comes first (a new waiter's first poll, in the same iteration
+        // as the release that made the room). If what is left does not cover
+        // this waiter, the scan at the end of the iteration wakes the older
+        // one.
+        let left = self.left_after_older_passers(head_needs, id, pool, &idle);
+        if !self.may_pass(head_needs, conn_index, required_slots, seq, left) {
+            self.scan_due = true;
+            return Admit::Wait;
+        }
+        Admit::Pass {
+            slots: required_slots,
+        }
+    }
+
+    /// `pool` less what the waiters between the head and `id` that could
+    /// pass take, oldest first, each counted against the free slots and B as
+    /// [`scan`](Self::scan) counts the waiters it wakes.
+    ///
+    /// Cost: one visit per id in `waiting` ahead of `id`, stale ones
+    /// included, and for each waiter that fits, the operations of its
+    /// connection. It runs only for a waiter that would pass on its own.
+    ///
+    /// So within one iteration it is quadratic in the waiters that pass: each
+    /// walks the ones ahead of it, including those that passed already and
+    /// left their ids. Measured with `n` one-slot waiters behind a head that
+    /// does not fit, all passing in one iteration, best of five, release
+    /// build on macOS: `n` = 1000 took 0.14 ms polled oldest first and 1.4 ms
+    /// newest first; `n` = 4000 took 1.9 ms and 23 ms. No cheaper form was
+    /// found that keeps the order exact: an admitted waiter has to count
+    /// every older one that could pass.
+    fn left_after_older_passers(
+        &self,
+        head_needs: usize,
+        id: SendId,
+        pool: PoolView,
+        idle: &impl Fn(u32) -> bool,
+    ) -> PoolView {
+        let mut left = pool;
+        for &older in self.waiting.iter().skip(1) {
+            if older == id {
+                break;
+            }
+            if let Some((required_slots, _)) = self.could_pass(older, head_needs, left, idle) {
+                left.free -= required_slots;
+                left.passing += required_slots;
+            }
+        }
+        left
+    }
+
+    /// If `id` is a waiter with an owner that could pass a head of
+    /// `head_needs` with `left`, its `required_slots` and owner. The test the scan applies to
+    /// each waiter it might wake, and that an admission applies to the
+    /// waiters older than itself. A waiter with no owner ([`NO_OWNER`]) is
+    /// left out: no task would poll it, and its holder's first poll checks
+    /// it.
+    ///
+    /// So is a waiter a scan before the latest one woke that has not polled
+    /// since. An admission still counts one the latest scan woke, which
+    /// gives it the iteration that wake is polled in, and not after: a waiter
+    /// its task does not poll would otherwise hold its room, and every newer
+    /// waiter behind it, for as long as the task does not poll it. A scan
+    /// raises `scan_epoch` before it walks, so it leaves out every waiter an
+    /// earlier scan woke, rather than wake the same task again; that task was
+    /// woken, and polls it whenever it next awaits it.
+    fn could_pass(
+        &self,
+        id: SendId,
+        head_needs: usize,
+        left: PoolView,
+        idle: &impl Fn(u32) -> bool,
+    ) -> Option<(usize, u32)> {
+        let Some(Entry {
+            conn_index,
+            task_id,
+            state:
+                Completion::Waiting {
+                    required_slots,
+                    seq,
+                    woken_in,
+                    ..
+                },
+            ..
+        }) = self.entry(id)
+        else {
+            return None;
+        };
+        let woken_earlier = *woken_in != 0 && *woken_in != self.scan_epoch;
+        let passes = *task_id != NO_OWNER
+            && !woken_earlier
+            && self.may_pass(head_needs, *conn_index, *required_slots, *seq, left)
+            && idle(*conn_index);
+        passes.then_some((*required_slots, *task_id))
+    }
+
+    /// The FIFO's head and the slots it needs.
+    fn head_and_need(&mut self) -> Option<(SendId, usize)> {
+        let head = self.front()?;
+        match self.entry(head)?.state {
+            Completion::Waiting { required_slots, .. } => Some((head, required_slots)),
+            _ => None,
+        }
+    }
+
+    /// Whether a waiter behind the head, which needs `head_needs` slots and
+    /// does not fit, may pass it: its `required_slots` fit in `pool.free`, no
+    /// waiter on `conn_index` arrived before it (`seq`), and the order allows
+    /// it ([`order_allows`](Self::order_allows)). `pool.passing` is B as the
+    /// caller counts it, which a scan raises by the waiters it has woken.
+    fn may_pass(
+        &self,
+        head_needs: usize,
+        conn_index: u32,
+        required_slots: usize,
+        seq: u32,
+        pool: PoolView,
+    ) -> bool {
+        required_slots <= pool.free
+            && !self.has_earlier_waiter(conn_index, seq)
+            && self.order_allows(head_needs, required_slots, pool)
+    }
+
+    /// The order's own condition for a waiter of `required_slots` to pass a
+    /// head of `head_needs`: under `Budget`, B plus its slots is at most
+    /// min(`slots`, P - H).
+    fn order_allows(&self, head_needs: usize, required_slots: usize, pool: PoolView) -> bool {
+        match self.order {
+            SendAdmissionOrder::Strict => false,
+            SendAdmissionOrder::Budget { slots } => {
+                let others = pool.slots.saturating_sub(head_needs);
+                pool.passing + required_slots <= usize::from(slots).min(others)
+            }
+        }
+    }
+
+    /// Whether a waiter on `conn_index` that arrived before `seq` is still
+    /// waiting. Visits the operations indexed under the connection, which
+    /// are few.
+    fn has_earlier_waiter(&self, conn_index: u32, seq: u32) -> bool {
+        let Some(list) = self.by_conn.get(conn_index as usize) else {
+            return false;
+        };
+        list.iter().any(|&index| {
+            matches!(
+                self.slots[index as usize].entry,
+                Some(Entry {
+                    state: Completion::Waiting { seq: earlier, .. },
+                    ..
+                }) if arrived_before(earlier, seq)
+            )
+        })
+    }
+
+    /// Whether a [`scan`](Self::scan) is due: the event loop runs its
+    /// capacity wake at the end of the iteration when this is set, as it
+    /// does when slots came back.
+    pub(crate) fn scan_due(&self) -> bool {
+        self.scan_due
+    }
+
+    /// The capacity wake under `Budget`, and the scan
+    /// [`scan_due`](Self::scan_due) asks for: push onto `wakes` the head's
+    /// task if the head fits, and otherwise the tasks of the waiters behind
+    /// it that could pass, oldest first. Clears `scan_due`, and sets it again
+    /// if it woke a passer, so that the next scan runs.
+    ///
+    /// Each waiter woken is counted against the free slots and the budget as
+    /// if it had passed, so that the waiters woken together fit together. It
+    /// reads `idle` for the waiter's connection. A waiter with no owner ([`NO_OWNER`]) is skipped
+    /// and not counted: no task would poll it, and its holder's first poll
+    /// checks it. The wakes may still be more than can pass, when the pool
+    /// changes before the woken tasks poll; each poll checks again
+    /// ([`admit`](Self::admit)).
+    ///
+    /// Cost: once the head does not fit, it visits every id in `waiting`, stale ones included (at most twice the
+    /// live ones plus 64, see [`left_waiting`](Self::left_waiting)), and for
+    /// each waiter that fits, the operations of its connection. It runs at
+    /// most once per event-loop iteration. It keeps visiting after the free
+    /// slots are used up, because a waiter that needs no slots (an empty
+    /// message) can still pass. Stale ids are skipped, not popped: only
+    /// `front` and `compact` remove ids.
+    pub(crate) fn scan(
+        &mut self,
+        pool: PoolView,
+        idle: impl Fn(u32) -> bool,
+        wakes: &mut Vec<u32>,
+    ) {
+        debug_assert_ne!(self.order, SendAdmissionOrder::Strict);
+        self.scan_due = false;
+        let Some((head, head_needs)) = self.head_and_need() else {
+            return;
+        };
+        if pool.free >= head_needs {
+            if let Some(e) = self.entry(head) {
+                wakes.push(e.task_id);
+            }
+            return;
+        }
+        self.counters.wake_scans += 1;
+        self.scan_epoch = self.scan_epoch.wrapping_add(1).max(1);
+        let woken_before = wakes.len();
+        let mut left = pool;
+        // `front` left the head at the front of `waiting`.
+        for position in 1..self.waiting.len() {
+            let id = self.waiting[position];
+            if let Some((required_slots, task_id)) = self.could_pass(id, head_needs, left, &idle) {
+                wakes.push(task_id);
+                left.free -= required_slots;
+                left.passing += required_slots;
+                let epoch = self.scan_epoch;
+                if let Some(Entry {
+                    state: Completion::Waiting { woken_in, .. },
+                    ..
+                }) = self.entry_mut(id)
+                {
+                    *woken_in = epoch;
+                }
+            }
+        }
+        let woken = wakes.len() - woken_before;
+        self.counters.scan_wakes += woken as u64;
+        // A waiter woken here that does not poll before the next scan loses
+        // its claim then, and the waiters it held back get their turn; the
+        // next scan has to run for that even if nothing else asks for it.
+        if woken > 0 {
+            self.scan_due = true;
+        }
+    }
+
+    /// `id`, a waiter [`admit`](Self::admit) let pass the head with
+    /// `slots`, was submitted: count the pass, then
+    /// [`mark_submitted`](Self::mark_submitted).
+    pub(crate) fn mark_passed(&mut self, id: SendId, slots: usize) -> Option<u32> {
+        self.counters.passing_admissions += 1;
+        self.counters.passing_slots += slots as u64;
+        self.mark_submitted(id)
     }
 
     /// The connection at `conn_index` is released (any generation): the
@@ -1025,6 +1606,86 @@ impl Executor {
             }
             let _ = self.wake_task(head);
         }
+    }
+
+    /// [`SendCompletions::set_order`]. The event loops, right after
+    /// `Executor::new`, with `Config::send_admission_order`.
+    pub(crate) fn set_send_admission_order(&mut self, order: SendAdmissionOrder) {
+        self.send_completions.set_order(order);
+    }
+
+    /// The worker's admission order. `Admission`, each poll while waiting,
+    /// to choose between [`send_capacity_turn`](Self::send_capacity_turn)
+    /// and [`send_capacity_admit`](Self::send_capacity_admit).
+    pub(crate) fn send_admission_order(&self) -> SendAdmissionOrder {
+        self.send_completions.order()
+    }
+
+    /// [`SendCompletions::admit`]. `Admission`, each poll while waiting,
+    /// under `Budget`.
+    pub(crate) fn send_capacity_admit(
+        &mut self,
+        id: SendId,
+        pool: PoolView,
+        first_poll: bool,
+        idle: impl Fn(u32) -> bool,
+    ) -> Admit {
+        self.send_completions.admit(id, pool, first_poll, idle)
+    }
+
+    /// [`SendCompletions::mark_passed`]. `Admission`, after submitting a
+    /// send that passed the head. `id` was behind the head, so the head does
+    /// not change and nothing is woken.
+    pub(crate) fn mark_send_passed(&mut self, id: SendId, slots: usize) {
+        let next = self.send_completions.mark_passed(id, slots);
+        debug_assert!(next.is_none(), "a send that passed was the head");
+    }
+
+    /// The worker's [`SendAdmissionCounters`]: the FIFO's counts, with B and
+    /// its largest value from `pool`.
+    pub(crate) fn send_admission_counters(&self, pool: &SendCopyPool) -> SendAdmissionCounters {
+        SendAdmissionCounters {
+            passing_held: pool.passing_held() as u64,
+            passing_held_max: pool.passing_peak() as u64,
+            main_free: pool.free_count() as u64,
+            ..self.send_completions.counters
+        }
+    }
+
+    /// [`SendCompletions::scan_due`]. The event loops' end-of-iteration
+    /// capacity wake runs when this is set or slots came back.
+    pub(crate) fn send_scan_due(&self) -> bool {
+        self.send_completions.scan_due()
+    }
+
+    /// The event loops' end-of-iteration capacity wake, with the worker's
+    /// copy pool. Under `Strict`,
+    /// [`wake_send_capacity`](Self::wake_send_capacity) with the free count.
+    /// Under `Budget`, [`SendCompletions::scan`] plus a wake of every task it
+    /// returns; `idle` answers, for a connection index, whether the
+    /// connection has no send queued or in flight and its last settled send
+    /// did not wait for room (`Driver::send_idle`). Either way each wake is
+    /// counted under `cfg(test)` in [`Executor::send_capacity_wakes`].
+    pub(crate) fn wake_send_capacity_in(
+        &mut self,
+        pool: &SendCopyPool,
+        idle: impl Fn(u32) -> bool,
+    ) {
+        if self.send_completions.order() == SendAdmissionOrder::Strict {
+            self.wake_send_capacity(pool.free_count());
+            return;
+        }
+        let mut wakes = std::mem::take(&mut self.send_completions.wake_scratch);
+        let view = PoolView::of(pool);
+        self.send_completions.scan(view, idle, &mut wakes);
+        #[cfg(test)]
+        {
+            self.send_capacity_wakes += wakes.len() as u32;
+        }
+        for task_id in wakes.drain(..) {
+            let _ = self.wake_task(task_id);
+        }
+        self.send_completions.wake_scratch = wakes;
     }
 
     /// [`SendCompletions::abort_connection`] plus a wake of every returned
@@ -1918,5 +2579,505 @@ mod tests {
             assert!(q.take_result(id).is_some());
         }
         assert_eq!(q.live(), 0);
+    }
+
+    // ── The Budget order ────────────────────────────────────────────────
+
+    /// `Budget` with a budget that never binds, for the tests that are not
+    /// about it.
+    const UNBOUNDED: SendAdmissionOrder = SendAdmissionOrder::Budget { slots: u16::MAX };
+
+    fn pool(free: usize, passing: usize, slots: usize) -> PoolView {
+        PoolView {
+            free,
+            passing,
+            slots,
+        }
+    }
+
+    fn idle(_conn_index: u32) -> bool {
+        true
+    }
+
+    /// The task ids `scan` wakes for `view`, every connection idle.
+    fn scanned(q: &mut SendCompletions, view: PoolView) -> Vec<u32> {
+        let mut wakes = Vec::new();
+        q.scan(view, |_| true, &mut wakes);
+        wakes
+    }
+
+    /// Under `Strict` the queue keeps no arrival numbers and asks for no
+    /// scan, whatever leaves the FIFO: none of `Budget`'s work runs.
+    #[test]
+    fn strict_keeps_no_arrival_numbers_and_asks_for_no_scan() {
+        let mut q = SendCompletions::new();
+        let head = q.enqueue(1, 0, 6, task(1));
+        let behind = q.enqueue(2, 0, 1, task(2));
+        let gone = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(q.next_seq, 0);
+        assert!(!q.turn(behind, 4), "nothing passes the head");
+        q.cancel(gone);
+        q.mark_submitted(head);
+        q.remove_connection(2);
+        assert!(!q.scan_due());
+        assert_eq!(q.counters, SendAdmissionCounters::default());
+    }
+
+    /// A waiter that fits passes a head that does not, and once the head
+    /// fits the head is admitted, not the waiter.
+    #[test]
+    fn a_waiter_that_fits_passes_a_head_that_does_not() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        let head = q.enqueue(1, 0, 6, task(1));
+        let small = q.enqueue(2, 0, 1, task(2));
+        assert_eq!(q.admit(head, pool(4, 0, 8), true, idle), Admit::Wait);
+        assert_eq!(
+            q.admit(small, pool(4, 0, 8), true, idle),
+            Admit::Pass { slots: 1 }
+        );
+        assert_eq!(
+            q.admit(small, pool(6, 0, 8), true, idle),
+            Admit::Wait,
+            "the head fits and goes first"
+        );
+        assert_eq!(q.admit(head, pool(6, 0, 8), true, idle), Admit::Head);
+        assert_eq!(
+            q.admit(small, pool(0, 0, 8), true, idle),
+            Admit::Wait,
+            "a waiter that does not fit waits"
+        );
+    }
+
+    /// No waiter passes while an earlier waiter on its own connection
+    /// waits, the head's connection included; once the earlier one leaves,
+    /// it may.
+    #[test]
+    fn a_waiter_whose_connection_has_an_earlier_waiter_does_not_pass() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        let head = q.enqueue(1, 0, 6, task(1));
+        let behind_head = q.enqueue(1, 0, 1, task(2));
+        let large = q.enqueue(2, 0, 5, task(3));
+        let small = q.enqueue(2, 0, 1, task(4));
+        let view = pool(4, 0, 8);
+        assert_eq!(q.admit(behind_head, view, true, idle), Admit::Wait);
+        assert_eq!(q.admit(large, view, true, idle), Admit::Wait);
+        assert_eq!(q.admit(small, view, true, idle), Admit::Wait);
+        q.cancel(large);
+        assert_eq!(q.admit(small, view, true, idle), Admit::Pass { slots: 1 });
+        q.mark_submitted(head);
+        assert_eq!(
+            q.admit(behind_head, view, true, idle),
+            Admit::Head,
+            "the next on the head's connection is the new head"
+        );
+    }
+
+    /// B plus a passing send's slots stays within min(slots, P - H), with B
+    /// counted by a real pool as the passing sends take slots.
+    #[test]
+    fn budget_never_lets_passing_sends_hold_more_than_the_budget() {
+        // (budget, P, H, slots each waiter needs): the budget binds, then
+        // P - H binds.
+        let cases = [(3u16, 16u16, 10, 1), (10, 16, 14, 1), (4, 16, 10, 3)];
+        for (budget, slots, head_needs, each) in cases {
+            budget_case(budget, slots, head_needs, each);
+        }
+    }
+
+    /// One case of the test above: a budget of `budget`, a pool of `slots`,
+    /// a head of `head_needs` and waiters of `each` slots.
+    fn budget_case(budget: u16, slots: u16, head_needs: usize, each: usize) {
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Budget { slots: budget });
+        let mut copy_pool = SendCopyPool::new(slots, 8);
+        copy_pool.track_passing();
+        // Sends outside the FIFO hold all but 8 slots, so the head waits.
+        let held: Vec<u16> = (0..slots - 8)
+            .map(|_| copy_pool.copy_in(b"x").unwrap().0)
+            .collect();
+        q.enqueue(1, 0, head_needs, task(1));
+        let limit = usize::from(budget).min(usize::from(slots) - head_needs);
+        let mut passed = 0;
+        for conn in 2..20 {
+            let id = q.enqueue(conn, 0, each, task(conn));
+            match q.admit(id, PoolView::of(&copy_pool), true, idle) {
+                Admit::Pass { slots } => {
+                    copy_pool.begin_passing();
+                    for _ in 0..slots {
+                        copy_pool.copy_in(b"p").unwrap();
+                    }
+                    copy_pool.end_passing();
+                    q.mark_submitted(id);
+                    passed += slots;
+                }
+                Admit::Wait => {
+                    q.cancel(id);
+                }
+                Admit::Head => panic!("not the head"),
+            }
+            assert!(copy_pool.passing_held() <= limit, "B within min(R, P - H)");
+        }
+        assert_eq!(copy_pool.passing_held(), passed);
+        assert!(
+            passed + each > limit,
+            "budget {budget}: stopped only at the limit, at {passed}"
+        );
+        for slot in held {
+            copy_pool.release(slot);
+        }
+    }
+
+    /// A budget above the pool's slot count admits as one of P - H does.
+    #[test]
+    fn a_budget_above_the_pool_admits_as_the_pool_does() {
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Budget { slots: 1000 });
+        q.enqueue(1, 0, 6, task(1));
+        let fits = q.enqueue(2, 0, 2, task(2));
+        let over = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(fits, pool(4, 0, 8), true, idle),
+            Admit::Pass { slots: 2 }
+        );
+        q.mark_passed(fits, 2);
+        assert_eq!(
+            q.admit(over, pool(2, 2, 8), true, idle),
+            Admit::Wait,
+            "B = 2 = P - H"
+        );
+    }
+
+    /// No waiter passes while its connection has a send queued or in
+    /// flight, or its last settled send waited for room; the scan reads the
+    /// same test.
+    #[test]
+    fn a_waiter_whose_connection_is_busy_does_not_pass() {
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Budget { slots: 8 });
+        q.enqueue(1, 0, 6, task(1));
+        let w = q.enqueue(2, 0, 1, task(2));
+        assert_eq!(q.admit(w, pool(4, 0, 8), true, |_| false), Admit::Wait);
+        let mut wakes = Vec::new();
+        q.scan(pool(4, 0, 8), |conn| conn != 2, &mut wakes);
+        assert!(wakes.is_empty(), "the scan reads the same test");
+        q.scan(pool(4, 0, 8), |_| true, &mut wakes);
+        assert_eq!(wakes, vec![task(2)]);
+        assert_eq!(
+            q.admit(w, pool(4, 0, 8), true, idle),
+            Admit::Pass { slots: 1 }
+        );
+    }
+
+    /// A waiter admitted past the head leaves its id in `waiting`, like a
+    /// cancelled one: `front` pops it once it reaches the front, and the
+    /// live count drops at once.
+    #[test]
+    fn a_waiter_that_passed_leaves_its_id_for_front_to_pop() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        let head = q.enqueue(1, 0, 6, task(1));
+        let w = q.enqueue(2, 0, 1, task(2));
+        assert_eq!(
+            q.admit(w, pool(4, 0, 8), true, idle),
+            Admit::Pass { slots: 1 }
+        );
+        assert_eq!(q.mark_submitted(w), None, "passing promotes nobody");
+        assert_eq!(q.waiting_len(), 1);
+        assert_eq!(
+            q.waiting.len(),
+            2,
+            "the id stays until it reaches the front"
+        );
+        assert_eq!(q.mark_submitted(head), None, "no waiter left");
+        assert!(q.waiting.is_empty(), "popped behind the head");
+        assert_eq!(q.complete(w, Ok(1)), Some(task(2)));
+        assert_eq!(q.take_result(w).unwrap().unwrap(), 1);
+    }
+
+    /// The scan wakes the head alone when it fits, and otherwise the oldest
+    /// waiters that could pass, counting each against the free slots,
+    /// skipping one behind an earlier waiter on its connection, a stale id
+    /// and a waiter with no owner. A waiter that needs no slots is woken
+    /// after the free slots run out. Having woken passers, it asks for the
+    /// next scan, which does not wake them again before they poll.
+    #[test]
+    fn scan_wakes_the_waiters_that_could_pass_oldest_first() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        let head = q.enqueue(1, 0, 10, task(1));
+        q.enqueue(2, 0, 2, task(2));
+        let gone = q.enqueue(3, 0, 1, task(3));
+        q.enqueue(4, 0, 3, task(4));
+        q.enqueue(2, 0, 1, task(5));
+        q.enqueue(5, 0, 1, NO_OWNER);
+        q.enqueue(6, 0, 1, task(6));
+        q.enqueue(7, 0, 5, task(7));
+        q.enqueue(8, 0, 0, task(8));
+        q.cancel(gone);
+        assert!(q.scan_due());
+
+        assert_eq!(
+            scanned(&mut q, pool(10, 0, 16)),
+            vec![task(1)],
+            "the head fits"
+        );
+        assert_eq!(
+            scanned(&mut q, pool(6, 0, 16)),
+            vec![task(2), task(4), task(6), task(8)],
+            "2 + 3 + 1 slots, then the empty message"
+        );
+        assert!(q.scan_due(), "a scan that woke passers asks for the next");
+        assert_eq!(q.front(), Some(head), "the scan pops nothing");
+        let again = scanned(&mut q, pool(6, 0, 16));
+        assert!(
+            [task(2), task(4), task(6), task(8)]
+                .iter()
+                .all(|woken| !again.contains(woken)),
+            "the next scan does not wake them again before they poll: {again:?}"
+        );
+    }
+
+    /// The scan counts the waiters it wakes against the budget as if they
+    /// had passed.
+    #[test]
+    fn scan_counts_woken_waiters_against_the_budget() {
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Budget { slots: 3 });
+        q.enqueue(1, 0, 10, task(1));
+        for conn in 2..8 {
+            q.enqueue(conn, 0, 1, task(conn));
+        }
+        assert_eq!(
+            scanned(&mut q, pool(6, 1, 16)),
+            vec![task(2), task(3)],
+            "B = 1, so two more fit the budget of 3"
+        );
+    }
+
+    /// Under `Budget`, `scan_due` is set whenever a waiter leaves the
+    /// waiting state, whatever the way, and by a later poll told to wait; a
+    /// first poll told to wait does not set it.
+    #[test]
+    fn scan_due_follows_every_way_a_waiter_leaves() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        let head = q.enqueue(1, 0, 6, task(1));
+        let w = q.enqueue(1, 0, 1, task(2));
+        assert_eq!(q.admit(w, pool(4, 0, 8), true, idle), Admit::Wait);
+        assert!(!q.scan_due(), "a first poll that waits");
+        assert_eq!(q.admit(w, pool(4, 0, 8), false, idle), Admit::Wait);
+        assert!(q.scan_due(), "a later poll that waits");
+
+        let leave: [fn(&mut SendCompletions, SendId); 5] = [
+            |q, id| {
+                q.cancel(id);
+            },
+            |q, id| {
+                q.mark_submitted(id);
+            },
+            |q, _| {
+                q.remove_connection(3);
+            },
+            |q, _| {
+                q.fail_waiting(3, 0, io::ErrorKind::BrokenPipe, "shut down");
+            },
+            |q, _| {
+                q.abort_connection(3, 0);
+            },
+        ];
+        for (n, leave) in leave.iter().enumerate() {
+            let id = q.enqueue(3, 0, 1, task(10));
+            q.scan(pool(0, 0, 8), |_| true, &mut Vec::new());
+            assert!(!q.scan_due());
+            leave(&mut q, id);
+            assert!(q.scan_due(), "way {n}");
+        }
+        q.scan(pool(0, 0, 8), |_| true, &mut Vec::new());
+        q.mark_submitted(head);
+        assert!(q.scan_due(), "the head was admitted");
+    }
+
+    /// The FIFO's counts: a pass and its slots, and a scan that looks behind
+    /// the head, with the waiters it wakes. A scan that stops at a head that
+    /// fits is not counted.
+    #[test]
+    fn counters_record_passes_and_scans() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        let head = q.enqueue(1, 0, 6, task(1));
+        let a = q.enqueue(2, 0, 2, task(2));
+        q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(a, pool(4, 0, 8), true, idle),
+            Admit::Pass { slots: 2 }
+        );
+        assert_eq!(q.mark_passed(a, 2), None);
+        assert_eq!(
+            scanned(&mut q, pool(2, 2, 8)),
+            Vec::<u32>::new(),
+            "B = P - H"
+        );
+        assert_eq!(scanned(&mut q, pool(2, 0, 8)), vec![task(3)]);
+        assert_eq!(
+            q.counters,
+            SendAdmissionCounters {
+                passing_admissions: 1,
+                passing_slots: 2,
+                wake_scans: 2,
+                scan_wakes: 1,
+                ..SendAdmissionCounters::default()
+            }
+        );
+
+        q.cancel(head);
+        assert_eq!(scanned(&mut q, pool(6, 0, 8)), vec![task(3)], "it fits");
+        assert_eq!(q.counters.wake_scans, 2, "a scan of a head that fits");
+    }
+
+    /// The executor's counters take B and its largest value from the pool.
+    #[test]
+    fn executor_counters_take_passing_slots_from_the_pool() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.set_send_admission_order(UNBOUNDED);
+        let mut copy_pool = SendCopyPool::new(8, 8);
+        copy_pool.track_passing();
+        copy_pool.begin_passing();
+        let (first, _p, _l) = copy_pool.copy_in(b"p").unwrap();
+        copy_pool.copy_in(b"q").unwrap();
+        copy_pool.end_passing();
+        copy_pool.release(first);
+        let counters = exec.send_admission_counters(&copy_pool);
+        assert_eq!((counters.passing_held, counters.passing_held_max), (1, 2));
+        assert_eq!(counters.main_free, 7);
+    }
+
+    /// Heads admitted at the front keep the stale ids that passers left
+    /// behind them within twice the live ids plus 64, the bound the scan's
+    /// cost rests on.
+    #[test]
+    fn heads_admitted_at_the_front_keep_stale_ids_bounded() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        let heads: Vec<SendId> = (0..65).map(|i| q.enqueue(i, 0, 6, task(i))).collect();
+        for i in 0..100 {
+            let passer = q.enqueue(100 + i, 0, 1, task(100 + i));
+            assert_eq!(
+                q.admit(passer, pool(4, 0, 8), true, idle),
+                Admit::Pass { slots: 1 }
+            );
+            q.mark_submitted(passer);
+        }
+        for head in heads {
+            q.mark_submitted(head);
+            assert!(
+                q.waiting.len() <= 2 * q.waiting_len() + 64,
+                "{} ids for {} live",
+                q.waiting.len(),
+                q.waiting_len()
+            );
+        }
+    }
+
+    /// A waiter's first poll does not take the room an older parked waiter
+    /// could pass with: the older one is counted first, as the scan that
+    /// wakes it counts it. One slot coming back, and then a budget of 2 with
+    /// B falling from 2 to 1.
+    #[test]
+    fn an_older_waiter_that_could_pass_goes_before_a_newer_one() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        q.enqueue(1, 0, 6, task(1));
+        let older = q.enqueue(2, 0, 1, task(2));
+        assert_eq!(q.admit(older, pool(0, 0, 8), true, idle), Admit::Wait);
+        let newer = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(newer, pool(1, 0, 8), true, idle),
+            Admit::Wait,
+            "the slot is the older waiter's"
+        );
+        assert!(q.scan_due(), "the older waiter is woken");
+        assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(2)]);
+        assert_eq!(
+            q.admit(older, pool(1, 0, 8), false, idle),
+            Admit::Pass { slots: 1 }
+        );
+
+        let mut q = SendCompletions::with_order(SendAdmissionOrder::Budget { slots: 2 });
+        q.enqueue(1, 0, 10, task(1));
+        let older = q.enqueue(2, 0, 1, task(2));
+        let budget = |passing| pool(4, passing, 16);
+        assert_eq!(q.admit(older, budget(2), true, idle), Admit::Wait);
+        let newer = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(q.admit(newer, budget(1), true, idle), Admit::Wait);
+        assert_eq!(
+            q.admit(older, budget(1), false, idle),
+            Admit::Pass { slots: 1 }
+        );
+    }
+
+    /// An older waiter that a scan woke and that does not poll keeps its
+    /// claim on the room only until the next scan: then a newer waiter that
+    /// fits is woken and passes.
+    #[test]
+    fn an_older_waiter_that_does_not_poll_loses_its_claim_at_the_next_scan() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        q.enqueue(1, 0, 6, task(1));
+        let older = q.enqueue(2, 0, 1, task(2));
+        assert_eq!(q.admit(older, pool(0, 0, 8), true, idle), Admit::Wait);
+        assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(2)]);
+        let newer = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(
+            q.admit(newer, pool(1, 0, 8), true, idle),
+            Admit::Wait,
+            "the older one was woken for that slot this iteration"
+        );
+        assert!(q.scan_due());
+        assert_eq!(
+            scanned(&mut q, pool(1, 0, 8)),
+            vec![task(3)],
+            "the older one did not poll: the newer one is woken"
+        );
+        assert_eq!(
+            q.admit(newer, pool(1, 0, 8), false, idle),
+            Admit::Pass { slots: 1 }
+        );
+
+        // Once the older one polls, it competes again.
+        assert_eq!(q.admit(older, pool(0, 0, 8), false, idle), Admit::Wait);
+        assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(2)]);
+    }
+
+    /// Two waiters of one task, the task polling only the newer: the
+    /// newer is admitted within two scans, and then the scans stop, instead
+    /// of each poll asking for a scan that wakes the same task again.
+    #[test]
+    fn a_task_that_polls_only_its_newer_waiter_does_not_spin() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        q.enqueue(1, 0, 6, task(1));
+        let older = q.enqueue(2, 0, 1, task(9));
+        let newer = q.enqueue(3, 0, 1, task(9));
+        assert_eq!(q.admit(older, pool(0, 0, 8), true, idle), Admit::Wait);
+        assert_eq!(q.admit(newer, pool(0, 0, 8), true, idle), Admit::Wait);
+        let mut scans = 0;
+        let mut admitted = false;
+        while q.scan_due() || scans == 0 {
+            scans += 1;
+            assert!(scans <= 4, "still scanning after {scans} scans");
+            if !scanned(&mut q, pool(1, 0, 8)).is_empty()
+                && !admitted
+                && q.admit(newer, pool(1, 0, 8), false, idle) == (Admit::Pass { slots: 1 })
+            {
+                q.mark_passed(newer, 1);
+                admitted = true;
+            }
+        }
+        assert!(admitted, "the newer waiter passed");
+    }
+
+    /// A scan that wakes passers asks for the next: here both waiters parked
+    /// before the slot came back, so nothing else would ask, and only the
+    /// next scan finds the older one's claim gone and wakes the newer one.
+    #[test]
+    fn a_scan_that_woke_passers_asks_for_the_next() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        q.enqueue(1, 0, 6, task(1));
+        let older = q.enqueue(2, 0, 1, task(2));
+        let newer = q.enqueue(3, 0, 1, task(3));
+        assert_eq!(q.admit(older, pool(0, 0, 8), true, idle), Admit::Wait);
+        assert_eq!(q.admit(newer, pool(0, 0, 8), true, idle), Admit::Wait);
+        assert!(!q.scan_due(), "first polls ask for nothing");
+        assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(2)]);
+        assert!(q.scan_due(), "the next scan is due");
+        assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(3)]);
     }
 }

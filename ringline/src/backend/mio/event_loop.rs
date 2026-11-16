@@ -178,13 +178,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             disk_io_pool,
         )?;
 
-        let executor = Executor::new(
+        let mut executor = Executor::new(
             config.max_connections,
             config.standalone_task_capacity,
             crate::runtime::TIMER_SLOTS,
             config.udp_bind.len() as u32,
             config.udp_recv_queue_capacity,
         );
+        executor.set_send_admission_order(config.send_admission_order);
         // A waker woken off this thread rings the worker's own wake fd.
         if let Some(handle) = config
             .wake_keep_alive
@@ -1651,11 +1652,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// [`drain_send_completions`](Self::drain_send_completions).
     ///
     /// Separate from the loop body so the tests can drive it directly.
+    ///
+    /// Under `SendAdmissionOrder::Budget` it also runs when the admission
+    /// queue asks for a scan (`Executor::send_scan_due`): a waiter can become
+    /// able to pass the head without any permit coming back.
     fn wake_capacity_if_released(&mut self) {
-        if self.driver.capacity_released {
+        if self.driver.capacity_released || self.executor.send_scan_due() {
             self.driver.capacity_released = false;
+            let driver = &self.driver;
             self.executor
-                .wake_send_capacity(self.driver.send_copy_pool.free_count());
+                .wake_send_capacity_in(&driver.send_copy_pool, |conn| driver.send_idle(conn));
         }
     }
 

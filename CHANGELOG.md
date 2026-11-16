@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `SendAdmissionOrder` and `ConfigBuilder::send_admission_order`: the order
+  in which each worker admits `send_admitted` and `send_backpressured` sends
+  that wait for send-pool capacity. `Strict` admits only the oldest waiter.
+  `Budget { slots }`, the default with 32 slots, also admits a waiter that
+  fits ahead of an older waiter on another connection that does not, while
+  the sends admitted that way hold at most `slots` slots, and no more than
+  the pool less the older waiter's need, and only onto a connection with no
+  send queued or in flight whose last send did not wait for room in the
+  socket. A small reply then no longer waits behind a large one that does not
+  fit. Sends on one connection are admitted in order under either.
+  `build()` refuses `Budget { slots: 0 }`.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been
   handed to the kernel, without taking a send-pool slot. A server that sends
@@ -386,6 +397,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Bounded sends (`send_admitted`, `send_backpressured`) are admitted under
+  `SendAdmissionOrder::Budget { slots: 32 }` by default, so one can be
+  admitted ahead of an older waiter on another connection when the older one
+  does not fit the send pool; before, admission was strictly first come first
+  served per worker. Sends on one connection keep their order. Set
+  `ConfigBuilder::send_admission_order(SendAdmissionOrder::Strict)` to keep
+  strict order across connections.
 - **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` (on
   `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`, resolving with
   `data.len()`, instead of `io::Result<()>`. `send_parts().build(f)`
