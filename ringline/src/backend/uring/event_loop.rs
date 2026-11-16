@@ -11595,7 +11595,7 @@ mod tests {
         // below, so the slice stays valid.
         let view = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-        let err = with_driver_state(&mut el, || stale.forward_recv_buf(view).map(drop))
+        let err = with_driver_state(&mut el, || stale.forward_recv_buf(view))
             .expect_err("a stale handle must be refused");
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         assert_eq!(
@@ -11797,7 +11797,7 @@ mod tests {
         let data = el.driver.accumulators.data(conn_index);
         // SAFETY: the accumulator is not touched before the call below.
         let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-        let err = with_driver_state(&mut el, || old.forward_recv_buf(view).map(drop))
+        let err = with_driver_state(&mut el, || old.forward_recv_buf(view))
             .expect_err("a stale handle must be refused");
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         assert_eq!(

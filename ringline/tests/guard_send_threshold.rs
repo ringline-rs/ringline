@@ -247,7 +247,7 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
                 .map(drop);
             trace(port, format!("send_parts -> {result:?}"));
             if let Err(e) = result {
-                let r = conn.send(format!("ERR:{e}").as_bytes()).map(drop);
+                let r = conn.send(format!("ERR:{e}").as_bytes());
                 trace(port, format!("ERR send -> {r:?}"));
             }
 
@@ -307,7 +307,7 @@ impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
                 .map(drop);
             trace(port, format!("send_chain -> {result:?}"));
             if let Err(e) = result {
-                let r = conn.send(format!("ERR:{e}").as_bytes()).map(drop);
+                let r = conn.send(format!("ERR:{e}").as_bytes());
                 trace(port, format!("ERR send -> {r:?}"));
             }
 

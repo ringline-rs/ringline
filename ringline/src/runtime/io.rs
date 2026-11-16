@@ -4432,6 +4432,22 @@ enum SendCompletionState {
     Ready(Option<io::Result<u32>>),
 }
 
+/// Shows the connection the send targets, and `Pending` while the result is
+/// to come or `Ready` once it is known, including after a poll has taken it.
+impl fmt::Debug for SendCompletion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match self.state {
+            SendCompletionState::Pending(_) => "Pending",
+            SendCompletionState::Ready(_) => "Ready",
+        };
+        f.debug_struct("SendCompletion")
+            .field("conn_index", &self.conn_index)
+            .field("generation", &self.generation)
+            .field("state", &format_args!("{state}"))
+            .finish_non_exhaustive()
+    }
+}
+
 impl SendCompletion {
     /// A future for the send `id` names, which the caller has submitted.
     fn pending(conn_index: u32, generation: u32, id: SendId) -> Self {
@@ -4785,6 +4801,34 @@ impl Future for YieldNow {
         self.yielded = true;
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod send_completion_debug_tests {
+    use super::*;
+
+    /// `Debug` shows the connection and whether the result is known, and
+    /// takes nothing: a `Ready` result is still there for the first poll.
+    #[test]
+    fn debug_shows_the_connection_and_the_state() {
+        let ready = SendCompletion::ready(3, 7, Ok(5));
+        assert_eq!(
+            format!("{ready:?}"),
+            "SendCompletion { conn_index: 3, generation: 7, state: Ready, .. }"
+        );
+        assert!(matches!(
+            ready.state,
+            SendCompletionState::Ready(Some(Ok(5)))
+        ));
+
+        // Dropped with no driver state installed, it touches no table.
+        let mut table = crate::runtime::send_completion::SendCompletions::new();
+        let pending = SendCompletion::pending(3, 7, table.register(3, 3));
+        assert_eq!(
+            format!("{pending:?}"),
+            "SendCompletion { conn_index: 3, generation: 7, state: Pending, .. }"
+        );
     }
 }
 
