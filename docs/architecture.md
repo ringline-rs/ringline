@@ -209,8 +209,10 @@ slicing of the accumulator, not a reference to kernel-owned ring memory.
 `send` eagerly submits an owned copy and returns `SendCompletion`, which waits
 for the logical send's completion; dropping it does not cancel the send.
 Backend completion handling runs either way: the completion is required to
-release pool or slab resources and advance the queue. On io_uring, `send_parts` can retain guarded user memory for zero-copy
-sends; on Mio guards are consumed by copying.
+release pool or slab resources and advance the queue. The `build` and
+`submit_batch` of `send_parts`, `send_chain` and `forward_recv_buf` return a
+`SendCompletion` the same way. On io_uring, `send_parts` can retain guarded
+user memory for zero-copy sends; on Mio guards are consumed by copying.
 
 `send_backpressured` differs from all of these in *when* it is admitted. The
 others decide at call time and fail if the send-copy pool is exhausted; this

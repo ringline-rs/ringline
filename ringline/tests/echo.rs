@@ -4992,7 +4992,7 @@ impl AsyncEventHandler for SendPartsHandler {
                 .send_parts()
                 .build(|b| b.copy(part1).copy(part2).copy(part3).submit())
             {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(e) => {
                     let _ = conn.send(format!("ERR:{e}").as_bytes());
                 }

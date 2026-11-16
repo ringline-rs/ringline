@@ -54,7 +54,7 @@ struct InFlightSendEntry {
     /// (`submit_next_queued_inner` lifts them, since the
     /// coalesced completion releases the slots), and by
     /// [`set_send_id`](InFlightSendSlab::set_send_id) for a zero-copy
-    /// (`submit_batch_await`) entry, which carries at most one.
+    /// (`send_parts`, `forward_recv_buf`) entry, which carries at most one.
     sends: SendRun,
     /// Bytes of the entry the kernel has sent so far (`try_advance`).
     sent: u32,

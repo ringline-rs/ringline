@@ -1197,13 +1197,12 @@ impl ConnCtx {
         })
     }
 
-    // ── Send (synchronous / fire-and-forget) ─────────────────────────
+    // ── Send from the accumulator ────────────────────────────────────
 
     /// Crate-internal body of [`SendHalf::forward_recv_buf`]; see that method
     /// for behaviour and errors.
-    pub(crate) fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
-        with_state(|driver, _| {
-            #[cfg_attr(not(has_io_uring), allow(unused_variables))]
+    pub(crate) fn forward_recv_buf(&self, data: &[u8]) -> io::Result<SendCompletion> {
+        with_state(|driver, executor| {
             let conn_index = self.conn_index;
 
             // Before the zero-copy branch: it acts on the slot's accumulator,
@@ -1253,26 +1252,34 @@ impl ConnCtx {
                     // keeps `data` allocated while the caller's closure runs.
                     let keep = frozen.clone();
                     // `guard()` honours `send_zc_threshold`, so a forward below
-                    // it still folds into a copy exactly as before.
+                    // it still folds into a copy exactly as before. The id
+                    // settles when the guarded (or folded) send completes.
+                    let id = executor.register_send(conn_index);
                     let result = driver
                         .make_ctx()
                         .send_parts(token)
                         .guard(crate::guard::GuardBox::new(AccumulatorGuard(frozen)))
-                        .submit();
-                    if result.is_err() {
+                        .submit_awaited(id);
+                    if let Err(e) = result {
+                        executor.withdraw_send(id);
                         driver.accumulators.put_back(conn_index, keep);
                         driver.forward_zc_consumed[conn_index as usize] = 0;
-                    } else {
-                        driver.forward_zc_held[conn_index as usize] = Some(keep);
-                        driver.forwards_recv_buf[conn_index as usize] = true;
+                        return Err(e);
                     }
-                    return result;
+                    driver.forward_zc_held[conn_index as usize] = Some(keep);
+                    driver.forwards_recv_buf[conn_index as usize] = true;
+                    return Ok(SendCompletion::pending(conn_index, self.generation, id));
                 }
             }
 
-            // Not the whole accumulator, or mio: copy send.
+            // Not the whole accumulator, or mio: copy send, as `send`.
+            let id = executor.register_send(conn_index);
             let mut ctx = driver.make_ctx();
-            ctx.send(self.id(), data)
+            if let Err(e) = ctx.send_awaited(self.id(), data, id) {
+                executor.withdraw_send(id);
+                return Err(e);
+            }
+            Ok(SendCompletion::pending(conn_index, self.generation, id))
         })
     }
 
@@ -1666,9 +1673,10 @@ impl ConnCtx {
 /// Builder for scatter-gather sends in the async API.
 ///
 /// From [`SendHalf::send_parts`]. [`build`](Self::build) takes a closure that
-/// chains `.copy()` and `.guard()` and ends with `.submit()`. This is a synchronous
-/// builder: `build` and `submit_batch` are fire-and-forget, and
-/// `submit_batch_await` returns a [`SendCompletion`].
+/// chains `.copy()` and `.guard()` and ends with `.submit()`;
+/// [`submit_batch`](Self::submit_batch) takes pre-classified `SendPart`s. Both
+/// submit the send at the call and return a [`SendCompletion`]; dropping it
+/// does not cancel the send.
 ///
 /// `!Send`: its connection id names a slot in its worker's table, and a send
 /// through it on another worker would go out on that worker's connection.
@@ -1687,32 +1695,56 @@ pub struct AsyncSendBuilder {
 #[cfg(has_io_uring)]
 impl AsyncSendBuilder {
     /// Build and submit the send by calling the provided closure with a
-    /// `SendBuilder`.
+    /// `SendBuilder`, and return a [`SendCompletion`] that resolves with the
+    /// total length of its parts once the send completes.
     ///
-    /// The closure receives the `SendBuilder` and should chain `.copy()` / `.guard()`
-    /// calls then call `.submit()`.
+    /// The closure chains `.copy()` / `.guard()` calls and ends with
+    /// `.submit()`, as a [`send_chain`](SendHalf::send_chain) closure ends
+    /// with `.finish()`. `submit` refuses a batch that carries no bytes with
+    /// `InvalidInput`. A closure that returns `Ok` without a successful
+    /// `submit` sent nothing, and `build` returns `InvalidInput`.
     ///
     /// # Example
     /// ```no_run
-    /// # fn example(tx: &mut ringline::SendHalf) -> std::io::Result<()> {
-    /// tx.send_parts().build(|b| {
+    /// # async fn example(tx: &mut ringline::SendHalf) -> std::io::Result<()> {
+    /// let sent = tx.send_parts().build(|b| {
     ///     b.copy(b"header").submit()
     /// })?;
+    /// sent.await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn build<F>(self, f: F) -> io::Result<()>
+    pub fn build<F>(self, f: F) -> io::Result<SendCompletion>
     where
         F: FnOnce(crate::handler::SendBuilder<'_, '_>) -> io::Result<()>,
     {
-        with_state(|driver, _| {
+        with_state(|driver, executor| {
+            let conn_index = self.token.index;
+            let id = executor.register_send(conn_index);
             let mut ctx = driver.make_ctx();
-            let builder = ctx.send_parts(self.token);
-            f(builder)
+            let builder = ctx.send_parts_awaited(self.token, id);
+            if let Err(e) = f(builder) {
+                executor.withdraw_send(id);
+                return Err(e);
+            }
+            if !ctx.parts_id_carried {
+                executor.withdraw_send(id);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the build closure submitted no send",
+                ));
+            }
+            Ok(SendCompletion::pending(
+                conn_index,
+                self.token.generation,
+                id,
+            ))
         })
     }
 
-    /// Submit a scatter-gather send from pre-classified `SendPart`s.
+    /// Submit a scatter-gather send from pre-classified `SendPart`s, and
+    /// return the number of parts submitted (always `parts.len()`) with a
+    /// [`SendCompletion`] that resolves when the batch has been sent.
     ///
     /// This avoids the lifetime constraints of the closure-based [`build()`](Self::build),
     /// allowing callers to mix copy and guard parts in a single SQE from borrowed data.
@@ -1721,48 +1753,15 @@ impl AsyncSendBuilder {
     /// iovec or guard limits, or on a plaintext connection its copy parts
     /// together exceed one send-pool slot, the entire batch is rejected with
     /// `Err` (`InvalidInput`; nothing is sent, guard parts are dropped): the
-    /// call never consumes a prefix. On success, returns the number of parts
-    /// submitted (always `parts.len()`); callers wanting larger batches
-    /// should split them (ringline-redis flushes at 8 guards or 17 iovecs).
-    pub fn submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<usize> {
-        use crate::handler::SendPart;
-        with_state(|driver, _| {
-            let mut ctx = driver.make_ctx();
-            let mut builder = ctx.send_parts(self.token);
-            let mut consumed = 0usize;
-            for part in parts {
-                match part {
-                    SendPart::Copy(data) => {
-                        builder = builder.copy(data);
-                    }
-                    SendPart::Guard(guard) => {
-                        builder = builder.guard(guard);
-                    }
-                }
-                consumed += 1;
-            }
-            if consumed == 0 {
-                return Ok(0);
-            }
-            builder.submit()?;
-            Ok(consumed)
-        })
-    }
-
-    /// Like [`submit_batch`](Self::submit_batch), but returns a [`SendCompletion`]
-    /// that resolves when the batch has been sent.
+    /// call never consumes a prefix. Callers wanting larger batches should
+    /// split them (ringline-redis flushes at 8 guards or 17 iovecs). A batch
+    /// that is empty or carries no bytes is rejected with `InvalidInput`.
     ///
-    /// Use this when the caller needs completion-paced backpressure rather
-    /// than fire-and-forget. Awaiting the future parks the task until the
-    /// kernel signals the send, which returns control to the event loop so
-    /// completions are reaped and send-pool slots recycled. Awaiting
-    /// [`yield_now`] is not a substitute: the task resumes without waiting
-    /// for the send to complete.
-    ///
-    /// Batch limits and the all-or-nothing rejection behavior are identical
-    /// to [`submit_batch`](Self::submit_batch). A batch that is empty or
-    /// carries no bytes is rejected with `InvalidInput`.
-    pub fn submit_batch_await(
+    /// Awaiting the future parks the task until the kernel signals the send,
+    /// which returns control to the event loop so completions are reaped and
+    /// send-pool slots recycled. Awaiting [`yield_now`] is not a substitute:
+    /// the task resumes without waiting for the send to complete.
+    pub fn submit_batch(
         self,
         parts: Vec<crate::handler::SendPart<'_>>,
     ) -> io::Result<(usize, SendCompletion)> {
@@ -1851,56 +1850,54 @@ impl ConnCtx {
 
 #[cfg(not(has_io_uring))]
 impl AsyncSendBuilder {
-    /// Build and submit the send by concatenating all copy parts.
-    pub fn build<F>(self, f: F) -> io::Result<()>
+    /// Build and submit the send by concatenating all parts, and return a
+    /// [`SendCompletion`] that resolves with their total length once the
+    /// bytes have been written to the socket.
+    ///
+    /// The closure chains `.copy()` / `.guard()` calls and ends with
+    /// `.submit()`. `submit` refuses a batch that carries no bytes with
+    /// `InvalidInput`, and a closure that returns `Ok` without a successful
+    /// `submit` sends nothing: `build` returns `InvalidInput`.
+    pub fn build<F>(self, f: F) -> io::Result<SendCompletion>
     where
         F: FnOnce(MioSendBuilder<'_>) -> io::Result<()>,
     {
-        with_state(|driver, _| {
+        with_state(|driver, executor| {
             let mut buf = Vec::new();
-            let builder = MioSendBuilder { buf: &mut buf };
-            f(builder)?;
-            if !buf.is_empty() {
-                let mut ctx = driver.make_ctx();
-                ctx.send(self.token, &buf)?;
+            let mut submitted = false;
+            f(MioSendBuilder {
+                buf: &mut buf,
+                submitted: &mut submitted,
+            })?;
+            if !submitted {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the build closure submitted no send",
+                ));
             }
-            Ok(())
+            let conn_index = self.token.index;
+            let id = executor.register_send(conn_index);
+            let mut ctx = driver.make_ctx();
+            if let Err(e) = ctx.send_awaited(self.token, &buf, id) {
+                executor.withdraw_send(id);
+                return Err(e);
+            }
+            Ok(SendCompletion::pending(
+                conn_index,
+                self.token.generation,
+                id,
+            ))
         })
     }
 
-    /// Submit a scatter-gather send from pre-classified `SendPart`s.
+    /// Submit a scatter-gather send from pre-classified `SendPart`s, and
+    /// return the number of parts submitted with a [`SendCompletion`] that
+    /// resolves when the batch has been written to the socket.
     ///
-    /// On the mio backend, guard data is copied (no kernel zero-copy).
-    pub fn submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<usize> {
-        use crate::handler::SendPart;
-        with_state(|driver, _| {
-            let mut buf = Vec::new();
-            let mut consumed = 0usize;
-            for part in &parts {
-                match part {
-                    SendPart::Copy(data) => buf.extend_from_slice(data),
-                    SendPart::Guard(guard) => {
-                        let (ptr, len) = guard.as_ptr_len();
-                        let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-                        buf.extend_from_slice(data);
-                    }
-                }
-                consumed += 1;
-            }
-            if !buf.is_empty() {
-                let mut ctx = driver.make_ctx();
-                ctx.send(self.token, &buf)?;
-            }
-            Ok(consumed)
-        })
-    }
-
-    /// Like [`submit_batch`](Self::submit_batch), but returns a [`SendCompletion`]
-    /// that resolves when the batch has been written to the socket.
-    ///
-    /// A batch that is empty or carries no bytes is rejected with
+    /// On the mio backend, guard data is copied (no kernel zero-copy). A
+    /// batch that is empty or carries no bytes is rejected with
     /// `InvalidInput`.
-    pub fn submit_batch_await(
+    pub fn submit_batch(
         self,
         parts: Vec<crate::handler::SendPart<'_>>,
     ) -> io::Result<(usize, SendCompletion)> {
@@ -1944,6 +1941,8 @@ impl AsyncSendBuilder {
 #[cfg(not(has_io_uring))]
 pub struct MioSendBuilder<'a> {
     buf: &'a mut Vec<u8>,
+    /// Set by a successful [`submit`](Self::submit); `build` sends only then.
+    submitted: &'a mut bool,
 }
 
 #[cfg(not(has_io_uring))]
@@ -1962,8 +1961,16 @@ impl<'a> MioSendBuilder<'a> {
         self
     }
 
-    /// Submit the accumulated send.
+    /// Submit the accumulated send: `build` sends it once the closure
+    /// returns. A batch that carries no bytes is refused with `InvalidInput`.
     pub fn submit(self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty send batch",
+            ));
+        }
+        *self.submitted = true;
         Ok(())
     }
 }
@@ -3146,7 +3153,7 @@ impl Connection {
     }
 
     /// See [`SendHalf::forward_recv_buf`].
-    pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
+    pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.tx.conn.forward_recv_buf(data)
     }
 
@@ -3243,11 +3250,9 @@ impl SendHalf {
     /// [`build`](AsyncSendBuilder::build) takes a closure that chains
     /// `.copy(data)` and `.guard(guard)` and ends with `.submit()`.
     /// [`submit_batch`](AsyncSendBuilder::submit_batch) takes pre-classified
-    /// `SendPart`s. Both are fire-and-forget;
-    /// [`submit_batch_await`](AsyncSendBuilder::submit_batch_await) also returns
-    /// a [`SendCompletion`]. On the mio backend every part is copied. A batch
-    /// whose parts carry no bytes queues nothing through `build` and
-    /// `submit_batch`; `submit_batch_await` rejects it with `InvalidInput`.
+    /// `SendPart`s. Both return a [`SendCompletion`]; dropping it does not
+    /// cancel the send. On the mio backend every part is copied. A batch
+    /// whose parts carry no bytes is rejected with `InvalidInput`.
     /// On an io_uring plaintext connection the copy parts of one batch are
     /// gathered into one send-pool slot, so together they must fit the
     /// `slot_size` given to [`ConfigBuilder::send_pool`](crate::ConfigBuilder::send_pool);
@@ -3403,7 +3408,9 @@ impl SendHalf {
     }
 
     /// Send `data`, the bytes a `with_data` closure was handed, without
-    /// copying them when possible.
+    /// copying them when possible, and return a [`SendCompletion`] that
+    /// resolves with `data.len()` once the send completes. As for
+    /// [`send`](Self::send), dropping it does not cancel the send.
     ///
     /// On io_uring, if `data` is exactly the connection's whole recv
     /// accumulator, the accumulator is detached and sent under a guard
@@ -3431,7 +3438,7 @@ impl SendHalf {
     /// [`send`](Self::send), and, when `data` is the whole
     /// accumulator, `Other` if the zero-copy send slab is full. Nothing is
     /// sent or consumed on `Err`.
-    pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
+    pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.conn.forward_recv_buf(data)
     }
 

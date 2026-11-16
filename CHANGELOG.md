@@ -363,6 +363,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` returns
+  `io::Result<SendCompletion>`, resolving with `data.len()`, instead of
+  `io::Result<()>`. `send_parts().build(f)` returns
+  `io::Result<SendCompletion>`, resolving with the total length of the parts;
+  `f` still ends with `submit()`. `submit_batch_await` is renamed
+  `submit_batch` and keeps its return type,
+  `io::Result<(usize, SendCompletion)>`. Drop the completion where the caller
+  does not wait for the send; dropping it does not cancel the send. A `build`
+  whose parts carry no bytes is refused with `InvalidInput`; it used to queue
+  nothing and return `Ok`. So is a `build` closure that returns `Ok` without
+  calling `submit`, whose parts mio used to send.
 - **Breaking:** the direct I/O API is the `direct_io` module, with the same
   shapes as `fs` (#845): `direct_io::open(path)` and
   `open_with(path, options)` return an `OpenFuture` that resolves to a
@@ -1299,12 +1310,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Instant`. Remove `.timestamps(..)` and `.kernel_timestamps(..)` calls and
   the `timestamps` feature from `Cargo.toml`.
 - **Breaking:** `send_nowait` and `send_chain_nowait` on `Connection` and
-  `SendHalf`. Replace `send_nowait(data)` with `send(data)` and drop the
+  `SendHalf`, and the `AsyncSendBuilder::submit_batch` that returned no
+  completion. Replace `send_nowait(data)` with `send(data)` and drop the
   `SendCompletion` it returns: dropping it does not cancel the send, and
   `send` returns the same errors at the call. Replace `send_chain_nowait(f)`
   (io_uring only) with `send_chain(f)`, whose closure returns
   `io::Result<()>`; a closure that returned another value passes it out
-  through a variable it captures.
+  through a variable it captures. `submit_batch_await` is now `submit_batch`
+  (see Changed): drop its completion where the caller does not wait for the
+  send. A batch that carries no bytes, which the old `submit_batch` accepted
+  without sending anything, is refused with `InvalidInput`.
 
 ### Fixed
 

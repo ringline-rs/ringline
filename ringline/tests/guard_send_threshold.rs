@@ -243,7 +243,8 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
             let guard = GuardBox::new(VecGuard(value_of_len(VLEN)));
             let result = conn
                 .send_parts()
-                .build(|b| b.copy(PREFIX).guard(guard).copy(SUFFIX).submit());
+                .build(|b| b.copy(PREFIX).guard(guard).copy(SUFFIX).submit())
+                .map(drop);
             trace(port, format!("send_parts -> {result:?}"));
             if let Err(e) = result {
                 let r = conn.send(format!("ERR:{e}").as_bytes()).map(drop);

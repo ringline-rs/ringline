@@ -446,6 +446,11 @@ pub(crate) struct DriverCtx<'a> {
     /// future, because a TLS chain does not use `chain_table`, so
     /// `chain_table.carries` is false for it.
     pub(crate) tls_chain_carried: bool,
+    /// Set when a [`SendBuilder`] with an awaited id gave the id to
+    /// `attach_send_id`. `AsyncSendBuilder::build` reads it after its
+    /// closure returns: a closure that returned `Ok` without a successful
+    /// `submit` left the id with nothing to settle it.
+    pub(crate) parts_id_carried: bool,
 }
 
 /// The refusal of a TLS send made after this side's close_notify was queued:
@@ -585,7 +590,9 @@ impl<'a> DriverCtx<'a> {
     /// here. The TLS branch admits against the ciphertext bound before
     /// rustls mutates, so the same holds there (see `encrypt_tls_send`,
     /// which also names the one case that stays fatal). The user-facing
-    /// contract lives on `SendHalf::send`.
+    /// contract lives on `SendHalf::send`. Every public send attaches an id
+    /// (`send_awaited`), so only tests call this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<()> {
         self.send_inner(conn, data, None, false)
     }
@@ -964,6 +971,19 @@ impl<'a> DriverCtx<'a> {
         id: crate::runtime::send_completion::SendId,
     ) -> SendChainBuilder<'_, 'a> {
         let mut builder = self.send_chain(conn);
+        builder.send_id = Some(id);
+        builder
+    }
+
+    /// [`send_parts`](Self::send_parts), with `id` settled by the send's
+    /// completion once `submit` queues it. `submit` refuses an empty batch
+    /// with `InvalidInput`.
+    pub(crate) fn send_parts_awaited(
+        &mut self,
+        conn: ConnId,
+        id: crate::runtime::send_completion::SendId,
+    ) -> SendBuilder<'_, 'a> {
+        let mut builder = self.send_parts(conn);
         builder.send_id = Some(id);
         builder
     }
@@ -2354,7 +2374,9 @@ impl<'a> DriverCtx<'a> {
     /// flushes it when the socket becomes writable.
     ///
     /// On a TLS connection the data is encrypted into a `Vec` and queued the
-    /// same way; nothing is written in this call.
+    /// same way; nothing is written in this call. Every public send attaches
+    /// an id (`send_awaited`), so only tests call this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<()> {
         self.send_inner(conn, data, None)
     }
@@ -3538,16 +3560,17 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     fn commit(&mut self, built: BuiltSend) {
         if let Some(id) = self.send_id {
             self.ctx.attach_send_id(Some(&built), id, self.total_len);
+            self.ctx.parts_id_carried = true;
         }
         self.ctx.submit_or_queue(self.conn.index, built);
     }
 
     /// Submit the scatter-gather send.
     ///
-    /// A batch with no parts, or whose parts carry no bytes, queues nothing
-    /// and returns `Ok(())` on a live connection; a stale or closing
-    /// connection is reported as `NotConnected`, or `ConnectionAborted` after
-    /// `abort`, as for any batch.
+    /// A batch with no parts, or whose parts carry no bytes, is refused with
+    /// `InvalidInput` on a live connection; a stale or closing connection is
+    /// reported as `NotConnected`, or `ConnectionAborted` after `abort`, as
+    /// for any batch.
     pub fn submit(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             return Err(e);
@@ -3573,10 +3596,14 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
 
         // Nothing to send: build no SQE. A zero-length Send SQE completes
         // with 0, which `handle_send` reads as a failed send and drains the
-        // queue behind it. An awaited id (crate-internal) settles `Ok(0)`.
+        // queue behind it. A builder with an awaited id (every public one)
+        // refuses the batch; one without (crate-internal) queues nothing.
         if self.part_count == 0 || self.total_len == 0 {
-            if let Some(id) = self.send_id {
-                self.ctx.attach_send_id(None, id, 0);
+            if self.send_id.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "empty send batch",
+                ));
             }
             return Ok(());
         }
@@ -3635,6 +3662,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         let sends = self.ctx.encrypt_tls_send(self.conn, &plaintext)?;
         if let Some(id) = self.send_id {
             self.ctx.attach_send_id(sends.last(), id, self.total_len);
+            self.ctx.parts_id_carried = true;
         }
         self.ctx.queue_built_sends(self.conn.index, sends);
         Ok(())

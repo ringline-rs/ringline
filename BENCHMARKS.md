@@ -314,7 +314,8 @@ that drops each `SendCompletion`, and `forward` is `with_data` +
 `recv-forward` are refused. From 0.7.0-alpha.5 an accepted plaintext
 connection receives into its accumulator and `forward_recv_buf` sends the
 accumulator under a guard, so a rerun of `--echo-mode forward` measures that
-path. The September `uring-fwd` figure (20.95 µs/op) measured the
+path; from 0.7.0-alpha.141 each forward also registers a `SendCompletion`,
+which bench-server drops. The September `uring-fwd` figure (20.95 µs/op) measured the
 provided-buffer receive that #699 replaced.
 
 Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5

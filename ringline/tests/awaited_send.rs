@@ -31,10 +31,10 @@ const GUARDED: usize = 16384;
 /// A `send` whose completion is dropped, then an awaited `send`.
 const UNAWAITED_THEN_SEND: u8 = b'1';
 /// A `send` whose completion is dropped, then an awaited copy-only
-/// `submit_batch_await`.
+/// `submit_batch`.
 const UNAWAITED_THEN_COPY_BATCH: u8 = b'2';
 /// A `send` whose completion is dropped, then an awaited zero-copy
-/// `submit_batch_await`.
+/// `submit_batch`.
 const UNAWAITED_THEN_ZC_BATCH: u8 = b'3';
 /// A `send_chain` whose completion is dropped, then an awaited `send`.
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
@@ -90,7 +90,7 @@ impl AsyncEventHandler for Scenarios {
                     conn.send(&[b'a'; FIRST]).expect("unawaited send");
                     match conn
                         .send_parts()
-                        .submit_batch_await(vec![SendPart::Copy(&[b'b'; SECOND])])
+                        .submit_batch(vec![SendPart::Copy(&[b'b'; SECOND])])
                     {
                         Ok((_, fut)) => fut.await,
                         Err(e) => Err(e),
@@ -99,10 +99,7 @@ impl AsyncEventHandler for Scenarios {
                 UNAWAITED_THEN_ZC_BATCH => {
                     conn.send(&[b'a'; FIRST]).expect("unawaited send");
                     let guard = GuardBox::new(VecGuard(vec![b'b'; GUARDED]));
-                    match conn
-                        .send_parts()
-                        .submit_batch_await(vec![SendPart::Guard(guard)])
-                    {
+                    match conn.send_parts().submit_batch(vec![SendPart::Guard(guard)]) {
                         Ok((_, fut)) => fut.await,
                         Err(e) => Err(e),
                     }

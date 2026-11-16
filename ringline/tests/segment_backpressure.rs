@@ -42,7 +42,7 @@ impl AsyncEventHandler for Modes {
                     loop {
                         let n = rx
                             .with_data(|d| match tx.forward_recv_buf(d) {
-                                Ok(()) => ParseResult::Consumed(d.len()),
+                                Ok(_) => ParseResult::Consumed(d.len()),
                                 Err(_) => ParseResult::NeedMore,
                             })
                             .await;
@@ -212,7 +212,7 @@ fn a_held_forward_recv_buf_ends_when_its_peer_closes() {
                 loop {
                     let n = rx
                         .with_data(|d| match tx.forward_recv_buf(d) {
-                            Ok(()) => ParseResult::Consumed(d.len()),
+                            Ok(_) => ParseResult::Consumed(d.len()),
                             Err(_) => ParseResult::NeedMore,
                         })
                         .await;

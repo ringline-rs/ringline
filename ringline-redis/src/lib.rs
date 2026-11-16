@@ -1686,7 +1686,8 @@ impl Client {
                     .build(|b| b.copy(prefix).copy(value).copy(suffix).submit())
             }
         };
-        if let Err(e) = sent {
+        // Drop the completion now rather than hold it across the read.
+        if let Err(e) = sent.map(drop) {
             return (Err(e.into()), 0, None);
         }
         map_reply(self.read_reply().await, redis_error)

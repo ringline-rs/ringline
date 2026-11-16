@@ -5453,7 +5453,7 @@ mod tests {
     }
 
     /// Register an awaited send on `conn_index` and attach it to slab entry
-    /// `slab_idx` with `len`, as `submit_batch_await` does.
+    /// `slab_idx` with `len`, as `submit_batch` does.
     fn await_slab(
         el: &mut AsyncEventLoop<NoopHandler>,
         conn_index: u32,
@@ -10233,10 +10233,11 @@ mod tests {
     }
 
     /// A `send_parts` batch whose parts carry no bytes queues nothing: no
-    /// SQE, no pool slot, and an awaited one resolves `Ok(0)`, as a `send`
-    /// of an empty buffer does. A zero-length Send SQE would complete with
-    /// 0, which `handle_send` treats as a failed send and drains the queue
-    /// behind it.
+    /// SQE and no pool slot. Without an id (crate-internal) it returns `Ok`;
+    /// with one, as every public batch has, it is refused with
+    /// `InvalidInput` and settles nothing. A zero-length Send SQE would
+    /// complete with 0, which `handle_send` treats as a failed send and
+    /// drains the queue behind it.
     #[test]
     fn a_zero_length_send_parts_batch_queues_nothing() {
         let mut el = make_test_loop();
@@ -10260,24 +10261,23 @@ mod tests {
         );
 
         let id = el.executor.register_send(conn_index);
-        el.driver
+        let err = el
+            .driver
             .make_ctx()
             .send_parts(token)
             .copy(b"")
             .copy(b"")
             .submit_awaited(id)
-            .expect("nothing to send is not an error");
+            .expect_err("an awaited empty batch is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
         assert!(!el.driver.send_queues[idx].in_flight);
         assert_eq!(el.driver.send_copy_pool.free_count(), free);
         el.drain_settled_sends();
-        assert_eq!(
-            el.executor
-                .take_send_result(id)
-                .expect("settled")
-                .expect("ok"),
-            0,
-            "the awaited batch resolves with its length"
+        assert!(
+            el.executor.take_send_result(id).is_none(),
+            "the refused batch settled its id"
         );
+        el.executor.withdraw_send(id);
     }
 
     /// A `Shutdown` SQE the ring refuses is kept and pushed later, as a
@@ -11595,7 +11595,7 @@ mod tests {
         // below, so the slice stays valid.
         let view = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-        let err = with_driver_state(&mut el, || stale.forward_recv_buf(view))
+        let err = with_driver_state(&mut el, || stale.forward_recv_buf(view).map(drop))
             .expect_err("a stale handle must be refused");
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         assert_eq!(
@@ -11606,7 +11606,7 @@ mod tests {
         assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
 
         let current = ConnCtx::new(conn_index, generation);
-        with_driver_state(&mut el, || current.forward_recv_buf(view))
+        with_driver_state(&mut el, || current.forward_recv_buf(view).map(drop))
             .expect("the current handle forwards its accumulator");
         assert!(el.driver.accumulators.data(conn_index).is_empty());
         assert_eq!(
@@ -11654,7 +11654,8 @@ mod tests {
             let data = el.driver.accumulators.data(conn_index);
             // SAFETY: the accumulator is not touched before the call below.
             let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-            if let Err(e) = with_driver_state(&mut el, || current.forward_recv_buf(view)) {
+            if let Err(e) = with_driver_state(&mut el, || current.forward_recv_buf(view).map(drop))
+            {
                 refused = Some((attempt, e));
                 break;
             }
@@ -11796,7 +11797,7 @@ mod tests {
         let data = el.driver.accumulators.data(conn_index);
         // SAFETY: the accumulator is not touched before the call below.
         let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-        let err = with_driver_state(&mut el, || old.forward_recv_buf(view))
+        let err = with_driver_state(&mut el, || old.forward_recv_buf(view).map(drop))
             .expect_err("a stale handle must be refused");
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         assert_eq!(
