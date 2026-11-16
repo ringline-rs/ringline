@@ -477,22 +477,22 @@ without the log, so a rerun measures a different arm A. Client CPU stayed
 below 13 of 56 cores in every run. A and B runs alternated (A B A B ...),
 and each B run is compared with the A run before it.
 
-Two B builds were measured, both commits on #672 (`git fetch origin
-pull/672/head`). The first set of runs used a7d9abc, whose reader calls
+Two B builds were measured, both commits on #672 before it was merged. The
+first set of runs used the earlier one (B1 below), whose reader calls
 binary-searched the log for both ends of the range. The 64:16 repeat and the
-profiles used 2158324, whose reader calls read the front of the log, as the
-code does now.
+profiles used the later one (B2), whose reader calls read the front of the log,
+as the code does now.
 
 | Measurement | B build | Runs | Result |
 |---|---|---|---|
-| Closed loop, 64 and 4,096 connections, depth 1 and 16: throughput and p99, B/A per pair | a7d9abc | 5 pairs per cell | Throughput: median of the pairs +0.9% (64:1), −6.3% (64:16), −2.8% (4,096:1), −2.7% (4,096:16); B below A in 2, 3, 5 and 5 of 5 pairs. The A throughput spread (range over median) was 7.2–9.4%. p99 was lower in B in every 4,096:1 pair and higher in every 4,096:16 pair, and mixed at 64 connections; the A p99 spread was 5.5–18% |
-| The same cells: server CPU per request, B/A per pair | a7d9abc | 5 pairs per cell | Median of the pairs +0.3% (+73 ns, 64:1), +2.5% (+63 ns, 64:16), +3.0% (+577 ns, 4,096:1), +1.3% (+28 ns, 4,096:16); B above A in 3, 5, 5 and 5 of 5 pairs |
-| The same cells: server CPU time per second, B/A per pair | a7d9abc | 5 pairs per cell | Median of the pairs +0.4% (64:1), −5.2% (64:16), +0.6% (4,096:1), −1.3% (4,096:16) |
-| Open loop, 64 conns at 141,038/s and 4,096 at 174,945/s (target rates): server CPU per request, B/A per pair | a7d9abc | 5 pairs | Median of the pairs −2.1% (−619 ns, 64) and +0.2% (+43 ns, 4,096); B above A in 2 and 4 of 5 pairs. The A spread was 1.4% of 30 µs per request at 64 connections and 1.2% of 27 µs at 4,096, about 0.4 µs and 0.3 µs; the B spread was 7.3% and 2.0% |
-| Closed loop 64:16, server CPU per request, B/A per pair | 2158324 | 8 pairs | Median of the pairs +0.4% (+10 ns); B above A in 5 of 8 pairs, which ranged from −4.6% to +6.5% |
-| `perf record -a` in the server VM, 10 s at 64:16 | 2158324 | 1 A, 3 B | The self time of the log's functions (`recv_buffered`, `settle_read`, `add`, `record_arrival`, `arrival_settle`) is 0.33–0.43% of samples, 8–11 ns per request. The server binary's share of samples is 3.01% in A and 3.39–3.58% in B |
+| Closed loop, 64 and 4,096 connections, depth 1 and 16: throughput and p99, B/A per pair | B1 | 5 pairs per cell | Throughput: median of the pairs +0.9% (64:1), −6.3% (64:16), −2.8% (4,096:1), −2.7% (4,096:16); B below A in 2, 3, 5 and 5 of 5 pairs. The A throughput spread (range over median) was 7.2–9.4%. p99 was lower in B in every 4,096:1 pair and higher in every 4,096:16 pair, and mixed at 64 connections; the A p99 spread was 5.5–18% |
+| The same cells: server CPU per request, B/A per pair | B1 | 5 pairs per cell | Median of the pairs +0.3% (+73 ns, 64:1), +2.5% (+63 ns, 64:16), +3.0% (+577 ns, 4,096:1), +1.3% (+28 ns, 4,096:16); B above A in 3, 5, 5 and 5 of 5 pairs |
+| The same cells: server CPU time per second, B/A per pair | B1 | 5 pairs per cell | Median of the pairs +0.4% (64:1), −5.2% (64:16), +0.6% (4,096:1), −1.3% (4,096:16) |
+| Open loop, 64 conns at 141,038/s and 4,096 at 174,945/s (target rates): server CPU per request, B/A per pair | B1 | 5 pairs | Median of the pairs −2.1% (−619 ns, 64) and +0.2% (+43 ns, 4,096); B above A in 2 and 4 of 5 pairs. The A spread was 1.4% of 30 µs per request at 64 connections and 1.2% of 27 µs at 4,096, about 0.4 µs and 0.3 µs; the B spread was 7.3% and 2.0% |
+| Closed loop 64:16, server CPU per request, B/A per pair | B2 | 8 pairs | Median of the pairs +0.4% (+10 ns); B above A in 5 of 8 pairs, which ranged from −4.6% to +6.5% |
+| `perf record -a` in the server VM, 10 s at 64:16 | B2 | 1 A, 3 B | The self time of the log's functions (`recv_buffered`, `settle_read`, `add`, `record_arrival`, `arrival_settle`) is 0.33–0.43% of samples, 8–11 ns per request. The server binary's share of samples is 3.01% in A and 3.39–3.58% in B |
 
-The 1–3% estimate rests on the a7d9abc runs at 64:16, 4,096:1 and 4,096:16,
+The 1–3% estimate rests on the B1 runs at 64:16, 4,096:1 and 4,096:16,
 where B used more server CPU per request than the A run before it in every
 pair. Server CPU here is rezolus' CPU time summed over all vCPUs of the
 server VM, network softirq included. At 4,096 connections B's server used
@@ -505,12 +505,12 @@ the server's CPU time per second moved with throughput in each pair, and B
 used more CPU per request in all five pairs, including the two where it
 completed more requests.
 
-The reader code that ships is 2158324's. It was measured at 64:16 only: its
+The reader code that ships is B2's. It was measured at 64:16 only: its
 paired median, +0.4% or 10 ns per request, agrees with the profile, but its
 pairs spread too widely to exclude 2.5%. The 4,096-connection cells were not
 measured on it.
 
-The a7d9abc difference in CPU per request is not a fixed time: 63 ns at
+The B1 difference in CPU per request is not a fixed time: 63 ns at
 64:16, 577 ns at 4,096:1 and 28 ns at 4,096:16. In the open-loop
 4,096-connection cell, 577 ns would read as about +2.1%; it measured +0.2%.
 In the open-loop 64-connection cell, 63 ns (64:16) to 73 ns (64:1) is about
@@ -523,7 +523,7 @@ those are network softirq symbols; the idle-loop symbols take under 1%. If a
 halted vCPU is not sampled, the share of samples is the share of busy CPU.
 As a consistency check, the samples per request in the profiled runs
 (2.37–2.49 µs, at 2.60–2.74 M requests/s) are within 0.02 µs of the range
-of CPU per request rezolus measured in the unprofiled 2158324 runs at 64:16
+of CPU per request rezolus measured in the unprofiled B2 runs at 64:16
 (2.38–2.63 µs over both arms, at higher throughput). The server binary's
 share is 0.38–0.57 points higher in B than in the one A profile, 9–14 ns per
 request against the 8–11 ns attributed to the log's functions. With one A

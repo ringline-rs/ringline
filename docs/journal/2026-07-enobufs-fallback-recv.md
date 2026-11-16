@@ -168,7 +168,7 @@ counters prove no real disconnect). Follow-up, not a blocker.
 
 ## Outcome
 
-**GO — shipped on `feat/enobufs-fallback-recv` (#274).** Design deltas
+**GO — shipped in #274.** Design deltas
 from the sketch, both forced by evidence: pool-owned recv targets
 (accumulator spare capacity is unsound across close/slot-reuse);
 arbitration-based trigger + 1 MiB chunk floor (the dry-ring trigger

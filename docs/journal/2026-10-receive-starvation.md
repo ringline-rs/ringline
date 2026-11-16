@@ -1,10 +1,9 @@
 # Receive starvation at high connection counts, and what holds receive memory
 
 - **Status:** open
-- **Span:** 2026-10-12 to 2026-10-14 · #657, #658 (issue), #660 · rig
-  experiment specs on branch `exp/inc-step6-matrix` of the brayniac fork,
-  `experiments/recv-inc-matrix/`; the builds they ran are on that fork's
-  `exp/inc-step6-rearm` (neither is on `main`)
+- **Span:** 2026-10-12 to 2026-10-14 · #657, #658 (issue), #660 · the rig's
+  experiment specs (`experiments/recv-inc-matrix/`) and the builds they ran
+  are not in the repository
 
 ## Goal
 
@@ -67,11 +66,10 @@ so the order connections were re-armed in was arbitrary. With the
 64 KiB) left 3,000 or more connections unanswered, all of them accepted.
 
 #657 re-arms parked connections oldest first, at most one per free buffer.
-Its first commit gave each pass between two waits a full budget, so up to
-twice as many re-arms as free buffers reached the kernel; a later commit
-(e1cf14d) shares one budget across those passes. With the first commit,
-10 runs per kernel and cell (5 boots, two identical copies of the
-configuration per boot), 80 runs in all:
+Its first commit gave each pass between two waits a full budget, so up to twice
+as many re-arms as free buffers reached the kernel; a later commit shares one
+budget across those passes. With the first commit, 10 runs per kernel and cell
+(5 boots, two identical copies of the configuration per boot), 80 runs in all:
 
 | Cell, 256 × 16 KiB ring | Before | After |
 |---|---|---|
@@ -181,8 +179,7 @@ forwarded 51–62% from ring buffers and sent the rest as zero-copy
 accumulator sends, one per refused lend.
 
 Measured locally (one worker, Linux 7.2, arm64, loopback). The build was
-68fed94 on the brayniac fork's `exp/inc-step6-rearm` branch (#657's first
-two commits on an experiment branch based on 5a88595), with an
+#657's first two commits on an experiment branch based on 5a88595, with an
 experimental accumulator patch; in two of the incremental runs per cell its
 shrink-on-drain switch was on, which did not change the result:
 

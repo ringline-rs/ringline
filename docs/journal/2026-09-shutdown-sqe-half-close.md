@@ -16,7 +16,7 @@ back-to-front from the answer.
 `backpressured_send_waits_for_pool_capacity_without_duplication`
 (`ringline/tests/echo.rs`) failed once in CI —
 [run 36524008903](https://github.com/ringline-rs/ringline/actions/runs/36524008903),
-job `Test` (io_uring, debug), commit `a959be78` on `feat/bench-service-time`,
+job `Test` (io_uring, debug), on a commit of #489,
 2026-09-29 04:58Z — with 12288 of 32768 bytes arriving:
 
 ```
