@@ -1,8 +1,7 @@
 # Experiment D: large replies in pieces gated on socket room
 
 - **Status:** open. The design is at 618149b4; the model (C1-D) and the
-  calibration have run; the runtime gate is in its second round of review
-  fixes; the matrix has not run.
+  calibration have run; the matrix (234 runs) is running on 3db626d8.
 - **Span:** Nov 2026 · follows Experiment C (`2026-11-send-admission-c.md`)
   · SystemsLab context `send-admission-expC`
 
@@ -154,6 +153,47 @@ stalled peers' sockets from `ss -tmi` every 100 ms:
   pieces waiting for room.
 - The image's own `rmem_max` and `wmem_max` are 212,992. No run recorded
   TCP memory pressure.
+
+### The matrix's binaries, and a pilot
+
+The matrix runs on 3db626d8 of `exp/send-admission-d-run` (artifact
+`01a1e2ca-f88b`): the gate after its first two review rounds, the harness
+after both of its rounds, and the order arm set to O7w. On delta's io_uring
+suite at 3db626d8 every gate test passed but one,
+`a_socket_filled_by_whole_sends_is_not_writable`, and 16 of 18 mutations
+went red; the two that stayed green had tests that could not reach them, and
+the failing test was later shown to be the socket's buffer growing, not the
+gate (below).
+
+Two later review rounds found gate bugs that 3db626d8 still has, each of
+which needs a second send waiting on, or still in the kernel of, the gated
+connection: a gate re-armed on `Recheck` could busy-loop the worker on a
+socket that reports `POLLOUT` while `send` returns `EAGAIN`, and a gate
+blocked on a waiting send could arm against that send while it was still in
+the kernel. The harness gates a piece only after the previous piece has
+settled, so neither can happen in D. The fixed gate, at cf35d0fb, broke the
+gate's wake on a peer reset (`a_peer_reset_while_waiting` hung), which D's
+drainers produce at the end of each episode, so the matrix stays on
+3db626d8 and the fixes continue on the gate branch.
+
+At cf35d0fb the whole-sends test read the kernel's figures through
+`NETLINK_SOCK_DIAG`: the gate started on a socket with `wmem_queued`
+1,761,664 and `sk_sndbuf` 2,626,560, not writable, and by the time it
+resolved `sk_sndbuf` had grown to 4,194,304 and the socket was writable. The
+gate was right; loopback's autotuning moved the threshold.
+
+A pilot on 3db626d8 checked the gate in D's own setting before the matrix:
+W4 with 128 stalled peers and gated 128 KiB pieces, one run each at
+`tcp_wmem` 1 MiB and 256 KiB, hv03 (`01a1e2d2-83e1`, `01a1e2d2-8442`):
+
+| `tcp_wmem` | fast small p99 | 7 MiB replies | their median | fewest free | stalled pieces that waited for room |
+| --- | --- | --- | --- | --- | --- |
+| 1 MiB | 2.4 ms | 10 of 10 | 4.2 ms | 501 of 512 | 0 of 7,680 |
+| 256 KiB | 1.1 ms | 10 of 10 | 4.2 ms | 503 of 512 | 0 of 2,560 |
+
+All 1,280 stalled connections were aborted at the room-wait limit, holding
+no slots. 21 of the 560 head pieces at 256 KiB waited for room, to a reader
+that drains. No TCP memory pressure.
 
 ## Outcome
 
