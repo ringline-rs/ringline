@@ -56,7 +56,9 @@ fn main() {
         .direct_io(DirectIoConfig::default())
         .build()
         .expect("config");
-    let (rt, handles) = RinglineBuilder::new(config).launch::<Probe>().expect("launch");
+    let (rt, handles) = RinglineBuilder::new(config)
+        .launch::<Probe>()
+        .expect("launch");
     for h in handles {
         let _ = h.join();
     }

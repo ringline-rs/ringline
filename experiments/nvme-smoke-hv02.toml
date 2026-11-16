@@ -7,7 +7,7 @@
 #
 # 1. nvme_smoke on /dev/ng0n1: Identify Namespace, two reads of LBA 0 that must
 #    match, write-and-restore at LBA 2048, flush.
-# 2. The dsync probe of the null_blk runs (fua.toml), on /dev/nvme0n1: 64
+# 2. The dsync probe of the null_blk runs (dsync-fua-null-blk.toml), on /dev/nvme0n1: 64
 #    sequential 4 KiB direct_io writes per arm, block tracepoints counting what
 #    reaches the device, both backends, dsync on and off.
 # Submit: systemslab submit experiments/nvme-smoke-hv02.toml (queues behind

@@ -24,8 +24,11 @@
 # Refuted if: uring sends no FUA on wb_fua; mio shows no flushes on wb_fua
 # (then the doc's pwrite claim is wrong); wt shows FUA or flushes.
 # Result (2026-11-15, SystemsLab 01a1e100-79d6 on 6.12, 01a1e100-7b31 on 7.1):
-# every arm as predicted, the same on both kernels, so the dsync docs need no
-# change. The counts are in custom-skills' lab skill, references/nvme.md.
+# every arm as predicted except wb_nofua on mio, which issued two flushes per
+# write (128 for 64), not one: by reading the kernel, one for the stripped FUA
+# and one from generic_write_sync. The same on both kernels. The dsync docs
+# need no change: they say a device without FUA gets a flush after the write
+# and that pwrite also flushes. The counts are in custom-skills' lab skill, references/nvme.md.
 name = "ringline dsync FUA/flush probe ({image})"
 
 [params]
