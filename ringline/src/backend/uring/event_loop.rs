@@ -16383,6 +16383,92 @@ mod tests {
         assert_eq!(el.executor.send_completions.live(), 0);
     }
 
+    /// A `submit_batch` whose guard panics while the batch is built leaves no
+    /// entry: the id was registered before the guard's code ran.
+    #[test]
+    fn a_panicking_guard_in_submit_batch_leaves_no_entry() {
+        struct PanickingRegion(Vec<u8>);
+        impl crate::SendGuard for PanickingRegion {
+            fn as_ptr_len(&self) -> (*const u8, u32) {
+                (self.0.as_ptr(), self.0.len() as u32)
+            }
+            fn region(&self) -> crate::RegionId {
+                panic!("a guard's region panics")
+            }
+        }
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        for _ in 0..10 {
+            let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_driver_state(&mut el, || {
+                    // At or above `send_zc_threshold`, so `build_with_guards`
+                    // reads the guard's region.
+                    let guard = crate::GuardBox::new(PanickingRegion(vec![7; 8192]));
+                    conn.send_parts()
+                        .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+                })
+            }));
+            assert!(submitted.is_err(), "the panic reached the caller");
+        }
+        assert_eq!(el.executor.send_completions.live(), 0);
+    }
+
+    /// A `build` or `send_chain` closure that panics after its send was
+    /// submitted leaves no entry, and the send's completion, when it arrives,
+    /// settles nothing: not the withdrawn id, and not a later send that took
+    /// its slot in the table.
+    #[test]
+    fn a_panic_after_a_submitted_build_or_chain_settles_nothing() {
+        let mut el = make_test_loop();
+        for chain in [false, true] {
+            let conn_index = accept_connection(&mut el);
+            let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_driver_state(&mut el, || {
+                    if chain {
+                        let _ = conn.send_chain(|c| -> io::Result<()> {
+                            c.copy(b"x").finish()?;
+                            panic!("a chain closure panics after finish")
+                        });
+                    } else {
+                        let _ = conn.send_parts().build(|b| -> io::Result<()> {
+                            b.copy(b"x").submit()?;
+                            panic!("a build closure panics after submit")
+                        });
+                    }
+                })
+            }));
+            assert!(
+                panicked.is_err(),
+                "the panic reached the caller (chain: {chain})"
+            );
+            assert_eq!(el.executor.send_completions.live(), 0, "chain: {chain}");
+            let ud = el
+                .driver
+                .ring
+                .last_pushed
+                .as_ref()
+                .expect("the send was pushed")
+                .user_data;
+
+            // A later send takes the withdrawn id's slot in the table.
+            let later = el.executor.register_send(conn_index);
+            el.test_dispatch_cqe(ud, 1, 0);
+            assert!(
+                !el.driver.send_queues[conn_index as usize].in_flight
+                    && !el.driver.chain_table.is_active(conn_index),
+                "the completion was handled (chain: {chain})"
+            );
+            assert!(
+                el.executor.take_send_result(later).is_none(),
+                "the completion settled a later send (chain: {chain})"
+            );
+            el.executor.withdraw_send(later);
+            assert_eq!(el.executor.send_completions.live(), 0, "chain: {chain}");
+        }
+    }
+
     /// A send owned by its connection's own task is abandoned when the
     /// connection is torn down, and the completion that arrives after the
     /// slot is reused frees its entry without settling it.

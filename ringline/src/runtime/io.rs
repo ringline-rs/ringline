@@ -1783,6 +1783,9 @@ impl AsyncSendBuilder {
             }
             let conn_index = self.token.index;
             let id = executor.register_send(conn_index);
+            // `submit` runs the guards' code: `SendGuard::region`, and each
+            // guard's `Drop` when the batch is refused.
+            let unwinding = WithdrawUnlessDisarmed(Some(id));
             let mut ctx = driver.make_ctx();
             let mut builder = ctx.send_parts(self.token);
             let mut consumed = 0usize;
@@ -1797,7 +1800,9 @@ impl AsyncSendBuilder {
                 }
                 consumed += 1;
             }
-            if let Err(e) = builder.submit_awaited(id) {
+            let submitted = builder.submit_awaited(id);
+            unwinding.disarm();
+            if let Err(e) = submitted {
                 executor.withdraw_send(id);
                 return Err(e);
             }
@@ -1812,12 +1817,13 @@ impl AsyncSendBuilder {
 /// Withdraws a registered send id when dropped, unless disarmed.
 ///
 /// `AsyncSendBuilder::build` and `ConnCtx::send_chain` register the id
-/// before their closure runs. A closure that panics unwinds past the
-/// withdrawal that follows it, and the entry would stay in the completion
-/// table for the life of the worker: nothing submitted it, so no completion
-/// frees it. Dropped while unwinding, this withdraws it, as
-/// `SendCompletion`'s `Drop` cancels its entry, through the thread-local
-/// driver state.
+/// before their closure runs, and `AsyncSendBuilder::submit_batch` before
+/// the guards' code runs. A panic there unwinds past the withdrawal that
+/// follows, and the entry would stay in the completion table for the life
+/// of the worker: no future holds it, so nothing would free it, and a send
+/// that was submitted before the panic would settle it for nobody. Dropped
+/// while unwinding, this withdraws it, as `SendCompletion`'s `Drop` cancels
+/// its entry, through the thread-local driver state.
 #[cfg(has_io_uring)]
 struct WithdrawUnlessDisarmed(Option<SendId>);
 
