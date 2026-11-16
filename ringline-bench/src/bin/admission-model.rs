@@ -2,10 +2,12 @@
 //! pool, its send-capacity FIFO, and the kernel socket buffers of the
 //! connections it sends on: Experiment C's stage C1
 //! (`docs/send-admission-design.md`, section 4, "Admission orders" and
-//! "Experiment C"). It runs an admission order against the load of
-//! Experiment B's contended case, with slow readers, draining peers, sends
-//! outside the FIFO and pipelined replies added, and reports how long the
-//! large reply at the head of the FIFO waits.
+//! "Experiment C"), extended for Experiment D. It runs an admission order
+//! against the load of Experiment B's contended case, with slow readers,
+//! draining peers, sends outside the FIFO and pipelined replies added, and
+//! reports how long the large reply at the head of the FIFO waits. For
+//! Experiment D it also sends large replies in pieces, optionally gated on
+//! room in the socket, and counts the send queue in truesize.
 //!
 //! The model reimplements the policy and calls nothing in ringline. Each
 //! order's admission pass is in [`policy`], apart from the event machinery.
@@ -23,7 +25,7 @@
 //! run's full completion. `--run-slots 1` returns each slot when its own
 //! bytes are in.
 //!
-//! Kernel buffer. Each connection's send buffer holds K bytes and drains
+//! Kernel buffer. Each connection's kernel buffer holds K bytes and drains
 //! linearly at its peer's read rate; drain times are computed, not stepped. A
 //! send writes while k < K (`wmem_queued < sndbuf`). A send that filled the
 //! buffer resumes when k falls to `--writable` x K (`POLLOUT` needs free space
@@ -32,6 +34,26 @@
 //! waiting send, whichever comes first. A reply settles when its last byte is
 //! in the buffer, which is when its `SendCompletion` resolves, and is
 //! delivered when the peer has read its last byte.
+//!
+//! Truesize. The paragraph above is the model at its defaults. Given a peer
+//! receive window W (`--rwnd` and the per-kind `--*-rwnd`, part of K), a
+//! segment size (`--seg` and `--*-seg`) and `--skb-overhead`, K splits into
+//! the peer's receive buffer, W bytes of payload, and the send queue,
+//! `sk_sndbuf` = K - W bytes of truesize. Bytes leave the send queue once the
+//! peer's receive buffer takes them: by time t, the first
+//! min(written, read(t) + W) bytes, with no delay, as on loopback. The
+//! queue's truesize, q, is its payload plus `--skb-overhead` for each segment
+//! not wholly out of the queue, as `tcp_stream_alloc_skb` charges
+//! `SKB_TRUESIZE` of the skb head and `skb_copy_to_page_nocache` and
+//! `tcp_trim_head` charge and release payload byte for byte. A write first
+//! tops up the queue's last segment to the segment size, then starts each new
+//! segment only while q < `sk_sndbuf`, as `tcp_sendmsg_locked` checks
+//! `sk_stream_memory_free` only at `new_segment`, so the last segment can take
+//! q past `sk_sndbuf` by up to one segment. `POLLOUT` holds while
+//! q <= `--writable` x `sk_sndbuf`; at the default of 2/3 that is
+//! `__sk_stream_is_writeable`'s q + q / 2 <= `sk_sndbuf` to within a byte.
+//! With a segment size of 0, a write is cut at the buffer's limit and q is
+//! the payload alone, which with W = 0 is the model above.
 //!
 //! Server. As `admission-server`, one task per connection: it reads a
 //! request, builds the reply, waits in the FIFO for admission, and reads the
@@ -50,6 +72,19 @@
 //! takes slots at once or is refused, which aborts its connection
 //! (admission-server's `send` arm).
 //!
+//! Pieces. With `--stream-piece` p above 0, a reply that is not small and
+//! has more than p bytes is sent as ceil(n / p) pieces, as admission-server's
+//! `--stream-piece`. Each piece is a waiter of its own, with its own slots and
+//! its own `--admit-ms` from joining the FIFO, and settles on its own. The
+//! next piece starts when the one before it settles, so a reply has at most
+//! one piece waiting or unsettled. The connection reads no request from its
+//! first piece's start to its last piece's admission; the last piece then
+//! counts against `--pipeline` as one reply. Each piece is timed from its
+//! admission, as any reply is, and its connection is aborted when that
+//! reaches `--settle-ms`. With `--stream-gate`, a piece first waits for
+//! `POLLOUT` on its socket, q <= `--writable` x `sk_sndbuf` (see Truesize),
+//! and its connection is aborted when that wait reaches `--settle-ms`.
+//!
 //! Load. As `admission-load`: `--small-conns` connections offer requests at
 //! `--small-rate` per second in total, open loop, evenly spaced, and read at
 //! `--fast-read-bps`; `--slow-conns` connections do the same at `--slow-rate`
@@ -58,9 +93,16 @@
 //! `--episode-ms` from the start of the window, `--stall-peers` peers that
 //! never read and `--drainers` peers that read at `--drain-read-bps` each ask
 //! for one reply, and `--large-delay-ms` later one fast-reading connection
-//! asks for `--large-size`: the episode's head. The stalled peers and
-//! drainers close 100 ms before the episode ends, as admission-load's stalled
-//! peers do. `--outside-conns` fast-reading connections receive sends that
+//! asks for `--large-size`: the episode's head. The drainers ask at the
+//! episode's start. With `--stall-gap-us` above 0, stalled peer i asks
+//! i x the gap after the start, as admission-load connects and writes them
+//! one after another, and the head asks `--large-delay-ms` plus one gap after
+//! the last, as admission-load sleeps after the last write and then connects;
+//! at 0 every stalled peer asks at the start and the head `--large-delay-ms`
+//! after it. The stalled peers and drainers close 100 ms before the episode
+//! ends, as admission-load's stalled peers do; a close that finds the server
+//! still sending to the peer is counted as a peer reset.
+//! `--outside-conns` fast-reading connections receive sends that
 //! take slots without the FIFO, at `--outside-rate` per second in total, each
 //! dropped when the free slots do not cover it; they are not timed and never
 //! end their connection.
@@ -73,7 +115,18 @@
 //! small replies of fast and of slow readers, time-averaged over each head's
 //! wait, from its joining the FIFO to its admission or removal. Each episode
 //! lists the sends admitted ahead of its head while it waited, and how long
-//! each held its slots.
+//! each held its slots. With pieces, the head's admission and wait are its
+//! first piece's.
+//!
+//! Experiment D's statistics, under `d` and in each episode: per head, whether
+//! the client read all of it, the time from its request to its last byte, and
+//! the fewest free main-pool slots from its request to its last byte, both at
+//! every change and in samples every `--sample-ms` (0: no samples), as
+//! admission-server samples `main_free`; whether each drainer's reply was read
+//! whole before its connection ended; the sends of large replies (pieces, or
+//! whole replies) and those that waited for room in the socket, by the kind
+//! of connection; the pieces that waited at the gate; and the connections
+//! ended by each cause, by kind.
 //!
 //! Determinism. Time is integer nanoseconds. One event queue, ordered by time
 //! and then by the order the events were scheduled. An event and what it sets
@@ -206,6 +259,31 @@ struct Args {
     /// send; 0 turns it off.
     #[arg(long, default_value_t = 1000)]
     backstop_ms: u64,
+    /// Payload bytes of `--kbuf` that the peer's receive buffer of a
+    /// fast-reading connection takes (see Truesize in the module docs).
+    #[arg(long, default_value_t = 0)]
+    rwnd: u64,
+    /// Largest segment payload on fast-reading connections; 0: no segments.
+    /// Linux sizes a segment to the MSS, at most half the largest window
+    /// the peer has advertised (`tcp_bound_to_half_wnd`).
+    #[arg(long, default_value_t = 0)]
+    seg: u64,
+    /// Truesize of a segment beyond its payload, on connections with
+    /// segments. On Linux 6.12 with `MAX_TCP_HEADER` of 320 B, the skb head
+    /// comes from `skb_small_head_cache` and costs SKB_TRUESIZE(320) = 896 B
+    /// (derived from the source, not measured).
+    #[arg(long, default_value_t = 0)]
+    skb_overhead: u64,
+    /// Large replies of more than this many bytes are sent in pieces of
+    /// this many; 0 sends every reply whole.
+    #[arg(long, default_value_t = 0)]
+    stream_piece: u64,
+    /// Each piece waits for `POLLOUT` on its socket before it joins the FIFO.
+    #[arg(long)]
+    stream_gate: bool,
+    /// Interval of the free-slot samples; 0 takes none.
+    #[arg(long, default_value_t = 0)]
+    sample_ms: u64,
 
     #[arg(long, default_value_t = 16)]
     small_conns: usize,
@@ -225,6 +303,10 @@ struct Args {
     slow_read_bps: u64,
     #[arg(long, default_value_t = 1 << 20)]
     slow_kbuf: u64,
+    #[arg(long, default_value_t = 0)]
+    slow_rwnd: u64,
+    #[arg(long, default_value_t = 0)]
+    slow_seg: u64,
     /// Connections that receive sends outside the FIFO.
     #[arg(long, default_value_t = 4)]
     outside_conns: usize,
@@ -240,6 +322,14 @@ struct Args {
     stall_peers: usize,
     #[arg(long, default_value_t = 3 << 20)]
     stall_size: u64,
+    /// Microseconds between stalled peers' requests; 0 sends them together.
+    #[arg(long, default_value_t = 0)]
+    stall_gap_us: u64,
+    /// The part of `--stall-kbuf` the peer's receive buffer takes.
+    #[arg(long, default_value_t = 0)]
+    stall_rwnd: u64,
+    #[arg(long, default_value_t = 0)]
+    stall_seg: u64,
     #[arg(long, default_value_t = 0)]
     drainers: usize,
     #[arg(long, default_value_t = 3 << 20)]
@@ -248,6 +338,10 @@ struct Args {
     drain_read_bps: u64,
     #[arg(long, default_value_t = 1 << 20)]
     drain_kbuf: u64,
+    #[arg(long, default_value_t = 0)]
+    drain_rwnd: u64,
+    #[arg(long, default_value_t = 0)]
+    drain_seg: u64,
     #[arg(long, default_value_t = 200)]
     large_delay_ms: u64,
     #[arg(long, default_value_t = 7 << 20)]
@@ -257,7 +351,7 @@ struct Args {
 impl Args {
     /// Every parameter, by its argument id, as the run used it.
     fn params(&self) -> Value {
-        let fields: [(&str, Value); 43] = [
+        let fields: [(&str, Value); 56] = [
             ("order", json!(self.order.name())),
             ("seed", json!(self.seed)),
             ("warmup", json!(self.warmup)),
@@ -281,6 +375,12 @@ impl Args {
             ("writable", json!(self.writable)),
             ("fast_read_bps", json!(self.fast_read_bps)),
             ("backstop_ms", json!(self.backstop_ms)),
+            ("rwnd", json!(self.rwnd)),
+            ("seg", json!(self.seg)),
+            ("skb_overhead", json!(self.skb_overhead)),
+            ("stream_piece", json!(self.stream_piece)),
+            ("stream_gate", json!(self.stream_gate)),
+            ("sample_ms", json!(self.sample_ms)),
             ("small_conns", json!(self.small_conns)),
             ("small_rate", json!(self.small_rate)),
             ("small_size", json!(self.small_size)),
@@ -289,16 +389,23 @@ impl Args {
             ("slow_size", json!(self.slow_size)),
             ("slow_read_bps", json!(self.slow_read_bps)),
             ("slow_kbuf", json!(self.slow_kbuf)),
+            ("slow_rwnd", json!(self.slow_rwnd)),
+            ("slow_seg", json!(self.slow_seg)),
             ("outside_conns", json!(self.outside_conns)),
             ("outside_rate", json!(self.outside_rate)),
             ("outside_size", json!(self.outside_size)),
             ("episode_ms", json!(self.episode_ms)),
             ("stall_peers", json!(self.stall_peers)),
             ("stall_size", json!(self.stall_size)),
+            ("stall_gap_us", json!(self.stall_gap_us)),
+            ("stall_rwnd", json!(self.stall_rwnd)),
+            ("stall_seg", json!(self.stall_seg)),
             ("drainers", json!(self.drainers)),
             ("drain_size", json!(self.drain_size)),
             ("drain_read_bps", json!(self.drain_read_bps)),
             ("drain_kbuf", json!(self.drain_kbuf)),
+            ("drain_rwnd", json!(self.drain_rwnd)),
+            ("drain_seg", json!(self.drain_seg)),
             ("large_delay_ms", json!(self.large_delay_ms)),
             ("large_size", json!(self.large_size)),
         ];
@@ -336,6 +443,35 @@ impl Args {
         (pool, len.div_ceil(slot_size[pool]) as u32)
     }
 
+    /// The kernel buffer of a connection of `kind`.
+    fn socket(&self, kind: Kind) -> Socket {
+        let (kbuf, rwnd, seg, read_bps) = match kind {
+            Kind::Fast | Kind::Large | Kind::Outside => {
+                (self.kbuf, self.rwnd, self.seg, self.fast_read_bps)
+            }
+            Kind::Slow => (
+                self.slow_kbuf,
+                self.slow_rwnd,
+                self.slow_seg,
+                self.slow_read_bps,
+            ),
+            Kind::Stall => (self.stall_kbuf, self.stall_rwnd, self.stall_seg, 0),
+            Kind::Drain => (
+                self.drain_kbuf,
+                self.drain_rwnd,
+                self.drain_seg,
+                self.drain_read_bps,
+            ),
+        };
+        Socket {
+            kbuf,
+            rwnd,
+            seg,
+            overhead: if seg > 0 { self.skb_overhead } else { 0 },
+            read_bps,
+        }
+    }
+
     /// O6's D in nanoseconds.
     fn o6_ns(&self) -> u64 {
         self.o6_ms.unwrap_or(self.admit_ms / 2) * MS
@@ -355,8 +491,14 @@ impl Args {
         if slot_size.contains(&0) || capacity[MAIN] == 0 {
             return Err("every pool needs slots of at least one byte".into());
         }
-        if [self.kbuf, self.stall_kbuf, self.slow_kbuf, self.drain_kbuf].contains(&0) {
-            return Err("every kernel buffer holds at least one byte".into());
+        for kind in [Kind::Fast, Kind::Slow, Kind::Stall, Kind::Drain] {
+            let s = self.socket(kind);
+            if s.rwnd >= s.kbuf {
+                return Err("every kernel buffer holds more than its peer's receive window".into());
+            }
+        }
+        if self.stream_gate && self.stream_piece == 0 {
+            return Err("--stream-gate needs --stream-piece".into());
         }
         if !(0.0..1.0).contains(&self.writable) {
             return Err("--writable is at least 0 and below 1".into());
@@ -860,12 +1002,40 @@ enum Kind {
 }
 
 impl Kind {
+    const ALL: [Kind; 6] = [
+        Kind::Fast,
+        Kind::Slow,
+        Kind::Stall,
+        Kind::Drain,
+        Kind::Large,
+        Kind::Outside,
+    ];
+
     /// The statistics group of a reply on this kind of connection.
     fn source(self) -> usize {
         match self {
             Kind::Fast => FAST,
             Kind::Slow => SLOW,
             _ => EPISODE,
+        }
+    }
+
+    /// Its position in [`Kind::ALL`].
+    fn index(self) -> usize {
+        Kind::ALL
+            .iter()
+            .position(|&k| k == self)
+            .expect("every kind is listed")
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Fast => "fast",
+            Kind::Slow => "slow",
+            Kind::Stall => "stall",
+            Kind::Drain => "drain",
+            Kind::Large => "large",
+            Kind::Outside => "outside",
         }
     }
 }
@@ -876,6 +1046,9 @@ enum Stage {
     Requested,
     Waiting,
     Admitted,
+    /// A reply sent in pieces, from its first piece's start until its last
+    /// piece settles. The reply itself takes no slots; its pieces do.
+    Streaming,
     Settled,
     /// Its connection ended first, or it was refused.
     Ended,
@@ -910,6 +1083,11 @@ struct Reply {
     released_at: Option<u64>,
     /// When the peer read its last byte; set at settlement.
     delivered_at: Option<u64>,
+    /// For a piece: the reply it is part of, and its index there.
+    parent: Option<u32>,
+    piece: u32,
+    /// For a reply sent in pieces: the pieces started.
+    pieces: u32,
 }
 
 /// One slot of an admitted reply, in its connection's send queue.
@@ -918,15 +1096,35 @@ struct Chunk {
     bytes: u64,
 }
 
+/// A kernel buffer's parameters, from the arguments for its kind of
+/// connection.
+struct Socket {
+    kbuf: u64,
+    rwnd: u64,
+    seg: u64,
+    overhead: u64,
+    read_bps: u64,
+}
+
 struct Conn {
     kind: Kind,
     /// The client index for fast, slow and outside connections, the episode
     /// index otherwise.
     owner: usize,
     alive: bool,
-    /// K.
+    /// K, payload bytes in the send queue and the peer's receive buffer.
     kbuf: u64,
-    /// Occupancy at which a send that filled the buffer resumes.
+    /// The peer's receive window W, payload bytes of K.
+    rwnd: u64,
+    /// `sk_sndbuf`, K - W: the send queue's limit, in truesize.
+    sndbuf: u64,
+    /// The largest payload of a segment; 0: no segments.
+    seg: u64,
+    /// A segment's truesize beyond its payload.
+    overhead: u64,
+    /// The send queue's truesize at or below which the socket reports
+    /// `POLLOUT`: a send that filled the buffer resumes, and a gated piece
+    /// goes on.
     writable: u64,
     read_bps: u64,
     /// Bytes ever written into the kernel buffer.
@@ -936,6 +1134,11 @@ struct Conn {
     /// the buffer empty, so no rounding accumulates.
     read_base: u64,
     read_t: u64,
+    /// End offsets of the segments not wholly out of the send queue, oldest
+    /// first; the last one can be part full. Empty while `seg` is 0.
+    segs: VecDeque<u64>,
+    /// Where the last segment starts.
+    tail_start: u64,
     /// A send filled the buffer and waits for `writable` or the backstop.
     blocked: bool,
     /// Names the current wait, so an earlier wait's `Writable` is ignored.
@@ -957,6 +1160,18 @@ struct Conn {
     last_settled_at: u64,
     /// The last settled reply's `waited` (O4w).
     last_waited: bool,
+    /// The reply being sent in pieces. The connection reads no request
+    /// until its last piece is admitted.
+    streaming: Option<u32>,
+    /// A piece waits for `POLLOUT`; the value names the wait, so an earlier
+    /// wait's events are ignored.
+    gate: Option<u64>,
+    gate_token: u64,
+    /// The replies of an episode's connection that have settled, so that an
+    /// end before their last byte is read undoes their delivery.
+    settled: Vec<u32>,
+    /// When the connection ended.
+    ended_at: Option<u64>,
 }
 
 impl Conn {
@@ -978,6 +1193,99 @@ impl Conn {
         let ns = (u128::from(pos - self.read_base) * u128::from(SEC))
             .div_ceil(u128::from(self.read_bps));
         self.read_t + ns.min(u128::from(u64::MAX - self.read_t)) as u64
+    }
+
+    /// The stream offset below which written bytes have left the send queue
+    /// at `t`: what the reader has read, and the peer's receive window.
+    fn ack_limit(&self, t: u64) -> u64 {
+        self.read_at(t) + self.rwnd
+    }
+
+    /// The send queue's truesize at `t` (`sk_wmem_queued`).
+    fn queued(&self, t: u64) -> u64 {
+        let acked = self.written.min(self.ack_limit(t));
+        let gone = self.segs.partition_point(|&end| end <= acked);
+        self.written - acked + self.overhead * (self.segs.len() - gone) as u64
+    }
+
+    /// Drop the segments wholly below `acked`.
+    fn trim(&mut self, acked: u64) {
+        while self.segs.front().is_some_and(|&end| end <= acked) {
+            self.segs.pop_front();
+        }
+    }
+
+    /// The bytes of a `sendmsg` of `left` bytes at `t` that go into the send
+    /// queue, as `tcp_sendmsg_locked` takes them: without segments, up to the
+    /// buffer's limit; with them, the last segment topped up to `seg`
+    /// unchecked, then whole segments while the queue's truesize is below
+    /// `sndbuf`. Records the segments; the caller advances `written`.
+    fn take(&mut self, t: u64, left: u64) -> u64 {
+        let ack = self.ack_limit(t);
+        if self.seg == 0 {
+            return (ack + self.sndbuf).saturating_sub(self.written).min(left);
+        }
+        let mut w = self.written;
+        let mut n = 0;
+        self.trim(w.min(ack));
+        if let Some(end) = self.segs.back_mut() {
+            let unsent = *end - self.tail_start.max(w.min(ack));
+            if unsent < self.seg {
+                let more = (self.seg - unsent).min(left);
+                *end += more;
+                w += more;
+                n += more;
+            }
+        }
+        while n < left {
+            self.trim(w.min(ack));
+            let q = w - w.min(ack) + self.overhead * self.segs.len() as u64;
+            if q >= self.sndbuf {
+                break;
+            }
+            let more = self.seg.min(left - n);
+            self.tail_start = w;
+            w += more;
+            n += more;
+            self.segs.push_back(w);
+        }
+        self.trim(w.min(ack));
+        n
+    }
+
+    /// When the send queue's truesize falls to `writable`: `t` if it is
+    /// there now, and `None` for a reader that does not read.
+    fn writable_at(&self, t: u64) -> Option<u64> {
+        let acked = self.written.min(self.ack_limit(t));
+        if self.queued(t) <= self.writable {
+            return Some(t);
+        }
+        if self.read_bps == 0 {
+            return None;
+        }
+        // The smallest acknowledged offset A at which the queue is at most
+        // `writable`. While A is inside segment j of m left, the queue is
+        // written - A plus the overhead of segments j to m.
+        let gone = self.segs.partition_point(|&end| end <= acked);
+        let mut live = (self.segs.len() - gone) as u64;
+        let mut from = acked;
+        let mut target = None;
+        for &end in self.segs.iter().skip(gone) {
+            let need = (self.written + self.overhead * live).saturating_sub(self.writable);
+            if need.max(from) < end {
+                target = Some(need.max(from));
+                break;
+            }
+            from = end;
+            live -= 1;
+        }
+        let a = target.unwrap_or_else(|| self.written.saturating_sub(self.writable).max(from));
+        let pos = a.saturating_sub(self.rwnd);
+        Some(if pos <= self.read_at(t) {
+            t
+        } else {
+            self.time_reading(pos)
+        })
     }
 }
 
@@ -1006,6 +1314,7 @@ enum Outcome {
     Admitted,
     AdmitTimeout,
     SettleAbort,
+    RoomTimeout,
     Failed,
 }
 
@@ -1017,6 +1326,7 @@ impl Outcome {
             Outcome::Admitted => "admitted",
             Outcome::AdmitTimeout => "admit_timeout",
             Outcome::SettleAbort => "settle_abort",
+            Outcome::RoomTimeout => "room_timeout",
             Outcome::Failed => "failed",
         }
     }
@@ -1042,6 +1352,12 @@ struct Episode {
     covered_at: Option<u64>,
     /// Sends admitted ahead of the head while it waited, from behind it.
     passed: Vec<u32>,
+    /// The waiter whose wait is the head's: the head, or its first piece.
+    wait: Option<u32>,
+    /// The fewest free main-pool slots from the head's request to its last
+    /// byte read, or to its end: at every change, and in the samples.
+    min_free: Option<u32>,
+    min_free_sampled: Option<u32>,
 }
 
 /// Counters and delays for one reply class and source.
@@ -1056,6 +1372,7 @@ struct Stats {
     join_delay: Vec<u64>,
     admit_timeouts: u64,
     settle_aborts: u64,
+    room_timeouts: u64,
     refused: u64,
     failed: u64,
     dropped: u64,
@@ -1070,6 +1387,7 @@ impl Stats {
         self.join_delay.extend_from_slice(&o.join_delay);
         self.admit_timeouts += o.admit_timeouts;
         self.settle_aborts += o.settle_aborts;
+        self.room_timeouts += o.room_timeouts;
         self.refused += o.refused;
         self.failed += o.failed;
         self.dropped += o.dropped;
@@ -1084,6 +1402,7 @@ impl Stats {
             "join_to_admission_us": percentiles(&self.join_delay),
             "admit_timeouts": self.admit_timeouts,
             "settle_aborts": self.settle_aborts,
+            "room_timeouts": self.room_timeouts,
             "refused": self.refused,
             "failed": self.failed,
             "dropped": self.dropped,
@@ -1096,6 +1415,8 @@ enum Event {
     /// A client's next scheduled request or outside send.
     Send(usize),
     EpisodeStart(usize),
+    /// Stalled peer i of the episode asks (`--stall-gap-us` above 0).
+    StallRequest(usize, usize),
     LargeRequest(usize),
     /// The stalled peers and drainers close.
     EpisodeClose(usize),
@@ -1104,6 +1425,12 @@ enum Event {
     /// A blocked connection's buffer has drained to its writable mark.
     Writable(u32, u64),
     Backstop,
+    /// A gated piece's socket may have drained to its writable mark.
+    GateOpen(u32, u64),
+    /// A gated piece has waited `--settle-ms` for room.
+    RoomDeadline(u32, u64),
+    /// Sample the free slots for the heads in progress.
+    Sample,
 }
 
 /// An event and when it runs. `BinaryHeap` pops the largest, so the order
@@ -1139,12 +1466,38 @@ impl Ord for Scheduled {
 enum End {
     AdmitTimeout,
     SettleAbort,
+    /// A gated piece waited `--settle-ms` for room in the socket.
+    RoomTimeout,
     Refused,
     /// The reply can never be admitted: it needs more slots than its pool
     /// has (`bounded_send_slots`' `InvalidInput`).
     Failed,
     /// The client closed it.
     PeerClosed,
+}
+
+impl End {
+    const ALL: [End; 6] = [
+        End::AdmitTimeout,
+        End::SettleAbort,
+        End::RoomTimeout,
+        End::Refused,
+        End::Failed,
+        End::PeerClosed,
+    ];
+
+    /// The name of the cause in the output. A peer close is counted only
+    /// when the server was still sending to the peer, so it is a reset.
+    fn name(self) -> &'static str {
+        match self {
+            End::AdmitTimeout => "admit_timeout",
+            End::SettleAbort => "settle_timeout",
+            End::RoomTimeout => "room_timeout",
+            End::Refused => "refused",
+            End::Failed => "failed",
+            End::PeerClosed => "peer_reset",
+        }
+    }
 }
 
 struct Sim {
@@ -1192,9 +1545,18 @@ struct Sim {
     backstop_at: Option<u64>,
     to_pump: BTreeSet<u32>,
     to_serve: BTreeSet<u32>,
+    /// Connections whose reply's next piece is due.
+    to_stream: BTreeSet<u32>,
 
     /// Indexed by class, then by source.
     stats: [[Stats; 3]; 2],
+    /// Episodes whose head was requested and has not ended or been read.
+    open_heads: Vec<usize>,
+    /// Connections ended in the window, by cause (`End::ALL`) and kind
+    /// (`Kind::ALL`). A peer close counts only while the server was sending.
+    ends: [[u64; 6]; 6],
+    /// Pieces that waited at the gate, by kind.
+    gate_waits: [u64; 6],
 }
 
 impl Sim {
@@ -1232,7 +1594,11 @@ impl Sim {
             backstop_at: None,
             to_pump: BTreeSet::new(),
             to_serve: BTreeSet::new(),
+            to_stream: BTreeSet::new(),
             stats: Default::default(),
+            open_heads: Vec::new(),
+            ends: [[0; 6]; 6],
+            gate_waits: [0; 6],
         };
         let mut rng = SplitMix64(a.seed);
         let groups = [
@@ -1297,8 +1663,14 @@ impl Sim {
                 max_marked: 0,
                 covered_at: None,
                 passed: Vec::new(),
+                wait: None,
+                min_free: None,
+                min_free_sampled: None,
             });
             at += a.episode_ms * MS;
+        }
+        if a.sample_ms > 0 {
+            sim.schedule(0, Event::Sample);
         }
         sim
     }
@@ -1335,23 +1707,24 @@ impl Sim {
     }
 
     fn open(&mut self, kind: Kind, owner: usize) -> u32 {
-        let a = &self.a;
-        let (kbuf, read_bps) = match kind {
-            Kind::Fast | Kind::Large | Kind::Outside => (a.kbuf, a.fast_read_bps),
-            Kind::Slow => (a.slow_kbuf, a.slow_read_bps),
-            Kind::Stall => (a.stall_kbuf, 0),
-            Kind::Drain => (a.drain_kbuf, a.drain_read_bps),
-        };
+        let s = self.a.socket(kind);
+        let sndbuf = s.kbuf - s.rwnd;
         self.conns.push(Conn {
             kind,
             owner,
             alive: true,
-            kbuf,
-            writable: (kbuf as f64 * a.writable) as u64,
-            read_bps,
+            kbuf: s.kbuf,
+            rwnd: s.rwnd,
+            sndbuf,
+            seg: s.seg,
+            overhead: s.overhead,
+            writable: (sndbuf as f64 * self.a.writable) as u64,
+            read_bps: s.read_bps,
             written: 0,
             read_base: 0,
             read_t: self.now,
+            segs: VecDeque::new(),
+            tail_start: 0,
             blocked: false,
             token: 0,
             queue: VecDeque::new(),
@@ -1365,6 +1738,11 @@ impl Sim {
             unsettled: VecDeque::new(),
             last_settled_at: 0,
             last_waited: false,
+            streaming: None,
+            gate: None,
+            gate_token: 0,
+            settled: Vec::new(),
+            ended_at: None,
         });
         (self.conns.len() - 1) as u32
     }
@@ -1394,8 +1772,50 @@ impl Sim {
             settled_at: None,
             released_at: None,
             delivered_at: None,
+            parent: None,
+            piece: 0,
+            pieces: 0,
         });
         (self.replies.len() - 1) as u32
+    }
+
+    /// The reply `r` is part of: its parent for a piece, otherwise itself.
+    fn logical(&self, r: u32) -> u32 {
+        self.replies[r as usize].parent.unwrap_or(r)
+    }
+
+    /// Whether `r` is the first send of its reply: a whole reply, or a first
+    /// piece.
+    fn first_send(&self, r: u32) -> bool {
+        self.replies[r as usize].piece == 0
+    }
+
+    /// Whether `r` is the last send of its reply.
+    fn last_send(&self, r: u32) -> bool {
+        let reply = &self.replies[r as usize];
+        reply
+            .parent
+            .is_none_or(|p| reply.piece + 1 == self.piece_count(p))
+    }
+
+    /// The pieces reply `r` is sent in; 1 for a reply sent whole.
+    fn piece_count(&self, r: u32) -> u32 {
+        let reply = &self.replies[r as usize];
+        if self.pieced(r) {
+            reply.len.div_ceil(self.a.stream_piece) as u32
+        } else {
+            1
+        }
+    }
+
+    /// Whether reply `r` is sent in pieces.
+    fn pieced(&self, r: u32) -> bool {
+        let reply = &self.replies[r as usize];
+        reply.parent.is_none()
+            && self.a.stream_piece > 0
+            && !reply.small
+            && reply.kind != Kind::Outside
+            && reply.len > self.a.stream_piece
     }
 
     /// The client sends a request on `conn`.
@@ -1416,18 +1836,25 @@ impl Sim {
         match event {
             Event::Send(i) => self.send(i),
             Event::EpisodeStart(e) => {
-                for _ in 0..self.a.stall_peers {
-                    let c = self.open(Kind::Stall, e);
-                    self.request(c, self.a.stall_size);
-                    self.episodes[e].peers.push(c);
+                let gap = self.a.stall_gap_us * 1000;
+                if gap == 0 {
+                    for _ in 0..self.a.stall_peers {
+                        self.stall_request(e);
+                    }
                 }
                 for _ in 0..self.a.drainers {
                     let c = self.open(Kind::Drain, e);
                     self.request(c, self.a.drain_size);
                     self.episodes[e].peers.push(c);
                 }
+                if gap > 0 {
+                    for i in 0..self.a.stall_peers {
+                        self.schedule(self.now + i as u64 * gap, Event::StallRequest(e, i));
+                    }
+                }
+                let stalls = self.a.stall_peers as u64 * gap;
                 self.schedule(
-                    self.now + self.a.large_delay_ms * MS,
+                    self.now + stalls + self.a.large_delay_ms * MS,
                     Event::LargeRequest(e),
                 );
                 self.schedule(
@@ -1435,6 +1862,7 @@ impl Sim {
                     Event::EpisodeClose(e),
                 );
             }
+            Event::StallRequest(e, _) => self.stall_request(e),
             Event::LargeRequest(e) => {
                 let c = self.open(Kind::Large, e);
                 let r = self.request(c, self.a.large_size);
@@ -1442,6 +1870,9 @@ impl Sim {
                 ep.head = Some(r);
                 ep.requested_at = self.now;
                 ep.outcome = Outcome::Waiting;
+                ep.min_free = Some(self.free[MAIN]);
+                ep.min_free_sampled = None;
+                self.open_heads.push(e);
             }
             Event::EpisodeClose(e) => {
                 for c in self.episodes[e].peers.clone() {
@@ -1479,7 +1910,66 @@ impl Sim {
                     self.to_pump.insert(c);
                 }
             }
+            Event::GateOpen(c, token) => {
+                let conn = &self.conns[c as usize];
+                if conn.alive && conn.gate == Some(token) {
+                    match conn.writable_at(self.now) {
+                        Some(at) if at <= self.now => {
+                            self.conns[c as usize].gate = None;
+                            self.start_piece(c);
+                        }
+                        Some(at) => self.schedule(at, Event::GateOpen(c, token)),
+                        None => {}
+                    }
+                }
+            }
+            Event::RoomDeadline(c, token) => {
+                let conn = &self.conns[c as usize];
+                if conn.alive && conn.gate == Some(token) {
+                    let r = conn.streaming;
+                    self.end_conn(c, r, End::RoomTimeout);
+                }
+            }
+            Event::Sample => {
+                self.track_free(true);
+                let next = self.now + self.a.sample_ms * MS;
+                if next <= self.end {
+                    self.schedule(next, Event::Sample);
+                }
+            }
         }
+    }
+
+    /// One stalled peer of episode `e` connects and asks.
+    fn stall_request(&mut self, e: usize) {
+        let c = self.open(Kind::Stall, e);
+        self.request(c, self.a.stall_size);
+        self.episodes[e].peers.push(c);
+    }
+
+    /// Bring each open head's fewest free slots up to now, in its samples
+    /// too if `sample`, and drop the heads that have ended or been read.
+    fn track_free(&mut self, sample: bool) {
+        let free = self.free[MAIN];
+        let now = self.now;
+        let Sim {
+            open_heads,
+            episodes,
+            replies,
+            ..
+        } = self;
+        open_heads.retain(|&e| {
+            let ep = &mut episodes[e];
+            let head = &replies[ep.head.expect("an open head was requested") as usize];
+            if head.stage == Stage::Ended || head.delivered_at.is_some_and(|d| d < now) {
+                return false;
+            }
+            ep.min_free = ep.min_free.min(Some(free));
+            if sample {
+                ep.min_free_sampled = Some(ep.min_free_sampled.map_or(free, |m| m.min(free)));
+            }
+            true
+        });
     }
 
     /// A client's scheduled request or outside send.
@@ -1564,6 +2054,10 @@ impl Sim {
                 self.serve(c);
                 busy = true;
             }
+            while let Some(c) = self.to_stream.pop_first() {
+                self.next_piece(c);
+                busy = true;
+            }
             if self.admission_pass() {
                 busy = true;
             }
@@ -1573,18 +2067,35 @@ impl Sim {
         }
     }
 
-    /// The connection task reads requests while it has no waiter and fewer
-    /// than `--pipeline` unsettled replies.
+    /// The connection task reads requests while it has no waiter, sends no
+    /// reply in pieces, and has fewer than `--pipeline` unsettled replies.
     fn serve(&mut self, c: u32) {
         loop {
             let conn = &self.conns[c as usize];
-            if !conn.alive || conn.waiting > 0 || conn.unsettled.len() >= self.a.pipeline {
+            if !conn.alive
+                || conn.waiting > 0
+                || conn.streaming.is_some()
+                || conn.unsettled.len() >= self.a.pipeline
+            {
                 return;
             }
             let Some(&r) = conn.requests.front() else {
                 return;
             };
             self.conns[c as usize].requests.pop_front();
+            if self.pieced(r) {
+                let (pool, slots) = self.a.slots(self.a.stream_piece, self.slot_size);
+                if slots > self.capacity[pool] {
+                    self.end_conn(c, Some(r), End::Failed);
+                    return;
+                }
+                let reply = &mut self.replies[r as usize];
+                reply.joined_at = self.now;
+                reply.stage = Stage::Streaming;
+                self.conns[c as usize].streaming = Some(r);
+                self.next_piece(c);
+                continue;
+            }
             let reply = &mut self.replies[r as usize];
             reply.joined_at = self.now;
             let (pool, slots, small) = (reply.pool, reply.slots, reply.small);
@@ -1604,6 +2115,59 @@ impl Sim {
         }
     }
 
+    /// The streaming reply on `c` starts its next piece: with the gate, once
+    /// the socket reports `POLLOUT`, waiting at most `--settle-ms`.
+    fn next_piece(&mut self, c: u32) {
+        let now = self.now;
+        let conn = &mut self.conns[c as usize];
+        if !conn.alive || conn.streaming.is_none() {
+            return;
+        }
+        if self.a.stream_gate {
+            match conn.writable_at(now) {
+                Some(at) if at <= now => {}
+                at => {
+                    conn.gate_token += 1;
+                    let token = conn.gate_token;
+                    conn.gate = Some(token);
+                    self.gate_waits[conn.kind.index()] += 1;
+                    if let Some(at) = at {
+                        self.schedule(at, Event::GateOpen(c, token));
+                    }
+                    self.schedule(now + self.a.settle_ms * MS, Event::RoomDeadline(c, token));
+                    return;
+                }
+            }
+        }
+        self.start_piece(c);
+    }
+
+    /// The next piece of the streaming reply on `c` joins the FIFO.
+    fn start_piece(&mut self, c: u32) {
+        let l = self.conns[c as usize]
+            .streaming
+            .expect("a piece belongs to a streaming reply");
+        let p = self.a.stream_piece;
+        let logical = &mut self.replies[l as usize];
+        let i = logical.pieces;
+        logical.pieces += 1;
+        let len = p.min(logical.len - u64::from(i) * p);
+        let (scheduled_at, in_window) = (logical.scheduled_at, logical.in_window);
+        let r = self.new_reply(c, len);
+        let (pool, slots) = self.a.slots(len, self.slot_size);
+        let piece = &mut self.replies[r as usize];
+        piece.len = len;
+        piece.small = false;
+        piece.pool = pool;
+        piece.slots = slots;
+        piece.scheduled_at = scheduled_at;
+        piece.in_window = in_window;
+        piece.parent = Some(l);
+        piece.piece = i;
+        piece.joined_at = self.now;
+        self.join(r);
+    }
+
     fn join(&mut self, r: u32) {
         self.waiter_seq += 1;
         let reply = &mut self.replies[r as usize];
@@ -1615,11 +2179,12 @@ impl Sim {
         self.schedule(self.now + self.a.admit_ms * MS, Event::AdmitDeadline(r));
         if kind == Kind::Large {
             let e = self.conns[conn as usize].owner;
-            if self.episodes[e].head == Some(r) {
+            if self.episodes[e].head == Some(self.logical(r)) && self.first_send(r) {
                 self.advance_area();
                 let ep = &mut self.episodes[e];
                 ep.area_at_join = self.area;
                 ep.max_marked = self.marked;
+                ep.wait = Some(r);
                 self.waiting_heads.push(e);
             }
         }
@@ -1638,12 +2203,12 @@ impl Sim {
         self.note_head();
     }
 
-    /// If `r` is an episode's head, its wait ends now.
+    /// If `r` is an episode head's waiter, the head's wait ends now.
     fn leave_wait(&mut self, r: u32) {
         let Some(pos) = self
             .waiting_heads
             .iter()
-            .position(|&e| self.episodes[e].head == Some(r))
+            .position(|&e| self.episodes[e].wait == Some(r))
         else {
             return;
         };
@@ -1684,7 +2249,7 @@ impl Sim {
         }
         for &e in &self.waiting_heads {
             let ep = &mut self.episodes[e];
-            let h = ep.head.expect("a waiting head was requested");
+            let h = ep.wait.expect("a waiting head has a waiter");
             ep.max_marked = ep.max_marked.max(self.marked);
             if ep.covered_at.is_none() && covered >= self.replies[h as usize].slots {
                 ep.covered_at = Some(self.now);
@@ -1818,7 +2383,7 @@ impl Sim {
         let seq = self.replies[r as usize].seq;
         for &e in &self.waiting_heads {
             let ep = &mut self.episodes[e];
-            let h = ep.head.expect("a waiting head was requested");
+            let h = ep.wait.expect("a waiting head has a waiter");
             if self.replies[h as usize].seq < seq {
                 ep.passed.push(r);
             }
@@ -1847,7 +2412,8 @@ impl Sim {
             self.held[i] += u64::from(slots);
         }
         self.holding.insert(r);
-        if kind != Kind::Outside && in_window {
+        let (first, last) = (self.first_send(r), self.last_send(r));
+        if kind != Kind::Outside && in_window && first {
             let s = self.stats(r);
             s.admitted += 1;
             s.passed += u64::from(passed);
@@ -1868,13 +2434,24 @@ impl Sim {
                 self.arm_settle(r);
             }
         }
-        if kind == Kind::Large {
+        if let Some(l) = self.replies[r as usize].parent {
+            if first {
+                self.replies[l as usize].admitted_at = self.now;
+            }
+            if last {
+                // The send of the last piece returns: the connection reads
+                // again.
+                self.conns[c as usize].streaming = None;
+            }
+        }
+        if kind == Kind::Large && first {
             let e = self.conns[c as usize].owner;
-            if self.episodes[e].head == Some(r) {
+            if self.episodes[e].head == Some(self.logical(r)) {
                 self.episodes[e].outcome = Outcome::Admitted;
                 self.episodes[e].admitted_at = Some(self.now);
             }
         }
+        self.track_free(false);
         self.to_pump.insert(c);
         self.to_serve.insert(c);
         self.watch();
@@ -1911,12 +2488,12 @@ impl Sim {
                 conn.run_done = 0;
                 conn.run_left = conn.run.iter().map(|ch| ch.bytes).sum();
             }
-            let room = conn.kbuf.saturating_sub(conn.occupancy(self.now));
-            if room == 0 {
+            let left = conn.run_left;
+            let n = conn.take(self.now, left);
+            if n == 0 {
                 self.block(c);
                 return;
             }
-            let n = room.min(conn.run_left);
             self.write(c, n);
             if self.conns[c as usize].run_left > 0 {
                 self.block(c);
@@ -1990,11 +2567,27 @@ impl Sim {
         conn.last_settled_at = self.now;
         conn.last_waited = waited;
         let next = conn.unsettled.front().copied();
-        if in_window {
+        let last = self.last_send(r);
+        if in_window && last {
             self.stats(r).replies += 1;
         }
         if let Some(next) = next {
             self.arm_settle(next);
+        }
+        let l = self.logical(r);
+        if l != r {
+            if last {
+                let piece_delivered = self.replies[r as usize].delivered_at;
+                let reply = &mut self.replies[l as usize];
+                reply.stage = Stage::Settled;
+                reply.settled_at = Some(self.now);
+                reply.delivered_at = piece_delivered;
+            } else {
+                self.to_stream.insert(c);
+            }
+        }
+        if last && kind.source() == EPISODE {
+            self.conns[c as usize].settled.push(l);
         }
         self.to_serve.insert(c);
     }
@@ -2028,8 +2621,7 @@ impl Sim {
         }
         conn.blocked = true;
         conn.token += 1;
-        if conn.read_bps > 0 {
-            let at = conn.time_reading(conn.written - conn.writable);
+        if let Some(at) = conn.writable_at(self.now) {
             let token = conn.token;
             self.schedule(at, Event::Writable(c, token));
         }
@@ -2044,7 +2636,8 @@ impl Sim {
     /// End a connection: return its slots, drop its waiters, unsettled
     /// replies and unread requests, and discard its kernel buffer.
     /// `trigger` is counted by `why`; the connection's other outstanding
-    /// replies as failed for a peer close and dropped otherwise.
+    /// replies as failed for a peer close and dropped otherwise. A reply
+    /// sent in pieces counts once, whichever of its pieces is outstanding.
     fn end_conn(&mut self, c: u32, trigger: Option<u32>, why: End) {
         if !self.conns[c as usize].alive {
             return;
@@ -2056,13 +2649,26 @@ impl Sim {
             match why {
                 End::AdmitTimeout => s.admit_timeouts += 1,
                 End::SettleAbort => s.settle_aborts += 1,
+                End::RoomTimeout => s.room_timeouts += 1,
                 End::Refused => s.refused += 1,
                 End::Failed | End::PeerClosed => s.failed += 1,
             }
         }
         let conn = &mut self.conns[c as usize];
+        let sending = conn.waiting > 0
+            || !conn.unsettled.is_empty()
+            || conn.streaming.is_some()
+            || !conn.run.is_empty()
+            || !conn.queue.is_empty();
+        if self.now >= self.window.0 && (why != End::PeerClosed || sending) {
+            let cause = End::ALL.iter().position(|&e| e == why).expect("listed");
+            self.ends[cause][conn.kind.index()] += 1;
+        }
         conn.alive = false;
+        conn.ended_at = Some(self.now);
         conn.blocked = false;
+        conn.gate = None;
+        let streaming = conn.streaming.take();
         let chunks: Vec<u32> = conn
             .run
             .drain(..)
@@ -2071,6 +2677,7 @@ impl Sim {
             .collect();
         let unsettled: Vec<u32> = conn.unsettled.drain(..).collect();
         let requests: Vec<u32> = conn.requests.drain(..).collect();
+        let settled = std::mem::take(&mut conn.settled);
         let (kind, owner) = (conn.kind, conn.owner);
         self.blocked.remove(&c);
         for &r in &unsettled {
@@ -2089,8 +2696,14 @@ impl Sim {
         for &r in &waiters {
             self.fifo_remove(r);
         }
-        for r in waiters.into_iter().chain(unsettled) {
-            if Some(r) != trigger && self.replies[r as usize].in_window {
+        let sends: Vec<u32> = waiters.into_iter().chain(unsettled).collect();
+        let mut outstanding: BTreeSet<u32> = sends.iter().map(|&r| self.logical(r)).collect();
+        outstanding.extend(streaming);
+        if let Some(t) = trigger {
+            outstanding.remove(&self.logical(t));
+        }
+        for r in outstanding {
+            if self.replies[r as usize].in_window {
                 let s = self.stats(r);
                 if why == End::PeerClosed {
                     s.failed += 1;
@@ -2100,8 +2713,16 @@ impl Sim {
             }
             self.replies[r as usize].stage = Stage::Ended;
         }
-        for r in requests.into_iter().chain(trigger) {
+        for r in sends.into_iter().chain(requests).chain(trigger) {
             self.replies[r as usize].stage = Stage::Ended;
+            let l = self.logical(r);
+            self.replies[l as usize].stage = Stage::Ended;
+        }
+        for r in settled {
+            let reply = &mut self.replies[r as usize];
+            if reply.delivered_at.is_some_and(|d| d > self.now) {
+                reply.delivered_at = None;
+            }
         }
         match kind {
             Kind::Fast | Kind::Slow => {
@@ -2122,6 +2743,7 @@ impl Sim {
                         ep.outcome = match why {
                             End::AdmitTimeout => Outcome::AdmitTimeout,
                             End::SettleAbort => Outcome::SettleAbort,
+                            End::RoomTimeout => Outcome::RoomTimeout,
                             _ => Outcome::Failed,
                         };
                     }
@@ -2237,7 +2859,78 @@ impl Sim {
                 .iter()
                 .map(|e| self.delivery(e).map(|d| d / MS))
                 .collect::<Vec<_>>(),
+            "d": self.report_d(),
             "episodes": episodes,
+        })
+    }
+
+    /// Experiment D's statistics (see the module docs).
+    fn report_d(&self) -> Value {
+        let completed: Vec<u64> = self
+            .episodes
+            .iter()
+            .filter_map(|e| self.delivery(e))
+            .collect();
+        let requested = self.episodes.iter().filter(|e| e.head.is_some()).count();
+        let mut sends = [0u64; 6];
+        let mut waited = [0u64; 6];
+        let mut read: [Vec<u64>; 6] = Default::default();
+        let mut asked = [0u64; 6];
+        for (i, r) in self.replies.iter().enumerate() {
+            if !r.in_window || r.small || r.kind == Kind::Outside {
+                continue;
+            }
+            let k = r.kind.index();
+            if r.parent.is_none() {
+                asked[k] += 1;
+                if let Some(d) = r.delivered_at.filter(|&d| d <= self.end) {
+                    read[k].push(d - r.scheduled_at);
+                }
+            }
+            if !self.pieced(i as u32) && r.admitted_at > 0 {
+                sends[k] += 1;
+                waited[k] += u64::from(r.waited);
+            }
+        }
+        let by_kind = |v: &[u64; 6]| -> Value {
+            Value::Object(
+                Kind::ALL
+                    .iter()
+                    .zip(v)
+                    .filter(|&(_, &n)| n > 0)
+                    .map(|(k, &n)| (k.name().to_string(), json!(n)))
+                    .collect(),
+            )
+        };
+        let replies = |kind: Kind| {
+            let k = kind.index();
+            json!({
+                "requested": asked[k],
+                "completed": read[k].len(),
+                "completion_us": percentiles(&read[k]),
+            })
+        };
+        let ends: serde_json::Map<String, Value> = End::ALL
+            .iter()
+            .zip(&self.ends)
+            .map(|(e, n)| (e.name().to_string(), by_kind(n)))
+            .collect();
+        let min = |f: fn(&Episode) -> Option<u32>| self.episodes.iter().filter_map(f).min();
+        json!({
+            "large": {
+                "requested": requested,
+                "completed": completed.len(),
+                "not_completed": requested - completed.len(),
+                "completion_us": percentiles(&completed),
+                "min_free": min(|e| e.min_free),
+                "min_free_sampled": min(|e| e.min_free_sampled),
+            },
+            "drain": replies(Kind::Drain),
+            "stall": replies(Kind::Stall),
+            "sends": by_kind(&sends),
+            "sends_waited_for_room": by_kind(&waited),
+            "gate_waits": by_kind(&self.gate_waits),
+            "ends": Value::Object(ends),
         })
     }
 
@@ -2283,6 +2976,9 @@ impl Sim {
                 .covered_at
                 .zip(admitted)
                 .map(|(c, a)| us(a - c)),
+            "min_free": e.min_free,
+            "min_free_sampled": e.min_free_sampled,
+            "pieces": e.head.map(|h| self.replies[h as usize].pieces),
             "passed": passed,
         })
     }
@@ -2328,6 +3024,27 @@ impl Sim {
                 .filter(|&&w| self.replies[w as usize].conn == c as u32)
                 .count();
             assert_eq!(waiting as u32, conn.waiting);
+        }
+        // A reply has at most one piece waiting or unsettled, none while a
+        // piece waits at the gate, and none past its last.
+        for conn in self.conns.iter().filter(|c| c.alive) {
+            let Some(l) = conn.streaming else {
+                assert!(
+                    conn.gate.is_none(),
+                    "a gate waits only for a streaming reply"
+                );
+                continue;
+            };
+            let open = self
+                .fifos
+                .iter()
+                .flatten()
+                .chain(&conn.unsettled)
+                .filter(|&&r| self.replies[r as usize].parent == Some(l))
+                .count();
+            assert!(open <= 1, "{open} pieces of reply {l} are open at once");
+            assert!(conn.gate.is_none() || open == 0);
+            assert!(self.replies[l as usize].pieces <= self.piece_count(l));
         }
     }
 }
@@ -2948,6 +3665,385 @@ mod tests {
             "8",
         ]));
         assert!(v["small"]["slow"]["settle_aborts"].as_u64().unwrap() > 0);
+    }
+
+    /// One episode at 1 s with no fast readers, and `more`.
+    fn quiet(more: &[&str]) -> Args {
+        let mut v = vec!["--small-conns", "0", "--warmup", "1", "--duration", "4"];
+        v.extend_from_slice(more);
+        args(&v)
+    }
+
+    /// The pieces of reply `l`, in order.
+    fn pieces_of(sim: &Sim, l: u32) -> Vec<&Reply> {
+        let mut p: Vec<&Reply> = sim.replies.iter().filter(|r| r.parent == Some(l)).collect();
+        p.sort_by_key(|r| r.piece);
+        p
+    }
+
+    #[test]
+    fn a_reply_of_n_bytes_is_sent_in_ceil_n_over_p_pieces() {
+        let a = quiet(&[
+            "--stall-peers",
+            "0",
+            "--large-size",
+            "7340033",
+            "--stream-piece",
+            "131072",
+        ]);
+        let mut sim = Sim::new(&a);
+        sim.run();
+        let head = sim.episodes[0].head.unwrap();
+        let p = pieces_of(&sim, head);
+        // 56 pieces of 128 KiB and one of 1 B, which together are the reply.
+        assert_eq!(p.len(), 57);
+        assert_eq!(sim.replies[head as usize].pieces, 57);
+        assert!(p[..56].iter().all(|r| r.len == 131072 && r.slots == 8));
+        assert_eq!((p[56].len, p[56].slots), (1, 1));
+        assert!(p.iter().all(|r| r.stage == Stage::Settled));
+        assert!(sim.delivery(&sim.episodes[0]).is_some());
+        // A reply of at most p bytes is sent whole.
+        let v = run(&quiet(&[
+            "--stall-peers",
+            "0",
+            "--large-size",
+            "131072",
+            "--stream-piece",
+            "131072",
+        ]));
+        assert_eq!(v["episodes"][0]["pieces"], 0);
+        assert_eq!(v["d"]["sends"]["large"], 1);
+    }
+
+    #[test]
+    fn a_reply_has_one_piece_waiting_or_unsettled_at_a_time() {
+        // Ungated pieces to stalled peers end partly sent; gated ones wait at
+        // the gate; the drainers' pieces wait for room. `Sim::audit` checks
+        // after every event that no reply has two pieces open.
+        for gate in [&[][..], &["--stream-gate"][..]] {
+            let mut more = vec![
+                "--stall-peers",
+                "8",
+                "--stall-gap-us",
+                "40",
+                "--drainers",
+                "2",
+                "--drain-read-bps",
+                "1048576",
+                "--drain-kbuf",
+                "262144",
+                "--stream-piece",
+                "131072",
+                "--pipeline",
+                "16",
+            ];
+            more.extend_from_slice(gate);
+            let v = run_audited(&quiet(&more));
+            assert!(v["d"]["sends"]["stall"].as_u64().unwrap() > 8);
+            assert!(v["d"]["sends_waited_for_room"]["drain"].as_u64().unwrap() > 0);
+        }
+    }
+
+    /// A connection of `kind` opened at time 0 with `more` arguments.
+    fn socket(kind: Kind, more: &[&str]) -> Conn {
+        let mut sim = Sim::new(&args(more));
+        let c = sim.open(kind, 0);
+        sim.conns.swap_remove(c as usize)
+    }
+
+    #[test]
+    fn the_send_queue_takes_a_new_segment_only_below_sndbuf_and_overshoots_by_less_than_one() {
+        let ov = ["--stall-seg", "32768", "--skb-overhead", "896"];
+        let mut more = vec!["--stall-kbuf", "100000"];
+        more.extend_from_slice(&ov);
+        let mut conn = socket(Kind::Stall, &more);
+        assert_eq!(conn.sndbuf, 100_000);
+        // Segments start at q = 0, 33,664 and 67,328, all below 100,000; the
+        // fourth would start at 100,992.
+        let n = conn.take(0, 1 << 20);
+        assert_eq!(n, 3 * 32768);
+        conn.written += n;
+        assert_eq!(conn.queued(0), 3 * (32768 + 896));
+        assert!(conn.queued(0) - conn.sndbuf < 32768 + 896);
+        assert_eq!(conn.take(0, 1 << 20), 0);
+        // The last segment is topped up without the check: 52,000 B leave a
+        // second segment of 19,232 B and q = 53,792 >= 50,000, and the next
+        // write still adds 13,536 B to it, and no segment after it.
+        let mut more = vec!["--stall-kbuf", "50000"];
+        more.extend_from_slice(&ov);
+        let mut conn = socket(Kind::Stall, &more);
+        let n = conn.take(0, 52_000);
+        assert_eq!(n, 52_000);
+        conn.written += n;
+        assert_eq!(conn.queued(0), 52_000 + 2 * 896);
+        let n = conn.take(0, 1 << 20);
+        assert_eq!(n, 65536 - 52_000);
+        conn.written += n;
+        assert_eq!(conn.take(0, 1 << 20), 0);
+        // Without segments a write is cut at the limit, as Experiment C's
+        // model cut it: K less what is in the buffer.
+        let mut conn = socket(Kind::Stall, &["--stall-kbuf", "100000"]);
+        assert_eq!(conn.take(0, 1 << 20), 100_000);
+    }
+
+    #[test]
+    fn bytes_leave_the_send_queue_into_the_peers_receive_window() {
+        // K = 64 KiB, of which W = 4 KiB is the peer's: a write takes 64 KiB,
+        // 4 KiB of it at once out of the send queue.
+        let mut conn = socket(
+            Kind::Stall,
+            &["--stall-kbuf", "65536", "--stall-rwnd", "4096"],
+        );
+        assert_eq!(conn.sndbuf, 61440);
+        let n = conn.take(0, 1 << 20);
+        assert_eq!(n, 65536);
+        conn.written += n;
+        assert_eq!(conn.queued(0), 61440);
+        // With segments, the overhead of a segment stays until all of it is
+        // out of the queue: the first 32 KiB segment is 4 KiB out.
+        let mut conn = socket(
+            Kind::Stall,
+            &[
+                "--stall-kbuf",
+                "1052672",
+                "--stall-rwnd",
+                "4096",
+                "--stall-seg",
+                "32768",
+                "--skb-overhead",
+                "896",
+            ],
+        );
+        let n = conn.take(0, 131072);
+        conn.written += n;
+        assert_eq!(conn.queued(0), 131072 - 4096 + 4 * 896);
+    }
+
+    #[test]
+    fn a_gated_piece_waits_until_the_queue_is_at_most_two_thirds_of_sndbuf() {
+        // A 384 KiB reply in two pieces of 192 KiB to a drainer reading
+        // 1 MiB/s through a 256 KiB buffer. The first piece goes in whole at
+        // 1 s and leaves q = 196,608 above the mark, 174,762; the second
+        // piece joins when the reader has read 21,846 B.
+        let a = quiet(&[
+            "--stall-peers",
+            "0",
+            "--drainers",
+            "1",
+            "--drain-size",
+            "393216",
+            "--drain-read-bps",
+            "1048576",
+            "--drain-kbuf",
+            "262144",
+            "--stream-piece",
+            "196608",
+            "--stream-gate",
+            "--large-size",
+            "16384",
+        ]);
+        let mut sim = Sim::new(&a);
+        sim.run();
+        let drain = (0..sim.replies.len() as u32)
+            .find(|&r| sim.replies[r as usize].kind == Kind::Drain && sim.pieced(r))
+            .unwrap();
+        let p = pieces_of(&sim, drain);
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].joined_at, SEC);
+        let wait = (21_846 * SEC).div_ceil(1_048_576);
+        assert_eq!(p[1].joined_at, SEC + wait);
+        assert_eq!(sim.gate_waits[Kind::Drain.index()], 1);
+        // With 2 KiB segments of 896 B overhead, a 64 KiB piece is 32
+        // segments, q = 94,208 against a mark of 87,381 in a 128 KiB buffer.
+        // The mark is reached inside the third segment, at 5,035 B read: q =
+        // 65,536 - 5,035 + 30 x 896.
+        let a = quiet(&[
+            "--stall-peers",
+            "0",
+            "--drainers",
+            "1",
+            "--drain-size",
+            "131072",
+            "--drain-read-bps",
+            "1048576",
+            "--drain-kbuf",
+            "131072",
+            "--drain-seg",
+            "2048",
+            "--skb-overhead",
+            "896",
+            "--stream-piece",
+            "65536",
+            "--stream-gate",
+            "--large-size",
+            "16384",
+        ]);
+        let mut sim = Sim::new(&a);
+        sim.run();
+        let drain = (0..sim.replies.len() as u32)
+            .find(|&r| sim.replies[r as usize].kind == Kind::Drain && sim.pieced(r))
+            .unwrap();
+        let p = pieces_of(&sim, drain);
+        assert_eq!(p[1].joined_at, SEC + (5_035 * SEC).div_ceil(1_048_576));
+    }
+
+    #[test]
+    fn a_gated_piece_that_waits_settle_ms_for_room_aborts_its_connection() {
+        // One stalled peer, K = 1 MiB + 4 KiB of which 4 KiB is its window.
+        // Six 128 KiB pieces go in at 1 s, leaving q = 782,336 above the
+        // mark, 699,050; the seventh waits at the gate until 2 s.
+        let a = quiet(&[
+            "--stall-peers",
+            "1",
+            "--stall-kbuf",
+            "1052672",
+            "--stall-rwnd",
+            "4096",
+            "--stream-piece",
+            "131072",
+            "--stream-gate",
+            "--large-size",
+            "16384",
+        ]);
+        let mut sim = Sim::new(&a);
+        sim.run();
+        let stall = sim.episodes[0].peers[0];
+        assert_eq!(sim.conns[stall as usize].ended_at, Some(2 * SEC));
+        let l = (0..sim.replies.len() as u32)
+            .find(|&r| sim.replies[r as usize].kind == Kind::Stall)
+            .unwrap();
+        assert_eq!(sim.replies[l as usize].pieces, 6);
+        let v = sim.report();
+        assert_eq!(v["d"]["ends"]["room_timeout"]["stall"], 1);
+        assert_eq!(v["large"]["episode"]["room_timeouts"], 1);
+        assert_eq!(v["d"]["sends_waited_for_room"].get("stall"), None);
+    }
+
+    #[test]
+    fn a_piece_waits_admit_ms_from_its_own_join() {
+        // A 16-slot pool. The drainer's third piece holds 8 slots waiting for
+        // room; stalled peer 0's first piece, partly sent, holds the other 8
+        // until 2 s; stalled peer 1's waits and takes the drainer's 8 when its
+        // third piece settles. The drainer's fourth piece then waits from that
+        // moment, and times out 500 ms later, before 2 s.
+        let a = quiet(&[
+            "--stall-peers",
+            "2",
+            "--stall-gap-us",
+            "1000",
+            "--stall-kbuf",
+            "8192",
+            "--drainers",
+            "1",
+            "--drain-read-bps",
+            "1048576",
+            "--drain-kbuf",
+            "262144",
+            "--pool-slots",
+            "16",
+            "--stream-piece",
+            "131072",
+            "--admit-ms",
+            "500",
+            "--large-size",
+            "16384",
+        ]);
+        let mut sim = Sim::new(&a);
+        sim.run();
+        let drain = (0..sim.replies.len() as u32)
+            .find(|&r| sim.replies[r as usize].kind == Kind::Drain && sim.pieced(r))
+            .unwrap();
+        let last = *pieces_of(&sim, drain).last().unwrap();
+        assert_eq!(last.piece, 3);
+        assert_eq!(last.stage, Stage::Ended);
+        assert!(last.joined_at > SEC + 100 * MS);
+        let c = last.conn as usize;
+        assert_eq!(sim.conns[c].ended_at, Some(last.joined_at + 500 * MS));
+        assert_eq!(sim.report()["d"]["ends"]["admit_timeout"]["drain"], 1);
+    }
+
+    #[test]
+    fn a_piece_is_timed_for_settle_ms_from_its_own_admission() {
+        // 1 MiB to a drainer reading 96 KiB/s through a 128 KiB buffer, in
+        // 64 KiB pieces: the reply takes about 10.7 s, and each piece settles
+        // within 0.9 s of its admission, so none is aborted.
+        let drainer = [
+            "--small-conns",
+            "0",
+            "--warmup",
+            "1",
+            "--stall-peers",
+            "0",
+            "--drainers",
+            "1",
+            "--drain-size",
+            "1048576",
+            "--drain-read-bps",
+            "98304",
+            "--drain-kbuf",
+            "131072",
+            "--large-size",
+            "16384",
+            "--episode-ms",
+            "16000",
+            "--duration",
+            "16",
+        ];
+        let mut more = drainer.to_vec();
+        more.extend_from_slice(&["--stream-piece", "65536"]);
+        let v = run_audited(&args(&more));
+        assert_eq!(v["d"]["drain"]["completed"], 1);
+        assert_eq!(v["large"]["episode"]["settle_aborts"], 0);
+        assert!(v["d"]["drain"]["completion_us"]["max"].as_f64().unwrap() > 10e6);
+        // Sent whole, it settles only when 896 KiB have been read, 9.3 s
+        // after its admission.
+        let v = run(&args(&drainer));
+        assert_eq!(v["d"]["drain"]["completed"], 0);
+        assert_eq!(v["d"]["ends"]["settle_timeout"]["drain"], 1);
+    }
+
+    #[test]
+    fn stalled_peers_ask_one_gap_apart_and_the_head_one_gap_and_the_delay_after() {
+        let a = quiet(&["--stall-gap-us", "40"]);
+        let mut sim = Sim::new(&a);
+        sim.run();
+        let asked: Vec<u64> = sim
+            .replies
+            .iter()
+            .filter(|r| r.kind == Kind::Stall)
+            .map(|r| r.scheduled_at)
+            .collect();
+        assert_eq!(asked, [SEC, SEC + 40_000, SEC + 80_000]);
+        assert_eq!(sim.episodes[0].requested_at, SEC + 120_000 + 200 * MS);
+        // At 0 they ask together, and the head 200 ms after.
+        let mut sim = Sim::new(&quiet(&[]));
+        sim.run();
+        assert!(
+            sim.replies
+                .iter()
+                .filter(|r| r.kind == Kind::Stall)
+                .all(|r| r.scheduled_at == SEC)
+        );
+        assert_eq!(sim.episodes[0].requested_at, SEC + 200 * MS);
+    }
+
+    #[test]
+    fn the_fewest_free_slots_during_a_head_count_its_own_and_every_admission() {
+        // The head takes 448 of the 512 slots once the stalled peers are
+        // aborted; its 128 KiB pieces take 8 at a time.
+        let v = run(&quiet(&["--stall-gap-us", "40", "--sample-ms", "10"]));
+        assert_eq!(v["d"]["large"]["min_free"], 64);
+        // Every sample from its request to its last byte saw the stalled
+        // peers' 384 slots held, and none fell in the 6.8 ms after admission.
+        assert_eq!(v["d"]["large"]["min_free_sampled"], 128);
+        let v = run(&quiet(&[
+            "--stall-gap-us",
+            "40",
+            "--stream-piece",
+            "131072",
+            "--stream-gate",
+        ]));
+        assert_eq!(v["d"]["large"]["min_free"], 504);
     }
 
     #[test]
