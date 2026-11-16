@@ -1,8 +1,8 @@
 # Experiment D: large replies in pieces gated on socket room
 
 - **Status:** closed. All three gated arms pass the decision rule, which
-  picks 128 KiB pieces; the owner has yet to decide whether U's cost needs a
-  saturated-worker measurement before the fast-path specification.
+  picks 128 KiB pieces. U's 42% extra worker CPU per byte is not yet split
+  between ringline, the kernel send path and loopback's receive processing.
 - **Span:** Nov 2026 · follows Experiment C (`2026-11-send-admission-c.md`)
   · SystemsLab context `send-admission-expC`
 
@@ -267,15 +267,15 @@ O0 whole's own runs spread 135 µs in p50 and 0.017 ns/B in CPU per byte.
 Each piece adds 21 to 23 µs of worker CPU at 128 KiB (56 a reply) and 14 µs
 at 64 KiB (112 a reply).
 
-Worker CPU per reply equals the reply's time within 3% in every arm, so the
-worker thread was busy for the whole reply and the CPU figure measures the
-same thing as wall time. I do not know how much of the 42% is work done per
-piece and how much is time spent waiting on the next piece's settlement,
-wake, poll and admission; on loopback the sender's CPU also runs the
-receiver's TCP processing. What U shows is that pieces make a lone 7 MiB
-loopback reply 45% (128 KiB) and 61% (64 KiB) slower. A profile, or a U
-variant with enough concurrent replies to saturate the worker, would
-separate the two.
+The worker thread was 97.7 to 98.8% busy over the load's run in every arm
+(schedstat CPU against wall time), with one connection. The worker blocks in
+the kernel when it has nothing to do (no SQPOLL, no busy polling), so U
+already saturated it, and the extra time per reply is CPU time on the
+worker's CPU, not idle time between pieces. I do not know how that CPU
+divides between ringline's work per piece (admission, completion, the gate's
+poll and wake), the kernel's send path run once per piece, and loopback's
+receive processing, which runs on the sending CPU and would not run on the
+server with a real NIC. A profile of the worker's CPU would separate them.
 
 ### W4 at 256 KiB, rerun on hv03
 
@@ -337,8 +337,9 @@ By the decision rule, applied as written:
   TLS on the same worker uses it.
 - U's CPU per byte is 1.42 times whole replies for 128 KiB pieces (1.46
   under O7w), under the rule's 2x threshold, so the rule does not send it to
-  the owner. That figure tracks wall time in U (above), so the rule was
-  applied to a measure of time per reply, not of work per byte.
+  the owner. That figure includes loopback's receive processing on the
+  worker's CPU (above), so it overstates what pieces cost a server sending
+  over a NIC by an amount not yet measured.
 - The prediction is refuted in one cell, W4 at 256 KiB on hv01, by both
   128 KiB gated arms (12.1 and 12.7 ms median against 10 ms). On hv03 the same
   arms gave 1.2 and 1.3 ms.
@@ -352,9 +353,9 @@ My recommendation, apart from the rule:
   is 85 KiB) 128 KiB pieces to a fast reader were partly sent and 64 KiB
   pieces never were; at 1 MiB neither was. This is the rule's "how it sizes p
   against a socket's send buffer" clause, inferred from these cells.
-- Before the fast-path specification, the owner decides whether U needs the
-  saturated-worker measurement. The rule did not escalate, but it was applied
-  to wall time.
+- Before the fast-path specification, profile the worker's CPU in U to
+  find which part of the 42% is ringline's and the kernel send path's, and
+  which is loopback's receive processing.
 
 D ran on 3db626d8, whose gate still had two bugs that need a second send
 waiting on the gated connection (above); D's harness gates a piece only
