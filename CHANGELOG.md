@@ -179,7 +179,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   socket refused, usually `ENOTCONN` on a socket already in `TCP_CLOSE`
   after a reset or a retransmission timeout.
 - `yield_now()` wakes the calling task and returns `Pending` once, so a task
-  that makes many `send_nowait` calls without awaiting anything lets the
+  that makes many `send` calls without awaiting anything lets the
   worker poll its other queued tasks and process I/O between batches. Callers
   had each written this future themselves. Tasks woken by I/O or timers
   processed during the yield are polled after the yielding task resumes, and
@@ -726,7 +726,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tested) move 0.04-0.07 more per value byte. On mio, pipelined frames gain
   in some runs and not others. `with_bytes` readers are unchanged.
 - ringline requires `ringline-tls` 0.1.2. On the unbuffered engine (the
-  default), a TLS 1.3 send through `send`, `send_nowait` or
+  default), a TLS 1.3 send through `send` or
   `send_backpressured` costs 1 copy instead of 2 with the ring provider, and
   with aws-lc-rs on ChaCha20-Poly1305 or in FIPS mode: rustls seals the
   record in the send-pool slot (io_uring) or the queued buffer (mio). With
@@ -885,7 +885,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which a plaintext connection (`H2AsyncConn::from_conn` over `connect`)
   needs. Over TLS it copies as many bytes as before and allocates less.
 - On io_uring, a copy send wider than one send-pool slot (`send`,
-  `send_nowait`, `send_backpressured`), and TLS ciphertext from one send
+  `send_backpressured`), and TLS ciphertext from one send
   that fills two or more slots, go to the kernel as one `sendmsg` over up to
   32 of their slots when nothing else is in flight on the connection; with
   the send slab full, the first slot goes alone, as before. Before, the
@@ -1254,7 +1254,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   did nothing. On mio `forward_held` worked on every connection and
   `set_recv_sink` on every plaintext one (`enable_recv_forward` did nothing),
   and code that used them there no longer compiles. Echo or forward with
-  `with_data` and `send_nowait` or `forward_recv_buf`, or with
+  `with_data` and `send` or `forward_recv_buf`, or with
   `forward_to_conn`. A recv sink is replaced by copying out of `with_data`
   into the caller's buffer, which on mio is one copy more than the sink.
   On io_uring every replacement for `run_direct_echo` wakes a task per
@@ -1298,6 +1298,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ones. UDP `recv_batch_timed` is unchanged. Client latency is timed with
   `Instant`. Remove `.timestamps(..)` and `.kernel_timestamps(..)` calls and
   the `timestamps` feature from `Cargo.toml`.
+- **Breaking:** `send_nowait` and `send_chain_nowait` on `Connection` and
+  `SendHalf`. Replace `send_nowait(data)` with `send(data)` and drop the
+  `SendCompletion` it returns: dropping it does not cancel the send, and
+  `send` returns the same errors at the call. Replace `send_chain_nowait(f)`
+  (io_uring only) with `send_chain(f)`, whose closure returns
+  `io::Result<()>`; a closure that returned another value passes it out
+  through a variable it captures.
 
 ### Fixed
 

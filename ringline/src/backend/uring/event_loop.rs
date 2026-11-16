@@ -642,15 +642,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // This means the drain_completions() below sees those CQEs
             // inline, eliminating the "dead" submit_and_wait(1) iteration
             // that would otherwise burn a full event-loop cycle just to
-            // process send CQEs that wake no tasks (`send_nowait` sends
-            // settle nothing).
+            // process send CQEs that wake no tasks (a send whose
+            // `SendCompletion` was dropped wakes nothing).
             let _ = self.driver.ring.flush();
 
             // Non-blocking drain: consume the CQEs (primarily send completions)
             // that flush()'s GETEVENTS step posted to the CQ ring.
-            // For send_nowait the pool slot is freed here and nothing is
-            // settled. Draining inline collapses the two-iteration
-            // pattern (dead send-CQE iter + live recv-CQE iter) down to one.
+            // For a send whose completion was dropped, the pool slot and
+            // the abandoned table entry are freed here. Draining inline
+            // collapses the two-iteration pattern (dead send-CQE iter + live
+            // recv-CQE iter) down to one.
             self.drain_completions();
             diag_cqes_2nd += self.driver.cqe_batch.len() as u64;
 
@@ -4127,7 +4128,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.submit_next_queued(conn_index);
         }
 
-        // `send_chain` attached an id; `send_chain_nowait` did not.
+        // `SendHalf::send_chain` attaches an id; a chain built through
+        // `DriverCtx::send_chain` has none.
         if let Some(id) = chain.send_id {
             let result = match failure {
                 Some(error) => Err(error),
@@ -4137,8 +4139,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // The bytes of the chain and the queue behind it are gone, and a dropped
-        // `send_chain` future or a nowait chain reports that to nobody but the
-        // reader. Later sends must not reach the peer after that gap.
+        // `send_chain` future reports that to nobody but the reader. Later sends must not reach the peer after that gap.
         if let Some(err) = chain.failure() {
             self.abort_connection(conn_index, err);
         }
@@ -8836,7 +8837,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
-        // Allocate a pool slot (simulating send_nowait).
+        // Allocate a pool slot (simulating a copy send).
         let data = b"hello";
         let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
@@ -17797,7 +17798,7 @@ mod tests {
     }
 
     /// A forced close that abandons a queued send no caller waits on
-    /// (`send_nowait`) still reports the slot it returned to the pool, or a
+    /// (one with no send id) still reports the slot it returned to the pool, or a
     /// bounded send parked on the pool waits for an unrelated release.
     #[test]
     fn a_forced_close_abandoning_an_unawaited_send_releases_capacity() {

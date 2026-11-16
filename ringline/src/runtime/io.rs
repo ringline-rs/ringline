@@ -1199,14 +1199,6 @@ impl ConnCtx {
 
     // ── Send (synchronous / fire-and-forget) ─────────────────────────
 
-    /// See [`SendHalf::send_nowait`].
-    pub(crate) fn send_nowait(&self, data: &[u8]) -> io::Result<()> {
-        with_state(|driver, _| {
-            let mut ctx = driver.make_ctx();
-            ctx.send(self.id(), data)
-        })
-    }
-
     /// Crate-internal body of [`SendHalf::forward_recv_buf`]; see that method
     /// for behaviour and errors.
     pub(crate) fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
@@ -1445,35 +1437,13 @@ impl ConnCtx {
 
     // ── Send chain ────────────────────────────────────────────────────
 
-    /// Build an IO_LINK chained send on this connection (fire-and-forget).
-    ///
-    /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder) for
-    /// constructing linked SQEs. Call `.copy()`, `.parts()...add()` to add SQEs,
-    /// then `.finish()` to submit the chain.
-    ///
-    /// For backpressure-aware chained sending, use `send_chain()`.
-    #[cfg(has_io_uring)]
-    pub(crate) fn send_chain_nowait<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
-    {
-        with_state(|driver, _| {
-            let mut ctx = driver.make_ctx();
-            let token = ConnId::new(self.conn_index, self.generation);
-            let builder = ctx.send_chain(token);
-            f(builder)
-        })
-    }
-
-    /// Build an IO_LINK chained send and await completion.
+    /// Build an IO_LINK chained send. See [`SendHalf::send_chain`].
     ///
     /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder) for
     /// constructing linked SQEs. Call `.copy()`, `.parts()...add()` to build the
     /// chain, then `.finish()` to submit it. Returns a [`SendCompletion`] that
     /// resolves with the bytes the chain sent, or `Ok(0)` when the closure
     /// submitted nothing.
-    ///
-    /// For fire-and-forget chained sending, use `send_chain_nowait()`.
     #[cfg(has_io_uring)]
     pub(crate) fn send_chain<F>(&self, f: F) -> io::Result<SendCompletion>
     where
@@ -2605,7 +2575,7 @@ impl RecvHalf {
 ///
 /// ```ignore
 /// let (mut tx, mut rx) = conn.split();
-/// let n = rx.with_data(|d| { let _ = tx.send_nowait(d); ParseResult::Consumed(d.len()) }).await;
+/// let n = rx.with_data(|d| { let _ = tx.send(d); ParseResult::Consumed(d.len()) }).await;
 /// ```
 ///
 /// Dropping the last half closes the connection, with the same graceful close as
@@ -2631,7 +2601,7 @@ impl RecvHalf {
 ///             loop {
 ///                 let n = rx.with_data(|data| {
 ///                     // Echo back whatever we received
-///                     tx.send_nowait(data).ok();
+///                     let _ = tx.send(data);
 ///                     ParseResult::Consumed(data.len())
 ///                 }).await;
 ///                 // n == 0 means connection closed (EOF)
@@ -2659,7 +2629,7 @@ impl RecvHalf {
 ///                     // Find newline
 ///                     if let Some(pos) = data.iter().position(|&b| b == b'\n') {
 ///                         let line = &data[..=pos];
-///                         tx.send_nowait(line).ok();
+///                         let _ = tx.send(line);
 ///                         ParseResult::Consumed(pos + 1)
 ///                     } else {
 ///                         ParseResult::NeedMore
@@ -2731,8 +2701,9 @@ impl RecvHalf {
 ///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
 ///             let (mut tx, mut rx) = conn.split();
-///             // Fire-and-forget (returns Err if send pool exhausted)
-///             tx.send_nowait(b"hello").ok();
+///             // Without waiting: dropping the `SendCompletion` does not
+///             // cancel the send.
+///             let _ = tx.send(b"hello");
 ///
 ///             // Await send completion
 ///             if let Ok(future) = tx.send(b"world") {
@@ -2958,11 +2929,6 @@ impl Connection {
     /// See [`SendHalf::send`].
     pub fn send(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.tx.send(data)
-    }
-
-    /// See [`SendHalf::send_nowait`].
-    pub fn send_nowait(&mut self, data: &[u8]) -> io::Result<()> {
-        self.tx.send_nowait(data)
     }
 
     /// See [`SendHalf::send_parts`].
@@ -3193,15 +3159,6 @@ impl Connection {
         self.tx.conn.send_chain(f)
     }
 
-    /// See [`SendHalf::send_chain_nowait`].
-    #[cfg(has_io_uring)]
-    pub fn send_chain_nowait<F, R>(&mut self, f: F) -> R
-    where
-        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
-    {
-        self.tx.conn.send_chain_nowait(f)
-    }
-
     /// See [`SendHalf::shutdown_write`].
     pub fn shutdown_write(&mut self) {
         self.tx.conn.shutdown_write();
@@ -3243,8 +3200,11 @@ impl SendHalf {
     /// ciphertext's. Each future resolves with its own send's result, so
     /// several may be awaited at once.
     ///
-    /// Use this when you need backpressure or send completion notification.
-    /// For fire-and-forget sending, use `send_nowait()`.
+    /// Dropping the future does not cancel the send: the bytes still go out
+    /// and the result is discarded, so `tx.send(data)?;` sends without
+    /// waiting. [`send_backpressured`](Self::send_backpressured) and
+    /// [`send_admitted`](Self::send_admitted) wait for send-pool capacity
+    /// instead of failing when the pool is full.
     ///
     /// # Errors
     ///
@@ -3271,26 +3231,10 @@ impl SendHalf {
     /// Submission-queue pressure is not an error: the send is queued and
     /// retried. Persistent submission-queue starvation is reported like a
     /// write error: the awaited `SendCompletion` resolves `Err` and the
-    /// connection is closed.
+    /// connection is closed. With the future dropped, it surfaces only as the
+    /// connection closing.
     pub fn send(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.conn.send(data)
-    }
-
-    /// Fire-and-forget send: copies data into the send pool and submits the SQE.
-    /// One copy, no heap allocation, no future.
-    ///
-    /// This is the hot-path send for cache responses. The CQE is handled
-    /// internally by the executor (resource cleanup + send queue advancement).
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`send`](Self::send). With no future to resolve,
-    /// persistent submission-queue starvation surfaces only as the connection
-    /// closing.
-    ///
-    /// For backpressure-aware sending, use `send()` instead.
-    pub fn send_nowait(&mut self, data: &[u8]) -> io::Result<()> {
-        self.conn.send_nowait(data)
     }
 
     /// Begin building a scatter-gather send with mixed copy and zero-copy guard
@@ -3464,9 +3408,9 @@ impl SendHalf {
     /// On io_uring, if `data` is exactly the connection's whole recv
     /// accumulator, the accumulator is detached and sent under a guard
     /// (copied into the send pool below `send_zc_threshold`). Otherwise
-    /// `data` is copied as by [`send_nowait`](Self::send_nowait).
+    /// `data` is copied as by [`send`](Self::send).
     ///
-    /// On mio, `data` is always copied as by `send_nowait`, encrypted first
+    /// On mio, `data` is always copied as by `send`, encrypted first
     /// on a TLS connection. On io_uring a TLS connection is always encrypted
     /// into the send pool; when `data` is the whole accumulator, the
     /// accumulator is detached first and gathered into a temporary buffer.
@@ -3484,7 +3428,7 @@ impl SendHalf {
     ///
     /// `NotConnected` if this handle is stale: its connection closed and the
     /// slot now holds another. Otherwise the errors of
-    /// [`send_nowait`](Self::send_nowait), and, when `data` is the whole
+    /// [`send`](Self::send), and, when `data` is the whole
     /// accumulator, `Other` if the zero-copy send slab is full. Nothing is
     /// sent or consumed on `Err`.
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
@@ -3519,7 +3463,7 @@ impl SendHalf {
         self.conn.tls_info()
     }
 
-    /// Build an IO_LINK chained send and await completion.
+    /// Build an IO_LINK chained send, with a future for its completion.
     ///
     /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder)
     /// for constructing linked SQEs. Call `.copy()`, `.parts()...add()` to build
@@ -3555,33 +3499,14 @@ impl SendHalf {
     /// [`close`](Self::close) waits for a running chain, and a chain waits for
     /// the peer to read.
     ///
-    /// For fire-and-forget chained sending, use `send_chain_nowait()`.
+    /// Dropping the [`SendCompletion`] does not cancel the chain, as for
+    /// [`send`](Self::send).
     #[cfg(has_io_uring)]
     pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendCompletion>
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
     {
         self.conn.send_chain(f)
-    }
-
-    /// Build an IO_LINK chained send on this connection (fire-and-forget).
-    ///
-    /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder)
-    /// for constructing linked SQEs. Call `.copy()`, `.parts()...add()` to add
-    /// SQEs, then `.finish()` to submit the chain. On a TLS connection the
-    /// chain is encrypted and queued as one send; see
-    /// [`send_chain`](Self::send_chain).
-    ///
-    /// A chain that fails closes the connection, as for
-    /// [`send_chain`](Self::send_chain).
-    ///
-    /// For backpressure-aware chained sending, use `send_chain()`.
-    #[cfg(has_io_uring)]
-    pub fn send_chain_nowait<F, R>(&mut self, f: F) -> R
-    where
-        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
-    {
-        self.conn.send_chain_nowait(f)
     }
 
     /// Offer this connection for rebalancing. See
@@ -4783,7 +4708,7 @@ pub(crate) fn release_connect(
 /// A task runs until it awaits a future that is not ready. Until then no
 /// other task on its worker is polled, and no I/O completion, readiness event
 /// or timer is processed. A task that does a long stretch of work without such
-/// an await, such as many `send_nowait` calls in a row, can await
+/// an await, such as many `send` calls in a row, can await
 /// `yield_now()` between parts of it.
 ///
 /// The first poll wakes the task and returns `Pending`; the second returns

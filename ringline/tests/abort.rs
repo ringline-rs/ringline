@@ -169,7 +169,7 @@ fn fill(conn: &mut Connection) {
 #[cfg(not(has_io_uring))]
 fn fill(conn: &mut Connection) {
     for _ in 0..256 {
-        conn.send_nowait(&[1; 1 << 16]).expect("queued");
+        conn.send(&[1; 1 << 16]).expect("queued");
     }
 }
 

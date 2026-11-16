@@ -879,7 +879,7 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 ///             let (mut tx, mut rx) = conn.split();
 ///             loop {
 ///                 let n = rx.with_data(|data| {
-///                     tx.send_nowait(data).ok();
+///                     let _ = tx.send(data);
 ///                     ParseResult::Consumed(data.len())
 ///                 }).await;
 ///                 if n == 0 { break; }
@@ -2973,7 +2973,7 @@ mod worker_exit_tests {
                     if got == STALL {
                         std::thread::sleep(STALL_FOR);
                     }
-                    if n == 0 || conn.send_nowait(&got).is_err() {
+                    if n == 0 || conn.send(&got).is_err() {
                         return;
                     }
                 }

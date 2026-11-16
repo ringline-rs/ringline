@@ -123,14 +123,14 @@ impl AsyncEventHandler for RecordingServer {
                                     _ => String::from("<not a bulk string>"),
                                 };
                                 SEEN.lock().unwrap().push((name, items.len()));
-                                let _ = tx.send_nowait(reply(&items));
+                                let _ = tx.send(reply(&items));
                                 ParseResult::Consumed(consumed)
                             }
                             Ok((_, consumed)) => {
                                 SEEN.lock()
                                     .unwrap()
                                     .push((String::from("<not an array>"), 0));
-                                let _ = tx.send_nowait(b"-ERR not an array\r\n");
+                                let _ = tx.send(b"-ERR not an array\r\n");
                                 ParseResult::Consumed(consumed)
                             }
                             Err(e) if e.is_incomplete() => ParseResult::NeedMore,

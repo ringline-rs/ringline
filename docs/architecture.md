@@ -206,11 +206,10 @@ buffer that `read_tls` copies from) and feeds it to rustls; ringline copies the
 decrypted plaintext into the accumulator. `with_bytes` provides zero-copy
 slicing of the accumulator, not a reference to kernel-owned ring memory.
 
-`send_nowait` eagerly submits an owned copy and returns without a future.
-`send` also submits eagerly but returns `SendCompletion`, which waits for the
-logical send's completion. Neither form bypasses backend completion handling:
-the completion is required to release pool or slab resources and advance the
-queue. On io_uring, `send_parts` can retain guarded user memory for zero-copy
+`send` eagerly submits an owned copy and returns `SendCompletion`, which waits
+for the logical send's completion; dropping it does not cancel the send.
+Backend completion handling runs either way: the completion is required to
+release pool or slab resources and advance the queue. On io_uring, `send_parts` can retain guarded user memory for zero-copy
 sends; on Mio guards are consumed by copying.
 
 `send_backpressured` differs from all of these in *when* it is admitted. The
@@ -283,8 +282,8 @@ Backpressure is bounded and explicit at each layer:
 - `ConnSendState` permits at most one in-flight send per connection and queues
   later sends in a `VecDeque`. This preserves stream and TLS order.
 - Send-copy-pool, zero-copy slab, task-slab, and timer-slot exhaustion surface
-  as errors. A caller using `send` can await completion; `send_nowait` reports
-  immediate admission failures. `send_backpressured` and `send_admitted` are
+  as errors. `send` reports an admission failure at once, and its caller can
+  await completion. `send_backpressured` and `send_admitted` are
   the exception: copy-pool exhaustion parks them in the worker's admission
   FIFO instead of failing them.
 - Short sends retain their backing and resubmit the remainder. Socket `EAGAIN`
@@ -361,7 +360,8 @@ facts:
 - Connection identity is `(index, generation)` and stale completions are
   expected.
 - Stream sends, partial-send retries, and TLS records are serialized per
-  connection. `send_nowait` still requires completion cleanup.
+  connection. A send whose `SendCompletion` was dropped still requires
+  completion cleanup.
 - SQE-referenced memory lives until its CQE, and zero-copy guard memory lives
   until the notification CQE.
 - Exactly one backend is compiled into a process. Mio must not be drawn with

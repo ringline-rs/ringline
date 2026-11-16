@@ -72,7 +72,7 @@ impl AsyncEventHandler for StubServer {
                 let n = rx
                     .with_data(|data| match handle(data) {
                         Some((reply, len)) => {
-                            let _ = tx.send_nowait(&reply);
+                            let _ = tx.send(&reply);
                             ParseResult::Consumed(len)
                         }
                         None => ParseResult::NeedMore,

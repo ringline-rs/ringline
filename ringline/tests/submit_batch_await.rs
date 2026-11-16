@@ -82,14 +82,14 @@ impl AsyncEventHandler for AwaitedBatchSender {
             match conn.send_parts().submit_batch_await(parts) {
                 Ok((count, fut)) => match fut.await {
                     Ok(sent) => {
-                        let _ = conn.send_nowait(format!("OK:{count}:{sent}").as_bytes());
+                        let _ = conn.send(format!("OK:{count}:{sent}").as_bytes());
                     }
                     Err(e) => {
-                        let _ = conn.send_nowait(format!("AWAIT_ERR:{e}").as_bytes());
+                        let _ = conn.send(format!("AWAIT_ERR:{e}").as_bytes());
                     }
                 },
                 Err(e) => {
-                    let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                    let _ = conn.send(format!("ERR:{e}").as_bytes());
                 }
             }
 
@@ -125,7 +125,7 @@ impl AsyncEventHandler for EmptyBatchSender {
                 Ok(_) => "UNEXPECTED_OK".to_string(),
                 Err(e) => format!("KIND:{:?}", e.kind()),
             };
-            let _ = conn.send_nowait(reply.as_bytes());
+            let _ = conn.send(reply.as_bytes());
 
             loop {
                 let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;

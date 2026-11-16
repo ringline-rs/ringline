@@ -695,11 +695,11 @@ impl H2AsyncConn {
         })
     }
 
-    /// Drain `h2.take_pending_send()` to `conn.send_nowait()`.
+    /// Drain `h2.take_pending_send()` to `conn.send()`.
     fn flush_pending_send(&mut self) -> Result<(), HttpError> {
         let pending = self.h2.take_pending_send();
         if !pending.is_empty() {
-            self.tx.send_nowait(&pending)?;
+            self.tx.send(&pending)?;
         }
         Ok(())
     }

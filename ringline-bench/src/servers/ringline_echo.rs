@@ -17,8 +17,8 @@ impl AsyncEventHandler for EchoHandler {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        if let Err(e) = tx.send_nowait(data) {
-                            eprintln!("echo: send_nowait failed: {e}");
+                        if let Err(e) = tx.send(data) {
+                            eprintln!("echo: send failed: {e}");
                             return ParseResult::NeedMore;
                         }
                         ParseResult::Consumed(data.len())

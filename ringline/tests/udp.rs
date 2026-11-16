@@ -1218,7 +1218,7 @@ impl AsyncEventHandler for TcpUdpHandler {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;

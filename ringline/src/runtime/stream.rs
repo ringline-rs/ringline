@@ -19,8 +19,8 @@
 //! Wakeups are driven by the internal waiter-flag system (`recv_waiters`), which
 //! is set inside `poll_read` before it returns `Poll::Pending`. `waker::pending`
 //! keeps the `Context`'s waker if it is not the task's own. `poll_write` copies
-//! into the send pool with `send_nowait` and does not wait for the send to
-//! complete.
+//! into the send pool with `send` and drops the returned `SendCompletion`, so
+//! it does not wait for the send to complete.
 
 use bytes::{Buf, Bytes};
 use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
@@ -217,10 +217,9 @@ impl AsyncWrite for ConnStream {
         let max_len = with_state(|driver, _| driver.send_copy_pool.slot_size() as usize);
         let write_len = buf.len().min(max_len);
 
-        match ctx.send_nowait(&buf[..write_len]) {
-            Ok(()) => Poll::Ready(Ok(write_len)),
-            Err(e) => Poll::Ready(Err(e)),
-        }
+        // The completion is dropped: the bytes still go out, and a write
+        // does not wait for them.
+        Poll::Ready(ctx.send(&buf[..write_len]).map(|_| write_len))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {

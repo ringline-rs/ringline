@@ -336,7 +336,7 @@ pub struct Config {
     /// Maximum parts in one `send_chain` (`SendChainBuilder::copy` and
     /// `ChainPartsBuilder::add` each count one). A chain that would exceed
     /// it fails with `InvalidInput`. 0 refuses every chain. It does not
-    /// affect `send`, `send_nowait` or `send_parts`. Default: 16.
+    /// affect `send` or `send_parts`. Default: 16.
     pub(crate) max_chain_length: u16,
     /// Maximum number of standalone async tasks (not bound to connections)
     /// per worker. Used with [`spawn()`](crate::spawn).

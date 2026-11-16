@@ -113,7 +113,7 @@ impl AsyncEventHandler for RespondThenRead {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let _ = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
-            conn.send_nowait(&vec![b'x'; RESPONSE])
+            conn.send(&vec![b'x'; RESPONSE])
                 .expect("queue the response");
             record(
                 conn.with_data_result(|d| ParseResult::Consumed(d.len()))

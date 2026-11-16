@@ -246,8 +246,8 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
                 .build(|b| b.copy(PREFIX).guard(guard).copy(SUFFIX).submit());
             trace(port, format!("send_parts -> {result:?}"));
             if let Err(e) = result {
-                let r = conn.send_nowait(format!("ERR:{e}").as_bytes());
-                trace(port, format!("ERR send_nowait -> {r:?}"));
+                let r = conn.send(format!("ERR:{e}").as_bytes()).map(drop);
+                trace(port, format!("ERR send -> {r:?}"));
             }
 
             // Keep the connection open until the client finishes reading.
@@ -289,23 +289,25 @@ impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
 
             let g1 = GuardBox::new(VecGuard(value_of_len(VLEN)));
             let g2 = GuardBox::new(VecGuard(value_of_len(VLEN)));
-            let result = conn.send_chain_nowait(|c| {
-                c.parts()
-                    .copy(PREFIX)
-                    .guard(g1)
-                    .copy(SUFFIX)
-                    .add()
-                    .parts()
-                    .copy(PREFIX)
-                    .guard(g2)
-                    .copy(SUFFIX)
-                    .add()
-                    .finish()
-            });
-            trace(port, format!("send_chain_nowait -> {result:?}"));
+            let result = conn
+                .send_chain(|c| {
+                    c.parts()
+                        .copy(PREFIX)
+                        .guard(g1)
+                        .copy(SUFFIX)
+                        .add()
+                        .parts()
+                        .copy(PREFIX)
+                        .guard(g2)
+                        .copy(SUFFIX)
+                        .add()
+                        .finish()
+                })
+                .map(drop);
+            trace(port, format!("send_chain -> {result:?}"));
             if let Err(e) = result {
-                let r = conn.send_nowait(format!("ERR:{e}").as_bytes());
-                trace(port, format!("ERR send_nowait -> {r:?}"));
+                let r = conn.send(format!("ERR:{e}").as_bytes()).map(drop);
+                trace(port, format!("ERR send -> {r:?}"));
             }
 
             loop {
@@ -354,7 +356,7 @@ fn run_case<const VLEN: usize>(config: Config) {
 }
 
 /// Chain variant: two linked part-groups → two copies of the payload.
-/// The chain API (`send_chain_nowait`) only exists on the io_uring backend.
+/// The chain API (`send_chain`) only exists on the io_uring backend.
 #[cfg(has_io_uring)]
 fn run_case_chain<const VLEN: usize>(config: Config) {
     run_case_with::<ChainGuardPartsSender<VLEN>, VLEN>(config, 2);

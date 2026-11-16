@@ -43,7 +43,7 @@ impl AsyncEventHandler for RecordingEcho {
                         return;
                     }
                     Ok(_) => {
-                        let _ = conn.send_nowait(&echo);
+                        let _ = conn.send(&echo);
                     }
                     Err(e) => {
                         *READ_END.lock().unwrap() = Some(Err(e.kind()));

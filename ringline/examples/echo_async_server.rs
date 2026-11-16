@@ -22,7 +22,7 @@ impl AsyncEventHandler for AsyncEcho {
             loop {
                 let consumed = rx
                     .with_data(|data| {
-                        if let Err(e) = tx.send_nowait(data) {
+                        if let Err(e) = tx.send(data) {
                             eprintln!("[worker {worker_id}] send error: {e}");
                         }
                         ParseResult::Consumed(data.len())

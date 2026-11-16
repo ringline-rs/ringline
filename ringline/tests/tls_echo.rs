@@ -142,7 +142,7 @@ impl AsyncEventHandler for TlsEchoHandler {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -421,7 +421,7 @@ fn tls_echo_large_multichunk() {
     // synchronous client writes the whole payload before reading, so echo
     // sends queue until it turns around). The default 64-slot test pool is
     // about 1 MiB — sitting on the exhaustion cliff, and TlsEchoHandler's
-    // send_nowait errors are swallowed, which turned exhaustion into a
+    // send errors are swallowed, which turned exhaustion into a
     // silent short echo. Give this test 4× headroom.
     let config = test_config_builder()
         .send_pool(256, 16448)
@@ -646,7 +646,7 @@ impl AsyncEventHandler for TlsInfoHandler {
                             };
                             *TLS_INFO_SNAPSHOT.lock().unwrap() = Some(snapshot);
                         }
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -820,7 +820,7 @@ impl AsyncEventHandler for TlsCloseHandler {
         async move {
             let (mut tx, mut rx) = conn.split();
             rx.with_data(|data| {
-                let _ = tx.send_nowait(data);
+                let _ = tx.send(data);
                 ParseResult::Consumed(data.len())
             })
             .await;
@@ -858,7 +858,7 @@ impl AsyncEventHandler for TlsReturnHandler {
         async move {
             let (mut tx, mut rx) = conn.split();
             rx.with_data(|data| {
-                let _ = tx.send_nowait(data);
+                let _ = tx.send(data);
                 ParseResult::Consumed(data.len())
             })
             .await;
@@ -977,7 +977,7 @@ impl AsyncEventHandler for TlsBigReplyThenReturn {
             }
             let chunk = vec![0x5au8; 64 * 1024];
             for _ in 0..BIG_REPLY / chunk.len() {
-                conn.send_nowait(&chunk).expect("queue the reply");
+                conn.send(&chunk).expect("queue the reply");
             }
         }
     }
@@ -1090,7 +1090,7 @@ impl AsyncEventHandler for TlsBigReplyShutdownThenReturn {
             }
             let chunk = vec![0x5au8; 64 * 1024];
             for _ in 0..BIG_REPLY / chunk.len() {
-                conn.send_nowait(&chunk).expect("queue the reply");
+                conn.send(&chunk).expect("queue the reply");
             }
             conn.shutdown_write();
         }
@@ -1214,9 +1214,9 @@ impl AsyncEventHandler for TlsSendAfterClose {
             if n == 0 {
                 return;
             }
-            conn.send_nowait(b"early").expect("send before close");
+            conn.send(b"early").expect("send before close");
             conn.close();
-            *TLS_SEND_AFTER_CLOSE.lock().unwrap() = Some(conn.send_nowait(b"late"));
+            *TLS_SEND_AFTER_CLOSE.lock().unwrap() = Some(conn.send(b"late").map(drop));
         }
     }
 
@@ -1246,7 +1246,7 @@ impl AsyncEventHandler for TlsBackpressuredSendAfterClose {
             if n == 0 {
                 return;
             }
-            conn.send_nowait(b"early").expect("send before close");
+            conn.send(b"early").expect("send before close");
             conn.close();
             let late = conn.send_backpressured(b"late").await.map(|_| ());
             *TLS_SEND_AFTER_CLOSE.lock().unwrap() = Some(late);
@@ -1258,7 +1258,7 @@ impl AsyncEventHandler for TlsBackpressuredSendAfterClose {
     }
 }
 
-/// On io_uring a TLS `send_nowait` after `close()` is refused: its record
+/// On io_uring a TLS `send` after `close()` is refused: its record
 /// would follow the close_notify, and the peer discards records after the
 /// alert.
 #[cfg(has_io_uring)]
@@ -1371,7 +1371,7 @@ impl AsyncEventHandler for TlsSendChain {
             // so do not wait for it.
             let mut before = vec![b'x'; CHAIN_BEFORE_LEN];
             before.extend_from_slice(b"before-");
-            conn.send_nowait(&before).expect("send before the chain");
+            conn.send(&before).expect("send before the chain");
             let guard = ringline::GuardBox::new(ChainGuard(vec![b'g'; CHAIN_GUARD_LEN]));
             let sent = conn
                 .send_chain(|chain| {
@@ -1595,7 +1595,7 @@ impl AsyncEventHandler for TlsForwardProxy {
                         return;
                     }
                 }
-                if client.send_nowait(&echo).is_err() {
+                if client.send(&echo).is_err() {
                     break;
                 }
             }
@@ -1620,7 +1620,7 @@ impl AsyncEventHandler for PlainEcho {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -1810,7 +1810,7 @@ impl AsyncEventHandler for TlsForwardToStuckSink {
             // The ack is queued before the forward is armed, but both happen
             // in this poll, before the ack's send is submitted, so the
             // client's flood arrives after the forward is armed.
-            let _ = client.send_nowait(b"a");
+            let _ = client.send(b"a");
             let _ = client.forward_to_conn(&mut sink_tx, 1 << 30).await;
         }
     }
@@ -1885,7 +1885,7 @@ impl AsyncEventHandler for TlsIdleReader {
             if n == 0 {
                 return;
             }
-            let _ = conn.send_nowait(b"a");
+            let _ = conn.send(b"a");
             loop {
                 ringline::sleep(Duration::from_secs(1)).await;
             }
@@ -1955,7 +1955,7 @@ impl AsyncEventHandler for TlsCloseWatcher {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let _report = ReportCloseOnDrop;
-            let _ = conn.send_nowait(b"a");
+            let _ = conn.send(b"a");
             let started = Instant::now();
             while started.elapsed() < Duration::from_secs(5) {
                 if conn.peer_closed() {

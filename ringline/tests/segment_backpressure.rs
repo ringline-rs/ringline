@@ -60,7 +60,7 @@ impl AsyncEventHandler for Modes {
                     loop {
                         let n = rx
                             .with_data(|d| {
-                                let _ = tx.send_nowait(d);
+                                let _ = tx.send(d);
                                 ParseResult::Consumed(d.len())
                             })
                             .await;

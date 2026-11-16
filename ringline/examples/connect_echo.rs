@@ -34,7 +34,7 @@ impl AsyncEventHandler for ConnectHandler {
                     // exactly like an accepted one.
                     let (mut conn_tx, mut conn_rx) = conn.split();
                     let msg: &[u8] = b"Hello from ringline!\n";
-                    if let Err(e) = conn_tx.send_nowait(msg) {
+                    if let Err(e) = conn_tx.send(msg) {
                         eprintln!("[worker {worker_id}] send error: {e}");
                         return;
                     }
