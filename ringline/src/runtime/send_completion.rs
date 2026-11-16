@@ -104,7 +104,8 @@ pub(crate) struct SendId {
 /// The owner of an entry whose owning task is gone while the future that
 /// holds it is alive, handed to a task that has not polled it yet. A wake
 /// for it reaches no task ([`Executor::wake_task`] finds no slot); the next
-/// poll records the polling task as the owner.
+/// poll records the polling task as the owner. Also the owner of an
+/// `Abandoned` entry, whose future is gone (`cancel`).
 pub(crate) const NO_OWNER: u32 = u32::MAX;
 
 /// Where one operation stands.

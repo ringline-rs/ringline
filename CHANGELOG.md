@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `SendCompletion` implements `Debug`, showing the connection the send
-  targets and whether its result is known.
+- `SendCompletion` (`SendFuture` in 0.6) implements `Debug`, showing the
+  connection the send targets and whether its result is known.
 - `ringline::buf`: the buffer traits the disk reads and writes take by
   value (#825). `IoBuf` (a write's source) is implemented for `Vec<u8>`,
   `BytesMut`, `Bytes`, `AlignedBuf` and `AlignedBytes`; `IoBufMut` (a read's destination)
@@ -365,19 +365,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` returns
-  `io::Result<SendCompletion>`, resolving with `data.len()`, instead of
-  `io::Result<()>`. `send_parts().build(f)` returns
-  `io::Result<SendCompletion>`, resolving with the total length of the parts;
-  `f` still ends with `submit()`. `submit_batch_await` is renamed
-  `submit_batch` and keeps its return type,
-  `io::Result<(usize, SendCompletion)>`. Drop the completion where the caller
-  does not wait for the send; dropping it does not cancel the send. A `build`
-  whose parts carry no bytes is refused with `InvalidInput`; in 0.6 on
-  io_uring it took a pool slot and broke the queue (see Fixed), and on mio it
+- **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` (on
+  `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`, resolving with
+  `data.len()`, instead of `io::Result<()>`. `send_parts().build(f)`
+  (`send_parts` on `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`,
+  resolving with the total length of the parts; `f` still ends with
+  `submit()`. `submit_batch_await` is renamed `submit_batch` and returns
+  `io::Result<(usize, SendCompletion)>` (`SendFuture` in 0.6). Drop the
+  completion where the caller does not wait for the send; dropping it does not
+  cancel the send. A `build` whose parts carry no bytes is refused with
+  `InvalidInput`; in 0.6 on io_uring one with at least one part took a pool
+  slot and broke the queue (see Fixed); one with no parts, and any on mio,
   sent nothing and returned `Ok`. So is a `build` closure that returns `Ok`
-  without a successful `submit`, including one that discards `submit`'s
-  error; mio used to send the parts of one that never called `submit`.
+  without a successful `submit`, including one that discards `submit`'s error;
+  mio used to send the parts of one that never called `submit`.
 - **Breaking:** the direct I/O API is the `direct_io` module, with the same
   shapes as `fs` (#845): `direct_io::open(path)` and
   `open_with(path, options)` return an `OpenFuture` that resolves to a
@@ -1314,10 +1315,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Instant`. Remove `.timestamps(..)` and `.kernel_timestamps(..)` calls and
   the `timestamps` feature from `Cargo.toml`.
 - **Breaking:** `send_nowait` and `send_chain_nowait` on `Connection` and
-  `SendHalf`, and the `AsyncSendBuilder::submit_batch` that returned no
-  completion. Replace `send_nowait(data)` with `send(data)` and drop the
-  `SendCompletion` it returns: dropping it does not cancel the send, and
-  `send` returns the same errors at the call. Drop it at once: a
+  `SendHalf` (on `ConnCtx` in 0.6), and the `AsyncSendBuilder::submit_batch`
+  that returned no completion. Replace `send_nowait(data)` with `send(data)`
+  and drop the `SendCompletion` it returns: dropping it does not cancel the
+  send, and `send` returns the same errors at the call. Drop it at once: a
   `SendCompletion` kept alive, in a `let _sent =` binding or a `match` arm
   `Ok(_)`, wakes its task when the send completes. `Ok(())` patterns become
   `Ok(_)`. Replace `send_chain_nowait(f)` (io_uring only) with
@@ -1325,8 +1326,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   returned another value passes it out through a variable it captures.
   `submit_batch_await` is now `submit_batch` (see Changed): drop its
   completion where the caller does not wait for the send. A batch that carries
-  no bytes, which the old `submit_batch` accepted without sending anything, is
-  refused with `InvalidInput`.
+  no bytes is refused with `InvalidInput`. The old `submit_batch` returned
+  `Ok(0)` for one with no parts; in 0.6 on io_uring one with at least one part
+  took a pool slot and broke the queue (see Fixed), and on mio it sent
+  nothing.
 
 ### Fixed
 
@@ -1756,14 +1759,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   F13).
 
 - io_uring: a `send_parts` batch whose parts carry no bytes is refused with
-  `InvalidInput` (see Changed). It took a send-pool slot and pushed a
-  zero-length Send SQE, whose result 0 the completion handler read as a failed
-  send: every send queued behind it on the connection was discarded with
-  `ConnectionAborted`, the connection stayed open, and later sends reached the
-  peer after the gap. mio sent nothing for such a batch already. No in-tree
-  caller sends such a batch; `ringline-redis` sends an empty value as an empty
-  part beside a non-empty prefix and suffix, which was unaffected. Found by
-  the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F7).
+  `InvalidInput` (see Changed). One with at least one part took a send-pool
+  slot and pushed a zero-length Send SQE, whose result 0 the completion
+  handler read as a failed send: every send queued behind it on the connection
+  was discarded with `ConnectionAborted`, the connection stayed open, and
+  later sends reached the peer after the gap. One with no parts sent nothing,
+  and mio sent nothing for either already. No in-tree caller sends such a
+  batch; `ringline-redis` sends an empty value as an empty part beside a
+  non-empty prefix and suffix, which was unaffected. Found by the send-path
+  audit (`docs/journal/2026-11-send-path-audit.md`, F7).
 
 - io_uring: a TLS close that finds the send pool exhausted no longer drops
   its close_notify and records it as sent. The alert needs one pool slot;
