@@ -19,7 +19,7 @@ use crate::chain::SendChainTable;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, Lifecycle, ReadHalf, WriteHalf};
-use crate::handler::{BuiltSend, ConnSendState, Disconnect, DriverCtx, SendPoll};
+use crate::handler::{BuiltSend, ConnSendState, Disconnect, DriverCtx, SendPoll, SendProbe};
 use crate::metrics;
 use crate::runtime::send_completion::SendId;
 
@@ -900,6 +900,15 @@ pub(crate) struct Driver {
     /// `SendPollOut`s the SQ had no room for: (conn_index, generation, multi).
     /// Drained each tick.
     pub(crate) pending_send_pollout_retries: Vec<(u32, u32, bool)>,
+    /// `SendPollProbe`s the SQ had no room for: (conn_index, generation).
+    /// Drained each tick, with the `SendPollOut` retries.
+    pub(crate) pending_send_probe_retries: Vec<(u32, u32)>,
+    /// (conn_index, generation) of connections whose close was requested
+    /// while a `writable` future was registered on them. The event loop
+    /// wakes those futures before it polls tasks (`wake_writable_on_close`):
+    /// the close may not complete, as a drain to a peer that does not read,
+    /// and its `Close` CQE removes the connection's own task.
+    pub(crate) writable_close_wakes: Vec<(u32, u32)>,
     /// Connections with a send waiting for room, as (conn_index, generation),
     /// for `handle_send_backstop`. An entry leaves when the backstop finds nothing
     /// waiting.
@@ -1389,6 +1398,8 @@ impl Driver {
             eventfd_armed: false,
             pending_resubmit_retries: Vec::new(),
             pending_send_pollout_retries: Vec::new(),
+            pending_send_probe_retries: Vec::new(),
+            writable_close_wakes: Vec::new(),
             send_backstop_list: Vec::new(),
             send_backstop_scratch: Vec::new(),
             send_backstop_at: None,
@@ -1561,6 +1572,13 @@ impl Driver {
         state.pollout_seen = false;
         state.resubmitted_on_pollout = false;
         state.on_send_backstop = false;
+        state.writable_task = None;
+        state.writable_event = None;
+        state.writable_blocked = false;
+        state.resubmit_queued = false;
+        state.send_probe = SendProbe::None;
+        state.send_buf_task = None;
+        state.send_buf_result = None;
         self.disarm_close_notify_deadline(conn_index);
         // A previous occupant's awaited send can still be sitting in the
         // queue here (its close abandoned the drain); the new occupant must
@@ -1847,6 +1865,17 @@ impl Driver {
             return;
         };
         self.forward_zc_consumed[conn_index as usize] = 0;
+        // Every close request except `abort`, which wakes the future itself,
+        // comes through here, an error's or a peer's as much as the
+        // handler's: a `writable` future waiting on it, blocked or armed, is
+        // woken and fails.
+        if self.send_queues[conn_index as usize]
+            .writable_task
+            .is_some()
+        {
+            let generation = self.connections.generation(conn_index);
+            self.writable_close_wakes.push((conn_index, generation));
+        }
         // Release handler state here rather than waiting for the slot to be
         // reused: a `ParkState` is an arbitrary user value, and a slot that is
         // never reused would hold it for the life of the process.
@@ -2199,12 +2228,49 @@ impl Driver {
         }
     }
 
+    /// Arm the connection's `SendPollOut`, one shot or multishot, or queue
+    /// it on `pending_send_pollout_retries` if the SQ is full. See
+    /// `AsyncEventLoop::wait_for_room`.
+    pub(crate) fn arm_send_poll(&mut self, conn_index: u32, multi: bool) {
+        let generation = self.connections.generation(conn_index);
+        let armed = self.ring.submit_send_pollout(conn_index, generation, multi);
+        let state = &mut self.send_queues[conn_index as usize];
+        state.send_poll = match (armed.is_ok(), multi) {
+            (true, true) => SendPoll::Multi,
+            (true, false) => SendPoll::OneShot,
+            (false, _) => {
+                self.pending_send_pollout_retries
+                    .push((conn_index, generation, multi));
+                SendPoll::Pending
+            }
+        };
+    }
+
+    /// Arm the connection's `SendPollProbe` for a `writable` future, or
+    /// queue it on `pending_send_probe_retries` if the SQ is full. Nothing
+    /// is armed while one is armed or queued.
+    pub(crate) fn arm_send_probe(&mut self, conn_index: u32) {
+        if self.send_queues[conn_index as usize].send_probe != SendProbe::None {
+            return;
+        }
+        let generation = self.connections.generation(conn_index);
+        let armed = self.ring.submit_send_probe(conn_index, generation);
+        self.send_queues[conn_index as usize].send_probe = if armed.is_ok() {
+            SendProbe::Armed
+        } else {
+            self.pending_send_probe_retries
+                .push((conn_index, generation));
+            SendProbe::Pending
+        };
+    }
+
     /// Submit the `Close` of a connection whose close is committed, after
-    /// cancelling its `SendPollOut`: a poll holds the socket open past the
-    /// `Close`, and a multishot one outlives a shutdown lead. After `abort` on
-    /// a TCP connection (`Disconnect::WithClose`) the disconnect, the lead and
-    /// the `Close` go as one chain. On an error the caller retries this,
-    /// chain included; a cancel that went through is not repeated.
+    /// cancelling its `SendPollOut` and any `SendPollProbe`: a poll holds the
+    /// socket open past the `Close`, and a multishot one outlives a shutdown
+    /// lead. After `abort` on a TCP connection (`Disconnect::WithClose`) the
+    /// disconnect, the lead and the `Close` go as one chain. On an error the
+    /// caller retries this, chain included; a cancel that went through is not
+    /// repeated.
     pub(crate) fn submit_committed_close(&mut self, conn_index: u32) -> io::Result<()> {
         let generation = self.connections.generation(conn_index);
         let state = &mut self.send_queues[conn_index as usize];
@@ -2213,6 +2279,15 @@ impl Driver {
                 .submit_cancel_send_pollout(conn_index, generation)?;
         }
         state.send_poll = SendPoll::None;
+        // A `writable` probe completes at once on a half-closed peer, but
+        // on a multishot armed for an `EAGAIN` after a `POLLOUT` it can stay
+        // in the kernel until the socket is writable, holding the socket as
+        // the poll does.
+        if state.send_probe == SendProbe::Armed {
+            self.ring.submit_cancel_send_probe(conn_index, generation)?;
+        }
+        self.send_queues[conn_index as usize].send_probe = SendProbe::None;
+        let state = &mut self.send_queues[conn_index as usize];
         let with_disconnect = state.disconnect == Disconnect::WithClose;
         let lead = self.close_lead(conn_index);
         if with_disconnect {

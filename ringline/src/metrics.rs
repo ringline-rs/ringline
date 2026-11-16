@@ -422,14 +422,14 @@ pub mod recv_arrival {
 /// Slot indices for per-`OpTag` completion counters: the slot *is* the
 /// discriminant.
 pub mod cqe_tag {
-    /// One past the largest `OpTag` discriminant (`Disconnect = 39`).
+    /// One past the largest `OpTag` discriminant (`SendPollProbe = 40`).
     ///
     /// Deliberately not derived from the enum: `ShardedCounterGroup::new` needs
     /// a const, and there is no const way to ask an enum for its maximum
     /// discriminant. `count_covers_every_tag` in the tests below fails if a new
     /// tag is added above this, which is the case that would otherwise drop
     /// completions silently.
-    pub const COUNT: usize = 40;
+    pub const COUNT: usize = 41;
 }
 
 /// Counter slot indices for pool exhaustion metrics.

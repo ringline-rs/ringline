@@ -749,6 +749,17 @@ impl Ring {
         Ok(())
     }
 
+    /// A real fd for the connection's socket, for `send_buffer_size`. The
+    /// completion closes it.
+    pub fn submit_send_buf_install(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let ud = UserData::encode(OpTag::SendBufInstall, conn_index, generation);
+        let entry = Sqe::new(Op::FixedFdInstall { index: conn_index }, ud.raw());
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
     /// Recover a real fd for a connection whose recv is already cancelled.
     pub fn submit_park_install(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         let ud = UserData::encode(OpTag::ParkInstall, conn_index, generation);
@@ -944,6 +955,40 @@ impl Ring {
             self.push_sqe(&entry)?;
         }
         Ok(())
+    }
+
+    /// Submit the one-shot `POLL_ADD` for `POLLOUT` that a
+    /// `SendHalf::writable` future arms while the connection's
+    /// [`submit_send_pollout`](Self::submit_send_pollout) poll is multishot
+    /// (`OpTag::SendPollProbe`).
+    pub fn submit_send_probe(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::SendPollProbe, conn_index, generation);
+        let entry = Sqe::new(
+            Op::PollAdd {
+                fd: sqe::Fd::Fixed(conn_index),
+                mask: libc::POLLOUT as u32,
+                multi: false,
+            },
+            user_data.raw(),
+        );
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
+    /// Cancel the [`submit_send_probe`](Self::submit_send_probe) of
+    /// `conn_index`, if it is still in the kernel.
+    pub fn submit_cancel_send_probe(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let target = UserData::encode(OpTag::SendPollProbe, conn_index, generation);
+        let ud = UserData::encode(OpTag::Cancel, conn_index, 0);
+        let entry = Sqe::new(
+            Op::Cancel {
+                target: target.raw(),
+            },
+            ud.raw(),
+        );
+        unsafe { self.push_sqe(&entry) }
     }
 
     /// Cancel the armed [`submit_send_pollout`](Self::submit_send_pollout) of

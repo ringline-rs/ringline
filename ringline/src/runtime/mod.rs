@@ -586,6 +586,7 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
                 abrupt,
             } => {
                 io::release_half(driver, conn_index, generation, half, abrupt);
+                io::wake_writable_if_closing(driver, executor, conn_index, generation);
             }
             Orphan::Blocking(request_id) => {
                 let dropped = executor.pending_blocking.remove(&request_id);

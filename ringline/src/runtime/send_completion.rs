@@ -143,6 +143,9 @@ struct Entry {
     /// Task to wake on admission or completion.
     task_id: u32,
     state: Completion,
+    /// A write on the connection found the socket full while this send was
+    /// in flight ([`mark_waited_for_room`](SendCompletions::mark_waited_for_room)).
+    waited_for_room: bool,
 }
 
 /// One slot of the table: its current generation and, while an operation
@@ -396,6 +399,7 @@ impl SendCompletions {
                 generation,
                 required_slots,
             },
+            waited_for_room: false,
         });
         self.waiting.push_back(id);
         self.waiting_live += 1;
@@ -414,7 +418,50 @@ impl SendCompletions {
             conn_index,
             task_id,
             state: Completion::InFlight,
+            waited_for_room: false,
         })
+    }
+
+    /// Mark every send in flight on `conn_index` as having waited for room
+    /// in the socket. A send in flight has been submitted and has not
+    /// settled: its bytes, or bytes queued ahead of it on the connection,
+    /// are not all in the socket.
+    ///
+    /// Called by the io_uring event loop at every call of `wait_for_room`;
+    /// mio marks sends by id instead
+    /// ([`mark_send_waited_for_room`](Self::mark_send_waited_for_room)).
+    /// Visits the entries indexed under the connection.
+    pub(crate) fn mark_waited_for_room(&mut self, conn_index: u32) {
+        let Some(list) = self.by_conn.get(conn_index as usize) else {
+            return;
+        };
+        for &index in list {
+            if let Some(e) = self.slots[index as usize].entry.as_mut()
+                && matches!(e.state, Completion::InFlight)
+            {
+                e.waited_for_room = true;
+            }
+        }
+    }
+
+    /// Mark the send `id` names as having waited for room, if it is in
+    /// flight, or settled with its result not yet taken. mio marks the sends
+    /// a `writev` that returned `WouldBlock` carried one by one, by the ids
+    /// their queued entries carry.
+    #[cfg_attr(has_io_uring, allow(dead_code))]
+    pub(crate) fn mark_send_waited_for_room(&mut self, id: SendId) {
+        if let Some(e) = self.entry_mut(id)
+            && matches!(e.state, Completion::InFlight | Completion::Done(_))
+        {
+            e.waited_for_room = true;
+        }
+    }
+
+    /// Whether the send `id` names has waited for room: see
+    /// [`mark_waited_for_room`](Self::mark_waited_for_room). False for an
+    /// unknown id.
+    pub(crate) fn waited_for_room(&self, id: SendId) -> bool {
+        self.entry(id).is_some_and(|e| e.waited_for_room)
     }
 
     /// Record the task that currently owns `id`, whether it is waiting or
@@ -940,6 +987,19 @@ impl Executor {
     /// submission.
     pub(crate) fn take_send_result(&mut self, id: SendId) -> Option<io::Result<u32>> {
         self.send_completions.take_result(id)
+    }
+
+    /// [`SendCompletions::mark_waited_for_room`]. The io_uring event loop's
+    /// `wait_for_room`.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn mark_sends_waited_for_room(&mut self, conn_index: u32) {
+        self.send_completions.mark_waited_for_room(conn_index);
+    }
+
+    /// [`SendCompletions::waited_for_room`]. `SendCompletion::waited_for_room`,
+    /// and its poll before it takes the result.
+    pub(crate) fn send_waited_for_room(&self, id: SendId) -> bool {
+        self.send_completions.waited_for_room(id)
     }
 
     /// [`SendCompletions::cancel`] plus a wake of the new head. The send
