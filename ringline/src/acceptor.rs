@@ -286,8 +286,9 @@ pub(crate) fn classify_accept_error(errno: i32) -> AcceptErrorAction {
         // ENETUNREACH, EHOSTDOWN, EHOSTUNREACH, ENONET, EOPNOTSUPP and
         // ENOPROTOOPT are the errors accept(2) says Linux passes through from
         // the new socket, to be retried like EAGAIN; ETIMEDOUT is one it says
-        // some kernels return. EOPNOTSUPP also means a listener that is not SOCK_STREAM,
-        // which cannot occur here: ringline creates every listener itself.
+        // some kernels return. EOPNOTSUPP also means a listener that is not
+        // SOCK_STREAM, which cannot occur here: ringline creates every
+        // listener itself.
         libc::EINTR
         | libc::EAGAIN
         | libc::ECONNABORTED

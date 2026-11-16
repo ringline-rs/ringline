@@ -237,8 +237,7 @@ fn shutdown_releases_the_port_while_the_runtime_lives() {
 }
 
 /// Every listener socket closes once the `Runtime` is dropped and its threads
-/// have exited. In merged mode the workers hold the sockets, so their exit is
-/// waited for.
+/// have exited.
 #[test]
 fn listener_sockets_close_after_shutdown() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
