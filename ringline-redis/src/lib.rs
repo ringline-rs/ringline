@@ -2764,8 +2764,8 @@ impl Client {
                 .submit()
         });
         // A send error is recorded too, with nothing read.
-        let (resp, rx_bytes, arrival) = match sent {
-            Ok(_) => self.read_reply().await,
+        let (resp, rx_bytes, arrival) = match sent.map(drop) {
+            Ok(()) => self.read_reply().await,
             Err(e) => (Err(e.into()), 0, None),
         };
         let latency_ns = elapsed_ns(start);
@@ -2836,8 +2836,8 @@ impl Client {
                 .submit()
         });
         // A send error is recorded too, with nothing read.
-        let (resp, rx_bytes, arrival) = match sent {
-            Ok(_) => self.read_reply().await,
+        let (resp, rx_bytes, arrival) = match sent.map(drop) {
+            Ok(()) => self.read_reply().await,
             Err(e) => (Err(e.into()), 0, None),
         };
         let latency_ns = elapsed_ns(start);
