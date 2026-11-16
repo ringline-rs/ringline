@@ -1,7 +1,7 @@
 # 2026-11: The acceptor's queue-full poll does not bound the connect rate
 
-- **Status:** NO-GO — a wake from a worker that drained its accept queue, in place of the 1 ms poll `send_when_room` runs while every queue is full, is not built. One io_uring worker under a connect storm took about 32,000 conns/s (measured); the accepted rate followed min(R_worker, capacity × 1000/s) at capacities 4 and 1, so the poll bounds the rate only below a capacity of about 32 (derived). The default is 1024. Capacities 64 and 1024 could not fill with the 8-thread client used.
-- **Span:** 2026-11-15 · tree 4509097c (`main`, 0.7.0-alpha.135) · follows #817 · SystemsLab experiment `01a1e10a-62e7-7120-3130-b055cec01169`
+- **Status:** NO-GO — a wake from a worker that drained its accept queue, in place of the 1 ms poll `send_when_room` runs while every queue is full, is not built. One io_uring worker under a connect storm took about 32,000 conns/s (measured). At capacity 64 the queue filled about 5,300 times per 12 s run and the rate and the mean latency were not worse than at the default, 1024; at 16 the rate was 10 to 14% lower; at 4 it was 4,400 to 5,150/s and at 1 about 910/s. The default is 1024.
+- **Span:** 2026-11-15 · tree 4509097c (`main`, 0.7.0-alpha.135) · follows #817 · SystemsLab experiments `01a1e10a-62e7-7120-3130-b055cec01169` (8 client threads) and `01a1e19c-bfd0-7194-4e4c-59ccf9630106` (256)
 
 ## Goal
 
@@ -23,9 +23,13 @@ channel means the worker is `accept_queue_capacity` connections behind at that
 instant. While the acceptor sleeps, no connection is lost: later connections
 wait in the kernel listen backlog (65535 by default), and a SYN that overflows
 it is retried by the peer (#658). With
-the acceptor sleep-bound it delivers at most `capacity` connections per sleep,
-so the accepted rate is about min(R_worker, capacity × 1000/s), where
-R_worker is the one-worker rate with the queue never full.
+the acceptor sleep-bound and refilling exactly `capacity` connections per
+sleep, the accepted rate is about min(R_worker, capacity × 1000/s), where
+R_worker is the one-worker rate with the queue never full. It is more when
+the worker drains while the acceptor refills, so the queue takes longer than
+`capacity` deliveries to fill again (the second run below measures that at
+capacity 16), and a little less when a sleep plus the retry takes longer than
+1 ms (capacity 1).
 
 Predictions, from that model: at 1024 the `accept_queue_full` counter stays 0
 and the rate is R_worker; at 64 the rate is within the round-to-round spread
@@ -94,14 +98,50 @@ worker alone takes about the same rate here. With arrivals at R_worker, a
 (1024 / 32,000, derived); with arrivals above R_worker it fills in
 1024 / (arrival rate − R_worker) seconds with no stall.
 
+## Second run: 256 client threads
+
+Written before it ran: with 256 connections in flight a queue of 64 can
+fill and one of 1024 cannot, so `accept_queue_full` is above 0 at 64 and 0
+at 1024, and the rate at 64 stays at R_worker. The run used the first run's
+spec with the base64-embedded patch at 4509097c plus the `threads` param and
+the `gate_patch` gate the committed spec has (the committed spec reproduces
+it with `-p threads=256 -p caps="1024 64 16 4"` once this entry is on `main`,
+since the patch file it reads is not at 4509097c). Same guest class: hv03,
+Linux 6.12.116, io_uring, `nofile=65536` this time. Four rounds, capacities
+interleaved, 16 runs, 0 connect or I/O errors.
+
+| Capacity | Runs | conns/s (min to max) | Mean connection latency | `accept_queue_full` |
+|---|---|---|---|---|
+| 1024 (default) | 4 | 31,905 to 31,992 | 7,992 to 8,014 µs | 0, 0, 0, 0 |
+| 64 | 4 | 32,205 to 32,258 | 7,927 to 7,941 µs | 5,307 to 5,402 |
+| 16 | 4 | 27,507 to 28,601 | 8,944 to 9,298 µs | 10,029 to 10,093 |
+| 4 | 4 | 4,412 to 4,543 | 56,319 to 57,996 µs | 10,647 to 10,677 |
+
+Both predictions held. At capacity 64 the acceptor waited about 5,300 to
+5,400 times per 12 s run, about 440 to 450 per second, and the rate and the
+mean latency were not worse than at 1024: the rate was 0.7 to 1.1% higher
+and the latency 0.6 to 1.1% lower, a difference larger than the spread within
+either capacity (0.3% and 0.2%) and in the direction of the poll costing
+nothing; why 64 is slightly faster was not investigated. The mean latency of
+about 8 ms at every capacity above 4 is the 256 connections in flight divided
+by the rate (Little's law, derived); it is not the poll. At capacity 16 the
+rate was 10 to 14% below R_worker and the
+latency 12 to 16% above it, so the poll costs something there; the model's
+floor for 16 is 16,000/s and the measured 27,507 to 28,601 is 72 to 79% above
+it, which is the refill the model leaves out. At capacity 4 the rate matched
+the first run (4,412 to 4,543 against 4,474 to 5,150).
+
 ## Outcome
 
-NO-GO on the wake. By the model, which the capacity 4 and 1 cells confirm,
-the poll bounds the accepted rate when the capacity is below about
-R_worker / 1000, about 32 here (derived). At the default, 1024, a queue that
-fills under an open-loop storm costs each connection at most about 1 ms of
-poll on top of about 32 ms of queueing behind the 1024 ahead of it. The code,
-`ROOM_POLL_INTERVAL` and its doc comment are unchanged.
+NO-GO on the wake. At capacity 64 the queue filled about 440 to 450 times a
+second and the rate and the mean latency were not worse than at 1024
+(measured, second run). The poll costs rate from capacity 16 down: 10 to 14%
+at 16, 86% at 4, 97% at 1 (measured). The model's floor, min(R_worker,
+capacity × 1000/s), puts the boundary at about R_worker / 1000, about 32
+(derived); the measured boundary is between 16 and 64. At the default, 1024, a
+queue that fills under an open-loop storm costs each connection at most about
+1 ms of poll on top of about 32 ms of queueing behind the 1024 ahead of it
+(derived). The code, `ROOM_POLL_INTERVAL` and its doc comment are unchanged.
 
 What the wake would cost was not measured, since no case was found where it
 changes the rate or the latency: it adds a signal from every worker's drain
@@ -110,30 +150,21 @@ to the acceptor, on the accept path of every connection, for a state the
 
 ## Ruled out
 
-- That the poll adds to connection latency at the rates this client reaches:
-  mean latency at 1024 and 64 was the same, 240 to 244 µs. This does not
-  cover a full 1024-deep queue, which this client cannot produce.
+- That the poll adds to connection latency at capacity 64 or above: with 8
+  client threads mean latency at 1024 and 64 was the same, 240 to 244 µs
+  (the queue never filled); with 256 threads, where the 64-deep queue filled
+  about 440 to 450 times a second, it was 7,927 to 7,941 µs at 64 against
+  7,992 to 8,014 µs at 1024. Neither client can fill a 1024-deep queue.
 - That macOS loopback can host this measurement: it cannot, at this rate,
   without a shorter TIME_WAIT (`net.inet.tcp.msl`), which was not changed on
   the development machine.
 
-## Deferred
-
-A second run (experiment `01a1e19c-bfd0-7194-4e4c-59ccf9630106`, queued, not
-yet run) from the run-1 spec with the base64-embedded patch at 4509097c plus
-the `threads` param and the `gate_patch` gate the committed spec has; 256
-client threads, capacities 1024, 64, 16 and 4. It tests capacity 64 with a
-queue that can fill. The model predicts the rate stays at R_worker there with
-`accept_queue_full` above 0, and `accept_queue_full` still 0 at 1024, which
-256 connections cannot fill. The committed spec reproduces it only once this
-branch is on `main`, since the patch file it reads is not at 4509097c or on
-`main` before that. Its result goes into this entry when it lands.
-
 ## Reopen if
 
-- A deployment needs `accept_queue_capacity` at or below about 32, or a
-  worker rate above about 64,000 connections/s, where capacity 64 would start
-  to bind.
+- A deployment needs `accept_queue_capacity` below 64 (the cost was measured
+  at 16 and not at 64; the boundary between them was not located), or a
+  worker rate well above about 32,000 connections/s, where a 64-deep queue
+  refills in less time and the poll could start to cost there.
 - `accept_queue_full` is seen rising at the default capacity under a real
   workload. That says arrivals exceeded the worker's rate for long enough to
   queue 1024 connections; by the model the poll then adds at most about 1 ms

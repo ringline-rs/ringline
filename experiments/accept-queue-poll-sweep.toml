@@ -7,18 +7,23 @@
 #
 # Model: a worker drains its whole queue on every wake, and the acceptor
 # sleeps 1 ms whenever every queue is full, so the accepted rate is about
-# min(R_worker, capacity x 1000/s). Result (experiment
-# 01a1e10a-62e7-7120-3130-b055cec01169 at 4509097c, Linux 6.12, io_uring,
-# `docs/journal/2026-11-accept-queue-full-poll.md`): about 32,000 conns/s and
-# accept_queue_full = 0 at 1024 and 64; 4,474 to 5,150 at 4; 905 to 915 at 1.
-# The client is closed-loop with {threads} connections in flight at most, so
-# a capacity above {threads} cannot fill.
+# min(R_worker, capacity x 1000/s) at least. Results
+# (`docs/journal/2026-11-accept-queue-full-poll.md`; Linux 6.12, io_uring, at
+# 4509097c): with 8 client threads (experiment
+# 01a1e10a-62e7-7120-3130-b055cec01169) about 32,000 conns/s and
+# accept_queue_full = 0 at 1024 and 64, 4,474 to 5,150 at 4, 905 to 915 at 1;
+# with 256 threads and capacities 1024, 64, 16, 4 (experiment
+# 01a1e19c-bfd0-7194-4e4c-59ccf9630106) the 64-deep queue filled about 440 to
+# 450 times a second with the rate and latency unchanged against 1024, and
+# the rate at 16 was 10 to 14% lower. The client is closed-loop with
+# {threads} connections in flight at most, so a capacity above {threads}
+# cannot fill.
 #
-# The spec that produced that result embedded the patch as base64 at rev
-# 4509097c, ran `sudo prlimit` (which did not reach the payload's subshell)
-# and had no gate on the patch applying. This spec reads the patch from the
-# clone, uses `ulimit -Sn`, and fails the run when the patch does not apply.
-# The measurement does not depend on those differences.
+# The specs that produced those results embedded the patch as base64 at rev
+# 4509097c; the first also ran `sudo prlimit` (which did not reach the
+# payload's subshell) and had no gate on the patch applying. This spec reads
+# the patch from the clone, uses `ulimit -Sn`, and fails the run when the
+# patch does not apply. The measurement does not depend on those differences.
 #
 #   systemslab submit experiments/accept-queue-poll-sweep.toml
 name = "ringline accept queue-full poll sweep, {threads} client threads"
