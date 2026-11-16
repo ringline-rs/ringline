@@ -204,10 +204,13 @@ fn index_add(lists: &mut Vec<VecDeque<u32>>, key: u32, index: u32) {
 /// Forget `index` under `key`, keeping the rest of the list in order.
 ///
 /// The sends on one connection mostly settle in the order they were
-/// registered, so the index is mostly the list's front and leaves in one
-/// comparison. Any other index is found by a scan. A list that kept no
-/// order would put the next index to settle anywhere, and settling N queued
-/// sends would cost about N^2/2 comparisons.
+/// registered, so in a connection's list the index is mostly the front. A
+/// task's list spans its connections; an abandoned entry leaves it when its
+/// future is dropped ([`cancel`](SendCompletions::cancel)), which for a
+/// send whose completion is dropped at once is the back. Both leave in at
+/// most two comparisons. Any other index is found by a scan. A list that
+/// kept no order would put the next index to settle anywhere, and settling
+/// N queued sends would cost about N^2/2 comparisons.
 fn index_remove(lists: &mut [VecDeque<u32>], key: u32, index: u32) {
     let Some(list) = lists.get_mut(key as usize) else {
         return;
@@ -218,9 +221,15 @@ fn index_remove(lists: &mut [VecDeque<u32>], key: u32, index: u32) {
         list.pop_front();
         return;
     }
+    if list.back() == Some(&index) {
+        #[cfg(test)]
+        INDEX_SCANNED.with(|c| c.set(c.get() + 2));
+        list.pop_back();
+        return;
+    }
     let found = list.iter().position(|&i| i == index);
     #[cfg(test)]
-    INDEX_SCANNED.with(|c| c.set(c.get() + 1 + found.map_or(list.len(), |pos| pos + 1)));
+    INDEX_SCANNED.with(|c| c.set(c.get() + 2 + found.map_or(list.len(), |pos| pos + 1)));
     if let Some(pos) = found {
         list.remove(pos);
     }
@@ -551,7 +560,9 @@ impl SendCompletions {
     ///
     /// Waiting: removed; if it was the head, the new head's task id is
     /// returned for waking. `InFlight`: becomes `Abandoned` (the driver
-    /// still owns the operation; its completion removes the entry). `Done`
+    /// still owns the operation; its completion removes the entry), owned
+    /// by [`NO_OWNER`] and no longer listed under its task: no future is
+    /// left to wake, so nothing reads its owner again. `Done`
     /// or `Aborted`: removed, result discarded (a driver result that arrives
     /// afterwards finds no entry and is ignored). Unknown: ignored.
     ///
@@ -572,7 +583,17 @@ impl SendCompletions {
                     return self.head_task();
                 }
             }
-            Completion::InFlight => e.state = Completion::Abandoned,
+            Completion::InFlight => {
+                e.state = Completion::Abandoned;
+                // Leave the task's list now rather than at the completion.
+                // A task's list spans its connections, and one connection's
+                // abandoned entries left there would sit ahead of another's
+                // that settle first.
+                let owner = std::mem::replace(&mut e.task_id, NO_OWNER);
+                if is_connection_task(owner) {
+                    index_remove(&mut self.by_task, owner, id.index);
+                }
+            }
             Completion::Done(_) | Completion::Aborted(_) => {
                 self.remove(id);
             }
@@ -1672,9 +1693,10 @@ mod tests {
     const CONN: u32 = 3;
     const OTHER_CONN: u32 = 5;
 
-    /// Sends whose futures were dropped settle in the order they were
-    /// registered, and each one leaves the front of its connection's and its
-    /// task's lists, which keep the rest in registration order.
+    /// Sends settle in the order they were registered, and each leaves the
+    /// front of its lists, which keep the rest in registration order. A send
+    /// whose future was dropped has already left its task's list; one whose
+    /// future takes the result leaves both lists then.
     #[test]
     fn settling_in_order_keeps_the_lists_in_registration_order() {
         let mut q = SendCompletions::new();
@@ -1682,12 +1704,22 @@ mod tests {
         for &id in &ids {
             assert_eq!(q.cancel(id), None, "in flight: nothing to promote");
         }
+        assert_eq!(listed(&q.by_task, CONN), Vec::<u32>::new());
         for (n, &id) in ids.iter().enumerate() {
             assert_eq!(
                 q.complete(id, Ok(1)),
                 None,
                 "an abandoned send wakes nobody"
             );
+            let rest: Vec<u32> = ids[n + 1..].iter().map(|id| id.index).collect();
+            assert_eq!(listed(&q.by_conn, CONN), rest, "by_conn after {n}");
+        }
+        assert_eq!(q.live(), 0);
+
+        let ids: Vec<SendId> = (0..64).map(|_| q.register(CONN, CONN)).collect();
+        for (n, &id) in ids.iter().enumerate() {
+            assert_eq!(q.complete(id, Ok(1)), Some(CONN));
+            assert!(q.take_result(id).is_some());
             let rest: Vec<u32> = ids[n + 1..].iter().map(|id| id.index).collect();
             assert_eq!(listed(&q.by_conn, CONN), rest, "by_conn after {n}");
             assert_eq!(listed(&q.by_task, CONN), rest, "by_task after {n}");
@@ -1745,22 +1777,85 @@ mod tests {
         assert_eq!(q.live(), 0);
     }
 
-    /// Settling N queued sends in order costs one comparison per list per
-    /// send. A list that does not keep registration order costs about
-    /// N^2/2 per list, 200 million at this N.
+    /// The comparisons `index_remove` makes while `f` runs.
+    fn comparisons(f: impl FnOnce()) -> usize {
+        INDEX_SCANNED.with(|c| c.set(0));
+        f();
+        INDEX_SCANNED.with(|c| c.get())
+    }
+
+    /// Settling N queued sends whose futures were dropped costs one
+    /// comparison per list per send: the task's list when the future is
+    /// dropped, the connection's when the send settles. That holds too when
+    /// one task sends on two connections and the second one's sends settle
+    /// while the first one's wait. A list that does not keep registration
+    /// order costs about N^2/2 per list, 200 million at this N, and so does
+    /// keeping abandoned entries in the task's list in the two-connection
+    /// case.
     #[test]
     fn settling_in_order_compares_once_per_list_per_send() {
         const N: usize = 20_000;
+
         let mut q = SendCompletions::new();
-        let ids: Vec<SendId> = (0..N).map(|_| q.register(CONN, CONN)).collect();
-        for &id in &ids {
-            q.cancel(id);
+        let scanned = comparisons(|| {
+            let ids: Vec<SendId> = (0..N).map(|_| q.register(CONN, CONN)).collect();
+            for &id in &ids {
+                q.cancel(id);
+            }
+            for &id in &ids {
+                q.complete(id, Ok(1));
+            }
+        });
+        assert_eq!(scanned, 2 * N, "one connection");
+        assert_eq!(q.live(), 0);
+
+        // One task, two connections, each future dropped as soon as its send
+        // is made (`let _ = tx.send(..)`); the second connection's sends
+        // settle first.
+        let mut q = SendCompletions::new();
+        let scanned = comparisons(|| {
+            let mut first = Vec::new();
+            let mut second = Vec::new();
+            for _ in 0..N {
+                for (conn, ids) in [(CONN, &mut first), (OTHER_CONN, &mut second)] {
+                    let id = q.register(conn, CONN);
+                    q.cancel(id);
+                    ids.push(id);
+                }
+            }
+            for &id in second.iter().chain(&first) {
+                q.complete(id, Ok(1));
+            }
+        });
+        assert_eq!(scanned, 2 * 2 * N, "two connections");
+        assert_eq!(q.live(), 0);
+    }
+
+    /// A send whose future is dropped at once leaves its task's list from
+    /// the back, so the sends a task makes behind awaited ones it still
+    /// holds cost the same few comparisons however many it holds.
+    #[test]
+    fn a_dropped_send_leaves_its_tasks_list_from_the_back() {
+        const N: usize = 20_000;
+        const HELD: usize = 16;
+        let mut q = SendCompletions::new();
+        let held: Vec<SendId> = (0..HELD).map(|_| q.register(OTHER_CONN, CONN)).collect();
+        let scanned = comparisons(|| {
+            for _ in 0..N {
+                let id = q.register(CONN, CONN);
+                q.cancel(id);
+                q.complete(id, Ok(1));
+            }
+        });
+        // Dropping compares the front (a held send) and then the back;
+        // settling compares the front of the connection's list.
+        assert_eq!(scanned, 3 * N);
+        let held_indices: Vec<u32> = held.iter().map(|id| id.index).collect();
+        assert_eq!(listed(&q.by_task, CONN), held_indices);
+        for &id in &held {
+            assert_eq!(q.complete(id, Ok(1)), Some(CONN));
+            assert!(q.take_result(id).is_some());
         }
-        INDEX_SCANNED.with(|c| c.set(0));
-        for &id in &ids {
-            q.complete(id, Ok(1));
-        }
-        assert_eq!(INDEX_SCANNED.with(|c| c.get()), 2 * N);
         assert_eq!(q.live(), 0);
     }
 }
