@@ -907,8 +907,8 @@ mod policy {
         }
 
         /// Admit `pool`'s head while it fits. Each admission changes the
-        /// head, and a new head starts with the latch off; [`below_head`]
-        /// (Self::below_head) still compares F + B with its own H.
+        /// head, and a new head starts with the latch off;
+        /// [`below_head`](Self::below_head) still compares F + B with its own H.
         fn admit_heads(&mut self, pool: usize) {
             while let Some(h) = self.head(pool) {
                 if self.s.fifos[pool][h].slots > self.free[pool] {
