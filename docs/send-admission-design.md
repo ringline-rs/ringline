@@ -972,7 +972,7 @@ Experiment C's orders, so this part is a port onto main, not a change of
 visibility. The port carries the gate and the hidden `waited_for_room` that the
 gate's tests read, and none of the orders. The fixes after D's last review are
 unreviewed (journal D). Its tests are the gate's event-loop unit tests and
-`tests/writable_gate.rs`, run on the rack's 6.8, 6.12 and 7.2 images as section
+`tests/writable_gate.rs`, run on the rack's 6.8, 6.12 and 7.3 images as section
 3's were. The part is done when they pass there, each fix's test fails with
 that fix reverted, and the existing suite passes unchanged; `send_buffer_size`
 returns, on both backends, the send buffer `ss -tmi` reports as `tb`; and a
