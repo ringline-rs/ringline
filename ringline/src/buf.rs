@@ -26,9 +26,9 @@
 //! for a type that owns its claim on that memory. If that memory is in a
 //! region registered with
 //! [`Runtime::register_region`](crate::Runtime::register_region), the type
-//! returns the region from [`IoBuf::region`], and on io_uring its direct
-//! I/O and NVMe operations use the registered buffer instead of pinning its
-//! pages for each operation.
+//! returns the region from [`IoBuf::region`], and on io_uring its reads and
+//! writes use the registered buffer, so direct I/O and NVMe operations do
+//! not pin its pages for each operation.
 
 use std::alloc::Layout;
 use std::ptr::NonNull;

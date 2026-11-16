@@ -34,8 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and unpin the buffer's pages. A buffered fs read or write pins nothing
   either way. A buffer whose range is not inside the region it names is
   refused with `InvalidInput`. The method defaults to
-  `RegionId::UNREGISTERED`, so existing implementations are unchanged. The
-  mio backend ignores it.
+  `RegionId::UNREGISTERED`. The mio backend ignores it.
 - `nvme_lba_size(device)` returns the namespace's logical block size, which
   `open_nvme_device` now reads with Identify Namespace.
 - `SendHalf::send_admitted` and `Connection::send_admitted`, returning an

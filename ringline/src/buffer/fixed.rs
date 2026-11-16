@@ -53,8 +53,8 @@ pub struct RegionId(pub(crate) u16);
 
 impl RegionId {
     /// Sentinel for memory not in a registered io_uring region: the default
-    /// of `IoBuf::region`, and a `SendGuard` that skips pointer validation in
-    /// `submit_with_guards`.
+    /// of `IoBuf::region`; a `SendGuard` that returns it skips pointer
+    /// validation in `submit_with_guards`.
     pub const UNREGISTERED: Self = RegionId(u16::MAX);
 }
 

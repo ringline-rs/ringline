@@ -986,7 +986,8 @@ pub(crate) fn release_orphans(
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor, unless `buf` is
-/// refused before submission (the `InvalidInput` cases above).
+/// refused before submission (no spare capacity, or more than `u32::MAX`
+/// bytes of it).
 pub fn read_into<B: IoBufMut>(file: File, offset: u64, buf: B) -> ReadFuture<B> {
     read_into_file(FileKind::Fs, file.index, file.generation, offset, buf)
 }
@@ -1045,7 +1046,7 @@ pub(crate) fn read_into_file<B: IoBufMut>(
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor, unless `buf` is
-/// refused before submission (the `InvalidInput` cases above).
+/// refused before submission (an initialized length above `u32::MAX`).
 pub fn write_from<B: IoBuf>(file: File, offset: u64, buf: B) -> WriteFuture<B> {
     write_from_file(FileKind::Fs, file.index, file.generation, offset, buf)
 }
