@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Bucket CPU 0's cpu-clock samples from send-admission-d-profile.toml runs.
 
-Usage: prof-buckets.py <dir>...   each <dir> holds one run's results.tgz
-(found recursively) and the run's experiment name contains the arm.
+Usage: send-admission-d-profile-buckets.py <dir>...
+Each <dir> holds one run's results.tgz (found recursively), and the run's
+experiment name contains the arm.
 
 Prints, per run and per arm (mean of runs), microseconds of CPU 0 per reply
-in each bucket of prof-prediction.md, at 4000 Hz (250 us per sample), and
-the top leaf symbols of the buckets that grew.
+in each bucket listed in docs/journal/2026-11-send-admission-d.md ("U
+profile"), at 4000 Hz (250 us per sample), and the top leaf symbols of the
+buckets that grew.
 """
 import collections, gzip, io, os, re, sys, tarfile
 
