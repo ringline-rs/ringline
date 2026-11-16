@@ -19336,6 +19336,24 @@ mod tests {
     /// What a `writable` task resolved with, as an error kind.
     type GateSeen = std::rc::Rc<std::cell::Cell<Option<Result<(), io::ErrorKind>>>>;
 
+    /// A fresh connection and its context.
+    fn bounded_conn(el: &mut AsyncEventLoop<NoopHandler>) -> ConnCtx {
+        let conn_index = accept_connection(el);
+        ConnCtx::new(conn_index, el.driver.connections.generation(conn_index))
+    }
+
+    /// Run `task` as a standalone task until it parks or finishes, and
+    /// return its index.
+    fn run_task(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        task: impl std::future::Future<Output = ()> + 'static,
+    ) -> u32 {
+        let idx = el.executor.standalone_slab.spawn(Box::pin(task)).unwrap();
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+        el.poll_ready_tasks();
+        idx
+    }
+
     /// Run `ctx.writable()` in a task of its own until it parks or resolves.
     fn gate_task(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> GateSeen {
         let seen: GateSeen = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -20133,7 +20151,7 @@ mod tests {
         el.handle_send_backstop();
         el.poll_ready_tasks();
         assert!(el.driver.send_queues[conn_index as usize].resubmit_queued);
-        el.drain_copy_retries();
+        el.drain_resubmit_retries();
         el.poll_ready_tasks();
         dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
         assert_eq!(seen.get(), None, "the resubmitted send may take the room");
@@ -20179,7 +20197,7 @@ mod tests {
         assert_eq!(seen.get(), None, "the re-send is not in the kernel yet");
 
         el.driver.ring.last_pushed = None;
-        el.drain_zc_retries();
+        el.drain_resubmit_retries();
         assert_plain_drain(&el, conn_index);
         assert!(!el.driver.send_queues[conn_index as usize].resubmit_queued);
         el.poll_ready_tasks();
@@ -20214,7 +20232,7 @@ mod tests {
         );
         assert_eq!(seen.get(), None);
 
-        el.drain_copy_retries();
+        el.drain_resubmit_retries();
         assert!(!el.driver.send_queues[conn_index as usize].resubmit_queued);
         el.poll_ready_tasks();
         assert!(
