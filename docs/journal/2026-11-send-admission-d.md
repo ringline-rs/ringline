@@ -1,8 +1,8 @@
 # Experiment D: large replies in pieces gated on socket room
 
 - **Status:** closed. All three gated arms pass the decision rule, which
-  picks 128 KiB pieces. U's 42% extra worker CPU per byte is not yet split
-  between ringline, the kernel send path and loopback's receive processing.
+  picks 128 KiB pieces. A profile of U puts 90% of the 42% extra worker CPU
+  per byte in loopback's receive path, mostly waking the reader.
 - **Span:** Nov 2026 · follows Experiment C (`2026-11-send-admission-c.md`)
   · SystemsLab context `send-admission-expC`
 
@@ -297,6 +297,87 @@ sent in 4% of cases against 31% on hv01. I do not know which property of
 hv01 causes either difference. The refutation stands as measured on hv01;
 the rerun shows the cell passes on the host class the other W4 cells ran on.
 
+### U profile: where the extra CPU goes
+
+The matrix's U left the 42% extra worker CPU per byte unattributed (above).
+With the owner's agreement this replaced a saturated-worker sweep, since U
+already kept the worker 98-99% busy with one connection.
+
+Setup: `experiments/send-admission-d-profile.toml` and its build spec at
+2f145cc4 of `exp/send-admission-d-run`, binaries from 3db626d8 rebuilt with
+forced frame pointers (artifact `01a1e3da-50c2`). U as in the matrix on
+hv01, with `perf record -e cpu-clock -F 4000 -C 0 -g --call-graph fp` on the
+worker's CPU for the load's run; two runs each of O0 whole, O0 ungated
+128 KiB and O0 gated 128 KiB (`01a1e3df-70e8` to `01a1e3df-7319`). A first
+batch of six (`01a1e3db-249a` to `01a1e3db-26f6`) recorded nothing: the
+image has no `perf`, and `apt-get install` needs an `apt-get update` first.
+Samples are bucketed per reply by `send-admission-d-profile-buckets.py`; a
+sample goes to the first bucket whose frames are in its stack: loopback
+receive (`net_rx_action`, `tcp_v4_rcv` and the like), kernel send
+(`tcp_sendmsg` and the like), poll, other io_uring, then user space.
+Profiled replies took longer than unprofiled ones (O0 whole's p50 3,212
+against 2,813 µs), so only the shares are used.
+
+Prediction, written before these runs:
+
+- P1: ringline's user-space code accounts for less than a quarter of the
+  extra, under 5 µs per piece; refuted at 5 µs per piece or more.
+- P2: the gate costs under 1 µs per piece: gated exceeds ungated by under
+  56 µs per reply, and the gate's poll path is under 1 µs per piece.
+- P3 (a guess, not a test): most of the extra is in the kernel, more likely
+  in loopback's receive processing than in the send path.
+
+CPU 0's busy time per reply (µs, mean of two runs; idle excluded):
+
+| bucket | O0 whole | ungated 128 KiB | gated 128 KiB | gated minus whole |
+| --- | --- | --- | --- | --- |
+| loopback receive: waking the reader (`sock_def_readable`) | 284 | 1,015 | 1,228 | +944 |
+| loopback receive: the rest | 274 | 424 | 538 | +264 |
+| kernel send | 1,764 | 2,132 | 2,123 | +359 |
+| copy into send slots (libc, under `send_bounded`) | 777 | 563 | 464 | -313 |
+| ringline user space | 45 | 90 | 96 | +51 |
+| io_uring, other | 61 | 78 | 83 | +22 |
+| poll (gate and room) | 1 | 1 | 11 | +10 |
+| other kernel | 9 | 41 | 15 | +6 |
+| total busy | 3,215 | 4,342 | 4,557 | +1,342 |
+
+The reader-wakeup row is the samples whose leaf is
+`_raw_spin_unlock_irqrestore` called from `sock_def_readable`: cpu-clock
+samples taken with interrupts off are recorded where they are re-enabled, so
+the leaf stands for the wakeup of the client's reading thread on another
+CPU, an IPI. The widest run-to-run spreads are gated's loopback receive
+(1,632 and 1,900) and its slot copy (416 and 511); the buckets script prints
+each run's range.
+
+- Most of the extra (+1,208 µs per reply, 90%) is loopback's receive path
+  on the sending CPU, and three quarters of that is waking the reader:
+  in pieces the reader drains the socket and sleeps between sends, so it is
+  woken more often. Over a NIC this work runs on the client's machine.
+- Kernel send grows 359 µs per reply, about 225 of it in `clear_page_rep`
+  under `prep_new_page` from `sk_page_frag_refill`, the kernel zeroing new
+  pages for the socket as it allocates them: 687 against 912 µs.
+- The copy into send slots costs 313 µs less per reply in 128 KiB pieces. I
+  infer that a 128 KiB piece's slots are still in cache when they are
+  reused, where a 7 MiB reply's are not; I did not measure cache misses.
+- Ringline's own code, io_uring's and the gate's poll together add 83 µs per
+  reply, 1.5 µs per piece.
+
+Against the prediction:
+
+- P1 holds: ringline's user space adds 0.9 µs per piece (1.5 µs with
+  io_uring and the poll).
+- P2: the gate's poll path costs 0.2 µs per piece, which holds; gated busy
+  time exceeds ungated by 215 µs per reply, which refutes the condition as
+  written. The excess is in the reader-wakeup and receive rows, which vary
+  most between runs. The unprofiled matrix (four runs each) gave 3,979
+  against 3,976 µs of worker CPU per reply, no difference.
+- P3 holds: 90% of the extra is loopback receive.
+
+Derived, not measured: without the loopback receive rows, gated 128 KiB's
+busy time per reply is 2,791 µs against whole's 2,657, 5% more. A NIC send
+path has costs loopback does not (driver, interrupts, segmentation), which
+this does not include.
+
 ### Against the prediction
 
 - U: 128 KiB gated pieces took 45% longer than whole replies, inside "up to
@@ -337,9 +418,9 @@ By the decision rule, applied as written:
   TLS on the same worker uses it.
 - U's CPU per byte is 1.42 times whole replies for 128 KiB pieces (1.46
   under O7w), under the rule's 2x threshold, so the rule does not send it to
-  the owner. That figure includes loopback's receive processing on the
-  worker's CPU (above), so it overstates what pieces cost a server sending
-  over a NIC by an amount not yet measured.
+  the owner. The profile puts 90% of the extra in loopback's receive path
+  on the worker's CPU, mostly waking the reader; without it, pieces cost 5%
+  more CPU per reply (derived). Ringline's own code adds 1.5 µs per piece.
 - The prediction is refuted in one cell, W4 at 256 KiB on hv01, by both
   128 KiB gated arms (12.1 and 12.7 ms median against 10 ms). On hv03 the same
   arms gave 1.2 and 1.3 ms.
@@ -353,9 +434,9 @@ My recommendation, apart from the rule:
   is 85 KiB) 128 KiB pieces to a fast reader were partly sent and 64 KiB
   pieces never were; at 1 MiB neither was. This is the rule's "how it sizes p
   against a socket's send buffer" clause, inferred from these cells.
-- Before the fast-path specification, profile the worker's CPU in U to
-  find which part of the 42% is ringline's and the kernel send path's, and
-  which is loopback's receive processing.
+- U's cost does not argue against 128 KiB or against 64 KiB pieces: the
+  per-piece cost on the server is about 1.5 µs of ringline and io_uring plus
+  the kernel's per-send work.
 
 D ran on 3db626d8, whose gate still had two bugs that need a second send
 waiting on the gated connection (above); D's harness gates a piece only
