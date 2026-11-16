@@ -145,14 +145,14 @@ impl AsyncEventHandler for StreamStubServer {
                         if let Some(key) = line.strip_prefix(b"gets ") {
                             // `gets <key>` — CAS-carrying reply.
                             let (reply, should_close) = decide_cas(key);
-                            let _ = tx.send_nowait(&reply);
+                            let _ = tx.send(&reply);
                             if should_close {
                                 tx.close();
                             }
                             ParseResult::Consumed(header_len)
                         } else if let Some(key) = line.strip_prefix(b"get ") {
                             let (reply, should_close) = decide(key);
-                            let _ = tx.send_nowait(&reply);
+                            let _ = tx.send(&reply);
                             if should_close {
                                 // Send has been queued; closing the connection
                                 // FINs after the queued bytes drain, giving the
@@ -184,7 +184,7 @@ impl AsyncEventHandler for StreamStubServer {
                             } else {
                                 b"SERVER_ERROR value mismatch\r\n"
                             };
-                            let _ = tx.send_nowait(reply);
+                            let _ = tx.send(reply);
                             ParseResult::Consumed(total)
                         } else {
                             // Unknown line — consume it.

@@ -218,7 +218,7 @@ async fn run_tokio_open_client(
             continue;
         }
         // Copy each message into the send buffer before writing — fair vs the
-        // ringline client, whose send_nowait copies each message into the send
+        // ringline client, whose send copies each message into the send
         // pool. (Measured: this does not move throughput at any payload size, so
         // the copy is not what differentiates the runtimes — but it removes the
         // confound so the comparison is defensible.)
@@ -296,7 +296,7 @@ mod ringline_client {
         /// `Some` => open-loop (rate-controlled); `None` => closed-loop.
         pub open: Option<OpenLoop>,
         /// Open-loop decomposition (per-connection sample vecs, ns). `svc` =
-        /// service time (recv - actual send_nowait); `lag` = offer lag
+        /// service time (recv - actual send); `lag` = offer lag
         /// (actual send - scheduled), the coordinated-omission/back-pressure
         /// component. Empty for closed-loop. The existing `histograms` keeps the
         /// CO-corrected response time (recv - scheduled).
@@ -469,7 +469,7 @@ mod ringline_client {
         while !state.stop.load(Ordering::Relaxed) {
             let t0 = Instant::now();
 
-            if conn_tx.send_nowait(&batch).is_err() {
+            if conn_tx.send(&batch).is_err() {
                 break;
             }
 
@@ -523,7 +523,7 @@ mod ringline_client {
 
     /// Open-loop ringline client. The connecting task is the *reader* (recv
     /// wake targets the owning task), and a separate spawned task is the
-    /// *sender* (fire-and-forget `send_nowait`, never awaits recv).
+    /// *sender* (`send` with the completion dropped, never awaits recv).
     async fn run_ringline_open_client(state: Arc<ClientState>, ol: OpenLoop) {
         let conn = match connect_to(&state).await {
             Ok(c) => c,
@@ -577,7 +577,7 @@ mod ringline_client {
                 if Instant::now() < target {
                     break; // next request not due yet
                 }
-                if conn_tx.send_nowait(&msg).is_err() {
+                if conn_tx.send(&msg).is_err() {
                     pool_full = true;
                     break; // send pool full; drain responses first
                 }
@@ -656,7 +656,7 @@ mod ringline_client {
             // Read before `state` is moved into GLOBAL_STATE below.
             let clients = state.num_clients;
             let inflight = state.open.as_ref().map_or(1, |o| o.max_inflight.max(1));
-            // Closed loop sends `depth` messages in one `send_nowait`.
+            // Closed loop sends `depth` messages in one `send`.
             let send_len = if state.open.is_some() {
                 msg_size
             } else {
@@ -689,7 +689,7 @@ mod ringline_client {
             // `send_copy_slot_size`; the unbuffered engine needs 16413 for a
             // 16 KiB fragment). On io_uring a TLS send takes one slot per
             // 16 KiB of plaintext, and admission needs one slot more. mio's
-            // `send_nowait` does not use the pool.
+            // `send` does not use the pool.
             let (slot, per_msg) = if tls {
                 (16448u32, send_len.div_ceil(16384) + 1)
             } else {

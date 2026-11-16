@@ -166,12 +166,14 @@ enum TokioEcho {
 /// Which ringline echo strategy `bench-server` drives.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum EchoMode {
-    /// `with_data` + `send_nowait`.
+    /// `with_data` + `send`, with the `SendCompletion` dropped.
     Copy,
     /// `with_data` + `forward_recv_buf`.
     Forward,
-    /// `with_bytes`, then `send_nowait` after the closure returns. The
-    /// baseline of Experiment B (`docs/send-admission-design.md`, section 4).
+    /// `with_bytes`, then `send` after the closure returns, with the
+    /// `SendCompletion` dropped. The baseline of Experiment B
+    /// (`docs/send-admission-design.md`, section 4), which ran it on
+    /// `send_nowait`.
     /// `bytes-nowait` and `bytes-admitted` differ only in the send call;
     /// `bytes-admitted-await` and `bytes-admitted-timeout` also await the
     /// reply's settlement before the next read, which arms the next receive
@@ -224,8 +226,8 @@ struct Args {
     /// (ringline only, required with `--runtime ringline` unless
     /// `--proxy-backend` is set) Which echo strategy the handler uses:
     ///
-    /// - `copy`: `with_data` + `send_nowait`, which copies the received bytes
-    ///   into a send.
+    /// - `copy`: `with_data` + `send`, which copies the received bytes
+    ///   into a send, with the `SendCompletion` dropped.
     /// - `forward`: `with_data` + `forward_recv_buf` — the ordinary
     ///   parse-then-forward loop a protocol server would write. On io_uring
     ///   it sends the accumulator under a guard (zero-copy at or above
@@ -694,15 +696,16 @@ fn run_ringline(cfg: EchoCfg) {
     /// justify threading a field through every one of them.
     static PARK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    /// `with_data` + `send_nowait`: the bytes are copied into a send.
+    /// `with_data` + `send`: the bytes are copied into a send, and the
+    /// `SendCompletion` is dropped.
     async fn copy_echo_loop(conn: Connection) {
         let (mut tx, mut rx) = conn.split();
         loop {
             let n = rx
                 .with_data(|data| {
                     burn_for(data.len());
-                    if let Err(e) = tx.send_nowait(data) {
-                        eprintln!("echo: send_nowait failed: {e}");
+                    if let Err(e) = tx.send(data) {
+                        eprintln!("echo: send failed: {e}");
                         return ParseResult::NeedMore;
                     }
                     ParseResult::Consumed(data.len())
@@ -799,9 +802,9 @@ fn run_ringline(cfg: EchoCfg) {
             burn_for(data.len());
             match MODE {
                 BYTES_NOWAIT => {
-                    if let Err(e) = tx.send_nowait(&data) {
+                    if let Err(e) = tx.send(&data) {
                         BYTES_SEND_FAILED.fetch_add(1, Relaxed);
-                        eprintln!("echo: send_nowait failed: {e}");
+                        eprintln!("echo: send failed: {e}");
                         break;
                     }
                 }

@@ -1,7 +1,6 @@
 //! A chain whose zero-copy part gets `-ENOMEM` fails, so the runtime closes the
 //! connection. Otherwise a later send reaches the peer after the bytes the chain
-//! lost, and a `send_chain_nowait` or a dropped `send_chain` future reports
-//! nothing (#734).
+//! lost, and a dropped `send_chain` future reports nothing (#734).
 //!
 //! The test lowers the soft `RLIMIT_MEMLOCK` to 0 after launch, as
 //! `zc_send_enomem.rs` does. From Linux 6.15 a zero-copy send is charged to the
@@ -37,39 +36,29 @@ impl SendGuard for VecGuard {
     }
 }
 
-/// Waits for one byte, sends a chain with a zero-copy part, then plain sends.
-/// The byte picks the chain: `n` for `send_chain_nowait`, `d` for a dropped
-/// `send_chain` future.
+/// Waits for one byte, sends a chain with a zero-copy part and drops its
+/// future, then plain sends.
 struct ChainSender;
 
 impl AsyncEventHandler for ChainSender {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let mut mode = 0;
             if conn
-                .with_data(|data| {
-                    mode = data[0];
-                    ParseResult::Consumed(data.len())
-                })
+                .with_data(|data| ParseResult::Consumed(data.len()))
                 .await
                 == 0
             {
                 return;
             }
             let guard = GuardBox::new(VecGuard(vec![7; GUARD_LEN]));
-            if mode == b'n' {
-                conn.send_chain_nowait(|c| c.parts().guard(guard).add().finish())
-                    .expect("chain accepted");
-            } else {
-                drop(
-                    conn.send_chain(|c| c.parts().guard(guard).add().finish())
-                        .expect("chain accepted"),
-                );
-            }
+            drop(
+                conn.send_chain(|c| c.parts().guard(guard).add().finish())
+                    .expect("chain accepted"),
+            );
             // One send queued behind the chain, and one after it has finished.
-            conn.send_nowait(LATER_SEND).expect("later send accepted");
+            conn.send(LATER_SEND).expect("later send accepted");
             ringline::sleep(Duration::from_millis(50)).await;
-            let _ = conn.send_nowait(LATER_SEND);
+            let _ = conn.send(LATER_SEND);
             while conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
                 .await
@@ -133,43 +122,43 @@ fn a_failed_chain_closes_the_connection() {
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &r) }, 0);
 
     let charged = zero_copy_sends_are_charged();
-    for mode in *b"nd" {
-        let mut stream = TcpStream::connect(addr).expect("connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(&[mode]).unwrap();
 
-        let mut received = Vec::new();
-        let mut buf = [0u8; 65536];
-        let closed = loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break true,
-                Ok(n) => received.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == ErrorKind::ConnectionReset => break true,
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    break false;
-                }
-                Err(e) => panic!("read: {e}"),
-            }
-            if !charged && received.len() == GUARD_LEN + 2 * LATER_SEND.len() {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"g").unwrap();
+
+    let mut received = Vec::new();
+    let mut buf = [0u8; 65536];
+    let closed = loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => break true,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 break false;
             }
-        };
-
-        if charged {
-            assert!(closed, "the connection stayed open after the chain failed");
-            assert!(
-                received.is_empty(),
-                "{} bytes reached the peer after the failed chain",
-                received.len()
-            );
-        } else {
-            assert_eq!(received.len(), GUARD_LEN + 2 * LATER_SEND.len());
-            assert!(received.ends_with(LATER_SEND));
+            Err(e) => panic!("read: {e}"),
         }
+        if !charged && received.len() == GUARD_LEN + 2 * LATER_SEND.len() {
+            break false;
+        }
+    };
+
+    if charged {
+        assert!(closed, "the connection stayed open after the chain failed");
+        assert!(
+            received.is_empty(),
+            "{} bytes reached the peer after the failed chain",
+            received.len()
+        );
+    } else {
+        assert_eq!(received.len(), GUARD_LEN + 2 * LATER_SEND.len());
+        assert!(received.ends_with(LATER_SEND));
     }
 
+    drop(stream);
     runtime.shutdown();
     for handle in handles {
         handle.join().expect("worker panicked").expect("worker");

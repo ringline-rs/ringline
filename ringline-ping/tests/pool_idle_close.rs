@@ -56,7 +56,7 @@ impl AsyncEventHandler for OneReplyServer {
                     if data.len() < PING.len() {
                         return ParseResult::NeedMore;
                     }
-                    let _ = tx.send_nowait(b"PONG\r\n");
+                    let _ = tx.send(b"PONG\r\n");
                     ParseResult::Consumed(PING.len())
                 })
                 .await;

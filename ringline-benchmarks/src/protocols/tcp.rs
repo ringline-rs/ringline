@@ -354,7 +354,7 @@ impl ringline::AsyncEventHandler for RinglineTcpBench {
 
                         let t0 = Instant::now();
 
-                        if conn_tx.send_nowait(&msg).is_err() {
+                        if conn_tx.send(&msg).is_err() {
                             break;
                         }
 

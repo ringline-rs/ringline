@@ -192,6 +192,14 @@ impl Driver {
             return false;
         }
         let generation = cs.generation;
+        // After a receive that left the socket empty, the next one would
+        // usually find it empty too: POLL_FIRST skips that attempt. A
+        // Unix-domain connection always receives first: af_unix reports no
+        // `msg_inq` before Linux 6.17, so on 6.12 `IORING_CQE_F_SOCK_NONEMPTY`
+        // is never set, which would make every receive poll first, and on
+        // 6.1 the flag comes from a field io_uring does not initialise.
+        let poll_first = cs.recv_direct_drained
+            && !matches!(cs.peer_addr, Some(crate::connection::PeerAddr::Unix(_)));
         let (buf, ptr, len, held, known) = if tls {
             let Some(target) = self
                 .tls_table
@@ -236,7 +244,7 @@ impl Driver {
         };
         if self
             .ring
-            .submit_recv_direct(conn_index, ptr, len as u32, slot)
+            .submit_recv_direct(conn_index, ptr, len as u32, slot, poll_first)
             .is_err()
         {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
@@ -268,6 +276,9 @@ impl Driver {
         metrics::RECV_DIRECT.increment(metrics::recv_direct::ARMED);
         if known {
             metrics::RECV_DIRECT.increment(metrics::recv_direct::KNOWN_LENGTH);
+        }
+        if poll_first {
+            metrics::RECV_DIRECT.increment(metrics::recv_direct::POLL_FIRST);
         }
         false
     }
@@ -1510,6 +1521,7 @@ impl Driver {
             next_disk_io_seq: &mut self.next_disk_io_seq,
             write_orders: &mut self.write_orders,
             tls_chain_carried: false,
+            parts_id_carried: false,
         }
     }
 

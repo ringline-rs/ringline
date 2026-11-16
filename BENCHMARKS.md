@@ -308,13 +308,15 @@ tokio. The mio arm is a `--features force-mio` build; `tokio-uring` needs
 `--features tokio-uring-arm`. `--defer-recv-arm` turns on
 `ConfigBuilder::defer_recv_arm`. The `uring` and `rfwd` arms cannot be rerun:
 ringline has no `run_direct_echo` or `forward_held`. `--echo-mode` is
-required with `--runtime ringline`: `copy` is a `with_data` + `send_nowait`
-loop and `forward` is `with_data` + `forward_recv_buf`; `direct` and
+required with `--runtime ringline`: `copy` is a `with_data` + `send` loop
+and `forward` is `with_data` + `forward_recv_buf`; `direct` and
 `recv-forward` are refused. From 0.7.0-alpha.5 an accepted plaintext
 connection receives into its accumulator and `forward_recv_buf` sends the
 accumulator under a guard, so a rerun of `--echo-mode forward` measures that
-path. The September `uring-fwd` figure (20.95 µs/op) measured the
-provided-buffer receive that #699 replaced.
+path. From 0.7.0-alpha.141 `copy` and `forward` register a `SendCompletion`
+per send, which bench-server drops; the checked-in rows predate it. The
+September `uring-fwd` figure (20.95 µs/op) measured the provided-buffer
+receive that #699 replaced.
 
 Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5
 --duration 20`.

@@ -70,7 +70,7 @@ impl AsyncEventHandler for GuardSender {
             let big = GuardBox::new(VecGuard(pattern(BIG, 1)));
             let (_, mixed) = conn
                 .send_parts()
-                .submit_batch_await(vec![
+                .submit_batch(vec![
                     SendPart::Copy(PREFIX),
                     SendPart::Guard(big),
                     SendPart::Copy(SUFFIX),
@@ -79,7 +79,7 @@ impl AsyncEventHandler for GuardSender {
             let small = GuardBox::new(VecGuard(pattern(SMALL, 2)));
             let (_, guard_only) = conn
                 .send_parts()
-                .submit_batch_await(vec![SendPart::Guard(small)])
+                .submit_batch(vec![SendPart::Guard(small)])
                 .expect("guard-only send accepted");
             // A chain starts only once the earlier sends have completed.
             mixed.await.expect("mixed guard send");

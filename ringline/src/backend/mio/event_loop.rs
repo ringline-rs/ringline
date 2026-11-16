@@ -3063,6 +3063,76 @@ mod tests {
         assert_eq!(read_line(&mut el, ctx), Some((at(base, 2), at(base, 3))));
     }
 
+    /// An awaited send that is refused after its id is registered, or a
+    /// `build` or `submit_batch` that sends nothing, leaves no entry in the
+    /// completion table: no completion would ever free it. Mio refuses a
+    /// plain send only on a stale or aborted connection; it never runs out
+    /// of pool for one.
+    #[test]
+    fn a_refused_awaited_send_leaves_no_entry() {
+        use crate::handler::SendPart;
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        let conn = ConnCtx::new(conn_index, generation);
+        el.driver.send_queues[conn_index as usize].aborted = true;
+        let kind = |r: io::Result<crate::SendCompletion>| r.err().map(|e| e.kind());
+        let batch_kind = |r: io::Result<(usize, crate::SendCompletion)>| r.err().map(|e| e.kind());
+        crate::runtime::io::with_driver_state(&mut el.driver, &mut el.executor, |_, _| {
+            for _ in 0..10 {
+                // Refused by the driver after the id is registered.
+                assert_eq!(kind(stale.send(b"x")), Some(io::ErrorKind::NotConnected));
+                let aborted = Some(io::ErrorKind::ConnectionAborted);
+                assert_eq!(kind(conn.send(b"x")), aborted);
+                assert_eq!(kind(conn.forward_recv_buf(b"x")), aborted);
+                assert_eq!(
+                    kind(conn.send_parts().build(|b| b.copy(b"x").submit())),
+                    aborted
+                );
+                assert_eq!(
+                    batch_kind(conn.send_parts().submit_batch(vec![SendPart::Copy(b"x")])),
+                    aborted
+                );
+
+                // Refused before an id is registered.
+                let invalid = Some(io::ErrorKind::InvalidInput);
+                assert_eq!(kind(conn.send_parts().build(|b| b.submit())), invalid);
+                let unsubmitted = conn.send_parts().build(|b| {
+                    let _unsubmitted = b.copy(b"x");
+                    Ok(())
+                });
+                assert_eq!(kind(unsubmitted), invalid);
+                assert_eq!(
+                    batch_kind(conn.send_parts().submit_batch(Vec::new())),
+                    invalid
+                );
+            }
+        });
+        assert_eq!(el.executor.send_completions.live(), 0);
+    }
+
+    /// A `build` closure that panics leaves no entry in the completion
+    /// table. Mio registers the id only after the closure returns.
+    #[test]
+    fn a_panicking_build_closure_leaves_no_entry() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        for _ in 0..10 {
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::runtime::io::with_driver_state(&mut el.driver, &mut el.executor, |_, _| {
+                    conn.send_parts()
+                        .build(|_b| -> io::Result<()> { panic!("a build closure panics") })
+                })
+            }));
+            assert!(built.is_err(), "the panic reached the caller");
+        }
+        assert_eq!(el.executor.send_completions.live(), 0);
+    }
+
     /// `finish_close` empties the slot's arrival log.
     #[test]
     fn a_closed_slot_releases_its_arrival_log() {
