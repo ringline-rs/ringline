@@ -400,7 +400,7 @@ inferring the mechanism is exactly the mistake made here.
 #### Evidence 3 — measured on Linux/io_uring
 
 hv01, kernel 6.12, rustc 1.98.1. Isolated in-process microbenchmark of the send
-path (harness on the local `bench/tls-send-microbench` branch, not merged).
+path (harness on a local branch, not merged).
 
 An allocation counter inside the measured call, 256 KiB payload: buffered
 **263,976** bytes/op, unbuffered **264,000** — 24 bytes apart. If the unbuffered

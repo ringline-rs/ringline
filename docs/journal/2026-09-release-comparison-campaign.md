@@ -96,8 +96,8 @@ Phased, because each phase's output is the next phase's input.
 - **Phase 3 — worker count and pipeline depth.** Tests whether
   connections-per-worker is the real parameter, and whether syscalls/op falls
   with depth as the copy/syscall doc claims.
-- **Phase 4 (separate effort) — segcache.** Revive `bench/fair-throughput`
-  (28k lines, vendors segcache + cache-core, predates the series) so
+- **Phase 4 (separate effort) — segcache.** Revive the segcache benchmark
+  branch (28k lines, vendors segcache + cache-core, predates the series) so
   `BENCHMARKS.md`'s own workload can be refreshed. Deliberately after the echo
   campaign: echo answers the scaling questions more cheaply, and the revival is
   a substantial job that should not block them.

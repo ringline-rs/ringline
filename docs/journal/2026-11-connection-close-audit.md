@@ -228,26 +228,27 @@ Fix: carry the generation in the Connect payload and check it first; build the
 cancel targets with the same payload; add a `connect_inflight` gate to
 `try_finalize_close` mirroring `shutdown_inflight`.
 
-Disposition: fixed in #774, by the identity check
-alone: `submit_connect` encodes the slot's generation, `handle_connect` returns
-on a mismatch before touching the slot, and the cancel targets carry the same
-payload. The proposed `connect_inflight` gate was added and then removed on
-review: a late CQE fails the generation check, and, read from the kernel source
-and not tested, the kernel holds the Connect's own file reference so
-re-registering the slot does not redirect it, and the Close's lead ends a
-Connect still in the kernel (from Linux 6.13 an `ASYNC_CANCEL` of the fixed
-file, which cancels a poll-armed Connect; before 6.13 a `shutdown(SHUT_RDWR)`,
-which disconnects a `SYN_SENT` socket and wakes the poll); with the gate, a
-cancel push refused by a full SQ left the slot `Closing` until the kernel's own
-connect timeout (about 127 s at the default `tcp_syn_retries`). Verified by
+Disposition: fixed in #774, by the identity check alone: `submit_connect`
+encodes the slot's generation, `handle_connect` returns on a mismatch before
+touching the slot, and the cancel targets carry the same payload. The proposed
+`connect_inflight` gate was added and then removed on review: a late CQE fails
+the generation check, and, read from the kernel source and not tested, the
+kernel holds the Connect's own file reference so re-registering the slot does
+not redirect it, and the Close's lead ends a Connect still in the kernel (from
+Linux 6.13 an `ASYNC_CANCEL` of the fixed file, which cancels a poll-armed
+Connect; before 6.13 a `shutdown(SHUT_RDWR)`, which disconnects a `SYN_SENT`
+socket and wakes the poll); with the gate, a cancel push refused by a full SQ
+left the slot `Closing` until the kernel's own connect timeout (about 127 s at
+the default `tcp_syn_retries`). Verified by
 `experiments/connect-identity-verify.toml` (SystemsLab experiment
 `01a1bc34-4f45-7153-842b-ffa04d3156c4`, Debian 13, Linux 6.12): at the
 tests-only commit of #774 the four pinning tests that exist there fail (4
 passed; 4 failed), among them
 `a_stale_connect_cqe_leaves_the_reused_slot_alone`, whose stale success CQE
-opens the new occupant; at #774's head ten pass, and the uring gate (fmt, clippy
-on three builds, rustdoc, `cargo test --all`) passes. The trigger itself (a
-Connect CQE dispatched after the Close CQE) was not reproduced on a kernel.
+opens the new occupant; at the commit of #774 that drops the `connect_inflight`
+gate ten pass, and the uring gate (fmt, clippy on three builds, rustdoc, `cargo
+test --all`) passes. The trigger itself (a Connect CQE dispatched after the
+Close CQE) was not reproduced on a kernel.
 
 ### F5 — connect-timeout cancels never match (invariant 14). Confirmed by reading; benign.
 
@@ -316,12 +317,12 @@ as the mio one does. Pinned by
 `a_forced_close_keeps_an_in_flight_shutdown_recorded` and
 `shutdown_write_after_a_requested_close_submits_nothing`; verified by
 `experiments/force-close-write-half-verify.toml` (SystemsLab experiment
-`01a1bc3b-0b66-7125-1396-0547f875c73f`, Debian 13, Linux 6.12): at the
-tests-only commit of #776 both fail (1 passed; 2 failed), at its head (the fix
-plus the spec and the alpha bump) three pass, and the uring gate (fmt, clippy
-on three builds, rustdoc, `cargo test --all`, lib 780 passed) passes. The
-trigger (a repeat `shutdown_write` in the window between the deadline and the
-Shutdown CQE) was not reproduced from outside the event loop.
+`01a1bc3b-0b66-7125-1396-0547f875c73f`, Debian 13, Linux 6.12): at #776's own
+tests-only commit both fail (1 passed; 2 failed), at #776's 0.7.0-alpha.31 bump
+(the fix plus the spec and the bump) three pass, and the uring gate (fmt,
+clippy on three builds, rustdoc, `cargo test --all`, lib 780 passed) passes.
+The trigger (a repeat `shutdown_write` in the window between the deadline and
+the Shutdown CQE) was not reproduced from outside the event loop.
 
 ### F8 — worker exit leaves `CONNECTIONS_ACTIVE` inflated and abandons mio closing connections (invariants 15, 3). Traced.
 
@@ -340,21 +341,21 @@ mio abandonment or run one bounded `drain_pending_closes` pass before
 returning.
 
 Disposition: fixed in #779: the `OpTag::Close` arm of io_uring's
-`handle_shutdown_cqe` and a mio `count_out_open_connections`, run at `run`'s shutdown
-return and in `drain_after_failure`, count each established connection into
-`CLOSED` and out of `CONNECTIONS_ACTIVE`, as `handle_close` and `finish_close`
-do. The mio abandonment is documented rather than replaced by a drain pass:
-`docs/mio-close-lifecycle-design.md`, "Worker exit", and the `metrics.rs` docs
-no longer list worker exit as an exception. Pinned by
+`handle_shutdown_cqe` and a mio `count_out_open_connections`, run at `run`'s
+shutdown return and in `drain_after_failure`, count each established connection
+into `CLOSED` and out of `CONNECTIONS_ACTIVE`, as `handle_close` and
+`finish_close` do. The mio abandonment is documented rather than replaced by a
+drain pass: `docs/mio-close-lifecycle-design.md`, "Worker exit", and the
+`metrics.rs` docs no longer list worker exit as an exception. Pinned by
 `worker_exit_counts_open_connections_out` in
-`ringline/tests/connection_metrics.rs`: on mio it fails at the tests-only
-commit of #779 (gauge 3, expected 0) and passes at the fix; on io_uring,
+`ringline/tests/connection_metrics.rs`: on mio it fails at #779's own
+tests-only commit (gauge 3, expected 0) and passes at the fix; on io_uring,
 verified by `experiments/exit-closes-count-down-verify.toml` (SystemsLab
 experiment `01a1bc48-5b3e-718d-e469-71f2b93528e2`, Debian 13, Linux 6.12): 0
-passed, 1 failed at that commit, 1 passed at #779's head, and the
-uring gate (fmt, clippy on three builds, rustdoc, `cargo test --all`) passes. A
-connection whose Close has not completed when `run_shutdown`'s 10 s bound
-runs out is not counted out: one holding a zero-copy entry whose
+passed, 1 failed at that commit, 1 passed at #779's 0.7.0-alpha.32 bump, and
+the uring gate (fmt, clippy on three builds, rustdoc, `cargo test --all`)
+passes. A connection whose Close has not completed when `run_shutdown`'s 10 s
+bound runs out is not counted out: one holding a zero-copy entry whose
 notification does not arrive (#607), or one whose Close the ring refused on
 every pass (#787).
 

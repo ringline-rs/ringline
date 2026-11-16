@@ -39,13 +39,12 @@ decision 15 extends it to accepted connections.
 
 All runs below are cachecannon with 16 client workers and 1,000 connections (62
 or 63 per worker) against Valkey (RESP) and memcached, on two VMs, at a fixed
-request rate per cell, in `experiments/segviews-screen.toml` on branch
-`feat/segment-clients`. Client CPU is the cachecannon process's user plus
-system time for the run. Each build runs in every cell of a SystemsLab
-experiment, and the three experiments rotate the build order. The ringline
-builds C3 to C8 below are from before this change was rebased onto main, and
-are not in the repository; each is identified by its SystemsLab binaries or
-experiments.
+request rate per cell, in `experiments/segviews-screen.toml` (not in the
+repository). Client CPU is the cachecannon process's user plus system time for
+the run. Each build runs in every cell of a SystemsLab experiment, and the
+three experiments rotate the build order. The ringline builds C3 to C8 below
+are from before this change was rebased onto main, and are not in the
+repository; each is identified by its SystemsLab binaries or experiments.
 
 ### What the ring path copies
 
@@ -67,7 +66,8 @@ and the incremental ring added about 1 GiB of peak RSS
 
 ### Direct receive (build C)
 
-Build C is cachecannon `exp/segviews-c2` on the ringline build A used, binaries
+Build C is cachecannon's segment-views client on this change's first prototype,
+based on the ringline commit build A used, binaries
 `01a154c2-7be1-7364-667e-192b469e7a14`. In the screen, `c` connects with
 `recv_direct(true)`, `c0` is the same binary on the multishot ring, and `c1` is
 the same binary with one-shot ring receives (`recv_multishot(false)`).
@@ -200,8 +200,8 @@ Build C8 is that commit without the counters (binaries
   The first three are 1 to 9% higher; RESP 64 B is 12 to 31% higher, in a
   cell where A's own p99 varies by 75% between runs. In the other nine
   cells `c`'s p99 is above A's in at most two runs.
-- Throughput with the hosts swapped (`experiments/segviews-screen-flip.toml`
-  on `feat/segment-clients`: client on the Zen 1 host with 12 threads,
+- Throughput with the hosts swapped (`experiments/segviews-screen-flip.toml`,
+  not in the repository: client on the Zen 1 host with 12 threads,
   servers on the Zen 2 host), one run (`01a15aad-c9c5-7104-23a5-5be594d89ccd`).
   A's client uses 597 to 604 CPU-seconds, all 12 cores for the 50 s of
   warmup and measurement, in six cells; at memcache 64 KiB depth 16,
@@ -281,12 +281,12 @@ stayed (`recv-buffering-approaches.md`).
 
 ### Accepted connections (RESP server, 1,000 and 8,000 connections)
 
-These runs used a prototype of this change (not in the repository) that had
-neither the hangup poll nor the single-`sendmsg` multi-slot send (#697). The
-poll's cost is not measured. #697 changes only the GET 4 KiB depth-16 cells at
-16 KiB send slots, where a flush spans up to 5 slots. Both ringline arms send
-through the same path, so #697 is expected to affect them alike; this is not
-measured.
+These runs used a prototype of this change and specs, neither in the
+repository, that had neither the hangup poll nor the single-`sendmsg`
+multi-slot send (#697). The poll's cost is not measured. #697 changes only the
+GET 4 KiB depth-16 cells at 16 KiB send slots, where a flush spans up to 5
+slots. Both ringline arms send through the same path, so #697 is expected to
+affect them alike; this is not measured.
 
 A RESP server (`ringline-bench` `resp-server` on that prototype, bins
 `01a164ab-e6aa-73c2-fd0b-2feb02733191`) ran with 8 workers on one VM and
@@ -563,7 +563,7 @@ its `capacity()` leaves out the bytes before it. `put` moves its start back
 to the start of the allocation (`try_reclaim`) before keeping it; without
 that, a buffer that had held several messages measured under 64 KiB and was
 freed, and every batch of 16 × 4 KiB allocated a new one (C5's 1.94 million
-allocations per run before the pool, 0 after).
+allocations per run before `try_reclaim` was added, 0 after).
 
 A receive that ends inside a message leaves that part to be moved to the
 front of the buffer at the next growth. Sizing receives to several messages
@@ -858,8 +858,8 @@ Made by the owner on 2026-10-19:
    byte without one.
 5. Opt-in per connection, off by default, until C3 and the scale run show no
    cell where it costs more than the ring.
-6. Segment views: the client switch on `feat/segment-clients` and the proto
-   releases it needs are not pursued.
+6. Segment views: the client switch in the segment-views prototype and the
+   proto releases it needs are not pursued.
 
 Made by the owner on 2026-10-20:
 

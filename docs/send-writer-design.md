@@ -422,11 +422,12 @@ a `--writer` arm to the RESP server benchmark that encodes responses with
 as the server's copy arm builds its buffer today. The prototype is based on
 main, where the copy arm receives directly and sends a multi-slot send as one
 `sendmsg` (#697, #699); the profile above predates both. The experiment branch
-takes that `resp-server.rs` without its `--stream-sets` option
-(`set_recv_sink`, removed by #699). Runs: the rig setup of the profile above, 4
-KiB and 64 KiB values, the writer arm against the copy arm and the zero-copy
-arm, with tokio for context, three reps each, with a server profile per arm.
-Every comparison is against arms from the same experiments.
+takes the profiled `resp-server.rs` (see the top of this document) without its
+`--stream-sets` option (`set_recv_sink`, removed by #699). Runs: the rig setup
+of the profile above, 4 KiB and 64 KiB values, the writer arm against the copy
+arm and the zero-copy arm, with tokio for context, three reps each, with a
+server profile per arm. Every comparison is against arms from the same
+experiments.
 
 Predictions, recorded before the runs:
 
