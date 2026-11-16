@@ -10,7 +10,9 @@ recorded in `docs/journal/2026-11-send-admission-c.md` and D's in
 `docs/journal/2026-11-send-admission-d.md`, where gated pieces pass D's
 decision rule.
 "What exists" describes the code before section 1, at 07dd0f56; section 3's
-specification cites the code at 03628fee.
+specification cites the code at 03628fee. `send_nowait` was removed in
+0.7.0-alpha.141 (#965); the sections that name it describe the code before
+that.
 
 A server that answers many connections on one worker replies with
 `send_nowait`. When the send copy pool is exhausted the reply fails, and the

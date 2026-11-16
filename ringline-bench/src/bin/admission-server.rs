@@ -12,10 +12,12 @@
 //! Flags:
 //! - bit 0: the client reads this connection slowly. The server reads it only
 //!   to split its statistics.
-//! - bit 1: send the reply with `send_nowait`, outside the send-capacity FIFO.
-//!   The reply is neither small nor large. A refusal is counted and the
-//!   request dropped, the connection stays open, and nothing waits for the
-//!   reply to settle.
+//! - bit 1: send the reply with `send` and drop its `SendCompletion`, outside
+//!   the send-capacity FIFO. The reply is neither small nor large. A refusal
+//!   is counted and the request dropped, the connection stays open, and
+//!   nothing waits for the reply to settle. Experiment C ran this arm with
+//!   `send_nowait`, which 0.7.0-alpha.141 removed; `send` returns the same
+//!   refusals.
 //! - bit 2: the client scheduled the request inside its measurement window.
 //!   The statistics below count only these, except the samples of held
 //!   slots; the counters count every request.
@@ -553,8 +555,8 @@ async fn serve(conn: Connection) {
         reply.extend_from_slice(&(req.len as u32).to_le_bytes());
         reply.resize(req.len, b'r');
         if req.flags & FLAG_OUTSIDE != 0 {
-            match tx.send_nowait(&reply) {
-                Ok(()) => count(&OUTSIDE, 0),
+            match tx.send(&reply) {
+                Ok(_) => count(&OUTSIDE, 0),
                 Err(e) if e.kind() == std::io::ErrorKind::Other && tx.is_alive() => {
                     count(&OUTSIDE, 1);
                 }

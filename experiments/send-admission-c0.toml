@@ -47,7 +47,8 @@
 #   drain_rcvbuf    SO_RCVBUF on each drainer, set before the connect; 0
 #                   leaves it to the kernel
 #   outside_conns   connections whose replies the server sends with
-#                   send_nowait, outside the FIFO
+#                   send (completion dropped; send_nowait when C ran),
+#                   outside the FIFO
 #   outside_rate    their requests per second, over all of them
 #   outside_size    their reply bytes
 #   tcp_wmem_max    the cap on net.ipv4.tcp_wmem, in bytes
