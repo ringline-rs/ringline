@@ -1704,8 +1704,10 @@ impl AsyncSendBuilder {
     /// The closure chains `.copy()` / `.guard()` calls and ends with
     /// `.submit()`, as a [`send_chain`](SendHalf::send_chain) closure ends
     /// with `.finish()`. `submit` refuses a batch that carries no bytes with
-    /// `InvalidInput`. A closure that returns `Ok` without a successful
-    /// `submit` sent nothing, and `build` returns `InvalidInput`.
+    /// `InvalidInput`. Unlike `send_chain`, whose closure may submit nothing
+    /// and resolve `Ok(0)`, a `build` that submits nothing is refused with
+    /// `InvalidInput`: a closure that returns `Ok` without a successful
+    /// `submit`, including one that discards `submit`'s error, sent nothing.
     ///
     /// # Example
     /// ```no_run

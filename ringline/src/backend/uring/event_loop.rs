@@ -4139,7 +4139,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // The bytes of the chain and the queue behind it are gone, and a dropped
-        // `send_chain` future reports that to nobody but the reader. Later sends must not reach the peer after that gap.
+        // `send_chain` future reports that to nobody but the reader. Later sends
+        // must not reach the peer after that gap.
         if let Some(err) = chain.failure() {
             self.abort_connection(conn_index, err);
         }

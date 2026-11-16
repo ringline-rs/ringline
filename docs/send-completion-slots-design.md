@@ -72,9 +72,10 @@ together with the length the send reports on success.
 | `send_chain` (io_uring) | The chain's `ChainState`; on a TLS connection, the final ciphertext chunk's pool slot, lifted onto the coalesced slab entry when the run is coalesced |
 | Any awaited send (mio) | The last `PendingSend` the call queued |
 
-Sends nothing awaits (`send_nowait`, `send_chain_nowait`,
-`forward_recv_buf`, TLS handshake and alert records) carry no id, and
-their completions settle nothing.
+TLS handshake and alert records carry no id, and their completions settle
+nothing. From 0.7.0-alpha.141 every send through `SendHalf` carries one.
+`forward_recv_buf`'s is carried as a zero-copy batch's when it forwards the
+whole accumulator on io_uring, and as a copy send's otherwise.
 
 ## The reported length
 

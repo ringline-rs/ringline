@@ -1,7 +1,7 @@
 #![allow(clippy::manual_async_fn)]
 //! An awaited send resolves with its own send's result, not with the
-//! completion of an earlier send on the same connection that nothing awaits
-//! (#617).
+//! completion of an earlier or later send on the same connection whose
+//! completion was dropped (#617).
 
 use std::future::Future;
 use std::io::{Read, Write};
