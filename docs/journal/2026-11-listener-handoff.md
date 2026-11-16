@@ -1,0 +1,209 @@
+# 2026-11 — Handing a listening socket to the next process
+
+- **Status:** open — intent; nothing built
+- **Span:** Nov 2026 · tree 911e0497 (`main`)
+
+## Goal
+
+Let a server restart under systemd without refusing a connection or dropping
+one from the listening socket's backlog. The old process stores its listening
+socket in systemd's fd store (`FDSTORE=1`) and the next process receives it
+(`LISTEN_FDS`). While no process accepts, connections wait in the backlog.
+Before it exits, the old process stops accepting, serves and ends the
+connections it holds, and finishes work that needs its tasks and I/O (a cache
+flushing to disk, for example), then shuts the runtime down. Connections still
+open when it calls `Runtime::shutdown()` are closed, as today.
+
+The consumer is a cache server whose warm restart this is built for. Every
+part below is general: any ringline server run by systemd with
+`FileDescriptorStoreMax=` can use it.
+
+## What the code does today (tree 911e0497)
+
+1. Ringline creates every listener itself (`RinglineBuilder::bind`,
+   `bind_unix`, `bind_tls`; `create_listener` in `ringline/src/worker.rs`).
+   There is no way to pass it a socket another process made.
+2. `ListenerSockets::shut_down` (`ringline/src/listener_sockets.rs`) calls
+   `shutdown(SHUT_RD)` on every socket of a listener. On Linux that takes the
+   socket out of the listening state for every holder of it, including a copy
+   systemd stores, and resets the connections in its backlog (read from
+   `inet_csk_listen_stop`, not measured). It is called by
+   `RuntimeShutdown::shutdown` (runtime shutdown, `Drop for Runtime`, a task
+   panic under `TaskPanicPolicy::Shutdown`, a worker exit under that policy),
+   by the acceptor thread when
+   `run_acceptor` returns (`worker.rs`, the `rl-acpt-` thread), by the launch
+   rollback, and, for merged listeners only, by
+   `RuntimeShutdown::stop_accepting(worker)` when no worker is left to accept.
+3. On Linux the pool-mode acceptor blocks in `accept4` (`accept_nonblock` in
+   `ringline/src/acceptor.rs`). `SHUT_RD` is what wakes it at shutdown:
+   closing the fd does not, and its accept path does not check the shutdown
+   flag until an `accept4` fails. On other platforms it polls the listener
+   with a 100 ms timeout and checks the shutdown flag between polls
+   (`wait_for_connection`). The acceptor thread is detached: its `JoinHandle`
+   is dropped at spawn.
+4. On io_uring, a worker that sees the shutdown flag calls `run_shutdown` and
+   returns from its event loop in the same iteration
+   (`ringline/src/backend/uring/event_loop.rs`, the check after
+   `drain_park_ready`). `run_shutdown` polls no task, and
+   `close_queued_connections` drops the accept channel, closing what was
+   queued but not installed. The mio loop checks the flag at the end of an
+   iteration, after polling tasks (`ringline/src/backend/mio/event_loop.rs`),
+   and has no `run_shutdown`; its queued connections close when the driver is
+   dropped.
+5. `Runtime::wait_on_signal` always calls `shutdown()` before it returns.
+   `signal::wait_or_ready`, which waits without shutting down, is
+   crate-private. It reports a task panic or a worker exit by the readability
+   of a pipe it never reads (the panic pipe gets one byte, the exit pipe one
+   byte per exit), so a later wait returns at once. The `SIGTERM`/`SIGINT`
+   handlers are installed on the first wait, so a `SIGTERM` that arrives
+   earlier kills the process with the default action.
+6. A worker treats a disconnected accept channel as empty (`try_recv().ok()`),
+   so the acceptors exiting does not disturb it.
+
+## Plan
+
+Four PRs in this order, each with tests on both backends and the io_uring run
+on Linux through SystemsLab.
+
+### PR 1: the acceptor waits in `poll` and is joined
+
+- One stop fd for the runtime, from `crate::wakeup::create_wake_fd`, written
+  by `stop_accepting` (PR 3) and by `Runtime::shutdown()`, and never read.
+  Every acceptor polls it. A runtime `stopping` flag, set before the write,
+  tells an acceptor to stop; the shutdown flag also tells it to drop a held
+  connection.
+- The acceptor, on every platform, waits in `poll` on the listening fd and the
+  stop fd, and accepts until `EAGAIN`, then polls again. `accept4` has no
+  per-call non-blocking flag, so the listener is set `O_NONBLOCK`, as it is on
+  macOS today. `EAGAIN` stays a `Retry` in `classify_accept_error` and now
+  means "poll again". The acceptor checks the `stopping` flag before each
+  `accept`.
+- An acceptor holding a connection no worker has room for (`send_when_room`)
+  keeps it until a live worker takes it or every worker has exited; on the
+  shutdown flag it still drops it, as today.
+- The acceptors' `JoinHandle`s are kept in `RuntimeShutdown`, and
+  `RuntimeShutdown::shutdown`, which `Runtime::shutdown()` and `Drop` call,
+  joins them. It may run on a worker thread
+  (`shutdown_for_panic`, `worker_exited`); the join cannot wait on that
+  worker, because on the shutdown flag an acceptor leaves `send_when_room`
+  within 1 ms and leaves `poll` through the stop fd.
+- This replaces the blocking `accept4` on Linux and the 100 ms shutdown poll
+  elsewhere, so an acceptor exits at once on shutdown on every platform. It
+  changes the accept path of every pool-mode listener, so it is measured
+  (below).
+
+### PR 2: a listener from an fd
+
+- `RinglineBuilder::bind_fd(fd: OwnedFd)` adds a listener on a socket the
+  caller made or received. `launch()` refuses it unless `SO_TYPE` is
+  `SOCK_STREAM`, the family from `getsockname` is `AF_INET`, `AF_INET6` or
+  `AF_UNIX`, and an inet socket's port is not 0 (unbound). It may already be
+  listening. `create_unix_listener`'s unlink does not apply. TLS falls back to
+  the process-wide config, as for `bind`; `TCP_NODELAY` applies when the
+  family is not `AF_UNIX`.
+- `ListenerSockets` records that the listener came from `bind_fd`, and
+  `shut_down` skips `SHUT_RD` for it on every path in fact 2. PR 1's stop fd
+  wakes its acceptor. The socket stays listening until every holder closes it.
+- `defer_listen()` applies to it. On a socket already listening, the gate
+  defers only `accept`: the kernel completes handshakes and queues them, so a
+  TCP readiness probe passes before the gate opens. Opening the gate sets
+  `SO_REUSEADDR` and calls `listen(2)`, which on a listening socket sets the
+  backlog to `Config::backlog` (65535 by default), replacing systemd's
+  `Backlog=` (read from `__inet_listen_sk`, not measured; macOS not checked).
+- The listener is left `O_NONBLOCK` (PR 1). The flag is on the open file
+  description, which systemd's stored copy and the next process share; a
+  process given the fd must not assume a blocking socket.
+- Refused with `AcceptMode::Merged` on io_uring, which needs one
+  `SO_REUSEPORT` socket per worker. Merged mode is ignored on mio.
+- `Runtime::shutdown()` alone may still accept connections from the backlog
+  and close them: an acceptor that passed its stop check calls `accept`, and
+  the worker it hands the connection to closes it in shutdown. A server with a
+  `bind_fd` listener calls `stop_accepting` (PR 3) first.
+
+### PR 3: stop accepting without shutting down
+
+- `Runtime::stop_accepting(timeout: Duration) -> io::Result<()>`. It closes
+  every listen gate, sets `stopping` and writes the stop fd, waits up to
+  `timeout` for each pool acceptor to signal its exit, joins only those that
+  have, and returns once every live worker has handled every connection placed
+  in its accept channel. The workers' shutdown flag is not set, so the workers
+  keep polling tasks and I/O and serve the connections they hold.
+  `Runtime::shutdown()` afterwards is the second phase and is unchanged.
+- It returns at once if already stopped or if the runtime has shut down. It
+  returns an error after `timeout` (a worker blocked in synchronous code never
+  drains its channel), and an error if called on a worker thread, where it
+  would wait on its own channel. After a timeout, an acceptor still holding a
+  connection keeps retrying; `shutdown()` joins it or drops the connection.
+- A listener from `bind`, `bind_unix` or `bind_tls` is shut down with
+  `SHUT_RD` when its acceptor exits, which resets its backlog. A merged-mode
+  listener is stopped with `SHUT_RD`, as today.
+- "Handled": a per-worker count of connections placed in its channel,
+  incremented at every successful send (by an acceptor, or by a merged-mode
+  worker placing a connection on another), and a count the worker increments
+  in its accept-channel drain (`handle_eventfd_read` on io_uring,
+  `drain_channels` on mio), once per item, after the item is installed or
+  closed (after `install_accepted` returns on io_uring; at the end of each
+  item in `drain_channels`, including the table-full `continue`, on mio). A
+  merged worker's own accepts and park adopts are not counted. A handled
+  connection is a task the server can see, or was closed because the
+  connection table was full or, on io_uring, the fixed-file update failed. On
+  a TLS listener, `on_accept` runs after the handshake, so a handled
+  connection may not have reached it yet.
+- The event loop changes only by that count. The private
+  `RuntimeShutdown::stop_accepting(worker)`, which steers merged listeners
+  away from one worker, is renamed `steer_away_from`. A merged listener's
+  `SHUT_RD` from `stop_accepting` does not increment `ACCEPTOR_STOPPED`.
+
+### PR 4: a signal wait that does not shut down
+
+- `Runtime::next_signal()`: returns the next `Signal` without calling
+  `shutdown()`. Each task panic and each worker exit is reported once: the
+  call reads the byte it was woken by. Under `TaskPanicPolicy::Shutdown` the
+  runtime has already shut down when `TaskPanic` is returned.
+- `signal::install()`: installs the handlers now, so a process can install
+  them at start. Idempotent.
+
+## Measurement
+
+PR 1 adds a `poll` each time the backlog empties, on the accept path of every
+pool-mode listener. Before merging it, measure the connect rate of one
+io_uring worker in pool mode under a connect storm with
+`experiments/accept-queue-poll-sweep.toml` (see
+[the queue-full poll entry](2026-11-accept-queue-full-poll.md)) at
+`caps=1024`. The spec takes one revision, so submit alternately
+`rev=<main>` and `rev=<PR 1 head>` with `repo` set to the fork, four
+experiments a side, plus two more at `main` for the floor. One experiment
+runs `rounds=4`, so that is 16 runs a side. The Linux mio
+backend uses the same acceptor and is not measured.
+
+## Decision rules
+
+- PR 1 is GO if the median connect rate at its head is within the spread of
+  the A-against-A medians at `main`. If it is lower by more than that spread,
+  the `poll` wait is used only for listeners from `bind_fd`, the others keep
+  the blocking `accept4` and `SHUT_RD`, and this entry records the measured
+  cost. PR 1 then lands the stop fd and the joined acceptors only, and the
+  `poll` wait lands in PR 2 for `bind_fd` listeners, and `stop_accepting`
+  stops the other pool listeners with `SHUT_RD`.
+- PRs 2 to 4 add API. PR 3 adds a counter to the accept drain; the others
+  change no path a server without the new calls takes.
+
+## Tests planned
+
+- PR 1: an acceptor exits within a bound after `shutdown()` on both backends,
+  with no `SHUT_RD`, and `shutdown()` then joins it.
+- PR 2: a listener from `bind_fd` keeps listening after `Runtime::shutdown()`
+  and after the runtime is dropped: once the acceptor is joined, a connect
+  completes its handshake and a `dup` of the fd accepts it. Each refusal in
+  `launch()` (a datagram socket, port 0) has a test.
+- PR 2: with `defer_listen()`, a listener from `bind_fd` that was already
+  listening accepts nothing until its gate opens, and connections made before
+  then are served once it opens.
+- PR 3: after `stop_accepting()` returns, a connection queued in a worker's
+  channel has reached `on_accept` (plaintext); a connection made afterwards
+  waits in the backlog of a `bind_fd` listener; existing connections keep
+  being served; the acceptor threads have exited. A second call, a call after
+  `shutdown()` return at once; a call from a worker thread returns an error
+  at once.
+- PR 4: after a worker exit, `next_signal()` returns `WorkerExited` once,
+  the other workers keep serving, and the next call waits for a signal.
