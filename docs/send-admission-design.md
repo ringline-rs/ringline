@@ -2,8 +2,11 @@
 
 Status: sections 1 to 3 are built; section 3 was specified from Experiment
 A's results (`docs/journal/2026-11-abort-close.md`). Section 4 records
-Experiment B's result and names Experiment C, which chooses the admission
-order the fast-path specification uses; Experiment C has not run.
+Experiment B's result and names Experiments C and D. C chooses an admission
+order; D tests sending large replies in pieces that take pool slots only once
+their socket has room, which the owner chose for plaintext on 2026-11-15, with
+C's orders as the fallback. C's runs are
+recorded in `docs/journal/2026-11-send-admission-c.md`; D has not run.
 "What exists" describes the code before section 1, at 07dd0f56; section 3's
 specification cites the code at 03628fee.
 
@@ -471,9 +474,10 @@ reply within `admit_limit`; `send` missed 4 in one of eight runs, to pool
 refusals. The rule does not count latency: small replies sent with
 `send_admitted` waited behind the head, p99 about 770 ms, where `send`'s p99 was
 11.5 ms, the setup's floor. The owner decided (2026-11-15) that a server
-cannot accept that wait. The specification needs an admission order that lets
-a reply past a waiting head without starving the head, and Experiment C
-chooses it.
+cannot accept that wait. Experiment C compares admission orders that let a
+reply past a waiting head without starving the head. Experiment D tests the
+design the owner chose for plaintext instead, which bounds what one send
+holds.
 
 ### Admission orders
 
@@ -665,8 +669,9 @@ Decision:
   operation must be within the floor of O0's, in Experiment B's echo
   comparison.
 - The specification uses the passing order that adds least, by the table
-  above. O1 cannot be chosen. If no order passes, the result goes to the
-  owner.
+  above, for TLS connections, and for plaintext if Experiment D's gated
+  pieces do not pass. O1 cannot be chosen. If no order passes, the result
+  goes to the owner.
 
 If Experiment C chooses an order other than O0, a waiting form covers the
 fast path: `send_admitted` resolves on its first poll whenever the order
@@ -702,6 +707,233 @@ Constraints already found for each outcome:
     case, returns the parts on every refusal, and converts to an `io::Error`
     whose pool and slab refusals are `WouldBlock`. Nothing wakes a caller after
     `WouldBlock`; the way to wait is `send_admitted`.
+
+### Experiment D
+
+The owner decided on 2026-11-15 that for plaintext the fast path bounds what
+one send holds, instead of choosing an admission order. Large replies are
+sent in pieces, and a piece takes pool slots only once its socket has room
+for it. Values are sent zero-copy where they can be, and guarded batches wait
+in the FIFO for their own pool cost (Constraints, above). Experiment D tests
+the pieces and the gate on socket room. Experiment C's orders are the
+fallback, and cover TLS.
+
+What holds slots today:
+
+- A copied send of n bytes takes ceil(n / slot_size) slots. It is queued as
+  one entry per slot and sent in runs of up to 32 slots (`send_slab.rs`). A
+  partial send advances the run and waits for room, and the run's slots return
+  together once all of it is sent (the `try_advance` branch of the io_uring
+  send completion). A send whose peer stops reading holds the runs its socket
+  has not taken: h slots, a multiple of a run.
+- A whole reply is admitted only when all its slots are free (`head_ready` in
+  `send_completion.rs`), and under O7w a waiter that needs more than R slots
+  never passes. So stalled whole replies stop being admitted once fewer than
+  their slots are free, and the replies waiting behind them hold nothing. In
+  W1, three 3 MiB stalled replies are admitted and hold 384 to 480 slots, and
+  the fourth waits at the head. Small replies wait behind it under O0 and pass
+  it under O7w, whatever the number of stalled peers.
+
+Pieces, as `admission-server` sends them (`--stream-piece p`, with
+`--stream-gate` for the gate):
+
+- A reply of more than p bytes is sent as ceil(n / p) pieces, one unsettled at
+  a time. The pieces count as one reply against `--pipeline N`.
+- With the gate, every piece first waits until its socket reports `POLLOUT`,
+  then waits in `send_admitted` for its slots, under `admit_limit`. Gating only
+  the pieces that follow a send that waited for room would let each stalled
+  peer's first piece into a full socket.
+- The gate is `SendHalf::writable`, a hidden method on the work branch. On
+  io_uring it uses the connection's `SendPollOut`, the poll the wait for room
+  uses, so the cancel that `close` and `abort` already issue covers it, and a
+  pending poll cannot hold the socket past its `Close`. With no poll armed, the
+  gate arms it one-shot; today a `POLLOUT` that arrives with no send waiting is
+  dropped, and `handle_send_pollout` instead wakes a waiting gate. The gate
+  resolves on `POLLOUT`, fails on `POLLERR` or `POLLHUP`, and is failed by
+  `abort` as a parked reader is. After the peer half-closes, a one-shot poll
+  completes at once with `POLLRDHUP`, so the connection's poll becomes
+  multishot, as for the wait for room. A multishot poll reports only edges, so
+  on such a connection the gate first arms a one-shot probe with its own tag.
+  The probe completes at once, with `POLLOUT` only if the socket is writable
+  now, so it never stays pending. When the socket is not writable, `tcp_poll`
+  sets `SOCK_NOSPACE`, and the multishot poll reports the next `POLLOUT`. The
+  gate resolves on the probe's `POLLOUT`, or else on the multishot poll's next
+  one. On mio the gate polls with a zero timeout, then waits for the
+  connection's next writable event. Its tests cover a socket already writable,
+  a full socket that drains, a half-closed peer with a full socket, filled by a
+  short send and filled by whole sends, an abort and a peer reset while
+  waiting, and a connection whose multishot poll is already armed.
+- TCP reports `POLLOUT` when `wmem_queued` is at most two thirds of
+  `sk_sndbuf` (`sk_stream_is_writeable`), and `tcp_sendmsg` queues while
+  `wmem_queued` is below `sk_sndbuf`, checking only before it starts a new
+  segment. Both count truesize: payload plus per-segment overhead. A piece is
+  sure to go in whole when its truesize fits in a third of `sk_sndbuf`. A
+  larger piece goes in whole when the gate opens with less queued, which is
+  always the case for a stalled peer's first pieces and never for a reader
+  that keeps its buffer near two thirds full. On loopback `sk_sndbuf` grows to
+  the `tcp_wmem` maximum at the handshake, so a third is about 341 KiB at
+  1 MiB and about 85 KiB at W2's 256 KiB. Small segments add overhead: a peer
+  with a 4 KiB receive window gets about 2 KiB segments, about 61% payload
+  (derived from the kernel source, not measured). A piece that does not go in
+  whole holds its slots until the socket takes the rest, as an ungated piece
+  does. To a reader that drains, that is until it has read enough for the
+  socket to take the rest; to a stalled peer, until `settle_limit`.
+- The wait for room is bounded by `settle_limit`, and a socket that stays
+  unwritable that long is aborted. The gate opens again once the reader has
+  taken about one piece, so a reader is aborted when it takes less than about
+  one piece in `settle_limit`: 128 KiB/s with 128 KiB pieces and a 1 s limit.
+  Without the gate a piece follows a full buffer, and the floor is about a
+  third of the buffer: 340 KiB/s at 1 MiB. With whole replies it is about
+  (n - X) / `settle_limit`, where X is what the socket accepts: about 2 MiB/s
+  for a 3 MiB reply. A reader between the gated floor and that is served with
+  gated pieces. It holds up to two thirds of its send buffer and a piece of
+  kernel memory, and no pool slots, for n / rate seconds: 24 s for 3 MiB at
+  128 KiB/s.
+- A reply's total time is bounded by ceil(n / p) x (`admit_limit` + 2 x
+  `settle_limit`): for each piece, the wait for room, for slots, and for a
+  partly sent piece to settle.
+- After its first piece, a reply that fails aborts its connection. The peer
+  has a prefix, and a FIN after it would read as a complete reply in a
+  protocol delimited by close, so section 2's `close()` on an admission
+  timeout does not apply. Once a reply's first piece is out, a server cannot
+  send an error reply in its place.
+- Without the gate, a piece takes slots as soon as the one before it
+  settles. A stalled peer's piece is admitted while its socket looked
+  writable, is partly sent, and holds its run, h_p slots (8 for a 128 KiB
+  piece), until `settle_limit`. Under O0, small replies then wait once k
+  stalled peers hold so much that the head's piece does not fit:
+  k x h_p + ceil(p / slot_size) > P, k > 63 at 128 KiB. Under O7w they pass the
+  waiting piece while any slots are free. This arm shows what the gate does.
+
+Arms, in C2's harness, N = 16, a ratio of 1, R = 32, all on D's binaries:
+
+- O0, whole replies: the control shared with Experiment C, rerun because
+  C2's runs predate D's instruments.
+- O7w, whole replies.
+- O0, pieces of 128 KiB without the gate.
+- O0, gated pieces of 64 KiB, and of 128 KiB.
+- The order Experiment C chooses, with gated pieces of 128 KiB, run after C's
+  decision. The order is set per worker, so if TLS on the same worker uses
+  C's order, plaintext pieces run under it.
+
+Before the matrix, a calibration run on io_uring confirms h for a stalled
+3 MiB whole reply and h_p for an ungated stalled piece, from the runtime's
+free-slot count, with one to three stalled peers. It also records
+`ss -tmi` (`sk_sndbuf`, `wmem_queued`) for a stalled socket and for a drainer
+with a 4 KiB receive window, where the truesize ratio matters, and the image's
+`rmem_max` and `wmem_max`. W4's values of k follow from it.
+
+Workloads, four repetitions, with two extra repetitions of O0 whole:
+
+- U, uncontended: a closed loop of at least 1,000 7 MiB replies per run to one
+  reader that reads as fast as it can, with `SO_RCVBUF` set to 512 KiB, which
+  the kernel doubles to 1 MiB (`rmem_max` raised so that it takes effect, and
+  the value `getsockopt` reports printed), so that loopback's autotuning does
+  not hide gaps between pieces, and nothing else running. Per run: the median
+  and p99 time per reply in microseconds, and the worker thread's CPU per
+  reply from its schedstat, as in Experiment B. Each arm is compared with
+  whole replies and with the spread between O0 whole's own runs, and the cost
+  of one piece is the difference divided by the number of pieces.
+- W1, and W2 with six slow readers (L / S of 1.5), as in Experiment C. Pieces
+  alone keep each connection to one piece here, so these cells check that
+  pieces cost nothing under contention; they do not test the gate.
+- W4, stalled peers: W1 with k stalled peers, at k = 4, either side of the
+  ungated arm's limit, and 128, with `tcp_wmem` at 1 MiB. One more cell at
+  k = 128 with `tcp_wmem` at 256 KiB, a third of which is smaller than a
+  128 KiB piece.
+- W5, slow readers of large replies: W1 with four readers taking 512 KiB/s
+  that each ask for 3 MiB, in place of the stalled peers, with 8 s episodes
+  and an 80 s duration, so that a 3 MiB reply (6 s) completes within an
+  episode.
+
+Statistics, beyond Experiment C's:
+
+- per 7 MiB reply, and in W5 per slow reader's 3 MiB reply: whether it
+  completed, and the time from its request to its last byte at the client, in
+  microseconds. A reply did not complete if the client did not receive all of
+  it, any of its pieces timed out waiting for slots or for room, or its
+  connection was aborted. Completion times are taken over completed replies;
+  the rest are counted.
+- the pool's free slots every 10 ms (`SendAdmissionCounters::main_free`),
+  every sample kept, and the smallest from each 7 MiB reply's request to its
+  last byte;
+- per piece, whether it waited for room, from a new hidden flag on its
+  `SendCompletion` that every call of the wait for room sets, including a send
+  refused with `EAGAIN` before any byte went in, read as `passed_head()` is;
+- aborts by cause: admission timeout, room-wait timeout, settlement timeout,
+  peer reset;
+- `/proc/net/sockstat` and `TcpExtTCPMemoryPressures` per run, so that memory
+  pressure, which shrinks `sk_sndbuf` and the gate's third with it, would show.
+
+Prediction (the author's, before C1 or the rack runs it):
+
+- U: I do not know the cost of a piece well enough to predict it closely. On
+  loopback a reader drains 128 KiB in tens of microseconds, about the time a
+  piece takes to settle, wake its task, poll and be admitted, so I expect
+  gated pieces of 128 KiB to take up to 50% longer than a whole reply, and
+  pieces of 64 KiB longer still.
+- W1 and W2: every gated arm keeps fast small replies' p99 below 1 ms and
+  completes every 7 MiB reply.
+- W4 at 1 MiB: every gated arm keeps fast small replies' p99 below 1 ms,
+  completes every 7 MiB reply at every k, and keeps at least 3/4 of the pool
+  free during each. The ungated arm's fast small p99 exceeds 100 ms once
+  k x h_p + 8 > 512. O0 whole makes small replies wait behind the fourth
+  stalled reply at every k, and O7w whole keeps them below 1 ms at every k.
+  C1 predicts whether the whole arms complete the 7 MiB reply at k >= 4.
+- W4 at 256 KiB: both gated arms keep 3/4 of the pool free. A stalled peer's
+  socket takes its first pieces whole, more than two thirds of 256 KiB, and its
+  gate then stays closed, so its pieces hold no slots. For 128 KiB pieces this
+  is derived, with a margin of less than one segment: the second piece's last
+  segment starts at about 236 KiB of 256 KiB.
+- Partial sends: in W4 no stalled peer's gated piece waits for room. In W2,
+  where drainers keep their buffers near two thirds of 256 KiB full, every
+  128 KiB piece to a drainer after the first waits for room, and most 64 KiB
+  pieces do too, each until the drainer reads the rest.
+- W5: every gated arm completes the slow readers' replies and the 7 MiB reply
+  with no aborts, and keeps fast small replies' p99 below 1 ms. Both whole
+  arms abort the slow readers.
+- Refuted if, in any cell, a gated arm's fast small p99 exceeds 10 ms, it
+  fails to complete a 7 MiB reply or a W5 slow reader's reply, less than 3/4
+  of the pool is free during a 7 MiB reply in W4, or a stalled peer's gated
+  piece waits for room in W4.
+
+C1's model gains pieces, the gate as a wait for a third of the socket buffer
+to be free, and stalled requests written one after another as
+`admission-load` writes them, in place of all at once. It checks the
+arithmetic above and the cells before the rack runs.
+
+Decision:
+
+- Gated pieces are used for plaintext by the fast-path specification if a
+  gated arm, in W1, W2, W4 at 1 MiB and W5, completes every 7 MiB reply and
+  every W5 slow reader's reply, keeps fast small replies' p99 at or below
+  10 ms, and has no more fast small replies beyond `admit_limit` than O0
+  whole. The specification then uses the larger passing p, under O0, or under
+  Experiment C's order if TLS on the same worker uses it. How it sizes p
+  against a socket's send buffer follows from the partial sends measured in
+  each cell.
+- U's cost is reported with the decision, as worker CPU per byte against
+  whole replies. A gated arm that costs more than twice as much per byte goes
+  to the owner before it is chosen.
+- Small replies are not gated, so a connection that pipelines small requests
+  and stops reading still holds its unsettled small replies' slots (Non-goals).
+- Otherwise the result goes to the owner, and Experiment C's outcome stands
+  for plaintext too.
+
+Not tested here:
+
+- zero-copy pieces, which hold their memory until the peer acknowledges them,
+  so the gate bounds the socket's share and not the arena's. Each also takes a
+  send-slab entry, of which a worker has 512 by default; how many a stalled
+  peer would hold is not checked;
+- TLS, where a piece's ciphertext is copied into slots as a whole reply's is;
+- a network between server and client, where `sk_sndbuf` starts near 85 KiB
+  and grows with the congestion window, so pieces of 64 or 128 KiB can be
+  partly sent early in a connection;
+- mio: `writable` is built and tested on it, and not run on the rack;
+- `TCP_NOTSENT_LOWAT`, which would cap a stalled socket's unsent payload at a
+  chosen value and make the fit exact in bytes while the buffer has room;
+- guarded batches waiting in the FIFO.
 
 ## Alternatives considered
 
@@ -742,7 +974,9 @@ Constraints already found for each outcome:
   its last reply.
 - Admitting a large plain send a slot at a time (`send_inner` already copies
   per slot, handler.rs:597-665). The admission point would then include the
-  connection's own drain, which is problem 1.
+  connection's own drain, which is problem 1. Experiment D's gated pieces keep
+  the two waits apart: a piece waits for room in its socket, under
+  `settle_limit`, before it waits for slots, under `admit_limit`.
 
 ## Non-goals
 
@@ -761,8 +995,8 @@ Constraints already found for each outcome:
    problem 1.
 3. Section 3, `abort`, as specified from Experiment A. Its tests run on the
    rack's 6.8, 6.12 and 7.2 images through `experiments/abort-verify.toml`.
-4. Experiment B, then Experiment C, then the fast-path specification and its
-   PR.
+4. Experiment B, then Experiments C and D, then the fast-path specification
+   and its PR.
 
 ## What a caller can no longer do
 

@@ -1,6 +1,7 @@
 # Experiment C: an admission order that lets replies past a waiting head
 
-- **Status:** open. C0, C1 and C2 have not run.
+- **Status:** open. C0, C1 and C2's matrix have run; C2's W1 cell with sends
+  outside the FIFO and the echo check are queued on the final binaries.
 - **Span:** Nov 2026 · follows #945 (Experiment B) · SystemsLab context
   `send-admission-expC`
 
@@ -221,6 +222,110 @@ scheduled-to-admission delay:
   fast small replies at 0 in every cell; O4 and O4w reach 86 ms with six
   slow readers, O7 215 ms with two or six.
 - C2 still runs O3, which the owner's prediction is about.
+
+### C2 matrix
+
+Binaries: a8249ba1 of `exp/send-admission-c-run` (artifact `01a1e08d-3591`),
+the orders after their first two reviews. Its io_uring suite passed
+(`01a1e08c-b436`). Seven cells, each on one host: the W1 cells on hv01, W2
+with no slow readers on hv02, the other W2 cells on hv03. Seven orders, four
+repetitions with the order rotated each round, and two more of O0: 210 runs,
+all `success`, ids in the scratch list `c2-ids-keep.txt` of the session that
+ran them. The W1 cell with sends outside the FIFO is not here: its 30 runs
+were cancelled before they ran, because the third and fourth reviews found
+that sends outside the FIFO could leave O3's and O4's latch open at a head
+change. It reran on the final binaries (below).
+
+Summarised by `experiments/send-admission-c2-report.py`. The largest head
+admission delay over every run, and the median over runs of the per-run p99
+of fast small replies' scheduled-to-admission delay, in ms:
+
+| cell | O0 | O1 | O3 | O4 | O5 | O7 | O7w |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| W1, N = 1 | 808.6, 766.2 | 808.9, 0.2 | 808.5, 0.3 | 808.8, 0.3 | 809.0, 0.4 | 808.6, 0.2 | 808.3, 0.4 |
+| W1, N = 16 | 808.6, 765.2 | 808.6, 0.3 | 808.5, 0.3 | 808.6, 0.3 | 808.9, 0.3 | 808.5, 0.3 | 808.0, 0.4 |
+| W1, N = 16, ratio 2 | 808.5, 765.4 | 809.5, 0.2 | 808.6, 0.3 | 808.5, 0.4 | 809.2, 0.2 | 808.8, 0.5 | 808.8, 0.3 |
+| W2, no slow readers | 741.5, 701.8 | 741.6, 0.5 | 741.4, 0.5 | 741.6, 0.5 | 743.2, 0.5 | 741.5, 0.5 | 741.7, 0.5 |
+| W2, 2 slow | 743.5, 678.2 | 744.3, 0.4 | 743.3, 0.4 | 743.1, 0.4 | 742.9, 0.4 | 743.8, 198.6 | 743.4, 0.4 |
+| W2, 6 slow | 721.3, 679.0 | all timed out, 0.4 | 949.2, 180.6 | 742.8, 0.4 | 743.1, 0.4 | 743.2, 274.1 | 742.8, 0.4 |
+| W2, 6 slow, ratio 2 | 721.2, 679.3 | all timed out, 0.4 | 949.2, 179.6 | 718.9, 0.4 | 743.1, 0.4 | 721.1, 274.0 | 718.9, 0.4 |
+
+Every head (40 per order and cell, 60 for O0) was admitted, except under O1
+with six slow readers, where all 40 timed out. The per-run fast p99s are
+within 0.3 ms of their median for every order but O0 (within 2.6 ms), O3
+(178.0 to 181.0 ms) and O7 (195.6 to 198.8 and 273.6 to 276.4 ms). Fast small
+replies beyond `admit_limit` or not admitted: none except O1's refusals (12 to
+31 per cell in W1 and W2 with no slow readers, 5 with two slow readers). The
+spread of O0's per-run maximum head delay is under 2.2 ms in every cell except
+W2 with two slow readers (24.3 ms).
+
+The orders' counters with six slow readers at a ratio of 1, summed over each
+order's four runs (at a ratio of 2 they are within 4 slots and 0.1%):
+
+| order | passes by slow readers | longest hold of one | passes by fast readers | most slots passing sends held | latch closings |
+| --- | --- | --- | --- | --- | --- |
+| O3 | 3,288 | 939.7 ms | 57,293 | 114 | 635 |
+| O4 | 0 | - | 57,301 | 7 | 0 |
+| O7 | 1,084 | 570.1 ms | 32,398 | 32 (R) | - |
+| O7w | 0 | - | 57,292 | 6 | - |
+
+- O3's 228 ms over O0 is the slow readers' passing sends: they held their
+  slots for up to 940 ms, and passing sends held up to 114 slots.
+- O4 let no reply to a slow reader pass, and its latch never closed: its idle
+  condition alone kept them out. O7w likewise.
+- O7's slow readers' passing sends filled R = 32, after which fast small
+  replies waited behind the head (274 ms p99). The W2 small-reply criterion
+  counts replies beyond `admit_limit`, of which O7 has none, so O7 passes
+  the rule. The criterion was written before the runs and is applied as
+  written; O7's p99 is reported beside it.
+
+The W1 cell with sends outside the FIFO (`send_nowait`, 1,000/s on four
+connections) ran on hv02 on the final binaries: f561f58a (artifact
+`01a1e11f-c3a0`), whose library is that of 86346b85, the run branch with the
+orders' last fix. The io_uring suite passed at 86346b85 (`01a1e126-bbea`, on
+delta) after a test fixed in eb956201 (below). 30 runs, all `success`. Every
+order admitted every head, and the largest head delay was 810.2 to 811.2 ms
+against O0's 810.4 ms (O0's run maxima spread 1.2 ms). Fast small replies'
+p99 was 766.3 ms under O0 and 0.5 to 0.6 ms under every other order, with
+none beyond `admit_limit`. The sends outside the FIFO changed no order's
+result.
+
+The suite at e0203d46 (`01a1e0c7-790d`) had failed one test,
+`a_cancelled_head_s_successor_latches_on_free_plus_passing_at_the_change`,
+with 12 free slots where it expected 9, alone and in the suite, every time
+(`01a1e121-6eb8`). An instrumented run (`01a1e124-423e`) showed the released
+task was never polled: the test pushed a parked task's index onto the ready
+queue, and `take_ready` returns a standalone task only once its slot records
+a wake. eb956201 wakes it with `wake_task`. With
+`restart_send_window_if_head_changed` made to return at once, the fixed test
+fails at its last assertion (`01a1e126-bc1a`).
+
+With that cell, the decision rule's result for C, before the echo check:
+O3 fails, on its head delay with six slow readers; O4, O5, O7 and O7w pass.
+
+Against the predictions:
+
+- O3 times heads out at a ratio of 1 and not at 2: refuted. O3 timed out no
+  head at either ratio; its slowest head was 949 ms at both.
+- O4 within 10 ms of O0's maximum in every contended cell: refuted in one
+  cell, where it exceeded O0's by 21.5 ms (742.8 against 721.3 ms, six slow
+  readers, a ratio of 1), held in the other (718.9 against 721.2). O0's own
+  maximum in W2 with two slow readers was 743.5 ms, so a 743 ms head occurs
+  under O0 too. O4's W1 p99 is 0.3 to 0.4 ms, as predicted.
+- O5 admits heads as O0 does and small replies as O1 does: held.
+- O7's head within O0's plus the time to return R slots, and small replies
+  waiting behind the head once slow readers hold R: held.
+- The owner's, that O3 starves a large head: refuted by its stated condition.
+  O3 timed out no more heads than O0 (none), and its maximum exceeded O0's by
+  228 ms, less than the 940 ms longest hold of a send that passed it. O3
+  fails the decision rule on that 228 ms.
+
+Against C1: the model's O0 is within 5% of the rack (648 against 679 ms in
+W2, 759 against 765 ms in W1), and its O5 and O7w match. It overstated O3,
+timing out every head with six slow readers at a ratio of 1 where the rack
+timed out none, and O4's fast p99 with six slow readers (86 ms in the model,
+0.4 ms on the rack). The rack's O4 passed no slow reader's reply; whether the
+model's idle condition lets them pass has not been checked.
 
 ## Outcome
 
