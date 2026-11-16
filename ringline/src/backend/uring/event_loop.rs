@@ -6737,7 +6737,7 @@ mod tests {
         unsafe {
             el.driver
                 .ring
-                .submit_direct_read(fd_index, buf.as_mut_ptr(), 4, 0, probe)
+                .submit_direct_read(fd_index, buf.as_mut_ptr(), 4, 0, None, probe)
                 .expect("push probe");
         }
         let mut result = None;
@@ -6868,6 +6868,7 @@ mod tests {
                 0,
                 SHORT.as_ptr(),
                 100,
+                crate::buffer::fixed::RegionId::UNREGISTERED,
                 write_key,
             )
         }
@@ -6876,6 +6877,146 @@ mod tests {
         let _ = el.driver.make_ctx().file_close(kind, index, generation);
         let _ = std::fs::remove_file(&path);
         assert_eq!(result, -libc::EINVAL, "an unaligned O_DIRECT write");
+    }
+
+    /// A read or write whose buffer names a registered region is submitted
+    /// as `READ_FIXED` / `WRITE_FIXED` with the region's index and moves the
+    /// data; the same file with an unregistered buffer gets a plain `WRITE`;
+    /// and a buffer outside the region it names is refused before anything
+    /// is pushed (#841).
+    #[test]
+    fn a_buffer_in_a_registered_region_uses_the_fixed_opcodes() {
+        use crate::backend::uring::sqe::Op;
+        use crate::buffer::fixed::{MemoryRegion, RegionId};
+        // The region outlives the loop: registered memory must stay valid
+        // until the ring is gone.
+        let backing: &'static mut crate::buf::AlignedBuf =
+            Box::leak(Box::new(crate::buf::AlignedBuf::zeroed(16384, 4096)));
+        let base = backing.as_mut_ptr();
+        // Safety: `backing` is leaked, so it stays valid and unmoved.
+        let region = unsafe { MemoryRegion::new(base, 16384) };
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .direct_io(crate::direct_io::DirectIoConfig::default())
+                .registered_regions(vec![region])
+                .max_registered_regions(4)
+                .build()
+                .expect("valid config"),
+        );
+        let rid = RegionId(0);
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(format!(".ringline-fixed-buffers-{}", std::process::id()));
+        std::fs::write(&path, [0u8; 8192]).unwrap();
+        let open_key = el.executor.begin_disk_io(0);
+        let (index, generation) = el
+            .driver
+            .make_ctx()
+            .direct_io_open(
+                &path,
+                crate::direct_io::DirectIoOpenOptions::new(),
+                open_key,
+            )
+            .expect("submit open");
+        assert!(wait_for_result(&mut el, open_key) >= 0, "O_DIRECT open");
+        let kind = crate::fs::FileKind::DirectIo;
+        // Safety (all three blocks): `base..base + 16384` is the leaked
+        // region and outlives every operation.
+        unsafe { std::ptr::write_bytes(base, 0xc3, 4096) };
+
+        let write_key = el.executor.begin_disk_io(0);
+        unsafe {
+            el.driver
+                .make_ctx()
+                .file_write(kind, index, generation, 0, base, 4096, rid, write_key)
+        }
+        .expect("submit fixed write");
+        let pushed = el.driver.ring.last_pushed.as_ref().unwrap().op;
+        assert!(
+            matches!(
+                pushed,
+                Op::WriteFixed {
+                    buf_index: 0,
+                    len: 4096,
+                    ..
+                }
+            ),
+            "a write from the region is WRITE_FIXED on index 0: {pushed:?}"
+        );
+        assert_eq!(wait_for_result(&mut el, write_key), 4096, "fixed write");
+
+        let read_key = el.executor.begin_disk_io(0);
+        let dest = unsafe { base.add(4096) };
+        unsafe {
+            el.driver
+                .make_ctx()
+                .file_read(kind, index, generation, 0, dest, 4096, rid, read_key)
+        }
+        .expect("submit fixed read");
+        let pushed = el.driver.ring.last_pushed.as_ref().unwrap().op;
+        assert!(
+            matches!(
+                pushed,
+                Op::ReadFixed {
+                    buf_index: 0,
+                    len: 4096,
+                    ..
+                }
+            ),
+            "a read into the region is READ_FIXED on index 0: {pushed:?}"
+        );
+        assert_eq!(wait_for_result(&mut el, read_key), 4096, "fixed read");
+        let back = unsafe { std::slice::from_raw_parts(dest, 4096) };
+        assert!(
+            back.iter().all(|&b| b == 0xc3),
+            "the read returned the write"
+        );
+
+        let plain = crate::buf::AlignedBuf::zeroed(4096, 4096);
+        let plain_key = el.executor.begin_disk_io(0);
+        unsafe {
+            el.driver.make_ctx().file_write(
+                kind,
+                index,
+                generation,
+                4096,
+                plain.as_ptr(),
+                4096,
+                RegionId::UNREGISTERED,
+                plain_key,
+            )
+        }
+        .expect("submit plain write");
+        let pushed = el.driver.ring.last_pushed.as_ref().unwrap().op;
+        assert!(
+            matches!(pushed, Op::Write { len: 4096, .. }),
+            "an unregistered buffer is a plain WRITE: {pushed:?}"
+        );
+        assert_eq!(wait_for_result(&mut el, plain_key), 4096, "plain write");
+
+        el.driver.ring.last_pushed = None;
+        let outside_key = el.executor.begin_disk_io(0);
+        let refused = unsafe {
+            el.driver.make_ctx().file_write(
+                kind,
+                index,
+                generation,
+                0,
+                plain.as_ptr(),
+                4096,
+                rid,
+                outside_key,
+            )
+        }
+        .expect_err("a buffer outside the region it names");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "nothing was pushed for the refused write"
+        );
+
+        let _ = el.driver.make_ctx().file_close(kind, index, generation);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// As `an_fsync_waits_for_an_earlier_write_to_complete`, for a direct
@@ -6904,8 +7045,19 @@ mod tests {
         let [write_key, sync_key] = [(); 2].map(|()| el.executor.begin_disk_io(0));
         {
             let mut ctx = el.driver.make_ctx();
-            unsafe { ctx.file_write(kind, index, generation, 0, block.as_ptr(), 4096, write_key) }
-                .expect("submit write");
+            unsafe {
+                ctx.file_write(
+                    kind,
+                    index,
+                    generation,
+                    0,
+                    block.as_ptr(),
+                    4096,
+                    crate::buffer::fixed::RegionId::UNREGISTERED,
+                    write_key,
+                )
+            }
+            .expect("submit write");
             ctx.file_fsync(kind, index, generation, sync_key)
                 .expect("submit fsync");
         }

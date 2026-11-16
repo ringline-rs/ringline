@@ -88,6 +88,24 @@ pub(crate) enum Op {
         len: u32,
         offset: u64,
     },
+    /// `READ_FIXED`: a read into registered buffer `buf_index`, which must
+    /// contain `buf..buf + len`.
+    ReadFixed {
+        fd: Fd,
+        buf: *mut u8,
+        len: u32,
+        offset: u64,
+        buf_index: u16,
+    },
+    /// `WRITE_FIXED`: a write from registered buffer `buf_index`, which must
+    /// contain `buf..buf + len`.
+    WriteFixed {
+        fd: Fd,
+        buf: *const u8,
+        len: u32,
+        offset: u64,
+        buf_index: u16,
+    },
     Fsync {
         fd: Fd,
     },
@@ -162,6 +180,9 @@ pub(crate) enum Op {
         fd: Fd,
         cmd_op: u32,
         cmd: [u8; 80],
+        /// With a registered buffer that contains the command's data,
+        /// `IORING_URING_CMD_FIXED` and its index.
+        buf_index: Option<u16>,
     },
 }
 

@@ -5440,7 +5440,15 @@ pub fn nvme_read<B: crate::buf::IoBufMut>(
         // Safety: the future owns `buf`, or parks it on drop until the
         // command completes.
         match crate::fs::submit_with_key(executor, |key| unsafe {
-            ctx.nvme_read(device, lba, num_blocks, ptr as u64, data_len, key)
+            ctx.nvme_read(
+                device,
+                lba,
+                num_blocks,
+                ptr as u64,
+                data_len,
+                buf.region(),
+                key,
+            )
         }) {
             Ok((key, target)) => ReadFuture::new(key, target, initial_len, Some(data_len), buf),
             Err(e) => ReadFuture::failed(e, buf),
@@ -5511,7 +5519,15 @@ pub fn nvme_write<B: crate::buf::IoBuf>(
         // Safety: the future owns `buf`, or parks it on drop until the
         // command completes.
         match crate::fs::submit_with_key(executor, |key| unsafe {
-            ctx.nvme_write(device, lba, num_blocks, ptr as u64, data_len, key)
+            ctx.nvme_write(
+                device,
+                lba,
+                num_blocks,
+                ptr as u64,
+                data_len,
+                buf.region(),
+                key,
+            )
         }) {
             Ok((key, target)) => WriteFuture::new(key, target, Some(data_len), buf),
             Err(e) => WriteFuture::failed(e, buf),

@@ -1437,6 +1437,7 @@ impl<'a> DriverCtx<'a> {
     /// `buf_addr` must point to a valid, aligned buffer of at least `buf_len`
     /// bytes that remains valid and exclusively accessible until the
     /// corresponding CQE completes.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn nvme_read(
         &mut self,
         device: crate::nvme::NvmeDevice,
@@ -1444,12 +1445,14 @@ impl<'a> DriverCtx<'a> {
         num_blocks: u16,
         buf_addr: u64,
         buf_len: u32,
+        region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         if num_blocks == 0 {
             return Err(io::Error::other("num_blocks must be >= 1"));
         }
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
+        let buf_index = self.fixed_buf_index(region, buf_addr as *const u8, buf_len)?;
 
         let slab = self
             .nvme_cmd_slab
@@ -1470,7 +1473,7 @@ impl<'a> DriverCtx<'a> {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
-        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, buf_index, ud) } {
             Ok(()) => {
                 if let Some(devices) = self.nvme_devices.as_mut()
                     && let Some(dev) = devices.get_mut(device.index)
@@ -1501,6 +1504,7 @@ impl<'a> DriverCtx<'a> {
     /// `buf_addr` must point to a valid, aligned buffer of at least `buf_len`
     /// bytes that remains valid and exclusively accessible until the
     /// corresponding CQE completes.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn nvme_write(
         &mut self,
         device: crate::nvme::NvmeDevice,
@@ -1508,12 +1512,14 @@ impl<'a> DriverCtx<'a> {
         num_blocks: u16,
         buf_addr: u64,
         buf_len: u32,
+        region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         if num_blocks == 0 {
             return Err(io::Error::other("num_blocks must be >= 1"));
         }
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
+        let buf_index = self.fixed_buf_index(region, buf_addr as *const u8, buf_len)?;
 
         let slab = self
             .nvme_cmd_slab
@@ -1534,7 +1540,7 @@ impl<'a> DriverCtx<'a> {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
-        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, buf_index, ud) } {
             Ok(()) => {
                 if let Some(devices) = self.nvme_devices.as_mut()
                     && let Some(dev) = devices.get_mut(device.index)
@@ -1582,7 +1588,7 @@ impl<'a> DriverCtx<'a> {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
-        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, None, ud) } {
             Ok(()) => {
                 if let Some(devices) = self.nvme_devices.as_mut()
                     && let Some(dev) = devices.get_mut(device.index)
@@ -1804,6 +1810,26 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
+    /// The registered buffer a disk operation's memory is in: `None` for
+    /// [`RegionId::UNREGISTERED`](crate::buffer::fixed::RegionId::UNREGISTERED),
+    /// otherwise the region's index once `ptr..ptr + len` is checked to lie
+    /// inside it. A range outside the region it names is refused with
+    /// `InvalidInput`, before a command slot is taken.
+    fn fixed_buf_index(
+        &self,
+        region: crate::buffer::fixed::RegionId,
+        ptr: *const u8,
+        len: u32,
+    ) -> io::Result<Option<u16>> {
+        if region == crate::buffer::fixed::RegionId::UNREGISTERED {
+            return Ok(None);
+        }
+        self.fixed_buffers
+            .validate_region_ptr(region, ptr, len)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        Ok(Some(region.0))
+    }
+
     /// Submit a read that completes to `key`. Returns its user_data, which a
     /// dropped future cancels.
     ///
@@ -1819,11 +1845,16 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *mut u8,
         len: u32,
+        region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let fd_index = self.validate_file(kind, index, generation)?;
+        let buf_index = self.fixed_buf_index(region, buf, len)?;
         let (slab_idx, ud) = self.file_command(kind, index, crate::fs::FsOp::Read, key)?;
-        let pushed = unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) };
+        let pushed = unsafe {
+            self.ring
+                .submit_direct_read(fd_index, buf, len, offset, buf_index, ud)
+        };
         self.file_pushed(kind, index, slab_idx, pushed)?;
         Ok(ud.raw())
     }
@@ -1843,13 +1874,15 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *const u8,
         len: u32,
+        region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let fd_index = self.validate_file(kind, index, generation)?;
+        let buf_index = self.fixed_buf_index(region, buf, len)?;
         let (slab_idx, ud) = self.file_command(kind, index, crate::fs::FsOp::Write, key)?;
         let pushed = unsafe {
             self.ring
-                .submit_direct_write(fd_index, buf, len, offset, ud)
+                .submit_direct_write(fd_index, buf, len, offset, buf_index, ud)
         };
         self.file_pushed(kind, index, slab_idx, pushed)?;
         self.write_orders.begin_write(
@@ -1977,7 +2010,18 @@ impl<'a> DriverCtx<'a> {
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let (index, generation) = (file.index, file.generation);
-        unsafe { self.file_read(FileKind::Fs, index, generation, offset, buf, len, key) }
+        unsafe {
+            self.file_read(
+                FileKind::Fs,
+                index,
+                generation,
+                offset,
+                buf,
+                len,
+                crate::buffer::fixed::RegionId::UNREGISTERED,
+                key,
+            )
+        }
     }
 
     /// Submit a filesystem write; see [`file_write`](Self::file_write).
@@ -1994,7 +2038,18 @@ impl<'a> DriverCtx<'a> {
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let (index, generation) = (file.index, file.generation);
-        unsafe { self.file_write(FileKind::Fs, index, generation, offset, buf, len, key) }
+        unsafe {
+            self.file_write(
+                FileKind::Fs,
+                index,
+                generation,
+                offset,
+                buf,
+                len,
+                crate::buffer::fixed::RegionId::UNREGISTERED,
+                key,
+            )
+        }
     }
 
     /// Submit an fsync for a filesystem file.
@@ -2827,6 +2882,7 @@ impl<'a> DriverCtx<'a> {
     ///
     /// Mirrors the io_uring backend's contract (caller-supplied DMA address
     /// must be valid and outlive the operation); this stub always errors.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn nvme_read(
         &mut self,
         _device: crate::nvme::NvmeDevice,
@@ -2834,6 +2890,7 @@ impl<'a> DriverCtx<'a> {
         _num_blocks: u16,
         _buf_addr: u64,
         _buf_len: u32,
+        _region: crate::buffer::fixed::RegionId,
         _key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         Err(io::Error::new(
@@ -2847,6 +2904,7 @@ impl<'a> DriverCtx<'a> {
     /// # Safety
     ///
     /// Mirrors the io_uring backend's contract; this stub always errors.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn nvme_write(
         &mut self,
         _device: crate::nvme::NvmeDevice,
@@ -2854,6 +2912,7 @@ impl<'a> DriverCtx<'a> {
         _num_blocks: u16,
         _buf_addr: u64,
         _buf_len: u32,
+        _region: crate::buffer::fixed::RegionId,
         _key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         Err(io::Error::new(
@@ -3076,6 +3135,7 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *mut u8,
         len: u32,
+        _region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let fd = self.validate_file(kind, index, generation)?;
@@ -3117,6 +3177,7 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *const u8,
         len: u32,
+        _region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let fd = self.validate_file(kind, index, generation)?;
@@ -3270,7 +3331,18 @@ impl<'a> DriverCtx<'a> {
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let (index, generation) = (file.index, file.generation);
-        unsafe { self.file_read(FileKind::Fs, index, generation, offset, buf, len, key) }
+        unsafe {
+            self.file_read(
+                FileKind::Fs,
+                index,
+                generation,
+                offset,
+                buf,
+                len,
+                crate::buffer::fixed::RegionId::UNREGISTERED,
+                key,
+            )
+        }
     }
 
     /// Submit a filesystem write via the disk I/O pool.
@@ -3284,7 +3356,18 @@ impl<'a> DriverCtx<'a> {
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let (index, generation) = (file.index, file.generation);
-        unsafe { self.file_write(FileKind::Fs, index, generation, offset, buf, len, key) }
+        unsafe {
+            self.file_write(
+                FileKind::Fs,
+                index,
+                generation,
+                offset,
+                buf,
+                len,
+                crate::buffer::fixed::RegionId::UNREGISTERED,
+                key,
+            )
+        }
     }
 
     /// Submit an fsync for a filesystem file via the disk I/O pool.

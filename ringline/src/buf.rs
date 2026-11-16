@@ -23,7 +23,12 @@
 //!
 //! An application with its own memory (a slot of an arena, a range of a
 //! larger buffer, memory pinned by another component) implements the traits
-//! for a type that owns its claim on that memory.
+//! for a type that owns its claim on that memory. If that memory is in a
+//! region registered with
+//! [`Runtime::register_region`](crate::Runtime::register_region), the type
+//! returns the region from [`IoBuf::region`], and on io_uring its reads and
+//! writes use the registered buffer instead of pinning its pages for each
+//! operation.
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
@@ -60,6 +65,27 @@ pub unsafe trait IoBuf: 'static {
 
     /// The number of initialized bytes at [`stable_ptr`](Self::stable_ptr).
     fn bytes_init(&self) -> usize;
+
+    /// The registered region the buffer's memory is in, or
+    /// [`RegionId::UNREGISTERED`](crate::RegionId::UNREGISTERED) (the
+    /// default).
+    ///
+    /// On io_uring, a read or write from a buffer that names a region is
+    /// submitted as `IORING_OP_READ_FIXED` / `IORING_OP_WRITE_FIXED` (for
+    /// NVMe, `IORING_URING_CMD_FIXED`) with the region's index, so the
+    /// kernel does not pin and unpin the buffer's pages for each operation.
+    /// ringline checks that the operation's range lies inside the region and
+    /// otherwise refuses it with
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput); an
+    /// operation refused that way returns the buffer as other refusals do.
+    /// [`Runtime::register_region`](crate::Runtime::register_region) returns
+    /// the `RegionId`, which names the region on every worker. The mio
+    /// backend ignores the region.
+    ///
+    /// Return the same value on every call while ringline holds the value.
+    fn region(&self) -> crate::RegionId {
+        crate::RegionId::UNREGISTERED
+    }
 }
 
 /// Memory a disk operation writes into: the destination of a read.

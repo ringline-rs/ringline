@@ -1001,13 +1001,14 @@ pub(crate) fn read_into_file<B: IoBufMut>(
         Ok(region) => region,
         Err(e) => return ReadFuture::failed(e, buf),
     };
+    let region = buf.region();
     with_state(|driver, executor| {
         // Safety: the future owns `buf`, or parks it on drop until the
         // operation completes (`ReadFuture::drop`), so the memory outlives
         // the kernel's use of it.
         let mut ctx = driver.make_ctx();
         match submit_with_key(executor, |key| unsafe {
-            ctx.file_read(kind, index, generation, offset, ptr, len, key)
+            ctx.file_read(kind, index, generation, offset, ptr, len, region, key)
         }) {
             Ok((key, target)) => ReadFuture::new(key, target, initial_len, None, buf),
             Err(e) => ReadFuture::failed(e, buf),
@@ -1059,12 +1060,13 @@ pub(crate) fn write_from_file<B: IoBuf>(
         Ok(region) => region,
         Err(e) => return WriteFuture::failed(e, buf),
     };
+    let region = buf.region();
     with_state(|driver, executor| {
         // Safety: the future owns `buf`, or parks it on drop until the
         // operation completes (`WriteFuture::drop`).
         let mut ctx = driver.make_ctx();
         match submit_with_key(executor, |key| unsafe {
-            ctx.file_write(kind, index, generation, offset, ptr, len, key)
+            ctx.file_write(kind, index, generation, offset, ptr, len, region, key)
         }) {
             Ok((key, target)) => WriteFuture::new(key, target, None, buf),
             Err(e) => WriteFuture::failed(e, buf),

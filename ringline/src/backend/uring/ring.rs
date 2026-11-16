@@ -1074,7 +1074,9 @@ impl Ring {
         std::mem::take(&mut self.disk_cancelled)
     }
 
-    /// Submit an NVMe passthrough command via `IORING_OP_URING_CMD`.
+    /// Submit an NVMe passthrough command via `IORING_OP_URING_CMD`, with
+    /// `IORING_URING_CMD_FIXED` when the command's data is in registered
+    /// buffer `buf_index`.
     ///
     /// The `fd_index` must be a fixed file table index pointing to an opened
     /// NVMe-generic character device (`/dev/ng<X>n<Y>`).
@@ -1086,6 +1088,7 @@ impl Ring {
         &mut self,
         fd_index: u32,
         cmd: &NvmeUringCmd,
+        buf_index: Option<u16>,
         user_data: UserData,
     ) -> io::Result<()> {
         let cmd_bytes = cmd.to_bytes();
@@ -1094,6 +1097,7 @@ impl Ring {
                 fd: sqe::Fd::Fixed(fd_index),
                 cmd_op: NVME_URING_CMD_IO,
                 cmd: cmd_bytes,
+                buf_index,
             },
             user_data.raw(),
         );
@@ -1101,7 +1105,8 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a file read via `IORING_OP_READ`.
+    /// Submit a file read via `IORING_OP_READ`, or `IORING_OP_READ_FIXED`
+    /// into registered buffer `buf_index`.
     ///
     /// The `fd_index` must be a fixed file table index pointing to an opened
     /// file.
@@ -1116,22 +1121,32 @@ impl Ring {
         buf: *mut u8,
         len: u32,
         offset: u64,
+        buf_index: Option<u16>,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = Sqe::new(
-            Op::Read {
-                fd: sqe::Fd::Fixed(fd_index),
+        let fd = sqe::Fd::Fixed(fd_index);
+        let op = match buf_index {
+            None => Op::Read {
+                fd,
                 buf,
                 len,
                 offset,
             },
-            user_data.raw(),
-        );
+            Some(buf_index) => Op::ReadFixed {
+                fd,
+                buf,
+                len,
+                offset,
+                buf_index,
+            },
+        };
+        let entry = Sqe::new(op, user_data.raw());
         unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
-    /// Submit a file write via `IORING_OP_WRITE`.
+    /// Submit a file write via `IORING_OP_WRITE`, or `IORING_OP_WRITE_FIXED`
+    /// from registered buffer `buf_index`.
     ///
     /// The `fd_index` must be a fixed file table index pointing to an opened
     /// file.
@@ -1146,17 +1161,26 @@ impl Ring {
         buf: *const u8,
         len: u32,
         offset: u64,
+        buf_index: Option<u16>,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = Sqe::new(
-            Op::Write {
-                fd: sqe::Fd::Fixed(fd_index),
+        let fd = sqe::Fd::Fixed(fd_index);
+        let op = match buf_index {
+            None => Op::Write {
+                fd,
                 buf,
                 len,
                 offset,
             },
-            user_data.raw(),
-        );
+            Some(buf_index) => Op::WriteFixed {
+                fd,
+                buf,
+                len,
+                offset,
+                buf_index,
+            },
+        };
+        let entry = Sqe::new(op, user_data.raw());
         unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
