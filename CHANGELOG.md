@@ -374,11 +374,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `io::Result<(usize, SendCompletion)>` (`SendFuture` in 0.6). Drop the
   completion where the caller does not wait for the send; dropping it does not
   cancel the send. A `build` whose parts carry no bytes is refused with
-  `InvalidInput`; in 0.6 on io_uring one with at least one part took a pool
-  slot and broke the queue (see Fixed); one with no parts, and any on mio,
-  sent nothing and returned `Ok`. So is a `build` closure that returns `Ok`
-  without a successful `submit`, including one that discards `submit`'s error;
-  mio used to send the parts of one that never called `submit`.
+  `InvalidInput`; in 0.6 on an io_uring plaintext connection one with at least
+  one part took a pool slot and broke the queue (see Fixed); one with no
+  parts, one on TLS, and any on mio sent nothing and returned `Ok`. So is a
+  `build` closure that returns `Ok` without a successful `submit`, including
+  one that discards `submit`'s error; mio used to send the parts of one that
+  never called `submit`.
 - **Breaking:** the direct I/O API is the `direct_io` module, with the same
   shapes as `fs` (#845): `direct_io::open(path)` and
   `open_with(path, options)` return an `OpenFuture` that resolves to a
@@ -1327,9 +1328,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `submit_batch_await` is now `submit_batch` (see Changed): drop its
   completion where the caller does not wait for the send. A batch that carries
   no bytes is refused with `InvalidInput`. The old `submit_batch` returned
-  `Ok(0)` for one with no parts; in 0.6 on io_uring one with at least one part
-  took a pool slot and broke the queue (see Fixed), and on mio it sent
-  nothing.
+  `Ok(0)` for one with no parts; in 0.6 on an io_uring plaintext connection
+  one with at least one part took a pool slot and broke the queue (see Fixed),
+  and on TLS or mio it sent nothing.
 
 ### Fixed
 
@@ -1759,15 +1760,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   F13).
 
 - io_uring: a `send_parts` batch whose parts carry no bytes is refused with
-  `InvalidInput` (see Changed). One with at least one part took a send-pool
-  slot and pushed a zero-length Send SQE, whose result 0 the completion
-  handler read as a failed send: every send queued behind it on the connection
-  was discarded with `ConnectionAborted`, the connection stayed open, and
-  later sends reached the peer after the gap. One with no parts sent nothing,
-  and mio sent nothing for either already. No in-tree caller sends such a
-  batch; `ringline-redis` sends an empty value as an empty part beside a
-  non-empty prefix and suffix, which was unaffected. Found by the send-path
-  audit (`docs/journal/2026-11-send-path-audit.md`, F7).
+  `InvalidInput` (see Changed). On a plaintext connection, one with at least
+  one part took a send-pool slot and pushed a zero-length Send SQE, whose
+  result 0 the completion handler read as a failed send: every send queued
+  behind it on the connection was discarded with `ConnectionAborted`, the
+  connection stayed open, and later sends reached the peer after the gap. One
+  with no parts sent nothing, and mio sent nothing for either already. No
+  in-tree caller sends such a batch; `ringline-redis` sends an empty value as
+  an empty part beside a non-empty prefix and suffix, which was unaffected.
+  Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
+  F7).
 
 - io_uring: a TLS close that finds the send pool exhausted no longer drops
   its close_notify and records it as sent. The alert needs one pool slot;
