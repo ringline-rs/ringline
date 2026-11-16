@@ -281,9 +281,9 @@ stayed (`recv-buffering-approaches.md`).
 
 ### Accepted connections (RESP server, 1,000 and 8,000 connections)
 
-These runs used a prototype of this change and specs, neither in the
-repository, that had neither the hangup poll nor the single-`sendmsg`
-multi-slot send (#697). The poll's cost is not measured. #697 changes only the
+These runs used a prototype of this change that had neither the hangup poll nor
+the single-`sendmsg` multi-slot send (#697); the prototype and its specs are
+not in the repository. The poll's cost is not measured. #697 changes only the
 GET 4 KiB depth-16 cells at 16 KiB send slots, where a flush spans up to 5
 slots. Both ringline arms send through the same path, so #697 is expected to
 affect them alike; this is not measured.

@@ -54,7 +54,7 @@ before any number is trusted:
 
 | Gap | Where | Consequence |
 |---|---|---|
-| tokio server uses `read_exact(msg_size)` — one read syscall per message | `ringline-bench/src/bin/server.rs:285` | Previously manufactured a spurious ~9.6× ringline "win". Fixed on the unmerged `bench/fair-throughput`; never landed on `main`. |
+| tokio server uses `read_exact(msg_size)` — one read syscall per message | `ringline-bench/src/bin/server.rs:285` | Previously manufactured a spurious ~9.6× ringline "win". Fixed on the segcache benchmark branch, which never landed on `main`. |
 | client hardcodes `send_pool(32768, …)` | `ringline-bench/src/client.rs:578` | At 4096 connections that is 8 slots/conn; the client collapses to 33k ops/s and the arm measures a client limit, not the server. |
 | no closed-loop pipeline depth | `ringline-bench/src/bin/client.rs` | `--max-inflight` covers open loop only, so the syscall-amortization claim cannot be tested in closed loop. |
 
