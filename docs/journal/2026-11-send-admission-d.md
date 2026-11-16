@@ -5,13 +5,13 @@
   per byte in loopback's receive path, mostly waking the reader.
 - **Span:** Nov 2026 · follows Experiment C (`2026-11-send-admission-c.md`)
   · SystemsLab context `send-admission-expC`
-- **Code:** the model and its sweep script are in the repository as merged
-  in #966. The gate, pieces and the harness that ran them are not in
-  ringline yet; the gate goes with the fast-path specification's PR. Runs
-  are identified by their SystemsLab experiment and build artifact ids; each
-  artifact's build experiment records the source it built. Specs and scripts
-  named under `experiments/` that are not in the repository are stored with
-  their SystemsLab experiments.
+- **Code:** the model and its sweep script are in the repository as merged in
+  #966. The gate, the pieces and the harness that ran them are not in ringline
+  yet; the gate goes with the fast-path specification's PR. Runs are identified
+  by their SystemsLab experiment and build artifact ids; each artifact's build
+  experiment records the source it built. Specs named under `experiments/` that
+  are not in the repository are stored, as evaluated, in their SystemsLab
+  experiments' `experiment.json`; the report scripts are in the repository.
 
 ## Goal
 
@@ -53,9 +53,9 @@ As written before any run: the design's "Prediction" list.
 ### C1-D: the model
 
 `admission-model` and `experiments/send-admission-d-model.py` as merged in
-#966, seeds 1 to 5, N = 16, `admit_limit` = `settle_limit` = 1 s,
-R = 32. With every new flag off, the model's output over C1's 160 cells at
-seeds 1 and 2 is identical to C1's version's apart from the added keys.
+#966, seeds 1 to 5, N = 16, `admit_limit` = `settle_limit` = 1 s, R = 32. With
+every new flag off, the model's output over C1's 160 cells at seeds 1 and 2 is
+identical to that of the version C1 used, apart from the added keys.
 
 Parameters the model assumes, derived, not measured:
 
@@ -179,12 +179,12 @@ waiting send could arm against that send while it was still in the kernel. The
 harness gates a piece only after the previous piece has settled, so neither can
 happen in D. The first fix broke the gate's wake on a peer reset
 (`a_peer_reset_while_waiting` hung), which D's drainers produce at the end of
-each episode, so the matrix stays on its build and the fixes continue with the
-gate.
+each episode, so the matrix stays on its build and the gate's fixes go with the
+fast-path specification's PR.
 
-With the first fix the whole-sends test read the kernel's figures through
-`NETLINK_SOCK_DIAG`: the gate started on a socket with `wmem_queued` 1,761,664
-and `sk_sndbuf` 2,626,560, not writable, and by the time it resolved
+On the build with the first fix, the whole-sends test read the kernel's figures
+through `NETLINK_SOCK_DIAG`: the gate started on a socket with `wmem_queued`
+1,761,664 and `sk_sndbuf` 2,626,560, not writable, and by the time it resolved
 `sk_sndbuf` had grown to 4,194,304 and the socket was writable. The gate was
 right; loopback's autotuning moved the threshold.
 

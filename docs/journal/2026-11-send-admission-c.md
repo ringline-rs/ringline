@@ -7,9 +7,10 @@
 - **Code:** the C0 tools and the model are in the repository as merged in
   #966. The orders and the harness that ran them are not in ringline. Runs
   are identified by their SystemsLab experiment and build artifact ids; each
-  artifact's build experiment records the source it built. Specs and scripts
-  named under `experiments/` that are not in the repository are stored with
-  their SystemsLab experiments.
+  artifact's build experiment records the source it built. Specs named
+  under `experiments/` that are not in the repository are stored, as
+  evaluated, in their SystemsLab experiments' `experiment.json`; the report
+  scripts are in the repository.
 
 ## Goal
 

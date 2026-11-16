@@ -74,17 +74,17 @@
 //!
 //! Pieces. With `--stream-piece` p above 0, a reply that is not small and has
 //! more than p bytes is sent as ceil(n / p) pieces, as admission-server's
-//! `--stream-piece` in D's harness does. Each piece is a waiter
-//! of its own, with its own slots and its own `--admit-ms` from joining the
-//! FIFO, and settles on its own. The next piece starts when the one before it
-//! settles, so a reply has at most one piece waiting or unsettled. The
-//! connection reads no request from its first piece's start to its last
-//! piece's admission; the last piece then counts against `--pipeline` as one
-//! reply. Each piece is timed from its admission, as any reply is, and its
-//! connection is aborted when that reaches `--settle-ms`. With
-//! `--stream-gate`, a piece first waits for `POLLOUT` on its socket, q <=
-//! `--writable` x `sk_sndbuf` (see Truesize), and its connection is aborted
-//! when that wait reaches `--settle-ms`.
+//! `--stream-piece` in D's harness does. Each piece is a waiter of its own,
+//! with its own slots and its own `--admit-ms` from joining the FIFO, and
+//! settles on its own. The next piece starts when the one before it settles,
+//! so a reply has at most one piece waiting or unsettled. The connection reads
+//! no request from its first piece's start to its last piece's admission; the
+//! last piece then counts against `--pipeline` as one reply. Each piece is
+//! timed from its admission, as any reply is, and its connection is aborted
+//! when that reaches `--settle-ms`. With `--stream-gate`, a piece first waits
+//! for `POLLOUT` on its socket, q <= `--writable` x `sk_sndbuf` (see
+//! Truesize), and its connection is aborted when that wait reaches
+//! `--settle-ms`.
 //!
 //! Load. As `admission-load`: `--small-conns` connections offer requests at
 //! `--small-rate` per second in total, open loop, evenly spaced, and read at
@@ -122,12 +122,12 @@
 //! Experiment D's statistics, under `d` and in each episode: per head, whether
 //! the client read all of it, the time from its request to its last byte, and
 //! the fewest free main-pool slots from its request to its last byte, both at
-//! every change and in samples every `--sample-ms` (0: no samples), as
-//! D's admission-server samples `main_free`; whether
-//! each drainer's reply was read whole before its connection ended; the sends
-//! of large replies (pieces, or whole replies) and those that waited for room
-//! in the socket, by the kind of connection; the pieces that waited at the
-//! gate; and the connections ended by each cause, by kind.
+//! every change and in samples every `--sample-ms` (0: no samples), as D's
+//! admission-server samples `main_free`; whether each drainer's reply was read
+//! whole before its connection ended; the sends of large replies (pieces, or
+//! whole replies) and those that waited for room in the socket, by the kind of
+//! connection; the pieces that waited at the gate; and the connections ended
+//! by each cause, by kind.
 //!
 //! Determinism. Time is integer nanoseconds. One event queue, ordered by time
 //! and then by the order the events were scheduled. An event and what it sets

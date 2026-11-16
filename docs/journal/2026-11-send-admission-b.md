@@ -20,9 +20,10 @@ Binaries: `experiments/send-admission-b-build.toml`, io_uring builds of two
 versions of B's tools. The first (artifact `01a1ddd9-1448`) ran the two floor
 runs, echo runs 1 and 2, and the four contended pilots. The second (artifact
 `01a1de0c-432a`) adds `bytes-admitted-await` and ran echo runs 3 and 4 and the
-24 contended runs. The commit that records this entry (#945) differs from the
-second in `ringline-bench` and `ringline/src` only in two doc comments in
-`ringline-bench/src/bin/server.rs`, so building it builds the same code.
+24 contended runs. #945's `ringline-bench` differs from the second only in two
+doc comments in `ringline-bench/src/bin/server.rs`. Its `ringline/src` also
+carries #944 and #946 to #949, which landed on main between the build and the
+merge, so building #945 does not build the same library.
 
 Uncontended: `bench-server` with one worker, pinned to CPU 0, in a guest on
 hv02 (z1, 24 vCPU); `bench-client` in a guest on hv01 (z2, 56 vCPU), across the
