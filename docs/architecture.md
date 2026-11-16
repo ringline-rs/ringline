@@ -66,8 +66,8 @@ The diagram above is generated from a checked-in, code-checked description; do
 not edit the SVG by hand. In text: the caller starts N independent workers,
 each containing one handler, executor, connection table, backend driver, and
 backend poll object. When a stream listener is configured, one centralized
-acceptor blocks in `accept4` on Linux, or polls a non-blocking listener and calls
-`accept` elsewhere, sends each accepted descriptor through a
+acceptor accepts from a non-blocking listener until it is empty, then waits in
+`poll` on the listener and the runtime's stop signal, sends each accepted descriptor through a
 bounded per-worker channel, then writes that worker's eventfd or pipe. Optional
 service pools return results through per-worker channels and use the same
 cross-thread wake mechanism. A shared atomic shutdown flag and the per-worker
@@ -301,12 +301,12 @@ queued and in-flight sends in order, cancels an armed receive, and only then
 finalizes close. Stale CQEs are normal during teardown and must release only
 their own backing without touching a reused connection.
 
-`Runtime::shutdown` sets a shared atomic flag, releases the listen gates, sets
-`SO_REUSEADDR` and calls `shutdown(SHUT_RD)` on each listener socket, and wakes
-every worker. On Linux `SHUT_RD` wakes an acceptor blocked in `accept4` and
-takes the socket out of the listening state. On other platforms `SHUT_RD` does
-not wake a blocked `accept`, so the acceptor polls a non-blocking listener. An
-acceptor polling or holding a connection sees the flag within about 100 ms. Each listener's sockets are owned
+`Runtime::shutdown` sets a shared atomic flag, releases the listen gates, raises
+the stop signal the acceptors poll, sets `SO_REUSEADDR` and calls
+`shutdown(SHUT_RD)` on each listener socket, wakes every worker, and joins the
+acceptor threads. On Linux `SHUT_RD` takes the socket out of the listening
+state. An acceptor in `poll` wakes on the stop signal; one holding a connection
+no worker has room for sees the flag within about 1 ms. Each listener's sockets are owned
 by a shared `ListenerSockets`. Every thread that passes their fd numbers to a
 syscall holds it, and the sockets close when the last holder drops it: after
 shutdown, when the acceptor thread or, in merged accept mode

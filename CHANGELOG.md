@@ -386,6 +386,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `Runtime::shutdown` (and dropping the `Runtime`) returns after every
+  pool-mode acceptor thread has exited, so a listener's socket is closed and
+  its port free when it returns. The acceptor now waits in `poll` on the
+  listener and a stop signal on every platform and accepts until `EAGAIN`,
+  in place of a blocking `accept4` on Linux. The listening socket is left
+  `O_NONBLOCK` on Linux too; the flag is on the open file description, so
+  another process holding the socket sees it.
 - **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` (on
   `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`, resolving with
   `data.len()`, instead of `io::Result<()>`. `send_parts().build(f)`
@@ -1969,7 +1976,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   part followed the gap: 2,392,576 bytes of a 3 MiB part arrived on loopback.
   The kernel now retries it, and a chain that still sends fewer bytes than it
   holds fails (#734).
-- macOS: an acceptor thread exits at shutdown within about 100 ms. It used to
+- macOS: an acceptor thread exits at once at shutdown. It used to
   stay blocked in `accept` until a peer connected, and its listener kept the
   port until then (#560).
 - The acceptor thread no longer closes a connection when every worker's accept

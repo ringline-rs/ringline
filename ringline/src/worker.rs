@@ -460,13 +460,13 @@ impl Runtime {
     /// Work that must finish before exit has to complete before shutdown is
     /// requested.
     ///
-    /// The listeners stop accepting at once on Linux, and within about 100 ms
-    /// elsewhere. A listener's sockets close, and its port is free, once the
-    /// threads accepting on it have exited: its acceptor thread, or with the
-    /// `unstable-accept` feature in merged accept mode the workers. An
-    /// acceptor exits at once on Linux. On other
-    /// platforms, or holding a connection no worker has room for, it exits
-    /// within about 100 ms. This `Runtime` does not hold the sockets open.
+    /// The listeners stop accepting at once. A listener's sockets close, and
+    /// its port is free, once the threads accepting on it have exited: its
+    /// acceptor thread, or with the `unstable-accept` feature in merged accept
+    /// mode the workers. An acceptor exits at once, or within about 1 ms if it
+    /// holds a connection no worker has room for, and this method returns
+    /// after every acceptor thread has exited. This `Runtime` does not hold
+    /// the sockets open.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
     }
@@ -481,6 +481,10 @@ pub(crate) struct RuntimeShutdown {
     /// Each listener's sockets and whether it is merged, added as `launch()`
     /// creates the listeners and released by `shutdown()`.
     listeners: std::sync::Mutex<Vec<(Arc<ListenerSockets>, bool)>>,
+    /// Raised by `shutdown()`; wakes every acceptor from `poll`.
+    stop: crate::acceptor::StopSignal,
+    /// The acceptor threads `launch()` started, joined by `shutdown()`.
+    acceptors: std::sync::Mutex<Vec<thread::JoinHandle<()>>>,
     wake: crate::wakeup::WakeKeepAlive,
     /// Readable once a task panic has shut the runtime down;
     /// [`Runtime::wait_on_signal`] polls it alongside the signal pipe.
@@ -561,6 +565,8 @@ impl RuntimeShutdown {
             flag,
             listen_gates,
             listeners: std::sync::Mutex::new(Vec::new()),
+            stop: crate::acceptor::StopSignal::new()?,
+            acceptors: std::sync::Mutex::new(Vec::new()),
             wake,
             panic_read,
             panic_write,
@@ -586,18 +592,26 @@ impl RuntimeShutdown {
         }
     }
 
-    /// Set the shutdown flag, release the listen gates, shut the listener
-    /// sockets down and wake every worker. Idempotent.
+    /// Set the shutdown flag, release the listen gates, stop the acceptors,
+    /// shut the listener sockets down, wake every worker, and join the
+    /// acceptor threads. Idempotent.
     ///
     /// Releases this struct's hold on the sockets, as `ListenGates::shutdown`
     /// releases the gates'. They close when the threads that accept on them,
     /// the acceptor or in merged mode the workers, have exited.
+    ///
+    /// May run on a worker thread (`shutdown_for_panic`, `worker_exited`).
+    /// The join does not wait on that worker: with the flag set, an acceptor
+    /// holding a connection leaves `send_when_room` within
+    /// `ROOM_POLL_INTERVAL`, and one in `poll` wakes on the stop signal.
     pub(crate) fn shutdown(&self) {
         self.flag.store(true, Ordering::Release);
-        // Before the sockets are shut down: an acceptor parked on a gate that
-        // was never opened is not inside `accept4`, so `SHUT_RD` does not
-        // reach it, and after this call no gate starts a socket listening.
+        // An acceptor parked on a gate that was never opened is not in
+        // `poll`; this releases it, and after this call no gate starts a
+        // socket listening.
         self.listen_gates.shutdown();
+        // After the flag: an acceptor woken by the signal sees it set.
+        self.stop.raise();
         let listeners =
             std::mem::take(&mut *self.listeners.lock().unwrap_or_else(|e| e.into_inner()));
         for (sockets, _) in listeners {
@@ -609,6 +623,28 @@ impl RuntimeShutdown {
         for wh in self.wake.iter() {
             wh.wake();
         }
+        let acceptors =
+            std::mem::take(&mut *self.acceptors.lock().unwrap_or_else(|e| e.into_inner()));
+        for acceptor in acceptors {
+            // A panic in an acceptor has already been reported by the panic
+            // hook, and the listener is shut down either way.
+            let _ = acceptor.join();
+        }
+    }
+
+    /// The signal acceptors poll beside their listening socket.
+    fn stop_signal(&self) -> crate::acceptor::StopSignal {
+        self.stop.clone()
+    }
+
+    /// Hold an acceptor thread for `shutdown()` to join. One started after a
+    /// shutdown exits on its own and is joined by the next `shutdown()`
+    /// (`Drop for Runtime` runs one).
+    fn add_acceptor(&self, handle: thread::JoinHandle<()>) {
+        self.acceptors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
     }
 
     /// Shut down after a task panic, and wake [`Runtime::wait_on_signal`].
@@ -1962,6 +1998,7 @@ impl RinglineBuilder {
                         // A Unix listener has no TCP_NODELAY to set.
                         tcp_nodelay: !spec.addr.is_unix() && self.config.tcp_nodelay,
                         conn_chunk_size: self.config.conn_chunk_size,
+                        stop: runtime_shutdown.stop_signal(),
                     };
                     thread::Builder::new()
                         .name(format!("rl-acpt-{idx}"))
@@ -1974,10 +2011,13 @@ impl RinglineBuilder {
                         })
                 };
 
-                if let Err(error) = spawn_result {
-                    runtime_shutdown.shutdown();
-                    let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
-                    return Err(launch_error(joined, crate::error::Error::Io(error)));
+                match spawn_result {
+                    Ok(acceptor) => runtime_shutdown.add_acceptor(acceptor),
+                    Err(error) => {
+                        runtime_shutdown.shutdown();
+                        let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                        return Err(launch_error(joined, crate::error::Error::Io(error)));
+                    }
                 }
 
                 listeners.push(ListenerHandle {
@@ -3155,6 +3195,21 @@ mod worker_exit_tests {
             );
             wait_for_exit(&handles, 2);
         }
+    }
+
+    /// `shutdown` returns after the acceptor thread has exited, so the
+    /// listener's socket is closed when it returns. Nothing connects, so the
+    /// acceptor is in `poll` and only the stop signal wakes it.
+    #[test]
+    fn shutdown_returns_after_the_acceptor_has_exited() {
+        let (runtime, handles, _fault) = launch(1, AcceptMode::Pool, TaskPanicPolicy::Contain);
+        assert!(runtime.listeners[0].sockets.upgrade().is_some());
+        runtime.shutdown();
+        assert!(
+            runtime.listeners[0].sockets.upgrade().is_none(),
+            "shutdown returned while the acceptor still held the listener"
+        );
+        wait_for_exit(&handles, 1);
     }
 
     /// With nobody in `wait_on_signal`, the `Shutdown` policy stops the runtime.
