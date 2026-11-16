@@ -8,7 +8,7 @@ their socket has room, which the owner chose for plaintext on 2026-11-15, with
 C's orders as the fallback. C's runs are
 recorded in `docs/journal/2026-11-send-admission-c.md` and D's in
 `docs/journal/2026-11-send-admission-d.md`, where gated pieces pass D's
-decision rule.
+decision rule. Section 4 ends with the proposed fast-path specification.
 "What exists" describes the code before section 1, at 07dd0f56; section 3's
 specification cites the code at 03628fee. `send_nowait` was removed in
 0.7.0-alpha.141 (#965); the sections that name it describe the code before
@@ -952,6 +952,182 @@ Not tested here:
   chosen value and make the fit exact in bytes while the buffer has room;
 - guarded batches waiting in the FIFO.
 
+### The fast-path specification
+
+Proposed on 2026-11-16, from Experiments C and D. It is built in three pull
+requests, one per part below, each with its own tests. The owner decided the
+choices it rests on: gated pieces for plaintext, O7w for TLS, and guarded
+batches that wait in the FIFO for their own pool cost (Experiment D's opening
+paragraph), and on 2026-11-16 the API decisions listed under Decisions.
+
+#### Part 1: the gate, `writable`
+
+`SendHalf::writable` and `Connection::writable` become public. The code is the
+gate Experiment D ran, which is not in ringline, plus the fixes made after D's
+matrix (a busy loop on a resubmit, a gate that armed against a send still in
+the kernel, a reset that no longer woke the gate, and a completion that closes
+the connection dropping the connection's own task with its gate unresolved). It
+was written on a work branch based on main before #965, together with
+Experiment C's orders, so this part is a port onto main, not a change of
+visibility. The port carries the gate and the hidden `waited_for_room` that the
+gate's tests read, and none of the orders. The fixes after D's last review are
+unreviewed (journal D). Its tests are the gate's event-loop unit tests and
+`tests/writable_gate.rs`, run on the rack's 6.8, 6.12 and 7.2 images as section
+3's were. The part is done when they pass there, each fix's test fails with
+that fix reverted, and the existing suite passes unchanged; `send_buffer_size`
+returns, on both backends, the send buffer `ss -tmi` reports as `tb`; and a
+`compile_fail` doctest shows that a second `writable` on one half does not
+compile.
+
+- It resolves `Ok` once the socket reports `POLLOUT`, after every send the
+  connection has queued has been handed to the kernel (io_uring) or written
+  (mio). It sends nothing and takes no pool slot.
+- It fails on `POLLERR` or `POLLHUP`, on `abort` (`ConnectionAborted`), on a
+  close requested or committed, and on a write half that is shut down
+  (`BrokenPipe`), with the error kinds of its doc comment on the gate's
+  branch.
+- It has no bound of its own. A caller bounds it with `ringline::timeout` and
+  treats a timeout as the room-wait timeout of Experiment D: it aborts the
+  connection once any piece of the reply has been sent.
+- The future borrows its half mutably, so a second `writable` on the same
+  half while one waits does not compile. On the branch it borrows nothing,
+  and dropping the registered one of two futures left the other unwoken.
+- `SendHalf::send_buffer_size` and `Connection::send_buffer_size` return the
+  socket's `SO_SNDBUF` (the kernel's `sk_sndbuf`). It is a future on both
+  backends, since on io_uring it is a round trip through the ring: through a
+  socket `URING_CMD` getsockopt, as `SetSockOpt` already does for
+  setsockopt, and on mio from the `TcpStream`. A server sizes its pieces as
+  min(`send_buffer_size` / 3, 128 KiB), Experiment D's recommendation, read
+  per reply since the buffer grows with the connection.
+- A gate does not wait for a send that waits in the FIFO on its connection.
+  Such a send, admitted after the gate opens, can take the room a piece was
+  gated for; bytes stay in order, but the piece may not go in whole.
+
+A server sends a plaintext reply of n bytes larger than p as ceil(n / p)
+pieces. Before each piece it awaits `writable`, then `send_admitted` for the
+piece under `admit_limit`, then the piece's `SendCompletion` before the next
+piece. This is the sequence Experiment D's harness ran. The caller forms the
+pieces (Decisions). A reply that fails after its first piece is sent
+aborts its connection (Experiment D, "After its first piece"). With pieces
+formed by the caller, ringline documents this rule and cannot enforce it: a
+caller that calls `close()` after a prefix sends a FIN, which a protocol
+delimited by close reads as a complete reply.
+
+#### Part 2: O7w, the default order
+
+The send pool gets one admission order besides strict FIFO: O7w, with a budget
+R of slots. It is the default, at R = 32. `ConfigBuilder` takes a
+`#[non_exhaustive]` order enum, strict or O7w with R. R must be at least 1,
+or the configuration is refused; an R above the pool's slots admits as R = P
+does, since a waiter passes only within min(R, S). A waiter passes a
+head that does not fit only while the slots held by passing sends plus its own
+are at most min(R, S), and only onto a connection with no send queued or in
+flight whose last settled send did not wait for room. Experiment C ran it at
+R = 32 of 512 slots, and Experiment D's O7w arm with gated 128 KiB plaintext
+pieces passed.
+
+- The order is per worker, since the pool is. With O7w on, plaintext pieces
+  on that worker run under it too, as in D's O7w arm.
+- The code is the `BudgetIdle` order from Experiment C's work branch, which is
+  not in ringline, without the other orders. That includes the marks on slots
+  held by passing sends and their release paths, the search behind the head and
+  its wake, oldest-first admission, each connection's earliest waiter, the
+  expiry of a woken waiter's claim, the exclusion of a forced close_notify from
+  B, and the room-wait state per connection (`room_waited` and `send_waited`,
+  and on mio `waited_entries`), kept only while the order is on. The two
+  backends count different sends as having waited when replies are pipelined.
+- On the branches `SendCompletion::passed_head`, `waited_for_room` and the
+  admission counters are `#[doc(hidden)] pub`, and stay so (Decisions).
+- O7w has not run on TLS. Neither Experiment C nor D sent TLS replies, and
+  under O7w a TLS reply is a whole reply: in D, O7w with whole replies
+  completed no 7 MiB reply in W4 or W5, and its fast small p99 was 25.4 ms in
+  W4 at 256 KiB. A TLS reply needs at least two slots, so R admits fewer TLS
+  passers than plaintext ones.
+- The part is done when C2's seven cells and the W1 cell with sends outside
+  the FIFO, rerun on the ported code, give, under O7w, each cell's largest
+  head delay within the larger of 10% of C2's O7w figure and the spread
+  between O0's runs in that cell (journal C), and fast small p99 within
+  0.3 ms of C2's O7w median (for the cell with sends outside the FIFO, within
+  C2's range over the passing orders, 810.2 to 811.2 ms and 0.5 to 0.6 ms);
+  under strict order, the same against C2's O0 figures; and the echo check
+  puts the default build within the floor of main.
+- Because O7w is the default and has not run on TLS, `admission-server` and
+  `admission-load` gain TLS, with a pool slot of at least one whole record
+  (16,413 bytes; `validate_tls_slot_size` refuses C's 16 KiB), and the W1 and
+  W2 cells run once with TLS under both orders. By two of C's conditions, O7w
+  must time out no more heads than strict order and keep W1's fast small p99 at
+  or below 10 ms. Otherwise the default goes back to the owner before the pull
+  request merges.
+
+#### Part 3: guarded batches that wait
+
+A new method beside `AsyncSendBuilder::submit_batch`, which is unchanged,
+waits in the FIFO for the batch's own pool cost, as `send_admitted` waits for
+a copied send's. Its refusal is a new `#[non_exhaustive]` error that returns
+every part; it converts to an `io::Error`, dropping the parts, for a caller
+that does not want them back.
+
+- The pool cost is that of the copy parts: at most one slot on a plaintext
+  connection, and the ciphertext bound on TLS. A batch below
+  `send_zc_threshold` takes one slot or goes zero-copy (handler.rs:3624-3632).
+  On a plaintext connection, a batch whose copy parts are empty joins no FIFO
+  and is submitted at once; one with copy parts waits for one slot. On TLS
+  every part is copied, and the batch waits for the ciphertext bound of its
+  total length.
+- The send-slab entry is not part of the FIFO's admission (Alternatives). It
+  is taken when the batch is admitted, and a full slab then refuses the
+  batch.
+- On mio, where `submit_batch` copies the whole batch and takes no slots,
+  the method waits as `send_admitted` does for the batch's total length.
+- A refusal returns every part to the caller, guards included, and every
+  check runs before any guard is consumed. On main every refusal of
+  `submit_batch` drops its parts: the empty batch, the builder's limits, a
+  stale or closing connection, TLS (which gathers the guards before its
+  capacity check), a guard outside its registered region, copy parts over
+  one slot, pool exhaustion and the slab (io.rs:1772-1820,
+  handler.rs:3570-3855).
+- Nothing wakes a caller after a slab refusal; releasing an entry wakes
+  nothing. A caller copies the same bytes or aborts.
+- The part is done when a test of each refusal path gets every part back,
+  a batch that waits is admitted when its slots return, and each of those
+  tests fails with its check moved after the guards are consumed.
+
+#### What the parts do not cover
+
+These are untested, and each is a limit of the specification as written:
+
+- zero-copy pieces, which hold their memory until the peer acknowledges them,
+  and a send-slab entry each: a stalled peer's socket takes gated pieces until
+  it is about two thirds full, about six 128 KiB pieces at 1 MiB, so about 85
+  stalled peers would hold the default 512 entries (derived, not measured),
+  and other connections' guarded batches would then be refused;
+- TLS replies in pieces;
+- a network between server and client, where `sk_sndbuf` starts near 85 KiB
+  and grows with the congestion window, so a piece can be partly sent early
+  in a connection;
+- mio under load: `writable` is tested on mio but did not run on the rack;
+- small replies to a peer that pipelines and stops reading, which still hold
+  their slots until `settle_limit` (Non-goals).
+
+#### Decisions
+
+Made by the owner on 2026-11-16:
+
+- O7w is on by default at R = 32, set through a `#[non_exhaustive]` order
+  enum (Part 2).
+- Pieces are sized from a new `send_buffer_size` accessor (Part 1).
+- `writable` borrows its half mutably (Part 1).
+- A waiting batch's refusal returns its parts (Part 3).
+
+Not asked, and followed as recommended until the owner says otherwise:
+
+- The caller forms the pieces. Its code has its framing and chooses which
+  values go zero-copy. A ringline method that sends one buffer as gated
+  pieces can be added later without breaking callers.
+- `SendCompletion::waited_for_room`, `passed_head` and the admission
+  counters stay `#[doc(hidden)] pub`: the gate's integration tests and the
+  experiments' harness read them.
+
 ## Alternatives considered
 
 - Keeping the send futures `Send` and checking the owner, as the disk-I/O
@@ -1013,7 +1189,8 @@ Not tested here:
 3. Section 3, `abort`, as specified from Experiment A. Its tests run on the
    rack's 6.8, 6.12 and 7.2 images through `experiments/abort-verify.toml`.
 4. Experiment B, then Experiments C and D, then the fast-path specification
-   and its PR.
+   (section 4), built in three pull requests: the gate, O7w, and guarded
+   batches that wait.
 
 ## What a caller can no longer do
 
@@ -1038,3 +1215,13 @@ fails with `NotConnected` before it joins the FIFO, as it already did on a TLS
 connection whose close_notify was queued. Before, it joined the FIFO and was
 refused when it won capacity, and with the write half also shut down it failed
 with `BrokenPipe`.
+
+The fast-path specification changes one default and adds API:
+
+- With O7w the default, a send can be admitted ahead of an older waiter on
+  another connection. A caller that relied on strict FIFO order across
+  connections sets the order to strict. Sends on one connection keep their
+  order either way.
+- A configuration with an O7w budget of 0 fails validation.
+- `writable`, `send_buffer_size` and the waiting batch method are new; no
+  existing signature changes.
