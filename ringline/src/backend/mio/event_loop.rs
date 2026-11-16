@@ -377,6 +377,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         if writable {
                             self.handle_writable(conn_index);
                         }
+                        // A `writable` future checks the socket again on any
+                        // event: room, an error, a hangup, or a close the
+                        // handlers above requested.
+                        self.wake_writable(conn_index);
                     }
                 }
             }
@@ -1344,6 +1348,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Wake the task of a `writable` future waiting on `conn_index`, which
+    /// polls the socket again.
+    fn wake_writable(&mut self, conn_index: u32) {
+        if let Some(task) = self
+            .driver
+            .send_queues
+            .get_mut(conn_index as usize)
+            .and_then(|state| state.writable_task.take())
+        {
+            self.executor.wake_task(task);
+        }
+    }
+
+    /// Mark in the completion table the awaited sends a `writev` found the
+    /// socket full for (`Driver::room_waited_sends`), before any task reads
+    /// `SendCompletion::waited_for_room`.
+    fn mark_room_waited_sends(&mut self) {
+        for id in self.driver.room_waited_sends.drain(..) {
+            self.executor.send_completions.mark_send_waited_for_room(id);
+        }
+    }
+
     /// A hard write error (EPIPE/ECONNRESET/peer-closed) during a flush:
     /// fail the awaiting sender, wake the recv side so the owning task
     /// observes the close, and tear the connection down. Previously the
@@ -1500,6 +1526,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.fail_connection_on_send_error(conn_index, e);
                 continue;
             }
+            // A `writable` future waits until the queue is written.
+            if self.driver.pending_sends[idx].is_empty() {
+                self.wake_writable(conn_index);
+            }
             if !self.driver.pending_sends[idx].is_empty() && !self.driver.sends_dirty_flag[idx] {
                 self.driver.sends_dirty_flag[idx] = true;
                 self.driver.sends_dirty.push(conn_index);
@@ -1598,6 +1628,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.forward_done[idx] = Some(Ok(st.forwarded));
             }
             self.driver.forward_resume_flag[idx] = false;
+            // A `writable` future on another task than the connection's,
+            // which `remove_connection` drops, polls again and finds the slot
+            // released.
+            self.wake_writable(conn_index);
 
             // Drops the connection's task if it is still alive, with the
             // driver state installed so the futures it holds clean up as
@@ -1638,6 +1672,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// `capacity_released` wherever a permit goes back, and the run loop
     /// issues one `wake_send_capacity` per iteration (see step 8a).
     fn drain_send_completions(&mut self) {
+        self.mark_room_waited_sends();
         loop {
             let mut delivered = false;
             while let Some((id, result)) = self.driver.settled_sends.pop_front() {
@@ -1755,6 +1790,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // behind (for example, a closed connection's timer slot), so tasks
         // polled in this pass can reuse it.
         crate::fs::release_orphans(&mut self.driver, &mut self.executor);
+        self.mark_room_waited_sends();
         // Form raw pointers once and access driver/executor exclusively through
         // them for the duration of this method. This avoids Stacked Borrows
         // violations: accessing self.driver or self.executor directly after
@@ -3870,5 +3906,132 @@ mod tests {
             el.driver.tcp_streams[conn_index as usize].is_none(),
             "the close finalized"
         );
+    }
+
+    // ── `SendHalf::writable` ──────────────────────────────────────────
+
+    /// Write to `conn_index`'s socket directly until a zero-timeout
+    /// `poll(2)` reports it not writable, so that a gate on it waits. macOS
+    /// grows a loopback send buffer that fills, so one write to `WouldBlock`
+    /// is not enough there.
+    fn fill_socket(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let stream = el.driver.tcp_streams[conn_index as usize]
+            .as_mut()
+            .expect("an attached stream");
+        let chunk = [7u8; 1 << 16];
+        for _ in 0..500 {
+            loop {
+                match stream.write(&chunk) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("fill: {e}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            let mut pfd = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one valid `pollfd` for the call, and a zero timeout.
+            if unsafe { libc::poll(&mut pfd, 1, 0) } == 0 {
+                return;
+            }
+        }
+        panic!("the socket still polls writable after 500 fills");
+    }
+
+    /// What a `writable` task resolved with, as an error kind.
+    type GateSeen = std::rc::Rc<std::cell::Cell<Option<Result<(), io::ErrorKind>>>>;
+
+    /// Run `ctx.writable()` in a standalone task until it parks or resolves;
+    /// returns its result's cell and the task's id.
+    fn gate_task(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> (GateSeen, u32) {
+        let seen: GateSeen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = seen.clone();
+        let idx = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                let result = ctx.writable().await;
+                record.set(Some(result.map_err(|e| e.kind())));
+            }))
+            .expect("a free standalone slot");
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+        el.poll_ready_tasks();
+        (seen, idx | STANDALONE_BIT)
+    }
+
+    /// `abort` wakes a gate waiting in another task: with no event on the
+    /// connection and no release yet, its next poll finds the connection
+    /// aborted.
+    #[test]
+    fn an_abort_wakes_a_waiting_writable_gate() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        fill_socket(&mut el, conn_index);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (seen, _) = gate_task(&mut el, ctx);
+        assert_eq!(seen.get(), None, "the socket is full");
+        in_poll(&mut el, || ctx.abort());
+        el.poll_ready_tasks();
+        assert_eq!(seen.get(), Some(Err(io::ErrorKind::ConnectionAborted)));
+    }
+
+    /// Two gates on one connection: the first registers, the second does,
+    /// the first registers again, and the second is dropped. The drop leaves
+    /// the first's registration, which is not its own.
+    #[test]
+    fn a_second_writable_gate_dropped_leaves_the_first_registered() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        fill_socket(&mut el, conn_index);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (first, first_task) = gate_task(&mut el, ctx);
+        let release = std::rc::Rc::new(std::cell::Cell::new(false));
+        let released = release.clone();
+        let second = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                let mut gate = Box::pin(ctx.writable());
+                std::future::poll_fn(|cx| {
+                    if released.get() {
+                        return std::task::Poll::Ready(());
+                    }
+                    let _ = gate.as_mut().poll(cx);
+                    std::task::Poll::Pending
+                })
+                .await;
+            }))
+            .expect("a free standalone slot")
+            | STANDALONE_BIT;
+        el.executor.ready_queue.push_back(second);
+        el.poll_ready_tasks();
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert_eq!(
+            state.writable_task,
+            Some(second),
+            "the second registered last"
+        );
+        assert!(el.executor.wake_task(first_task), "the first is parked");
+        el.poll_ready_tasks();
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].writable_task,
+            Some(first_task)
+        );
+        release.set(true);
+        assert!(el.executor.wake_task(second), "the second is parked");
+        el.poll_ready_tasks();
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].writable_task,
+            Some(first_task),
+            "the second gate's drop cleared the first's registration"
+        );
+        assert_eq!(first.get(), None);
     }
 }

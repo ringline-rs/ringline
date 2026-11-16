@@ -48,6 +48,9 @@ pub(crate) struct PendingSend {
     pub(crate) offset: usize,
     pub(crate) send_id: Option<(SendId, u32)>,
     pub(crate) permit: Option<SlotReservation>,
+    /// A `writev` that carried this entry returned `WouldBlock`, and its id
+    /// went on `Driver::room_waited_sends`.
+    pub(crate) waited_for_room: bool,
 }
 
 impl PendingSend {
@@ -58,6 +61,7 @@ impl PendingSend {
             offset: 0,
             send_id: None,
             permit: None,
+            waited_for_room: false,
         }
     }
 
@@ -68,6 +72,7 @@ impl PendingSend {
             offset: 0,
             send_id: Some((id, len)),
             permit: None,
+            waited_for_room: false,
         }
     }
 
@@ -82,6 +87,7 @@ impl PendingSend {
             offset: 0,
             send_id: Some((id, len)),
             permit: Some(permit),
+            waited_for_room: false,
         }
     }
 }
@@ -256,6 +262,10 @@ pub(crate) struct Driver {
     /// `drain_send_completions`. The driver never touches the `Executor`
     /// itself.
     pub(crate) settled_sends: VecDeque<(SendId, io::Result<u32>)>,
+    /// Awaited sends whose entry a `writev` carried when it returned
+    /// `WouldBlock`, for the event loop to mark in the executor's completion
+    /// table before it next polls a task (`SendCompletion::waited_for_room`).
+    pub(crate) room_waited_sends: Vec<SendId>,
     /// Set whenever a copy-pool permit goes back to the pool, so the event
     /// loop can call `Executor::wake_send_capacity` once per iteration
     /// instead of once per released permit. The event loop clears it.
@@ -583,6 +593,7 @@ impl Driver {
             send_half_taken: vec![false; max_conn],
             forward_hold_cap: config.forward_hold_cap,
             settled_sends: VecDeque::new(),
+            room_waited_sends: Vec::new(),
             capacity_released: false,
             udp_sockets,
             udp_connected_peers,
@@ -864,6 +875,7 @@ impl Driver {
         self.send_queues[idx].in_flight = false;
         self.send_queues[idx].close_pending = false;
         self.send_queues[idx].close_notify_deadline = None;
+        self.send_queues[idx].writable_task = None;
 
         // The future dropped at teardown may have owned a half, whose `Drop`
         // queues an orphan that finds a changed generation. Clear the flags
@@ -1071,6 +1083,15 @@ impl Driver {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
+                    // Every awaited send queued now has bytes the full socket
+                    // did not take (`SendCompletion::waited_for_room`).
+                    for entry in self.pending_sends[idx].iter_mut() {
+                        if let Some((id, _)) = entry.send_id
+                            && !std::mem::replace(&mut entry.waited_for_room, true)
+                        {
+                            self.room_waited_sends.push(id);
+                        }
+                    }
                     // Queue survives this flush — keep the dirty invariant.
                     self.mark_send_dirty(idx);
                     return Ok((false, total_written));

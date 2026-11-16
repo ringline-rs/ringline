@@ -113,6 +113,74 @@ pub(crate) struct ConnSendState {
     /// io_uring only.
     #[cfg(has_io_uring)]
     pub disconnect: Disconnect,
+    /// The task of a `SendHalf::writable` future that waits on this
+    /// connection for room in its socket. Taken when the task is woken: on
+    /// io_uring by the completion that ends the wait (a `POLLOUT`, an error,
+    /// a hangup or a cancel) and by the completion or push that leaves no
+    /// send queued or waiting, on mio by any event on the connection and by
+    /// the flush that empties its queue, and on both by `abort`, by `close`,
+    /// by a close that dropping the last half requests, and at the slot's
+    /// release. The future registers again if it is polled before its wait
+    /// has ended.
+    pub writable_task: Option<u32>,
+    /// io_uring: what ended a `writable` future's wait, for its next poll,
+    /// and the task it was for. The future clears its own when it starts to
+    /// wait on the socket, so only an event that arrives while it waits
+    /// counts.
+    #[cfg(has_io_uring)]
+    pub writable_event: Option<(u32, WritableEvent)>,
+    /// io_uring: the resubmit of the send that waited for room, or the plain
+    /// re-send of a zero-copy send that got `ENOMEM`, is on a retry list, the
+    /// SQ having had no room for it: as for a queued send, a `writable`
+    /// future waits until its push goes through.
+    #[cfg(has_io_uring)]
+    pub resubmit_queued: bool,
+    /// io_uring: the registered `writable` future waits for the
+    /// connection's queued and waiting sends, not yet on the socket; the
+    /// completion that leaves none wakes it.
+    #[cfg(has_io_uring)]
+    pub writable_blocked: bool,
+    /// io_uring: the state of the connection's `SendPollProbe`, the one-shot
+    /// `POLLOUT` poll a `writable` future arms while the connection's
+    /// `SendPollOut` is multishot.
+    #[cfg(has_io_uring)]
+    pub send_probe: SendProbe,
+    /// io_uring: the task of a `send_buffer_size` future whose
+    /// `FixedFdInstall` is in flight (`OpTag::SendBufInstall`). The completion
+    /// stores `send_buf_result` and wakes it; the slot's release wakes it too.
+    #[cfg(has_io_uring)]
+    pub send_buf_task: Option<u32>,
+    /// io_uring: `SO_SNDBUF` read by that completion, or the errno that
+    /// failed it, for the future's next poll.
+    #[cfg(has_io_uring)]
+    pub send_buf_result: Option<Result<u32, i32>>,
+}
+
+/// What ended a `writable` future's wait on io_uring.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WritableEvent {
+    /// The socket reported `POLLOUT`.
+    Room,
+    /// A send that waited for room was resubmitted, on the `POLLOUT` the
+    /// future waited for or by the backstop, or a send parked on a retry
+    /// list was pushed, and it may take the room: the future looks again,
+    /// from its check for queued and waiting sends, and waits for that send
+    /// to leave the kernel before it arms.
+    Recheck,
+    /// An error, a hangup or a cancel, with its errno.
+    Failed(i32),
+}
+
+/// The state of a connection's `SendPollProbe`.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendProbe {
+    None,
+    /// Queued on `Driver::pending_send_probe_retries`: the SQ was full.
+    Pending,
+    /// In the kernel.
+    Armed,
 }
 
 /// The `IORING_OP_CONNECT` with an `AF_UNSPEC` address that `abort` submits
@@ -172,6 +240,19 @@ impl ConnSendState {
             aborted: false,
             #[cfg(has_io_uring)]
             disconnect: Disconnect::None,
+            writable_task: None,
+            #[cfg(has_io_uring)]
+            writable_event: None,
+            #[cfg(has_io_uring)]
+            writable_blocked: false,
+            #[cfg(has_io_uring)]
+            resubmit_queued: false,
+            #[cfg(has_io_uring)]
+            send_probe: SendProbe::None,
+            #[cfg(has_io_uring)]
+            send_buf_task: None,
+            #[cfg(has_io_uring)]
+            send_buf_result: None,
         }
     }
 

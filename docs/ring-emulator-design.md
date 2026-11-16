@@ -311,6 +311,7 @@ conformance tests confirm against the real ring first.
 | SendMsgCoalesced | SENDMSG, `MSG_DONTWAIT` | One `writev` of the iovecs, with the same rule. | B |
 | SendMsgZc | SENDMSG_ZC, `MSG_DONTWAIT`, or `MSG_WAITALL` in a chain | One `writev`, posting a short count when that is all the socket took, or `-EAGAIN`. Then post the operation CQE with `F_MORE` and a separate `F_NOTIF` CQE in the same reap. A notification follows exactly when `F_MORE` is set, including on error and zero-length results (#487). The `writev` reads the guard's memory in place; the kernel copies it into the socket buffer, so the send is not zero-copy, but ringline makes no copy of its own. | C |
 | SendPollOut | POLL_ADD POLLOUT, one shot or multishot | Check writability at submit; otherwise post on the writable edge. A peer's half-close posts `POLLRDHUP` without `POLLOUT` at once. A multishot poll posts each edge with `F_MORE`, stays armed, and posts `-ECANCELED` without `F_MORE` when cancelled by user_data. | B |
+| SendPollProbe | POLL_ADD POLLOUT, one shot | As SendPollOut's one-shot form, on its own user_data, armed while the connection's SendPollOut is multishot. | B |
 | Connect | CONNECT | Nonblocking `connect`, then `SO_ERROR` on writable, as the mio backend does today. | A |
 | Shutdown, CloseShutdown | SHUTDOWN | `shutdown(2)` on the op's fd. | A |
 | Close | CLOSE (fixed) | See the fixed-file table: cancel the slot's pending ops, then drop the emulator's fd. | C |
@@ -318,6 +319,7 @@ conformance tests confirm against the real ring first.
 | EventFdRead | READ on the eventfd | The worker's wake fd (a pipe on macOS). Try at arm, then on readable. | A |
 | AcceptMulti | ACCEPT multishot | Try at arm, then on readable: `accept` (with `SOCK_NONBLOCK\|SOCK_CLOEXEC`, or `fcntl` after `accept` where `accept4` is missing) until `EAGAIN`, one CQE per fd with `F_MORE`. | B, P |
 | ParkInstall | FIXED_FD_INSTALL | `fcntl(F_DUPFD_CLOEXEC)` on the slot's fd; post the new fd. The kernel installs it close-on-exec, which #460 relies on. | A |
+| SendBufInstall | FIXED_FD_INSTALL | As ParkInstall; the driver reads `SO_SNDBUF` from the new fd and closes it. | A |
 | PidfdPoll | POLL_ADD on a pidfd | On Linux, poll the pidfd for readable. Off Linux there are no pidfds: the engine registers `EVFILT_PROC` / `NOTE_EXIT` for the pid on its kqueue and posts the completion when the child exits. `ChildProcess::wait` then works as on Linux. | A, P |
 | SendMsgUdp, SendUdp | SENDMSG (with `UDP_SEGMENT`), SEND | `sendmsg`, with `UDP_SEGMENT` on Linux. Off Linux there is no GSO: the engine sends one datagram per segment and posts one completion with the total. | B, P |
 | Fs, DirectIo | OPENAT (direct install), READ, WRITE, FSYNC, STATX, RENAMEAT, UNLINKAT, MKDIRAT | The disk-I/O thread pool (`disk_io_pool.rs`) runs the call. OPENAT installs into the emulated fixed-file table when reaped. Off Linux: STATX is filled from `fstatat` (fields `stat` lacks are left zero and unmarked in the mask), and direct I/O uses `F_NOCACHE` where Linux uses `O_DIRECT`. | B, P |
