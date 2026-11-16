@@ -328,6 +328,27 @@ cells), and by 0 to 5% in the cells below.
   starved connection in any arm: the least-served connection had 84 to 98%
   of the median in the ring and direct arms.
 
+### Poll first (#840)
+
+Prototype of `POLL_FIRST` behind an environment variable, the same rule as
+the code, with an echo benchmark that is not in the tree; SystemsLab run
+`01a1e0bf-8cd0-71a3-237a-f8832eec5588`. hv03, Linux 6.12, one worker, 64
+TCP connections over loopback, each echoing one message at a time, 4
+windows of 8 s per arm in the order A B B A A B B A, server CPU per KB
+echoed:
+
+| Message | Without | With | Change | Spread without | Spread with |
+|---|---|---|---|---|---|
+| 64 B | 150,847 ns | 147,922 ns | −1.9% | 2.8% | 1.2% |
+| 16 KiB | 739.1 ns | 729.9 ns | −1.2% | 0.8% | 0.6% |
+
+Each of the 4 adjacent A/B pairs at each size was lower with `POLL_FIRST`.
+At 64 B the arms' ranges overlap, and the run without it rose from 148.4k to
+152.6k ns over the run; the order cancels a linear drift. No A-against-A run
+measured the floor. The server ran at 99.9% CPU in every window, so
+throughput rose by about the same fractions. The result is from one run on
+one host and one kernel.
+
 ## Mechanism
 
 ### When a receive is armed
@@ -404,6 +425,39 @@ Invariant 8 in CLAUDE.md).
 Arming after the parse means no receive is outstanding while `with_bytes`
 holds the accumulator frozen, so the remainder the parser left can be taken
 back without a copy (below).
+
+### Poll first after an empty socket
+
+A receive tries the socket when it is issued and, if the socket is empty,
+arms a poll and tries again when data arrives. After a receive that returned
+bytes and whose completion did not carry `IORING_CQE_F_SOCK_NONEMPTY`, the
+socket was empty, and a request/response peer usually sends nothing more
+until it gets an answer. So the next receive on that connection is armed
+with `IORING_RECVSEND_POLL_FIRST` (Linux 5.19), which arms the poll without
+the first attempt (`ConnectionState::recv_direct_drained`, set in
+`handle_recv_direct`). A receive whose completion carried `SOCK_NONEMPTY`,
+returned 0 or failed leaves the flag clear, as does a new connection. If
+bytes are already queued when a `POLL_FIRST` receive is armed, arming the
+poll finds the socket readable and the kernel issues the receive from
+task_work without waiting for the socket's wakeup. A Unix-domain connection
+never polls first: af_unix reports no `msg_inq` before 6.17, so on those
+kernels io_uring does not report `SOCK_NONEMPTY` for it, and ringline
+excludes Unix-domain connections on every kernel. `SOCK_NONEMPTY` is also
+set when only a FIN is queued (`tcp_inq_hint` reports 1 after a FIN); the
+next receive then tries first and returns 0.
+
+If the kernel cannot allocate the poll, it hands the receive to io-wq,
+which issues it once and, since `POLL_FIRST` refuses the first attempt,
+completes it with `-EAGAIN`. That result closes nothing: the reader is
+woken and arms a receive without `POLL_FIRST` when it parks again, and a
+TLS connection that receives after each completion (during the handshake,
+or after a hangup) re-arms at once.
+
+The saving is measured at depth 1 only (Evidence, "Poll first"). A
+connection whose next bytes arrive between a completion that emptied the
+socket and the next arm (a pipelining client, or a message larger than one
+receive) takes the poll arm and a task_work issue in place of a plain
+receive; that cost is not measured.
 
 ### The buffer in flight
 
@@ -675,7 +729,8 @@ those, receives into a buffer grown for a `NeedAtLeast` of at least
 `POOL_ALLOCATED` (borrowed buffers that came from the pool, and ones
 allocated because none fit), `HANGUP` (connections closed because a hangup
 peek found the stream ended with no receive in flight and nothing
-buffered). Copies on a direct connection still count in
+buffered), `POLL_FIRST` (of `ARMED`, receives armed with
+`IORING_RECVSEND_POLL_FIRST`). Copies on a direct connection still count in
 `ringline/recv_ring` `BYTES_COPIED`.
 
 ## Tests
@@ -747,6 +802,15 @@ buffered). Copies on a direct connection still count in
   counters): 70,000-byte messages in 64 KiB and 1 MiB writes copy at most a
   quarter of a byte per byte received; 500 B messages at most 1/20; 1 MiB
   messages at most 1/5, with at least one known-length receive.
+- `POLL_FIRST` (`event_loop.rs`, `engine/uring.rs`, `connection.rs` unit
+  tests): a receive that returned bytes without `SOCK_NONEMPTY` arms the
+  next one with `POLL_FIRST`, read from the SQE the ring took; one with
+  `SOCK_NONEMPTY` does not; a Unix-domain connection never does; a
+  `-EAGAIN` completion keeps the connection open and the next receive is
+  plain, on an established TLS connection too, and on a TLS connection
+  mid-handshake it is re-armed at once;
+  the flag clears with the slot; the encoded SQE differs from a plain
+  receive only in `ioprio` bit 0. Each fails with its rule removed.
 - `event_loop.rs` unit tests: a synthetic `RecvDirect` completion with data
   for a connection whose generation moved on is not attached to the slot's
   new occupant, and its slab entry is freed (fails with the generation
@@ -858,6 +922,10 @@ closed or merged without a release.
   more runs agree.
 - Why `c` costs 2 to 4% more CPU per GET at 64 B depth 1 (Evidence,
   "Scale").
+- The cost of `POLL_FIRST` to a connection whose next bytes arrive before
+  the receive is armed (a pipelining client, or a message larger than one
+  receive), and its saving beyond loopback (Mechanism,
+  "Poll first after an empty socket").
 - A `ForwardToFuture` dropped by `handle_close` (which tears down another
   connection's task without `CURRENT_DRIVER` set) cannot clear
   `direct_forwarding`, so later forwards from its source are refused with

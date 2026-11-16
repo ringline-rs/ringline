@@ -48,12 +48,16 @@ pub(crate) enum Op {
         buf_group: u16,
     },
     /// One-shot `recv(2)` of up to `len` bytes into `buf` with `flags` (0, or
-    /// `MSG_PEEK | MSG_DONTWAIT` for the hangup peek).
+    /// `MSG_PEEK | MSG_DONTWAIT` for the hangup peek). With `poll_first`, the
+    /// SQE carries `IORING_RECVSEND_POLL_FIRST`: the kernel arms a poll
+    /// instead of first trying the receive, which skips a receive attempt
+    /// that would find the socket empty (Linux 5.19).
     Recv {
         fd: Fd,
         buf: *mut u8,
         len: u32,
         flags: i32,
+        poll_first: bool,
     },
     /// Multishot accept; `flags` are `accept4(2)` flags.
     AcceptMulti {

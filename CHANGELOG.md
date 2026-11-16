@@ -363,6 +363,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   On a TLS connection admission is sized by the *ciphertext* bound. Final PR
   of the series that lands #318.
 
+### Performance
+
+- io_uring: after a direct receive on a TCP connection returns bytes and
+  leaves the socket empty (no `IORING_CQE_F_SOCK_NONEMPTY`), the next
+  receive is armed with `IORING_RECVSEND_POLL_FIRST`, which skips a receive
+  attempt that would find the socket empty (#840). In a one-worker echo at
+  depth 1 over loopback on Linux 6.12, server CPU per byte fell 1.9% at
+  64-byte messages and 1.2% at 16 KiB. `ringline/recv_direct` `op=poll_first`
+  counts these receives.
+
 ### Changed
 
 - **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` (on
