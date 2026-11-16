@@ -78,7 +78,7 @@ Everything a request needs rides inside those batched enters as SQEs and CQEs:
 | Zero-copy notification | **0** | The "DMA done, guard can drop" signal is a second CQE on the same SQE, not a syscall. |
 | Timer arm/fire | **0** | A deadline in the worker's heap. The earliest deadline, or the next tick if sooner, is the timeout of the blocking `io_uring_enter` (`IORING_ENTER_EXT_ARG`); no SQE or CQE. |
 | Outbound connect | **0 dedicated** | Connect SQE. A connect timeout is a deadline that bounds the worker's wait; when it passes, an `ASYNC_CANCEL` of the connect. A plaintext connection then arms one `POLL_ADD(POLLRDHUP)` SQE (`docs/recv-direct-design.md`). |
-| Accept | 1 per connection | The dedicated acceptor thread runs non-blocking `accept4()` until `EAGAIN`, then one `poll` on the listener and the stop signal, and hands the fd to a worker over a channel, waking it via eventfd write. The worker's side of that wake is an eventfd-read *SQE* — no syscall on the worker. This is one-time per connection, not per request. |
+| Accept | 1 per connection, plus a failing `accept4()` and a `poll` each time the backlog empties | The dedicated acceptor thread runs non-blocking `accept4()` until `EAGAIN`, then one `poll` on the listener and the stop signal, and hands the fd to a worker over a channel, waking it via eventfd write. The worker's side of that wake is an eventfd-read *SQE* — no syscall on the worker. This is one-time per connection, not per request. |
 
 So in steady state:
 
@@ -111,7 +111,7 @@ loop can apply:
 | Wait | 1 per iteration | `poll.poll()` (`epoll_wait`/`kevent`) with a timer-heap-derived timeout. Amortizes over every ready connection in the batch. |
 | Drain a readable connection | N per wake on Linux TCP when the last read is short; otherwise N+1 | mio registrations are edge-triggered, so `handle_readable` drains the socket. On Linux TCP a read that leaves its 8192-byte buffer unfilled ends the drain, and a later FIN or urgent mark raises its own event. The reads run on to `WouldBlock` or `0` when the event reports either of those, on TLS, on a Unix socket, on other platforms, and when the last read fills the buffer. Pipelined requests arriving together share one read. |
 | Flush sends | ≥1 per dirty connection per pass | `Driver::flush_sends` gathers the connection's whole pending queue into one `writev()` (up to 1024 iovecs), looping only if the queue didn't fit or until `WouldBlock`. |
-| Accept | 1 per connection | Same acceptor thread, which runs non-blocking `accept()` and `fcntl()` until `EAGAIN`, then one `poll`; the wake pipe's read end is registered in the poll, so the worker pays a `read()` to drain it per wake (coalescing any number of pending accepts). |
+| Accept | 1 per connection on Linux (`accept4()`), 5 on macOS (`accept()` and four `fcntl()`), plus a failing accept and a `poll` each time the backlog empties | Same acceptor thread, which accepts until `EAGAIN`, then one `poll`; the wake pipe's read end is registered in the poll, so the worker pays a `read()` to drain it per wake (coalescing any number of pending accepts). |
 
 A request-response exchange on an otherwise idle Linux TCP connection therefore
 costs 3 syscalls: a read, a writev and an `epoll_wait`, measured on Linux 7.2

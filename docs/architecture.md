@@ -67,7 +67,7 @@ not edit the SVG by hand. In text: the caller starts N independent workers,
 each containing one handler, executor, connection table, backend driver, and
 backend poll object. When a stream listener is configured, one centralized
 acceptor accepts from a non-blocking listener until it is empty, then waits in
-`poll` on the listener and the runtime's stop signal, sends each accepted descriptor through a
+`poll` on the listener and the runtime's stop signal. It sends each accepted descriptor through a
 bounded per-worker channel, then writes that worker's eventfd or pipe. Optional
 service pools return results through per-worker channels and use the same
 cross-thread wake mechanism. A shared atomic shutdown flag and the per-worker
@@ -306,7 +306,8 @@ the stop signal the acceptors poll, sets `SO_REUSEADDR` and calls
 `shutdown(SHUT_RD)` on each listener socket, wakes every worker, and joins the
 acceptor threads. On Linux `SHUT_RD` takes the socket out of the listening
 state. An acceptor in `poll` wakes on the stop signal; one holding a connection
-no worker has room for sees the flag within about 1 ms. Each listener's sockets are owned
+no worker has room for sees the flag within about 1 ms, and one backing off
+after an accept error within 10 ms. Each listener's sockets are owned
 by a shared `ListenerSockets`. Every thread that passes their fd numbers to a
 syscall holds it, and the sockets close when the last holder drops it: after
 shutdown, when the acceptor thread or, in merged accept mode

@@ -69,7 +69,7 @@ The io_uring backend has this worker-local shape:
 ```
                       ┌─────────────────────────────┐
                       │        Acceptor Thread       │
-                      │   blocking accept4() loop    │
+                      │ accept4() until EAGAIN, poll │
                       └──────────┬──────────────────┘
                                  │ round-robin
           ┌──────────────────────┼──────────────────────┐

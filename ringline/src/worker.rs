@@ -463,10 +463,11 @@ impl Runtime {
     /// The listeners stop accepting at once. A listener's sockets close, and
     /// its port is free, once the threads accepting on it have exited: its
     /// acceptor thread, or with the `unstable-accept` feature in merged accept
-    /// mode the workers. An acceptor exits at once, or within about 1 ms if it
-    /// holds a connection no worker has room for, and this method returns
-    /// after every acceptor thread has exited. This `Runtime` does not hold
-    /// the sockets open.
+    /// mode the workers. An acceptor exits at once, within about 1 ms if it
+    /// holds a connection no worker has room for, or within 10 ms if it is
+    /// backing off after `EMFILE` or a similar error. This method, and any
+    /// call made while it runs, returns after every acceptor thread has
+    /// exited. This `Runtime` does not hold the sockets open.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
     }
@@ -603,29 +604,34 @@ impl RuntimeShutdown {
     /// May run on a worker thread (`shutdown_for_panic`, `worker_exited`).
     /// The join does not wait on that worker: with the flag set, an acceptor
     /// holding a connection leaves `send_when_room` within
-    /// `ROOM_POLL_INTERVAL`, and one in `poll` wakes on the stop signal.
+    /// `ROOM_POLL_INTERVAL`, one backing off after an accept error within
+    /// `ACCEPT_ERROR_BACKOFF`, and one in `poll` wakes on the stop signal.
     pub(crate) fn shutdown(&self) {
         self.flag.store(true, Ordering::Release);
         // An acceptor parked on a gate that was never opened is not in
         // `poll`; this releases it, and after this call no gate starts a
         // socket listening.
         self.listen_gates.shutdown();
-        // After the flag: an acceptor woken by the signal sees it set.
+        // Wakes every acceptor in `poll`; `wait_for_connection` returning
+        // false ends it.
         self.stop.raise();
         let listeners =
             std::mem::take(&mut *self.listeners.lock().unwrap_or_else(|e| e.into_inner()));
         for (sockets, _) in listeners {
-            // Wakes an acceptor blocked in `accept4`, and in merged mode ends
-            // the multishot accept a worker has armed on each socket.
+            // In merged mode, ends the multishot accept a worker has armed on
+            // each socket; on Linux, takes a pool socket out of the listening
+            // state.
             sockets.shut_down();
         }
         // Wake all workers so they see the flag even if blocked on I/O.
         for wh in self.wake.iter() {
             wh.wake();
         }
-        let acceptors =
-            std::mem::take(&mut *self.acceptors.lock().unwrap_or_else(|e| e.into_inner()));
-        for acceptor in acceptors {
+        // Held across the joins, so a concurrent caller (a worker's
+        // `worker_exited` beside `wait_on_signal`) waits for them too. No
+        // acceptor takes this lock.
+        let mut acceptors = self.acceptors.lock().unwrap_or_else(|e| e.into_inner());
+        for acceptor in acceptors.drain(..) {
             // A panic in an acceptor has already been reported by the panic
             // hook, and the listener is shut down either way.
             let _ = acceptor.join();
@@ -1902,8 +1908,8 @@ impl RinglineBuilder {
         // initialization. Before this point clients cannot connect or enter a
         // kernel listen backlog.
         //
-        // One acceptor thread per listener, each blocking in its own accept4
-        // and feeding the same worker channels. Accepts from different
+        // One acceptor thread per listener, each accepting from its own
+        // socket and feeding the same worker channels. Accepts from different
         // listeners interleave on those channels; each carries its own
         // `ListenerId` so the handler can tell them apart.
         let listeners: Vec<ListenerHandle> = if has_acceptor {
@@ -3199,7 +3205,9 @@ mod worker_exit_tests {
 
     /// `shutdown` returns after the acceptor thread has exited, so the
     /// listener's socket is closed when it returns. Nothing connects, so the
-    /// acceptor is in `poll` and only the stop signal wakes it.
+    /// acceptor is in `poll`; on macOS only the stop signal wakes it, and on
+    /// Linux `SHUT_RD` also does. `shutdown_joins_every_acceptor` checks the
+    /// join without that race.
     #[test]
     fn shutdown_returns_after_the_acceptor_has_exited() {
         let (runtime, handles, _fault) = launch(1, AcceptMode::Pool, TaskPanicPolicy::Contain);
@@ -3210,6 +3218,60 @@ mod worker_exit_tests {
             "shutdown returned while the acceptor still held the listener"
         );
         wait_for_exit(&handles, 1);
+    }
+
+    fn bare_shutdown() -> super::RuntimeShutdown {
+        super::RuntimeShutdown::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crate::listen_gate::ListenGates::new(0, 128),
+            Arc::from(Vec::new()),
+        )
+        .expect("runtime shutdown")
+    }
+
+    /// A thread that sets `done` after `delay`, for `shutdown` to join.
+    fn slow_acceptor(delay: Duration) -> (JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>) {
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            set.store(true, Ordering::Release);
+        });
+        (handle, done)
+    }
+
+    /// `shutdown` returns only after every acceptor thread it holds has
+    /// exited.
+    #[test]
+    fn shutdown_joins_every_acceptor() {
+        let shutdown = bare_shutdown();
+        let (handle, done) = slow_acceptor(Duration::from_millis(200));
+        shutdown.add_acceptor(handle);
+        shutdown.shutdown();
+        assert!(
+            done.load(Ordering::Acquire),
+            "shutdown returned before the join"
+        );
+    }
+
+    /// A second `shutdown` made while the first is joining waits for the same
+    /// acceptors, rather than returning because the first has taken them.
+    #[test]
+    fn a_concurrent_shutdown_waits_for_the_acceptors() {
+        let shutdown = Arc::new(bare_shutdown());
+        let (handle, done) = slow_acceptor(Duration::from_millis(300));
+        shutdown.add_acceptor(handle);
+        let first = {
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || shutdown.shutdown())
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        shutdown.shutdown();
+        assert!(
+            done.load(Ordering::Acquire),
+            "the second shutdown returned while the first was joining"
+        );
+        first.join().expect("first shutdown panicked");
     }
 
     /// With nobody in `wait_on_signal`, the `Shutdown` policy stops the runtime.

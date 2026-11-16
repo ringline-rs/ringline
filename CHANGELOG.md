@@ -386,13 +386,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- `Runtime::shutdown` (and dropping the `Runtime`) returns after every
-  pool-mode acceptor thread has exited, so a listener's socket is closed and
-  its port free when it returns. The acceptor now waits in `poll` on the
-  listener and a stop signal on every platform and accepts until `EAGAIN`,
-  in place of a blocking `accept4` on Linux. The listening socket is left
-  `O_NONBLOCK` on Linux too; the flag is on the open file description, so
-  another process holding the socket sees it.
+- `Runtime::shutdown` (and dropping the `Runtime`) returns once every
+  pool-mode acceptor thread has exited, so a pool-mode listener's port is
+  free when it returns. It may block for up to 10 ms while an acceptor
+  finishes.
 - **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` (on
   `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`, resolving with
   `data.len()`, instead of `io::Result<()>`. `send_parts().build(f)`

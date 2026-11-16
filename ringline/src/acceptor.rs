@@ -104,9 +104,10 @@ pub(crate) fn apply_accepted_sockopts(fd: RawFd, nodelay: bool) {
 ///
 /// Accepts connections with `accept_nonblock` until the listener has none,
 /// then waits in `poll` on the listener and the stop signal. Distributes the
-/// connections to workers round-robin, waking each worker via eventfd. One of these runs
-/// per listener; they share the worker channels, so accepts from different
-/// listeners interleave and each carries its own `ListenerId`.
+/// connections to workers round-robin, waking each worker through its wake
+/// fd. One of these runs per listener; they share the worker channels, so
+/// accepts from different listeners interleave and each carries its own
+/// `ListenerId`.
 pub fn run_acceptor(config: AcceptorConfig) {
     let num_workers = config.worker_channels.len();
     if num_workers == 0 {
@@ -279,14 +280,13 @@ pub(crate) fn classify_accept_error(errno: i32) -> AcceptErrorAction {
     match errno {
         // Not a socket, or not listening (also what `SHUT_RD` gives).
         libc::EBADF | libc::ENOTSOCK | libc::EINVAL => AcceptErrorAction::Stop,
-        // EINTR: a signal. EAGAIN: `run_acceptor` waits for a connection
-        // before it gets here, so this case is not reached from it.
-        // ECONNABORTED, ECONNRESET and
-        // EPERM end one pending connection. EPROTO, ENETDOWN, ENETUNREACH,
-        // EHOSTDOWN, EHOSTUNREACH, ENONET, EOPNOTSUPP and ENOPROTOOPT are the
-        // errors accept(2) says Linux passes through from the new socket, to
-        // be retried like EAGAIN; ETIMEDOUT is one it says some kernels
-        // return. EOPNOTSUPP also means a listener that is not SOCK_STREAM,
+        // EINTR: a signal. EAGAIN: `run_acceptor` handles it before calling
+        // this, by waiting in `wait_for_connection`. ECONNABORTED, ECONNRESET
+        // and EPERM end one pending connection. EPROTO, ENETDOWN,
+        // ENETUNREACH, EHOSTDOWN, EHOSTUNREACH, ENONET, EOPNOTSUPP and
+        // ENOPROTOOPT are the errors accept(2) says Linux passes through from
+        // the new socket, to be retried like EAGAIN; ETIMEDOUT is one it says
+        // some kernels return. EOPNOTSUPP also means a listener that is not SOCK_STREAM,
         // which cannot occur here: ringline creates every listener itself.
         libc::EINTR
         | libc::EAGAIN
@@ -311,7 +311,7 @@ pub(crate) fn classify_accept_error(errno: i32) -> AcceptErrorAction {
 }
 
 /// How often an acceptor waiting for queue room counts the wait.
-const SHUTDOWN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const QUEUE_FULL_COUNT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How often an acceptor holding a connection retries the full queues.
 const ROOM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
@@ -348,7 +348,7 @@ fn send_when_room(config: &AcceptorConfig, alive: &mut [bool], accepted: Accepte
         if !alive.contains(&true) || config.shutdown_flag.load(Ordering::Acquire) {
             return false;
         }
-        if counted.elapsed() >= SHUTDOWN_CHECK_INTERVAL {
+        if counted.elapsed() >= QUEUE_FULL_COUNT_INTERVAL {
             crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_QUEUE_FULL);
             counted = std::time::Instant::now();
         }
@@ -436,9 +436,9 @@ mod tests {
 
         let gates = crate::listen_gate::ListenGates::new(1, 128);
         // `TcpListener::bind` listens, so an acceptor that skipped the gate
-        // would block in `accept4` rather than exit. The assertions below
+        // would wait in `poll` rather than exit. The assertions below
         // separate the two: a gated acceptor exits on `gates.shutdown()`, one
-        // blocked in `accept4` does not.
+        // in `poll` does not.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let (tx, _rx) = crate::handoff::bounded::<AcceptedConn>(1);
 
@@ -557,8 +557,8 @@ mod tests {
     /// An acceptor whose listener stops accepting while the runtime is not
     /// shutting down exits and counts it, instead of exiting unseen.
     ///
-    /// Linux only: `SHUT_RD` makes `accept4` fail with `EINVAL` there; other
-    /// platforms do not wake a blocked `accept` that way.
+    /// Linux only: there `SHUT_RD` makes `poll` report the listener and
+    /// `accept4` fail with `EINVAL`; on macOS it does not wake `poll`.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_acceptor_whose_listener_dies_stops_and_counts_it() {
@@ -613,10 +613,6 @@ mod tests {
 
     /// A connection no worker has room for is held until one does, rather than
     /// closed (#658), and the worker is woken for it.
-    ///
-    /// Linux only: the test ends the acceptor by shutting its sockets down,
-    /// and other platforms see shutdown through the flag.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_connection_every_worker_is_too_busy_for_waits_for_room() {
         use std::io::{Read, Write};
@@ -625,6 +621,7 @@ mod tests {
         let (read_fd, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
         let (addr, sockets, gates, rx, config) = acceptor_with_a_full_queue(wake);
         let shutdown_flag = Arc::clone(&config.shutdown_flag);
+        let stop = config.stop.clone();
         let before = queue_full_count();
         let handle = std::thread::spawn(move || run_acceptor(config));
 
@@ -668,16 +665,16 @@ mod tests {
         served.read_exact(&mut request).expect("read the request");
         assert_eq!(&request, b"go");
 
-        // As `RuntimeShutdown::shutdown` does: the flag first, so the
-        // acceptor reads the `EINVAL` that `SHUT_RD` causes as shutdown.
+        // As `RuntimeShutdown::shutdown` does: the flag, then the stop signal.
         shutdown_flag.store(true, Ordering::Release);
         gates.shutdown();
+        stop.raise();
         sockets.shut_down();
         handle.join().expect("acceptor panicked");
     }
 
     /// An acceptor holding a connection does not wait for the workers to exit
-    /// at shutdown, as a blocked `accept4` does not.
+    /// at shutdown.
     #[test]
     fn shutdown_ends_an_acceptor_waiting_for_room() {
         use std::time::Duration;
@@ -760,6 +757,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(!waiter.is_finished(), "returned with nothing to accept");
         raiser.raise();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !waiter.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(waiter.is_finished(), "the stop signal did not end the wait");
         assert!(!waiter.join().expect("waiter panicked"));
         // `listener` is still listening: nothing but the signal woke the wait.
         drop(listener);
@@ -806,11 +808,11 @@ mod tests {
         handle.join().expect("acceptor panicked");
     }
 
-    /// `Runtime::shutdown` wakes an acceptor blocked in `accept4` by shutting
-    /// its listener's sockets down, and leaves the fd open for the acceptor to
-    /// drop.
+    /// On Linux, `SHUT_RD` alone also ends an acceptor in `poll`: `poll`
+    /// reports the listener and `accept4` fails with `EINVAL`. `shut_down`
+    /// leaves the fd open for the acceptor to drop.
     ///
-    /// Linux only: other platforms see shutdown through the flag.
+    /// Linux only: on macOS `SHUT_RD` does not wake `poll`.
     #[cfg(target_os = "linux")]
     #[test]
     fn shutting_the_sockets_down_ends_a_blocked_acceptor() {
