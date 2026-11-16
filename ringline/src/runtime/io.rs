@@ -3426,11 +3426,11 @@ impl SendHalf {
     /// (`POLLOUT`). Sends nothing and takes no send-pool slot.
     ///
     /// A server that sends a large reply in pieces awaits this before each
-    /// piece, so that a piece takes send-pool slots only once its
-    /// socket has room for it, and a peer that stops reading holds no slots
-    /// for the pieces it has not taken. On Linux, TCP reports `POLLOUT` once the memory
-    /// queued in the socket is at most two thirds of its send buffer, so a
-    /// piece whose bytes and per-segment overhead fit in a third of the
+    /// piece, so that a piece takes send-pool slots only once its socket has
+    /// room for it, and a peer that stops reading holds no slots for the
+    /// pieces it has not taken. On Linux, TCP reports `POLLOUT` once the
+    /// memory queued in the socket is at most two thirds of its send buffer,
+    /// so a piece whose bytes and per-segment overhead fit in a third of the
     /// buffer goes into the socket whole.
     ///
     /// Bytes this connection has queued and not yet handed to the socket
@@ -4429,6 +4429,11 @@ impl Drop for SendBufferSize {
                     let state = &mut driver.send_queues[conn_index as usize];
                     state.send_buf_task = None;
                     state.send_buf_result = None;
+                    // An install still queued for a full SQ would otherwise
+                    // be submitted for the next future on the connection.
+                    driver
+                        .pending_send_buf_installs
+                        .retain(|&entry| entry != (conn_index, generation));
                 }
             });
         }

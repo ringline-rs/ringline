@@ -20335,9 +20335,15 @@ mod tests {
         let ud = UserData::encode(OpTag::SendBufInstall, conn_index, generation).raw();
         dispatch_and_poll(&mut el, ud, installed, 0);
         assert_eq!(seen.get(), Some(Ok(expected as usize)));
-        assert_eq!(
-            unsafe { libc::fcntl(installed, libc::F_GETFD) },
-            -1,
+        // Closed: the number is free, or another test thread has since
+        // reused it for something other than this socket.
+        let ino = |fd: i32| {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino)
+        };
+        let now = ino(installed);
+        assert!(
+            now.is_none() || now != ino(ours.as_raw_fd()),
             "the installed fd was closed"
         );
     }
@@ -20359,12 +20365,17 @@ mod tests {
             "no future waits: nothing submitted"
         );
 
-        let seen = send_buf_task(&mut el, ConnCtx::new(conn_index, generation));
-        // As if the SQ had had no room for the future's install.
-        el.driver
-            .pending_send_buf_installs
-            .push((conn_index, generation));
+        // The SQ has no room for the future's install: it waits on the retry
+        // list instead of failing.
         el.driver.ring.last_pushed = None;
+        el.driver.ring.force_push_failures(1);
+        let seen = send_buf_task(&mut el, ConnCtx::new(conn_index, generation));
+        assert_eq!(seen.get(), None, "a full SQ does not fail the future");
+        assert!(el.driver.ring.last_pushed.is_none());
+        assert_eq!(
+            el.driver.pending_send_buf_installs,
+            [(conn_index, generation)]
+        );
         el.drain_send_pollout_retries();
         assert!(
             matches!(
