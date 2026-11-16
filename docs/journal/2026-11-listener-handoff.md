@@ -200,8 +200,9 @@ the first had taken the list of acceptor threads; the lock is now held across
 the joins.
 
 Connect rate, one io_uring worker, pool mode, `caps=1024`, 8 client threads,
-Linux 6.12.116 x86_64 (`debian-13-6.12`), four 10 s rounds per experiment,
-submitted alternately (measured):
+Linux 6.12.116 x86_64 (`debian-13-6.12`), an 8 vCPU guest, four 10 s rounds
+per experiment, submitted alternately, four a side, then two more at `main`,
+all on hv01 (measured):
 
 | arm | experiment | median of 4 rounds, conns/s |
 | --- | --- | --- |
@@ -220,13 +221,15 @@ The six `main` medians span 19,173 to 19,472 (300 conns/s); the four PR 1
 medians span 19,251 to 19,305. The median of the PR 1 medians, 19,291, is 79
 below that of `main`'s, 19,370 (0.4%), inside the `main` spread: GO under the
 rule above. Mean connection latency was 397 to 408 µs in every round, and
-`accept_queue_full` and connect errors were 0. The fix commit after these runs
-changes the shutdown join, tests and docs, not the accept path. The mio
+`accept_queue_full` and connect errors were 0. The two commits after these
+runs change the shutdown join, tests, docs and one constant's name, not the
+accept path. The mio
 backend was not measured.
 
 The rate is lower than the 32,000 conns/s the queue-full poll entry measured
-at 4509097c on the same image; these runs did not look into why, and both arms
-share it.
+at 4509097c with the same image. That run had a 16 vCPU guest on hv03; these
+ran in an 8 vCPU guest on hv01 (`nproc` in each log). They did not test which
+difference lowers the rate, and both arms share it.
 
 ## Tests planned
 
