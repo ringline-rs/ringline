@@ -654,13 +654,14 @@ mod tests {
                 needs_cq: 65536
             })
         );
-        // 16384, as the benchmark servers set, also needs 65536.
-        let bench = RingSizes {
+        // 16384 also needs 65536: its proportion would be 131072, so the
+        // configured CQ is reported.
+        let at_16384 = RingSizes {
             max_connections: 16384,
             ..defaults()
         };
         assert_eq!(
-            fit_ring_sizes(bench, set, under(8 * MIB, 8)),
+            fit_ring_sizes(at_16384, set, under(8 * MIB, 8)),
             Err(FitStop::MaxConnections {
                 max_connections: 16384,
                 needs_cq: 65536

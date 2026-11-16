@@ -175,7 +175,7 @@ fn launch_fits_default_rings_to_a_low_memlock_limit() {
 
     // A max_connections set on the builder above what a smaller CQ holds in
     // the defaults' proportion stops the fit, and the error says so: 16384
-    // connections, as the benchmark servers set, need a CQ of 65536.
+    // connections need a CQ of 65536.
     let err = launch(|| builder().max_connections(16384).sq_entries(256))
         .err()
         .expect("launch must refuse when the connections need the full CQ");

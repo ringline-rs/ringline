@@ -630,7 +630,6 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         .pin_to_core(pin_to_core)
         .sq_entries(256)
         .prefault_buffers(prefault_buffers)
-        .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
         .build()
@@ -887,7 +886,6 @@ fn run_ringline(cfg: EchoCfg) {
         .sq_entries(256)
         .prefault_buffers(prefault_buffers)
         .defer_recv_arm(defer_recv_arm)
-        .max_connections(16384)
         // With --tls the slot must hold one whole TLS record (16413 bytes at
         // the default fragment size), which the unbuffered engine requires.
         .send_pool(
