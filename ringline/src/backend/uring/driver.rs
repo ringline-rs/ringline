@@ -903,6 +903,9 @@ pub(crate) struct Driver {
     /// `SendPollProbe`s the SQ had no room for: (conn_index, generation).
     /// Drained each tick, with the `SendPollOut` retries.
     pub(crate) pending_send_probe_retries: Vec<(u32, u32)>,
+    /// `send_buffer_size` installs the SQ had no room for:
+    /// (conn_index, generation). Drained each tick, with the probe retries.
+    pub(crate) pending_send_buf_installs: Vec<(u32, u32)>,
     /// (conn_index, generation) of connections whose close was requested
     /// while a `writable` future was registered on them. The event loop
     /// wakes those futures before it polls tasks (`wake_writable_on_close`):
@@ -1399,6 +1402,7 @@ impl Driver {
             pending_resubmit_retries: Vec::new(),
             pending_send_pollout_retries: Vec::new(),
             pending_send_probe_retries: Vec::new(),
+            pending_send_buf_installs: Vec::new(),
             writable_close_wakes: Vec::new(),
             send_backstop_list: Vec::new(),
             send_backstop_scratch: Vec::new(),
@@ -2262,6 +2266,21 @@ impl Driver {
                 .push((conn_index, generation));
             SendProbe::Pending
         };
+    }
+
+    /// Submit the `FixedFdInstall` of a `send_buffer_size` future on
+    /// `conn_index`, or queue it on `pending_send_buf_installs` if the SQ is
+    /// full: a full SQ is backpressure, not the future's error.
+    pub(crate) fn submit_send_buf_install(&mut self, conn_index: u32) {
+        let generation = self.connections.generation(conn_index);
+        if self
+            .ring
+            .submit_send_buf_install(conn_index, generation)
+            .is_err()
+        {
+            self.pending_send_buf_installs
+                .push((conn_index, generation));
+        }
     }
 
     /// Submit the `Close` of a connection whose close is committed, after

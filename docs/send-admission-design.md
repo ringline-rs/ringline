@@ -994,11 +994,12 @@ compile.
   and dropping the registered one of two futures left the other unwoken.
 - `SendHalf::send_buffer_size` and `Connection::send_buffer_size` return the
   socket's `SO_SNDBUF` (the kernel's `sk_sndbuf`). It is a future on both
-  backends, since on io_uring it is a round trip through the ring: through a
-  socket `URING_CMD` getsockopt, as `SetSockOpt` already does for
-  setsockopt, and on mio from the `TcpStream`. A server sizes its pieces as
-  min(`send_buffer_size` / 3, 128 KiB), Experiment D's recommendation, read
-  per reply since the buffer grows with the connection.
+  backends, since on io_uring it is a round trip through the ring: it installs
+  a real descriptor for the fixed file (`IORING_OP_FIXED_FD_INSTALL`), reads
+  the option and closes the descriptor; on mio it reads the `TcpStream`'s. A
+  server sizes its pieces as min(`send_buffer_size` / 3, 128 KiB), Experiment
+  D's recommendation, read per reply since the buffer grows with the
+  connection.
 - A gate does not wait for a send that waits in the FIFO on its connection.
   Such a send, admitted after the gate opens, can take the room a piece was
   gated for; bytes stay in order, but the piece may not go in whole.

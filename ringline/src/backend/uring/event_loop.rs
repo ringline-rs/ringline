@@ -5194,6 +5194,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             self.driver.arm_send_probe(conn_index);
         }
+        for (conn_index, generation) in std::mem::take(&mut self.driver.pending_send_buf_installs) {
+            if self.driver.connections.generation(conn_index) != generation {
+                continue;
+            }
+            let state = &self.driver.send_queues[conn_index as usize];
+            if state.send_buf_task.is_none() || state.close_submitted {
+                continue;
+            }
+            self.driver.submit_send_buf_install(conn_index);
+        }
     }
 
     /// Test-only: inject multiple NOPs and dispatch them all in one batch.
@@ -20275,6 +20285,97 @@ mod tests {
         let poll = pollout_ud(&el, ci);
         dispatch_and_poll(&mut el, poll, libc::POLLOUT as i32, 0);
         assert_eq!(seen.get(), Some(Ok(())));
+    }
+
+    /// What a `send_buffer_size` task resolved with.
+    type SendBufSeen = std::rc::Rc<std::cell::Cell<Option<Result<usize, io::ErrorKind>>>>;
+
+    fn send_buf_task(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> SendBufSeen {
+        let seen: SendBufSeen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = seen.clone();
+        run_task(el, async move {
+            let result = ctx.send_buffer_size().await;
+            record.set(Some(result.map_err(|e| e.kind())));
+        });
+        seen
+    }
+
+    /// The install's fd is read for `SO_SNDBUF` and closed, and the future
+    /// resolves with the value.
+    #[test]
+    fn send_buffer_size_reads_the_installed_fd_and_closes_it() {
+        use std::os::fd::AsRawFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (ours, _peer) = attach_socketpair(&mut el, conn_index);
+        let seen = send_buf_task(&mut el, ConnCtx::new(conn_index, generation));
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::FixedFdInstall { index } if index == conn_index
+            ),
+            "the install was pushed"
+        );
+        assert_eq!(seen.get(), None);
+        let mut expected: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                ours.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw mut expected).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        let installed = unsafe { libc::dup(ours.as_raw_fd()) };
+        assert!(installed >= 0);
+        let ud = UserData::encode(OpTag::SendBufInstall, conn_index, generation).raw();
+        dispatch_and_poll(&mut el, ud, installed, 0);
+        assert_eq!(seen.get(), Some(Ok(expected as usize)));
+        assert_eq!(
+            unsafe { libc::fcntl(installed, libc::F_GETFD) },
+            -1,
+            "the installed fd was closed"
+        );
+    }
+
+    /// An install the SQ had no room for is submitted by the retry drain
+    /// while its future waits, and a failed install fails the future.
+    #[test]
+    fn a_send_buffer_install_the_sq_refused_is_submitted_by_the_retry_drain() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver
+            .pending_send_buf_installs
+            .push((conn_index, generation));
+        el.driver.ring.last_pushed = None;
+        el.drain_send_pollout_retries();
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "no future waits: nothing submitted"
+        );
+
+        let seen = send_buf_task(&mut el, ConnCtx::new(conn_index, generation));
+        // As if the SQ had had no room for the future's install.
+        el.driver
+            .pending_send_buf_installs
+            .push((conn_index, generation));
+        el.driver.ring.last_pushed = None;
+        el.drain_send_pollout_retries();
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::FixedFdInstall { index } if index == conn_index
+            ),
+            "the retry drain submitted the install"
+        );
+        let ud = UserData::encode(OpTag::SendBufInstall, conn_index, generation).raw();
+        dispatch_and_poll(&mut el, ud, -libc::EINVAL, 0);
+        assert_eq!(seen.get(), Some(Err(io::ErrorKind::InvalidInput)));
     }
 
     /// A probe the SQ had no room for is armed by the retry drain only while

@@ -3033,7 +3033,9 @@ impl Connection {
         self.tx.send_admitted(data)
     }
 
-    /// See [`SendHalf::writable`].
+    /// See [`SendHalf::writable`]. The future borrows the whole
+    /// connection, so a task that reads while it waits uses
+    /// [`split`](Self::split).
     pub fn writable(&mut self) -> impl Future<Output = io::Result<()>> {
         self.tx.writable()
     }
@@ -3426,7 +3428,7 @@ impl SendHalf {
     /// A server that sends a large reply in pieces awaits this before each
     /// piece, so that a piece takes send-pool slots only once its
     /// socket has room for it, and a peer that stops reading holds no slots
-    /// for the pieces it has not taken. TCP reports `POLLOUT` once the memory
+    /// for the pieces it has not taken. On Linux, TCP reports `POLLOUT` once the memory
     /// queued in the socket is at most two thirds of its send buffer, so a
     /// piece whose bytes and per-segment overhead fit in a third of the
     /// buffer goes into the socket whole.
@@ -3497,16 +3499,17 @@ impl SendHalf {
         self.conn.writable()
     }
 
-    /// The socket's send buffer in bytes (`SO_SNDBUF`, the kernel's
-    /// `sk_sndbuf`), which grows with the connection while the kernel tunes
-    /// it. A server that sends a large reply in pieces gated on
-    /// [`writable`](Self::writable) sizes each piece from it: a piece whose
-    /// bytes and per-segment overhead fit in a third of the buffer goes into
-    /// the socket whole once the gate opens.
+    /// The socket's send buffer in bytes (`SO_SNDBUF`; on Linux the kernel's
+    /// `sk_sndbuf`, which grows with the connection while the kernel tunes
+    /// it). A server that sends a large reply in pieces gated on
+    /// [`writable`](Self::writable) sizes each piece from it: on Linux a
+    /// piece whose bytes and per-segment overhead fit in a third of the
+    /// buffer goes into the socket whole once the gate opens.
     ///
     /// On io_uring the socket is a fixed file, so this installs a real
     /// descriptor for it with `IORING_OP_FIXED_FD_INSTALL`, reads the option
-    /// and closes the descriptor, one round trip through the ring. On mio it
+    /// and closes the descriptor, one round trip through the ring; a full
+    /// submission queue delays the install and does not fail it. On mio it
     /// reads the option at once.
     ///
     /// # Errors
@@ -4373,7 +4376,9 @@ impl Future for SendBufferSize {
         with_state(|driver, executor| {
             if let Some(e) = writable_refusal(driver, executor, this.conn_index, this.generation) {
                 #[cfg(has_io_uring)]
-                if std::mem::take(&mut this.submitted) {
+                if std::mem::take(&mut this.submitted)
+                    && driver.connections.generation(this.conn_index) == this.generation
+                {
                     driver.send_queues[this.conn_index as usize].send_buf_task = None;
                 }
                 return Poll::Ready(Err(e));
@@ -4394,12 +4399,7 @@ impl Future for SendBufferSize {
                     return pending(cx);
                 }
                 state.send_buf_result = None;
-                if let Err(e) = driver
-                    .ring
-                    .submit_send_buf_install(this.conn_index, this.generation)
-                {
-                    return Poll::Ready(Err(e));
-                }
+                driver.submit_send_buf_install(this.conn_index);
                 this.submitted = true;
                 driver.send_queues[this.conn_index as usize].send_buf_task = Some(task);
                 pending(cx)
@@ -5083,8 +5083,7 @@ impl SendCompletion {
     ///
     /// Read outside a task on the send's worker, it returns false until the
     /// future has resolved, and then the value taken with the result.
-    /// Experimental: a server that sends a large reply in pieces reads it per
-    /// piece, to count the pieces the socket did not take whole.
+    /// Hidden: `tests/writable_gate.rs` reads it.
     #[doc(hidden)]
     pub fn waited_for_room(&self) -> bool {
         if self.waited_for_room {

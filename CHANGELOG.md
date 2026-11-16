@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   handed to the kernel, without taking a send-pool slot. A server that sends
   a large reply in pieces awaits it before each piece, so a peer that stops
   reading holds no pool slots for the pieces it has not taken. The future
-  borrows its half mutably. It has no bound of its own; wrap it in
-  `ringline::timeout`.
+  borrows its half (or the whole `Connection`) mutably, so a task that reads
+  while it waits splits the connection first. It has no bound of its own;
+  wrap it in `ringline::timeout`.
 - `SendHalf::send_buffer_size` and `Connection::send_buffer_size`: the
   socket's `SO_SNDBUF`, for sizing those pieces. On io_uring it is one round
   trip through the ring (`IORING_OP_FIXED_FD_INSTALL`).
