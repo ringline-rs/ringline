@@ -5,11 +5,13 @@
   per byte in loopback's receive path, mostly waking the reader.
 - **Span:** Nov 2026 · follows Experiment C (`2026-11-send-admission-c.md`)
   · SystemsLab context `send-admission-expC`
-- **Commits:** commits cited here that are not on main are on
-  brayniac/ringline: the `exp/send-admission-*` branches, and
-  `docs/send-admission-expC`, which holds this entry's commits as they were
-  before they were squashed into main. The files under `experiments/` that
-  are cited here and are not on main are on `exp/send-admission-d-run`.
+- **Code:** the model and its sweep script are in the repository as merged
+  in #966. The gate, pieces and the harness that ran them are not in
+  ringline yet; the gate goes with the fast-path specification's PR. Runs
+  are identified by their SystemsLab experiment and build artifact ids; each
+  artifact's build experiment records the source it built. Specs and scripts
+  named under `experiments/` that are not in the repository are stored with
+  their SystemsLab experiments.
 
 ## Goal
 
@@ -44,16 +46,16 @@ against whole replies under O0 and O7w, and against pieces without the gate
 
 ## Prediction
 
-As committed in 618149b4, before any run: the design's "Prediction" list.
+As written before any run: the design's "Prediction" list.
 
 ## Results
 
 ### C1-D: the model
 
-`admission-model` at fbf4b3f9, sweep `experiments/send-admission-d-model.py`
-at 4c759ac0, seeds 1 to 5, N = 16, `admit_limit` = `settle_limit` = 1 s,
+`admission-model` and `experiments/send-admission-d-model.py` as merged in
+#966, seeds 1 to 5, N = 16, `admit_limit` = `settle_limit` = 1 s,
 R = 32. With every new flag off, the model's output over C1's 160 cells at
-seeds 1 and 2 is identical to cb95cc7e's apart from the added keys.
+seeds 1 and 2 is identical to C1's version's apart from the added keys.
 
 Parameters the model assumes, derived, not measured:
 
@@ -133,11 +135,10 @@ floor(504 / h_p).
 
 ### Calibration
 
-Binaries: ba3cec47 of `exp/send-admission-d-run` (artifact `01a1e2b3-f183`),
-the gate before its second round of fixes; the calibration's arms do not use
-the gate. hv03, `debian-13-6.12`, one run per cell, all `success`
-(`01a1e2b4-9fb8` to `01a1e2b4-a2c1`). The fewest free slots of 512, and the
-stalled peers' sockets from `ss -tmi` every 100 ms:
+Binaries: artifact `01a1e2b3-f183`, the gate before its second round of fixes;
+the calibration's arms do not use the gate. hv03, `debian-13-6.12`, one run per
+cell, all `success` (`01a1e2b4-9fb8` to `01a1e2b4-a2c1`). The fewest free slots
+of 512, and the stalled peers' sockets from `ss -tmi` every 100 ms:
 
 | stalled peers | whole 3 MiB replies | ungated 128 KiB pieces |
 | --- | --- | --- |
@@ -162,34 +163,33 @@ stalled peers' sockets from `ss -tmi` every 100 ms:
 
 ### The matrix's binaries, and a pilot
 
-The matrix runs on 3db626d8 of `exp/send-admission-d-run` (artifact
-`01a1e2ca-f88b`): the gate after its first two review rounds, the harness
-after both of its rounds, and the order arm set to O7w. On delta's io_uring
-suite at 3db626d8 every gate test passed but one,
-`a_socket_filled_by_whole_sends_is_not_writable`, and 16 of 18 mutations
-went red; the two that stayed green had tests that could not reach them, and
-the failing test was later shown to be the socket's buffer growing, not the
-gate (below).
+The matrix runs on artifact `01a1e2ca-f88b`: the gate after its first two
+review rounds, the harness after both of its rounds, and the order arm set to
+O7w. On delta's io_uring suite on that source every gate test passed but one,
+`a_socket_filled_by_whole_sends_is_not_writable`, and 16 of 18 mutations went
+red; the two that stayed green had tests that could not reach them, and the
+failing test was later shown to be the socket's buffer growing, not the gate
+(below).
 
-Two later review rounds found gate bugs that 3db626d8 still has, each of
-which needs a second send waiting on, or still in the kernel of, the gated
-connection: a gate re-armed on `Recheck` could busy-loop the worker on a
-socket that reports `POLLOUT` while `send` returns `EAGAIN`, and a gate
-blocked on a waiting send could arm against that send while it was still in
-the kernel. The harness gates a piece only after the previous piece has
-settled, so neither can happen in D. The fixed gate, at cf35d0fb, broke the
-gate's wake on a peer reset (`a_peer_reset_while_waiting` hung), which D's
-drainers produce at the end of each episode, so the matrix stays on
-3db626d8 and the fixes continue on the gate branch.
+Two later review rounds found gate bugs that the matrix's build still has, each
+of which needs a second send waiting on, or still in the kernel of, the gated
+connection: a gate re-armed on `Recheck` could busy-loop the worker on a socket
+that reports `POLLOUT` while `send` returns `EAGAIN`, and a gate blocked on a
+waiting send could arm against that send while it was still in the kernel. The
+harness gates a piece only after the previous piece has settled, so neither can
+happen in D. The first fix broke the gate's wake on a peer reset
+(`a_peer_reset_while_waiting` hung), which D's drainers produce at the end of
+each episode, so the matrix stays on its build and the fixes continue with the
+gate.
 
-At cf35d0fb the whole-sends test read the kernel's figures through
-`NETLINK_SOCK_DIAG`: the gate started on a socket with `wmem_queued`
-1,761,664 and `sk_sndbuf` 2,626,560, not writable, and by the time it
-resolved `sk_sndbuf` had grown to 4,194,304 and the socket was writable. The
-gate was right; loopback's autotuning moved the threshold.
+With the first fix the whole-sends test read the kernel's figures through
+`NETLINK_SOCK_DIAG`: the gate started on a socket with `wmem_queued` 1,761,664
+and `sk_sndbuf` 2,626,560, not writable, and by the time it resolved
+`sk_sndbuf` had grown to 4,194,304 and the socket was writable. The gate was
+right; loopback's autotuning moved the threshold.
 
-A pilot on 3db626d8 checked the gate in D's own setting before the matrix:
-W4 with 128 stalled peers and gated 128 KiB pieces, one run each at
+A pilot on the matrix's build checked the gate in D's own setting before the
+matrix: W4 with 128 stalled peers and gated 128 KiB pieces, one run each at
 `tcp_wmem` 1 MiB and 256 KiB, hv03 (`01a1e2d2-83e1`, `01a1e2d2-8442`):
 
 | `tcp_wmem` | fast small p99 | 7 MiB replies | their median | fewest free | stalled pieces that waited for room |
@@ -203,13 +203,13 @@ that drains. No TCP memory pressure.
 
 ### The matrix
 
-234 runs on 3db626d8 (artifact `01a1e2ca-f88b`), with the spec
-`experiments/send-admission-d.toml` and the matrix file as at 3db626d8:
-nine cells, six arms, four repetitions and two more of O0 whole. Run ids
-`01a1e2ed-d4df` to `01a1e2ee-4a24`, all `success`. The report is
-`experiments/send-admission-d-report.py` at a603ad17. Hosts: U, W1 and W4 at
-256 KiB on hv01 (Zen 2); W2 and W5 on hv02; the other W4 cells on hv03
-(Zen 4). No run recorded TCP memory pressure.
+234 runs on artifact `01a1e2ca-f88b`, with the spec
+`experiments/send-admission-d.toml` and its matrix file: nine cells, six arms,
+four repetitions and two more of O0 whole. Run ids `01a1e2ed-d4df` to
+`01a1e2ee-4a24`, all `success`. The report is
+`experiments/send-admission-d-report.py`. Hosts: U, W1 and W4 at 256 KiB on
+hv01 (Zen 2); W2 and W5 on hv02; the other W4 cells on hv03 (Zen 4). No run
+recorded TCP memory pressure.
 
 Fast small replies' p99, median over runs and the largest run in brackets
 (ms), and 7 MiB replies completed:
@@ -308,20 +308,19 @@ The matrix's U left the 42% extra worker CPU per byte unattributed (above).
 With the owner's agreement this replaced a saturated-worker sweep, since U
 already kept the worker 98-99% busy with one connection.
 
-Setup: `experiments/send-admission-d-profile.toml` and its build spec at
-2f145cc4 of `exp/send-admission-d-run`, binaries from 3db626d8 rebuilt with
-forced frame pointers (artifact `01a1e3da-50c2`). U as in the matrix on
-hv01, with `perf record -e cpu-clock -F 4000 -C 0 -g --call-graph fp` on the
-worker's CPU for the load's run; two runs each of O0 whole, O0 ungated
-128 KiB and O0 gated 128 KiB (`01a1e3df-70e8` to `01a1e3df-7319`). A first
-batch of six (`01a1e3db-249a` to `01a1e3db-26f6`) recorded nothing: the
-image has no `perf`, and `apt-get install` needs an `apt-get update` first.
-Samples are bucketed per reply by `send-admission-d-profile-buckets.py`; a
-sample goes to the first bucket whose frames are in its stack: loopback
-receive (`net_rx_action`, `tcp_v4_rcv` and the like), kernel send
-(`tcp_sendmsg` and the like), poll, other io_uring, then user space.
-Profiled replies took longer than unprofiled ones (O0 whole's p50 3,212
-against 2,813 µs), so only the shares are used.
+Setup: `experiments/send-admission-d-profile.toml` and its build spec, the
+matrix's source rebuilt with forced frame pointers (artifact `01a1e3da-50c2`).
+U as in the matrix on hv01, with `perf record -e cpu-clock -F 4000 -C 0 -g
+--call-graph fp` on the worker's CPU for the load's run; two runs each of O0
+whole, O0 ungated 128 KiB and O0 gated 128 KiB (`01a1e3df-70e8` to
+`01a1e3df-7319`). A first batch of six (`01a1e3db-249a` to `01a1e3db-26f6`)
+recorded nothing: the image has no `perf`, and `apt-get install` needs an
+`apt-get update` first. Samples are bucketed per reply by
+`send-admission-d-profile-buckets.py`; a sample goes to the first bucket whose
+frames are in its stack: loopback receive (`net_rx_action`, `tcp_v4_rcv` and
+the like), kernel send (`tcp_sendmsg` and the like), poll, other io_uring, then
+user space. Profiled replies took longer than unprofiled ones (O0 whole's p50
+3,212 against 2,813 µs), so only the shares are used.
 
 Prediction, written before these runs:
 
@@ -444,9 +443,8 @@ My recommendation, apart from the rule:
   per-piece cost on the server is about 1.5 µs of ringline and io_uring plus
   the kernel's per-send work.
 
-D ran on 3db626d8, whose gate still had two bugs that need a second send
-waiting on the gated connection (above); D's harness gates a piece only
-after the previous one settled, so neither occurs in D. cf35d0fb fixed them
-and broke the gate's wake on a peer reset; a603ad17 fixed that. The commits
-on the gate branch after its last review (67297b33, c381e17b, 8bde5e21,
-b7c28f9c, 7f0b245a) are unreviewed and go with the specification's PR.
+D's build has a gate with two bugs that need a second send waiting on the
+gated connection (above); D's harness gates a piece only after the previous
+one settled, so neither occurs in D. A later fix of both broke the gate's
+wake on a peer reset, and another fixed that. The gate's changes after its
+last review are unreviewed and go with the specification's PR.

@@ -17,12 +17,11 @@ behind the FIFO's head while slots are free.
 ## Method
 
 Binaries: `experiments/send-admission-b-build.toml`, io_uring builds of two
-commits of the work branch `exp/send-admission-b` on the brayniac fork.
-cf283561 (artifact `01a1ddd9-1448`) ran the two floor runs, echo runs 1 and
-2, and the four contended pilots. 31d31976 (artifact `01a1de0c-432a`) adds
-`bytes-admitted-await` and ran echo runs 3 and 4 and the 24 contended runs.
-The commit that records this entry differs from 31d31976 in `ringline-bench`
-and `ringline/src` only in two doc comments in
+versions of B's tools. The first (artifact `01a1ddd9-1448`) ran the two floor
+runs, echo runs 1 and 2, and the four contended pilots. The second (artifact
+`01a1de0c-432a`) adds `bytes-admitted-await` and ran echo runs 3 and 4 and the
+24 contended runs. The commit that records this entry (#945) differs from the
+second in `ringline-bench` and `ringline/src` only in two doc comments in
 `ringline-bench/src/bin/server.rs`, so building it builds the same code.
 
 Uncontended: `bench-server` with one worker, pinned to CPU 0, in a guest on
@@ -79,11 +78,11 @@ Four pilots at a ratio of 1 with `send_admitted` chose the cap:
 ## Prediction
 
 The predictions were written before the first rack run was submitted, and are
-as first committed in 31d31976, after echo runs 1 and 2 had finished; the note
-after them was added with the results. The contended part was revised before
-the first rack submission, after a local smoke run on mio (macOS), which showed
-the large-reply timeout at a ratio of 0.5 and seven small replies just past the
-limit.
+as first committed with the second version, after echo runs 1 and 2 had
+finished; the note after them was added with the results. The contended part
+was revised before the first rack submission, after a local smoke run on mio
+(macOS), which showed the large-reply timeout at a ratio of 0.5 and seven small
+replies just past the limit.
 
 Uncontended, closed loop:
 

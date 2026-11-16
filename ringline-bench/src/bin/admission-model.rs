@@ -74,7 +74,7 @@
 //!
 //! Pieces. With `--stream-piece` p above 0, a reply that is not small and has
 //! more than p bytes is sent as ceil(n / p) pieces, as admission-server's
-//! `--stream-piece` on `exp/send-admission-d-run` does. Each piece is a waiter
+//! `--stream-piece` in D's harness does. Each piece is a waiter
 //! of its own, with its own slots and its own `--admit-ms` from joining the
 //! FIFO, and settles on its own. The next piece starts when the one before it
 //! settles, so a reply has at most one piece waiting or unsettled. The
@@ -123,7 +123,7 @@
 //! the client read all of it, the time from its request to its last byte, and
 //! the fewest free main-pool slots from its request to its last byte, both at
 //! every change and in samples every `--sample-ms` (0: no samples), as
-//! admission-server on `exp/send-admission-d-run` samples `main_free`; whether
+//! D's admission-server samples `main_free`; whether
 //! each drainer's reply was read whole before its connection ended; the sends
 //! of large replies (pieces, or whole replies) and those that waited for room
 //! in the socket, by the kind of connection; the pieces that waited at the

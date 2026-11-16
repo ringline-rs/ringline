@@ -4,11 +4,12 @@
   O7w, and for plaintext chose Experiment D's design instead.
 - **Span:** Nov 2026 · follows #945 (Experiment B) · SystemsLab context
   `send-admission-expC`
-- **Commits:** commits cited here that are not on main are on
-  brayniac/ringline: the `exp/send-admission-*` branches, and
-  `docs/send-admission-expC`, which holds this entry's commits as they were
-  before they were squashed into main. The files under `experiments/` that
-  are cited here and are not on main are on `exp/send-admission-c-run`.
+- **Code:** the C0 tools and the model are in the repository as merged in
+  #966. The orders and the harness that ran them are not in ringline. Runs
+  are identified by their SystemsLab experiment and build artifact ids; each
+  artifact's build experiment records the source it built. Specs and scripts
+  named under `experiments/` that are not in the repository are stored with
+  their SystemsLab experiments.
 
 ## Goal
 
@@ -24,7 +25,7 @@ heads that today's order admits.
 
 ## Method
 
-As designed in section 4, at cd4f9bc5:
+As designed in section 4, before any run:
 
 - C0, on the rack with today's code: `admission-server` and `admission-load`
   gain request timestamps, server-side scheduled-to-admission delays, an L
@@ -33,15 +34,14 @@ As designed in section 4, at cd4f9bc5:
 - C1, a discrete-event model (`ringline-bench/src/bin/admission-model.rs`),
   validated against Experiment B and C0's W2, sweeps every order.
 - C2, on the rack: the orders C1 does not reject, with O0 and O1, behind a
-  hidden configuration option on the work branch
-  `exp/send-admission-c-orders`.
+  hidden configuration option on a work branch.
 
 The specifications the tools were built from are summarised here as they are
 built; deviations from the design are listed with their reason.
 
 ## Prediction
 
-As committed in cd4f9bc5, before any run. The author's:
+As written before any run. The author's:
 
 - O2 times heads out in W2 at L / S of 1.5, as O1 does.
 - O3 times heads out in W2 at L / S of 1.5 at a ratio of 1, and not at a
@@ -82,8 +82,8 @@ arm paired by round with `nowait`:
 
 ### C0 pilots
 
-Binaries: `experiments/send-admission-c-build.toml` at 81cc413c of
-`exp/send-admission-c-tools` (artifact `01a1e022-5ac7`). One run per cell,
+Binaries: `experiments/send-admission-c-build.toml` on the C0 tools before
+the load generator's timing fix (artifact `01a1e022-5ac7`). One run per cell,
 `experiments/send-admission-c0.toml`, one guest on hv03, Linux 6.12. W2 here:
 three drainers per episode asking for 2 MiB each and reading at 2 MiB/s with
 `SO_RCVBUF` 4096, `tcp_wmem` capped at 256 KiB, `--pipeline 16`, a 7 MiB head
@@ -110,10 +110,11 @@ delay from scheduled time to admission for small replies to fast readers.
   the client. In `a10b` the delay was 5.75 ms at p50 and 11.5 ms at p99 while
   the `send` call took at most 53 us, so the requests reached the server
   late. The fast connections waited for their next send in a blocking read
-  under `SO_RCVTIMEO`, which the kernel rounds up to a timer tick. e550b661
-  waits with `ppoll` instead and records how late each request is written.
+  under `SO_RCVTIMEO`, which the kernel rounds up to a timer tick. The fix,
+  in #966, waits with `ppoll` instead and records how late each request is
+  written.
 
-With e550b661 (artifact `01a1e02c-28c0`):
+With that fix (artifact `01a1e02c-28c0`):
 
 | run (`01a1e02c-`) | cell | fast p99 | send lateness p99 | heads admitted | head median / max |
 | --- | --- | --- | --- | --- | --- |
@@ -132,12 +133,12 @@ With e550b661 (artifact `01a1e02c-28c0`):
 
 ### C2 pilots
 
-Binaries: a6b625d8 of `exp/send-admission-c-run` (the tools merged with
-97375dea of `exp/send-admission-c-orders`; artifact `01a1e035-6b34`), before
-the fixes from that branch's review. ringline's whole suite, fmt, clippy and
-doc pass on io_uring at a6b625d8 (`experiments/send-admission-c-test.toml`,
-`01a1e041-c739`, Linux 6.12). One run per order, W2 with six slow readers at
-a ratio of 1, hv03, R = 32 for the budget orders:
+Binaries: the C0 tools merged with the orders' first version (artifact
+`01a1e035-6b34`), before the fixes from the orders' review. ringline's whole
+suite, fmt, clippy and doc pass on io_uring on that source
+(`experiments/send-admission-c-test.toml`, `01a1e041-c739`, Linux 6.12). One
+run per order, W2 with six slow readers at a ratio of 1, hv03, R = 32 for the
+budget orders:
 
 | run (`01a1e035-`) | order | fast p99 | heads admitted | head median / max | L / S |
 | --- | --- | --- | --- | --- | --- |
@@ -164,8 +165,8 @@ a ratio of 1, hv03, R = 32 for the budget orders:
 
 ### C1 validation
 
-`admission-model` (cb95cc7e), at its default buffer parameters (the kernel
-buffer 260 KiB in W2: the 256 KiB `tcp_wmem` cap plus the reader's
+`admission-model` as first written for C1, at its default buffer parameters
+(the kernel buffer 260 KiB in W2: the 256 KiB `tcp_wmem` cap plus the reader's
 `SO_RCVBUF`), seed 0.
 
 Against Experiment B's contended runs:
@@ -201,14 +202,13 @@ the pool's exact state at an episode's start.
 
 ### C1 sweep
 
-`admission-model` at cb95cc7e over the cells C2 runs, every order, seeds 1 to
-5 (the seeds move only the open-loop phases): W2 with 0, 2 and 6 slow readers
-and W1 with N = 1 and 16, at `admit_ms` 999, 1001 and 2000 (999 and 1001
-straddle the tie at a ratio of 1), and W1 with sends outside the FIFO at 1001.
-O5 has a main region of 448 x 16 KiB and a small one of 256 x 4 KiB, the
-bytes of O0's pool; O7 and O7w have R = 32. Heads admitted of 50, the
-largest admission delay, and the median p99 of fast small replies'
-scheduled-to-admission delay:
+The same `admission-model` over the cells C2 runs, every order, seeds 1 to 5
+(the seeds move only the open-loop phases): W2 with 0, 2 and 6 slow readers and
+W1 with N = 1 and 16, at `admit_ms` 999, 1001 and 2000 (999 and 1001 straddle
+the tie at a ratio of 1), and W1 with sends outside the FIFO at 1001. O5 has a
+main region of 448 x 16 KiB and a small one of 256 x 4 KiB, the bytes of O0's
+pool; O7 and O7w have R = 32. Heads admitted of 50, the largest admission
+delay, and the median p99 of fast small replies' scheduled-to-admission delay:
 
 | cell | O0 | O1 | O2 | O3 | O4 | O4w | O5 | O6 | O7 | O7w |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -230,16 +230,15 @@ scheduled-to-admission delay:
 
 ### C2 matrix
 
-Binaries: a8249ba1 of `exp/send-admission-c-run` (artifact `01a1e08d-3591`),
-the orders after their first two reviews. Its io_uring suite passed
-(`01a1e08c-b436`). Seven cells, each on one host: the W1 cells on hv01, W2
-with no slow readers on hv02, the other W2 cells on hv03. Seven orders, four
-repetitions with the order rotated each round, and two more of O0: 210 runs,
-all `success`, ids in the scratch list `c2-ids-keep.txt` of the session that
-ran them. The W1 cell with sends outside the FIFO is not here: its 30 runs
-were cancelled before they ran, because the third and fourth reviews found
-that sends outside the FIFO could leave O3's and O4's latch open at a head
-change. It reran on the final binaries (below).
+Binaries: artifact `01a1e08d-3591`, the orders after their first two reviews.
+Its io_uring suite passed (`01a1e08c-b436`). Seven cells, each on one host: the
+W1 cells on hv01, W2 with no slow readers on hv02, the other W2 cells on hv03.
+Seven orders, four repetitions with the order rotated each round, and two more
+of O0: 210 runs, all `success`, ids in the scratch list `c2-ids-keep.txt` of
+the session that ran them. The W1 cell with sends outside the FIFO is not here:
+its 30 runs were cancelled before they ran, because the third and fourth
+reviews found that sends outside the FIFO could leave O3's and O4's latch open
+at a head change. It reran on the final binaries (below).
 
 Summarised by `experiments/send-admission-c2-report.py`. The largest head
 admission delay over every run, and the median over runs of the per-run p99
@@ -285,23 +284,22 @@ order's four runs (at a ratio of 2 they are within 4 slots and 0.1%):
   written; O7's p99 is reported beside it.
 
 The W1 cell with sends outside the FIFO (`send_nowait`, 1,000/s on four
-connections) ran on hv02 on the final binaries: f561f58a (artifact
-`01a1e11f-c3a0`), whose library is that of 86346b85, the run branch with the
-orders' last fix. The io_uring suite passed at 86346b85 (`01a1e126-bbea`, on
-delta) after a test fixed in eb956201 (below). 30 runs, all `success`. Every
-order admitted every head, and the largest head delay was 810.2 to 811.2 ms
-against O0's 810.4 ms (O0's run maxima spread 1.2 ms). Fast small replies'
-p99 was 766.3 ms under O0 and 0.5 to 0.6 ms under every other order, with
-none beyond `admit_limit`. The sends outside the FIFO changed no order's
-result.
+connections) ran on hv02 on the final binaries (artifact `01a1e11f-c3a0`),
+whose library has the orders' last fix. The io_uring suite passed on that
+library (`01a1e126-bbea`, on delta) after the test fix below. 30 runs, all
+`success`. Every order admitted every head, and the largest head delay was
+810.2 to 811.2 ms against O0's 810.4 ms (O0's run maxima spread 1.2 ms). Fast
+small replies' p99 was 766.3 ms under O0 and 0.5 to 0.6 ms under every other
+order, with none beyond `admit_limit`. The sends outside the FIFO changed no
+order's result.
 
-The suite at e0203d46 (`01a1e0c7-790d`) had failed one test,
-`a_cancelled_head_s_successor_latches_on_free_plus_passing_at_the_change`,
-with 12 free slots where it expected 9, alone and in the suite, every time
+The suite before that fix (`01a1e0c7-790d`) had failed one test,
+`a_cancelled_head_s_successor_latches_on_free_plus_passing_at_the_change`, with
+12 free slots where it expected 9, alone and in the suite, every time
 (`01a1e121-6eb8`). An instrumented run (`01a1e124-423e`) showed the released
 task was never polled: the test pushed a parked task's index onto the ready
-queue, and `take_ready` returns a standalone task only once its slot records
-a wake. eb956201 wakes it with `wake_task`. With
+queue, and `take_ready` returns a standalone task only once its slot records a
+wake. The fix wakes it with `wake_task`. With
 `restart_send_window_if_head_changed` made to return at once, the fixed test
 fails at its last assertion (`01a1e126-bc1a`).
 
@@ -336,7 +334,7 @@ model's idle condition lets them pass has not been checked.
 
 `experiments/send-admission-c-echo.toml`, four runs (`01a1e12c-a499`,
 `-a4f7`, `-a553`, `-a5b1`), each one boot of a server guest on hv02 and a
-client guest on hv01, all `success`, on the binaries of f561f58a (artifact
+client guest on hv01, all `success`, on the final binaries (artifact
 `01a1e11f-c3a0`). Six arms, four rounds each, the order rotated so that
 `nowait` ran before `send` in two rounds and after it in two. One worker,
 256 B messages, 256 connections. Summarised by

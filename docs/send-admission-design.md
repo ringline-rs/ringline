@@ -590,10 +590,9 @@ uses, in three stages.
   follow from the schedule (journal, Prediction). It is also validated
   against C0's W2 runs, which exercise draining. The model is used to reject
   orders and to choose the cells C2 runs, not to choose the order.
-- C2, on the rack: the orders C1 does not reject, with O0 and O1, built on
-  `exp/send-admission-c-orders` (eb956201) behind a hidden configuration
-  option. O2, O3 and O7 are small changes to the FIFO, so C2 builds them
-  whatever C1 finds.
+- C2, on the rack: the orders C1 does not reject, with O0 and O1, built on a
+  work branch behind a hidden configuration option, not in ringline. O2, O3 and
+  O7 are small changes to the FIFO, so C2 builds them whatever C1 finds.
 
 Instruments, in `admission-server` and `admission-load`:
 
@@ -610,7 +609,7 @@ Instruments, in `admission-server` and `admission-load`:
 - Per head: its admission delay, or a timeout, which is counted apart from
   the delays.
 - C2 only: each send admitted past a head, with its slots and the time it
-  held them (on `exp/send-admission-c-run`).
+  held them (C2's harness, not in ringline).
 - `--pipeline N`: up to N unsettled replies per connection. Each is timed
   from when it was queued or, if later, from when the reply before it
   settled, and the connection is aborted when the oldest has been unsettled
@@ -751,8 +750,8 @@ What holds slots today:
   the fourth waits at the head. Small replies wait behind it under O0 and pass
   it under O7w, whatever the number of stalled peers.
 
-Pieces, as `admission-server` on `exp/send-admission-d-run` sends them
-(`--stream-piece p`, with `--stream-gate` for the gate):
+Pieces, as D's harness (not in ringline) sends them, with `--stream-piece p`
+and `--stream-gate` for the gate:
 
 - A reply of more than p bytes is sent as ceil(n / p) pieces, one unsettled at
   a time. The pieces count as one reply against `--pipeline N`.
@@ -760,27 +759,26 @@ Pieces, as `admission-server` on `exp/send-admission-d-run` sends them
   then waits in `send_admitted` for its slots, under `admit_limit`. Gating only
   the pieces that follow a send that waited for room would let each stalled
   peer's first piece into a full socket.
-- The gate is `SendHalf::writable`, a hidden method on
-  `exp/send-admission-d-gate` (7f0b245a), not on ringline's main. On io_uring
-  it uses the connection's `SendPollOut`, the poll the wait for room uses, so
-  the cancel that `close` and `abort` already issue covers it, and a pending
-  poll cannot hold the socket past its `Close`. With no poll armed, the gate
-  arms it one-shot; today a `POLLOUT` that arrives with no send waiting is
-  dropped, and `handle_send_pollout` instead wakes a waiting gate. The gate
-  resolves on `POLLOUT`, fails on `POLLERR` or `POLLHUP`, and is failed by
-  `abort` as a parked reader is. After the peer half-closes, a one-shot poll
-  completes at once with `POLLRDHUP`, so the connection's poll becomes
-  multishot, as for the wait for room. A multishot poll reports only edges, so
-  on such a connection the gate first arms a one-shot probe with its own tag.
-  The probe completes at once, with `POLLOUT` only if the socket is writable
-  now, so it never stays pending. When the socket is not writable, `tcp_poll`
-  sets `SOCK_NOSPACE`, and the multishot poll reports the next `POLLOUT`. The
-  gate resolves on the probe's `POLLOUT`, or else on the multishot poll's next
-  one. On mio the gate polls with a zero timeout, then waits for the
-  connection's next writable event. Its tests cover a socket already writable,
-  a full socket that drains, a half-closed peer with a full socket, filled by a
-  short send and filled by whole sends, an abort and a peer reset while
-  waiting, and a connection whose multishot poll is already armed.
+- The gate is `SendHalf::writable`, a hidden method built for D and not yet in
+  ringline. On io_uring it uses the connection's `SendPollOut`, the poll the
+  wait for room uses, so the cancel that `close` and `abort` already issue
+  covers it, and a pending poll cannot hold the socket past its `Close`. With
+  no poll armed, the gate arms it one-shot; today a `POLLOUT` that arrives with
+  no send waiting is dropped, and `handle_send_pollout` instead wakes a waiting
+  gate. The gate resolves on `POLLOUT`, fails on `POLLERR` or `POLLHUP`, and is
+  failed by `abort` as a parked reader is. After the peer half-closes, a
+  one-shot poll completes at once with `POLLRDHUP`, so the connection's poll
+  becomes multishot, as for the wait for room. A multishot poll reports only
+  edges, so on such a connection the gate first arms a one-shot probe with its
+  own tag. The probe completes at once, with `POLLOUT` only if the socket is
+  writable now, so it never stays pending. When the socket is not writable,
+  `tcp_poll` sets `SOCK_NOSPACE`, and the multishot poll reports the next
+  `POLLOUT`. The gate resolves on the probe's `POLLOUT`, or else on the
+  multishot poll's next one. On mio the gate polls with a zero timeout, then
+  waits for the connection's next writable event. Its tests cover a socket
+  already writable, a full socket that drains, a half-closed peer with a full
+  socket, filled by a short send and filled by whole sends, an abort and a peer
+  reset while waiting, and a connection whose multishot poll is already armed.
 - TCP reports `POLLOUT` when `wmem_queued` is at most two thirds of
   `sk_sndbuf` (`sk_stream_is_writeable`), and `tcp_sendmsg` queues while
   `wmem_queued` is below `sk_sndbuf`, checking only before it starts a new
@@ -864,9 +862,8 @@ Workloads, four repetitions, with two extra repetitions of O0 whole:
   and an 80 s duration, so that a 3 MiB reply (6 s) completes within an
   episode.
 
-Statistics, beyond Experiment C's, from instruments on
-`exp/send-admission-d-gate` (the runtime counters) and
-`exp/send-admission-d-run` (the bins):
+Statistics, beyond Experiment C's, from instruments built for D and not in
+ringline:
 
 - per 7 MiB reply, and in W5 per slow reader's 3 MiB reply: whether it
   completed, and the time from its request to its last byte at the client, in
