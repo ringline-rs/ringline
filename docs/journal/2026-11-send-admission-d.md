@@ -1,7 +1,8 @@
 # Experiment D: large replies in pieces gated on socket room
 
-- **Status:** open. The design is at 618149b4; the model (C1-D) and the
-  calibration have run; the matrix (234 runs) is running on 3db626d8.
+- **Status:** closed. All three gated arms pass the decision rule, which
+  picks 128 KiB pieces; the owner has yet to decide whether U's cost needs a
+  saturated-worker measurement before the fast-path specification.
 - **Span:** Nov 2026 · follows Experiment C (`2026-11-send-admission-c.md`)
   · SystemsLab context `send-admission-expC`
 
@@ -195,6 +196,169 @@ All 1,280 stalled connections were aborted at the room-wait limit, holding
 no slots. 21 of the 560 head pieces at 256 KiB waited for room, to a reader
 that drains. No TCP memory pressure.
 
+### The matrix
+
+234 runs on 3db626d8 (artifact `01a1e2ca-f88b`), with the spec
+`experiments/send-admission-d.toml` and the matrix file as at 3db626d8:
+nine cells, six arms, four repetitions and two more of O0 whole. Run ids
+`01a1e2ed-d4df` to `01a1e2ee-4a24`, all `success`. The report is
+`experiments/send-admission-d-report.py` at a603ad17. Hosts: U, W1 and W4 at
+256 KiB on hv01 (Zen 2); W2 and W5 on hv02; the other W4 cells on hv03
+(Zen 4). No run recorded TCP memory pressure.
+
+Fast small replies' p99, median over runs and the largest run in brackets
+(ms), and 7 MiB replies completed:
+
+| cell | O0 whole | O7w whole | O0 ungated 128 KiB | O0 gated 64 KiB | O0 gated 128 KiB | O7w gated 128 KiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| W1 | 765.3 (765.7), 60/60 | 0.4 (0.5), 40/40 | 0.3 (0.4), 40/40 | 0.3 (0.5), 40/40 | 0.2 (0.4), 40/40 | 0.3 (0.4), 40/40 |
+| W2, 6 slow | 680.6 (681.2), 60/60 | 0.5 (0.5), 40/40 | 0.4 (0.5), 40/40 | 0.5 (0.5), 40/40 | 0.5 (0.5), 40/40 | 0.5 (0.5), 40/40 |
+| W4, 1 MiB, k = 4 | 1153.2 (1153.7), 0/60 | 0.4 (0.4), 0/40 | 0.4 (0.6), 40/40 | 0.4 (0.4), 40/40 | 0.4 (0.5), 40/40 | 0.4 (0.4), 40/40 |
+| k = 56 | 1161.9 (1164.2), 0/60 | 0.5 (0.5), 0/40 | 0.6 (0.9), 40/40 | 0.5 (0.9), 40/40 | 0.6 (0.6), 40/40 | 0.6 (0.8), 40/40 |
+| k = 72 | 1162.9 (1164.1), 0/60 | 0.5 (0.5), 0/40 | 961.7 (962.0), 40/40 | 1.1 (3.0), 40/40 | 0.7 (1.1), 40/40 | 0.8 (1.0), 40/40 |
+| k = 128 | 1165.6 (1171.4), 0/60 | 5.4 (6.7), 0/40 | 957.5 (965.3), 40/40 | 1.2 (1.2), 40/40 | 2.6 (2.8), 40/40 | 2.4 (2.5), 40/40 |
+| W4, 256 KiB, k = 128, hv01 | 1168.6 (1169.9), 0/60 | 25.4 (26.5), 0/40 | 994.1 (1611.9), 40/40 | 8.8 (9.1), 40/40 | 12.7 (12.8), 40/40 | 12.1 (12.3), 40/40 |
+| W5 | 1112.3 (1114.4), 0/60 | 0.5 (0.5), 0/40 | 0.5 (0.5), 40/40 | 0.5 (0.5), 40/40 | 0.5 (0.6), 40/40 | 0.5 (0.5), 40/40 |
+
+- Gated arms: every 7 MiB reply completed in every cell, with medians of 3.9
+  to 7.2 ms. The fewest free slots during a 7 MiB reply was 501 of 512, in
+  W4, and none of the 282,920 pieces sent to stalled peers (W1 and
+  W4) waited for room. Every stalled connection was aborted at the room-wait
+  limit. W5's slow readers: 160 of 160 replies completed in each gated arm,
+  with no aborts. No fast small reply went past `admit_limit`.
+- Ungated 128 KiB pieces: fine at k = 56 (fewest free 55), and at k = 72 and
+  128 every slot was taken and fast small p99 was 957 to 994 ms, with 18 to
+  1,136 fast small replies per run past `admit_limit`. The step falls between
+  the calibrated limit's sides, 56 and 72 (floor(504 / 8) = 63).
+- O0 whole: fast small p99 1,112 to 1,169 ms in W4 and W5, with 3,905 to
+  4,375 fast small replies per run past `admit_limit`; no 7 MiB reply
+  completed in W4 or W5, and every W5 slow reader was aborted at
+  `settle_limit`.
+- O7w whole: fast small replies 0.4 to 0.5 ms in W4 up to k = 72, 2.0 to
+  6.7 ms at k = 128, and 16.9 to 26.5 ms at k = 128 with 256 KiB on hv01. No
+  7 MiB reply completed in W4 or W5 (every one timed out waiting for
+  admission, as C1 predicted), and every W5 slow reader was aborted.
+
+Partial sends (pieces that waited for room, of those sent):
+
+- W2, to drainers: 1,800 of 1,920 128 KiB pieces (every piece after the
+  first of each 2 MiB reply) and 3,600 of 3,840 64 KiB pieces (all but the
+  first two), in each 128 KiB arm, gated or not.
+- The 7 MiB reply to a fast reader, with `tcp_wmem` at 256 KiB: 128 KiB
+  pieces waited in 467 and 472 of 2,240 in W2 and 699 and 702 of 2,240 in W4
+  on hv01; 64 KiB pieces in none of 4,480 in either cell. With `tcp_wmem` at
+  1 MiB, no gated arm's 7 MiB pieces waited, in any cell.
+- W5, to slow readers at 1 MiB: no gated piece waited (0 of 3,840 and 0 of
+  7,680); 1,600 of 3,840 ungated pieces did.
+
+U, one reader, `SO_RCVBUF` reported as 1,048,576 in every run, every reply
+completed:
+
+| arm | p50 per reply (µs) | p99 (µs) | worker CPU per reply (µs) | CPU per byte against O0 whole |
+| --- | --- | --- | --- | --- |
+| O0 whole (6 runs) | 2,813 | 3,258 | 2,802 | 1.00 |
+| O7w whole | 2,806 | 3,174 | 2,793 | 1.00 |
+| O0 ungated 128 KiB | 4,013 | 4,241 | 3,976 | 1.42 |
+| O0 gated 64 KiB | 4,523 | 4,843 | 4,401 | 1.57 |
+| O0 gated 128 KiB | 4,085 | 4,362 | 3,979 | 1.42 |
+| O7w gated 128 KiB | 4,138 | 4,400 | 4,089 | 1.46 |
+
+O0 whole's own runs spread 135 µs in p50 and 0.017 ns/B in CPU per byte.
+Each piece adds 21 to 23 µs of worker CPU at 128 KiB (56 a reply) and 14 µs
+at 64 KiB (112 a reply).
+
+Worker CPU per reply equals the reply's time within 3% in every arm, so the
+worker thread was busy for the whole reply and the CPU figure measures the
+same thing as wall time. I do not know how much of the 42% is work done per
+piece and how much is time spent waiting on the next piece's settlement,
+wake, poll and admission; on loopback the sender's CPU also runs the
+receiver's TCP processing. What U shows is that pieces make a lone 7 MiB
+loopback reply 45% (128 KiB) and 61% (64 KiB) slower. A profile, or a U
+variant with enough concurrent replies to saturate the worker, would
+separate the two.
+
+### W4 at 256 KiB, rerun on hv03
+
+The prediction's 10 ms limit was exceeded in one cell, W4 at k = 128 with
+`tcp_wmem` at 256 KiB, by both 128 KiB gated arms (12.1 to 12.8 ms). I had
+placed that cell on hv01, and the other W4 cells on hv03. The gated arms of
+that cell were rerun on hv03 on the same binaries, four runs each (ids
+`01a1e37f-964d` to `01a1e37f-9a8c`):
+
+| arm | fast small p99, median (largest run) | 7 MiB replies, median | fewest free | 7 MiB pieces that waited |
+| --- | --- | --- | --- | --- |
+| O0 gated 64 KiB | 1.0 (1.0) ms | 40/40, 5.3 ms | 504 | 0 of 4,480 |
+| O0 gated 128 KiB | 1.3 (1.4) ms | 40/40, 4.3 ms | 501 | 90 of 2,240 |
+| O7w gated 128 KiB | 1.2 (1.5) ms | 40/40, 4.5 ms | 500 | 90 of 2,240 |
+
+No stalled peer's piece waited for room (0 of 40,960), and no run recorded
+TCP memory pressure. On hv03 the 7 MiB reply's 128 KiB pieces were partly
+sent in 4% of cases against 31% on hv01. I do not know which property of
+hv01 causes either difference. The refutation stands as measured on hv01;
+the rerun shows the cell passes on the host class the other W4 cells ran on.
+
+### Against the prediction
+
+- U: 128 KiB gated pieces took 45% longer than whole replies, inside "up to
+  50%", and 64 KiB pieces 61%, longer still. Agrees.
+- W1 and W2: below 1 ms (at most 0.5) and every 7 MiB reply completed.
+  Agrees.
+- W4 at 1 MiB: every 7 MiB reply completed and at least 500 slots stayed
+  free. Fast small p99 was above the predicted 1 ms at k = 72 (64 KiB,
+  median 1.1 ms and 3.0 ms in one run; 128 KiB, 1.1 ms in one run) and at
+  k = 128 (1.2 to 2.8 ms), inside the
+  10 ms refutation threshold. The ungated arm exceeded 100 ms at k = 72 and
+  128, past k x h_p + 8 > 512. O0 whole made small replies wait over a
+  second at every k. O7w whole was below 1 ms up to k = 72 but not at
+  k = 128 (2.0 to 6.7 ms); C1, which has no CPU time, gave 0.
+- W4 at 256 KiB: both gated arms kept at least 503 slots free and no stalled
+  peer's piece waited, as derived for 32 KiB segments. Fast small p99 for
+  128 KiB pieces exceeded 10 ms on hv01, which refutes the prediction there
+  (above).
+- Partial sends: none in W4 to stalled peers; in W2 every 128 KiB piece to a
+  drainer after the first and all but two 64 KiB pieces of each reply.
+  Agrees. Not predicted: at 256 KiB the 7 MiB reply's 128 KiB pieces to a
+  fast reader were also partly sent (4 to 31% by host), and its 64 KiB pieces
+  were not.
+- W5: every gated arm completed every slow reader's reply and every 7 MiB
+  reply with no aborts, below 1 ms. Both whole arms aborted every slow
+  reader. Agrees.
+
 ## Outcome
 
-Not yet.
+By the decision rule, applied as written:
+
+- O0 gated 64 KiB, O0 gated 128 KiB and O7w gated 128 KiB each pass in W1,
+  W2, W4 at 1 MiB and W5: every 7 MiB reply and every W5 slow reader's reply
+  completed, fast small p99 at most 3.0 ms, and no fast small reply past
+  `admit_limit` (O0 whole had 3,905 to 4,329 per run in W4 and W5). W4 at
+  256 KiB is not one of the rule's cells.
+- The rule picks the larger passing p, 128 KiB, under O0, or under O7w where
+  TLS on the same worker uses it.
+- U's CPU per byte is 1.42 times whole replies for 128 KiB pieces (1.46
+  under O7w), under the rule's 2x threshold, so the rule does not send it to
+  the owner. That figure tracks wall time in U (above), so the rule was
+  applied to a measure of time per reply, not of work per byte.
+- The prediction is refuted in one cell, W4 at 256 KiB on hv01, by both
+  128 KiB gated arms (12.1 and 12.7 ms median against 10 ms). On hv03 the same
+  arms gave 1.2 and 1.3 ms.
+
+My recommendation, apart from the rule:
+
+- Gated pieces for plaintext, as the rule says.
+- Size p from the socket's send buffer, not as a constant: at most a third of
+  `sk_sndbuf`, which is the free space the gate waits for, and at most
+  128 KiB. The partial sends support it: with `tcp_wmem` at 256 KiB (a third
+  is 85 KiB) 128 KiB pieces to a fast reader were partly sent and 64 KiB
+  pieces never were; at 1 MiB neither was. This is the rule's "how it sizes p
+  against a socket's send buffer" clause, inferred from these cells.
+- Before the fast-path specification, the owner decides whether U needs the
+  saturated-worker measurement. The rule did not escalate, but it was applied
+  to wall time.
+
+D ran on 3db626d8, whose gate still had two bugs that need a second send
+waiting on the gated connection (above); D's harness gates a piece only
+after the previous one settled, so neither occurs in D. cf35d0fb fixed them
+and broke the gate's wake on a peer reset; a603ad17 fixed that. The commits
+on the gate branch after its last review (67297b33, c381e17b, 8bde5e21,
+b7c28f9c, 7f0b245a) are unreviewed and go with the specification's PR.

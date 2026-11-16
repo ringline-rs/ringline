@@ -6,7 +6,9 @@ Experiment B's result and names Experiments C and D. C chooses an admission
 order; D tests sending large replies in pieces that take pool slots only once
 their socket has room, which the owner chose for plaintext on 2026-11-15, with
 C's orders as the fallback. C's runs are
-recorded in `docs/journal/2026-11-send-admission-c.md`; D has not run.
+recorded in `docs/journal/2026-11-send-admission-c.md` and D's in
+`docs/journal/2026-11-send-admission-d.md`, where gated pieces pass D's
+decision rule.
 "What exists" describes the code before section 1, at 07dd0f56; section 3's
 specification cites the code at 03628fee.
 
