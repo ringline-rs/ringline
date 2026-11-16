@@ -14,7 +14,7 @@
 # accept_queue_full = 0 at 1024 and 64, 4,474 to 5,150 at 4, 905 to 915 at 1;
 # with 256 threads and capacities 1024, 64, 16, 4 (experiment
 # 01a1e19c-bfd0-7194-4e4c-59ccf9630106) the 64-deep queue filled about 440 to
-# 450 times a second with the rate and latency unchanged against 1024, and
+# 450 times a second with the rate and latency not worse than at 1024, and
 # the rate at 16 was 10 to 14% lower. The client is closed-loop with
 # {threads} connections in flight at most, so a capacity above {threads}
 # cannot fill.

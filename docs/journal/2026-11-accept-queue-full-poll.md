@@ -1,6 +1,6 @@
 # 2026-11: The acceptor's queue-full poll does not bound the connect rate
 
-- **Status:** NO-GO — a wake from a worker that drained its accept queue, in place of the 1 ms poll `send_when_room` runs while every queue is full, is not built. One io_uring worker under a connect storm took about 32,000 conns/s (measured). At capacity 64 the queue filled about 5,300 times per 12 s run and the rate and the mean latency were not worse than at the default, 1024; at 16 the rate was 10 to 14% lower; at 4 it was 4,400 to 5,150/s and at 1 about 910/s. The default is 1024.
+- **Status:** NO-GO — a wake from a worker that drained its accept queue, in place of the 1 ms poll `send_when_room` runs while every queue is full, is not built. One io_uring worker under a connect storm took about 32,000 conns/s (measured). At capacity 64 the queue filled 5,300 to 5,400 times per 12 s run and the rate and the mean latency were not worse than at the default, 1024; at 16 the rate was 10 to 14% lower; at 4 it was 4,412 to 5,150/s and at 1 about 910/s. The default is 1024.
 - **Span:** 2026-11-15 · tree 4509097c (`main`, 0.7.0-alpha.135) · follows #817 · SystemsLab experiments `01a1e10a-62e7-7120-3130-b055cec01169` (8 client threads) and `01a1e19c-bfd0-7194-4e4c-59ccf9630106` (256)
 
 ## Goal
@@ -66,7 +66,7 @@ each with one connection at a time (connect, write a 64-byte request, read
 the echo, close), no TLS. The client therefore has at most 8 connections in
 flight, so a capacity above 8 cannot fill with it: the 64 and 1024 cells
 measure R_worker and say nothing about whether those queues fill under an
-open-loop storm. The accept queue capacity came from
+open-loop storm (the second run below fills the 64-deep queue). The accept queue capacity came from
 `experiments/accept-queue-poll.patch`, a diagnostic that reads
 `BENCH_ACCEPT_QUEUE` in bench-server; it is not merged into bench-server. Four
 rounds, capacities interleaved, 16 runs, 0 connect or I/O errors in every run.
@@ -163,8 +163,9 @@ to the acceptor, on the accept path of every connection, for a state the
 
 - A deployment needs `accept_queue_capacity` below 64 (the cost was measured
   at 16 and not at 64; the boundary between them was not located), or a
-  worker rate well above about 32,000 connections/s, where a 64-deep queue
-  refills in less time and the poll could start to cost there.
+  worker rate above about 64,000 connections/s, where the worker drains a
+  64-deep queue in less than the 1 ms sleep and the poll could start to cost
+  there.
 - `accept_queue_full` is seen rising at the default capacity under a real
   workload. That says arrivals exceeded the worker's rate for long enough to
   queue 1024 connections; by the model the poll then adds at most about 1 ms
