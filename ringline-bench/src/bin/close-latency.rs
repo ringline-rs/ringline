@@ -154,7 +154,6 @@ fn run_server(
         .workers(workers)
         .pin_to_core(false)
         .sq_entries(256)
-        .max_connections(16384)
         .send_pool(512, 4096);
     let builder = match iowq_max_workers {
         Some(n) => builder.iowq_max_workers(n),

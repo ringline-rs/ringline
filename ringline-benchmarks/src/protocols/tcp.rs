@@ -160,7 +160,6 @@ fn start_ringline_server(
         .workers(1)
         .pin_to_core(false)
         .sq_entries(256)
-        .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .build()
         .expect("valid config");
