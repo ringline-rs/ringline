@@ -17,13 +17,13 @@ behind the FIFO's head while slots are free.
 ## Method
 
 Binaries: `experiments/send-admission-b-build.toml`, io_uring builds of two
-commits of the work branch `exp/send-admission-b` on the brayniac fork.
-cf283561 (artifact `01a1ddd9-1448`) ran the two floor runs, echo runs 1 and
-2, and the four contended pilots. 31d31976 (artifact `01a1de0c-432a`) adds
-`bytes-admitted-await` and ran echo runs 3 and 4 and the 24 contended runs.
-The commit that records this entry differs from 31d31976 in `ringline-bench`
-and `ringline/src` only in two doc comments in
-`ringline-bench/src/bin/server.rs`, so building it builds the same code.
+versions of B's tools. The first (artifact `01a1ddd9-1448`) ran the two floor
+runs, echo runs 1 and 2, and the four contended pilots. The second (artifact
+`01a1de0c-432a`) adds `bytes-admitted-await` and ran echo runs 3 and 4 and the
+24 contended runs. #945's `ringline-bench` differs from the second only in two
+doc comments in `ringline-bench/src/bin/server.rs`. Its `ringline/src` also
+carries #946 to #949, which landed on main between the build and the merge,
+so building #945 does not build the same library.
 
 Uncontended: `bench-server` with one worker, pinned to CPU 0, in a guest on
 hv02 (z1, 24 vCPU); `bench-client` in a guest on hv01 (z2, 56 vCPU), across the
@@ -79,11 +79,11 @@ Four pilots at a ratio of 1 with `send_admitted` chose the cap:
 ## Prediction
 
 The predictions were written before the first rack run was submitted, and are
-as first committed in 31d31976, after echo runs 1 and 2 had finished; the note
-after them was added with the results. The contended part was revised before
-the first rack submission, after a local smoke run on mio (macOS), which showed
-the large-reply timeout at a ratio of 0.5 and seven small replies just past the
-limit.
+as first committed with the second version, after echo runs 1 and 2 had
+finished; the note after them was added with the results. The contended part
+was revised before the first rack submission, after a local smoke run on mio
+(macOS), which showed the large-reply timeout at a ratio of 0.5 and seven small
+replies just past the limit.
 
 Uncontended, closed loop:
 
@@ -216,8 +216,15 @@ Runs, by cell and repetition 1 to 4 (all `01a1de11-`): `send_admitted` 0.5
 - The cost of FIFO order is latency: small replies sent with `send_admitted`
   wait behind the head until it is admitted or times out, p99 about 770 ms.
   `send`'s 11.5 ms is this setup's floor on loopback: the uncontended first
-  pilot had a small-reply p50 of 5.9 ms and a maximum of 15.0 ms. I do not
-  know the cause of that floor.
+  pilot had a small-reply p50 of 5.9 ms and a maximum of 15.0 ms.
+  Correction (2026-11-15, Experiment C): the floor was the load generator.
+  Its small connections waited for their next send in a blocking read under
+  `SO_RCVTIMEO`, which the kernel rounds up to a timer tick, so each request
+  was written up to a tick late and its latency, measured from the scheduled
+  time, carried that. With the wait moved to `ppoll`, the same server's
+  delay from scheduled time to admission under `send` was 0.4 ms at p99 in
+  this case (`2026-11-send-admission-c.md`, C0). Both arms ran the same
+  load generator, so both carried the lateness.
 
 ## Outcome
 
