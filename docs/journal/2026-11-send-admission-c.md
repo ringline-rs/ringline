@@ -1,7 +1,7 @@
 # Experiment C: an admission order that lets replies past a waiting head
 
-- **Status:** open. C0, C1 and C2's matrix have run; C2's W1 cell with sends
-  outside the FIFO and the echo check are queued on the final binaries.
+- **Status:** closed. The decision rule passes O4, O5 and O7w; the owner chose
+  O7w, and for plaintext chose Experiment D's design instead.
 - **Span:** Nov 2026 · follows #945 (Experiment B) · SystemsLab context
   `send-admission-expC`
 
@@ -327,6 +327,73 @@ timed out none, and O4's fast p99 with six slow readers (86 ms in the model,
 0.4 ms on the rack). The rack's O4 passed no slow reader's reply; whether the
 model's idle condition lets them pass has not been checked.
 
+### Echo check
+
+`experiments/send-admission-c-echo.toml`, four runs (`01a1e12c-a499`,
+`-a4f7`, `-a553`, `-a5b1`), each one boot of a server guest on hv02 and a
+client guest on hv01, all `success`, on the binaries of f561f58a (artifact
+`01a1e11f-c3a0`). Six arms, four rounds each, the order rotated so that
+`nowait` ran before `send` in two rounds and after it in two. One worker,
+256 B messages, 256 connections. Summarised by
+`experiments/send-admission-c-echo-report.py`, which on Experiment B's four
+runs reproduces B's journal figures (floor 2.0%, `bytes-admitted` +1.7%,
+higher in 12 of 16).
+
+Closed loop, worker CPU per operation, each arm paired by round with its
+base arm over the 16 rounds, and the base arm's floor (the median change
+between its consecutive rounds within a boot):
+
+| arm | against | rounds higher | median change | range |
+| --- | --- | --- | --- | --- |
+| O7w (`budget-idle`) | strict | 9 of 16 | +0.3% | -3.9% to +5.8% |
+| O5 (`split-pool`) | strict | 12 of 16 | +1.0% | -2.8% to +6.4% |
+| O4 (`bounded-idle`) | strict | 7 of 16 | -0.1% | -3.5% to +4.5% |
+| `send` | `nowait` | 12 of 16 | +1.4% | -3.1% to +4.1% |
+| strict (`send_admitted`) | `nowait` | 12 of 16 | +1.2% | -3.7% to +4.4% |
+
+Floors: strict 1.4% (12 pairs, at most 3.9%), `nowait` 1.3% (at most 5.0%).
+Open-loop CPU per operation moved by 0.5% or less against either base, and
+open-loop p99 by 2.2% or less in median, inside floors of 4.1% (strict) and
+5.4% (`nowait`).
+
+- The orders: O4, O5 and O7w are within strict's floor, so each meets the
+  decision rule's uncontended condition. O7 was not in the echo check.
+- `send` against `send_nowait`: the author's prediction (within the floor of
+  `nowait`) is refuted by its stated condition, by 0.1 points: +1.4% against
+  a floor of 1.3%, higher in 12 of 16 rounds. `send` cost about what
+  `send_admitted` cost here (+1.2%). So the completion-table entry that
+  `send_nowait` skips costs about 1.3% of one saturated worker's CPU per
+  256 B operation, at the edge of what this setup resolves.
+- The control: `send_admitted` against `send_nowait`, +1.2%, is inside B's
+  range (-5.1% to +4.1%), so this session is comparable with B's (+1.7%).
+
 ## Outcome
 
-None yet.
+By the decision rule, applied as written:
+
+- W2 with six slow readers was contended (O1 timed out every head), so the
+  experiment ran to its decision.
+- O3 fails: its largest head delay with six slow readers was 949.2 ms
+  against an allowance of about 793 ms (O0's 721.3 ms plus 10%).
+- O4, O5 and O7w pass every condition: no more head timeouts than O0, head
+  delay within the allowance, no more fast small replies beyond
+  `admit_limit` than O0, fast small p99 at most 10 ms in W1 (0.2 to 0.6 ms),
+  every head admitted with no slow readers, and uncontended CPU within
+  strict's floor.
+- O7 passes the contended conditions, with a fast small p99 of 274 ms in W2
+  that the rule does not count, and has no echo figure.
+- The rule's tie-break, the passing order that adds least by the design's
+  table, does not rank O4, O5 and O7w (the table has no row for O7w). The
+  owner chose O7w on 2026-11-15: it matched O4 in every cell, caps what
+  passing sends hold at R, and has no latch, where every bug the orders'
+  reviews found was.
+- The owner's prediction that O3 starves a large head is refuted by its own
+  condition (no timeouts; 228 ms over O0, less than the 940 ms hold of a
+  passing send), while O3 still fails the rule on that delay.
+- The owner then chose, for plaintext, to bound what one send holds rather
+  than rely on an order: Experiment D (`2026-11-send-admission-d.md`). O7w is
+  the order for TLS connections, and for plaintext if D's gated pieces do not
+  pass.
+- `send_nowait` against `send`: the measured cost of a completion is about
+  1.3% of worker CPU per 256 B operation, at the floor. Whether that keeps
+  `send_nowait` in the API is the owner's decision.
