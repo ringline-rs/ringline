@@ -26,9 +26,9 @@
 //! for a type that owns its claim on that memory. If that memory is in a
 //! region registered with
 //! [`Runtime::register_region`](crate::Runtime::register_region), the type
-//! returns the region from [`IoBuf::region`], and on io_uring its reads and
-//! writes use the registered buffer instead of pinning its pages for each
-//! operation.
+//! returns the region from [`IoBuf::region`], and on io_uring its direct
+//! I/O and NVMe operations use the registered buffer instead of pinning its
+//! pages for each operation.
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
@@ -72,15 +72,22 @@ pub unsafe trait IoBuf: 'static {
     ///
     /// On io_uring, a read or write from a buffer that names a region is
     /// submitted as `IORING_OP_READ_FIXED` / `IORING_OP_WRITE_FIXED` (for
-    /// NVMe, `IORING_URING_CMD_FIXED`) with the region's index, so the
-    /// kernel does not pin and unpin the buffer's pages for each operation.
-    /// ringline checks that the operation's range lies inside the region and
-    /// otherwise refuses it with
-    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput); an
-    /// operation refused that way returns the buffer as other refusals do.
+    /// NVMe, `IORING_URING_CMD_FIXED`) with the region's index. A direct I/O
+    /// or NVMe operation then does not pin and unpin the buffer's pages; a
+    /// buffered `fs` read or write copies through the page cache and pins
+    /// nothing either way. ringline checks that the operation's range lies
+    /// inside the region and otherwise refuses it with
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput); an operation
+    /// refused that way returns the buffer as other refusals do.
     /// [`Runtime::register_region`](crate::Runtime::register_region) returns
-    /// the `RegionId`, which names the region on every worker. The mio
-    /// backend ignores the region.
+    /// the `RegionId`, which names the region on every worker. Unregister a
+    /// region only after every buffer that names it has been returned or
+    /// dropped: a dropped future keeps its buffer until the operation
+    /// completes. The mio backend ignores the region.
+    ///
+    /// A type that also implements [`SendGuard`](crate::SendGuard) has two
+    /// `region` methods; call them as `IoBuf::region(&v)` and
+    /// `SendGuard::region(&v)`.
     ///
     /// Return the same value on every call while ringline holds the value.
     fn region(&self) -> crate::RegionId {

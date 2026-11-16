@@ -52,8 +52,9 @@ unsafe impl Sync for MemoryRegion {}
 pub struct RegionId(pub(crate) u16);
 
 impl RegionId {
-    /// Sentinel for guards whose memory is not in a registered io_uring region.
-    /// Guards with this region skip pointer validation in `submit_with_guards`.
+    /// Sentinel for memory not in a registered io_uring region: the default
+    /// of `IoBuf::region`, and a `SendGuard` that skips pointer validation in
+    /// `submit_with_guards`.
     pub const UNREGISTERED: Self = RegionId(u16::MAX);
 }
 

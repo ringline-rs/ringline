@@ -7019,6 +7019,64 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// An NVMe read or write from a buffer that names a registered region
+    /// pushes its `URING_CMD` with that region's index
+    /// (`IORING_URING_CMD_FIXED`), and one from an unregistered buffer with
+    /// none (#841). The device slot is filled in by hand and has no device
+    /// behind it, so the kernel fails the commands; only what was pushed is
+    /// checked.
+    #[test]
+    fn an_nvme_command_from_a_registered_region_sets_the_fixed_index() {
+        use crate::backend::uring::sqe::Op;
+        use crate::buffer::fixed::{MemoryRegion, RegionId};
+        let backing: &'static mut crate::buf::AlignedBuf =
+            Box::leak(Box::new(crate::buf::AlignedBuf::zeroed(8192, 4096)));
+        let base = backing.as_mut_ptr();
+        // Safety: `backing` is leaked, so it stays valid and unmoved.
+        let region = unsafe { MemoryRegion::new(base, 8192) };
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .nvme(crate::nvme::NvmeConfig::default())
+                .registered_regions(vec![region])
+                .max_registered_regions(4)
+                .build()
+                .expect("valid config"),
+        );
+        let devices = el.driver.nvme_devices.as_mut().expect("NVMe configured");
+        let index = devices.allocate().expect("a device slot");
+        let generation = devices.get(index).unwrap().generation;
+        let device = crate::nvme::NvmeDevice::new(index, generation);
+        let rid = RegionId(0);
+        let cases: [(bool, RegionId, Option<u16>); 4] = [
+            (false, rid, Some(0)),
+            (true, rid, Some(0)),
+            (false, RegionId::UNREGISTERED, None),
+            (true, RegionId::UNREGISTERED, None),
+        ];
+        for (write, region, want) in cases {
+            let key = el.executor.begin_disk_io(0);
+            let mut ctx = el.driver.make_ctx();
+            // Safety: `base..base + 8192` is the leaked region.
+            let submitted = unsafe {
+                if write {
+                    ctx.nvme_write(device, 0, 1, base as u64, 4096, region, key)
+                } else {
+                    ctx.nvme_read(device, 0, 1, base as u64, 4096, region, key)
+                }
+            };
+            submitted.expect("submit NVMe command");
+            let pushed = el.driver.ring.last_pushed.as_ref().unwrap().op;
+            match pushed {
+                Op::UringCmd80 { buf_index, .. } => assert_eq!(
+                    buf_index, want,
+                    "write {write}, region {region:?}: the pushed index"
+                ),
+                other => panic!("expected a URING_CMD, got {other:?}"),
+            }
+            let _ = wait_for_result(&mut el, key);
+        }
+    }
+
     /// As `an_fsync_waits_for_an_earlier_write_to_complete`, for a direct
     /// I/O file (`O_DIRECT` through `OpenAt`).
     #[test]

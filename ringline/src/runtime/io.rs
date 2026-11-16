@@ -5406,7 +5406,9 @@ fn nvme_transfer_len(
 /// A command that cannot be submitted resolves at once to `(Err(e), buf)`:
 /// [`io::ErrorKind::WouldBlock`] when the NVMe command slab is full, which a
 /// later retry with the same buffer can pass; [`io::ErrorKind::InvalidInput`]
-/// if `buf`'s spare capacity is smaller than the transfer; the Identify
+/// if `buf`'s spare capacity is smaller than the transfer, or if the
+/// transfer's range is not inside the region `buf`'s
+/// [`IoBuf::region`](crate::buf::IoBuf::region) names; the Identify
 /// Namespace error if the LBA size is unknown ([`nvme_lba_size`]); and
 /// `Unsupported` on the mio backend.
 ///
