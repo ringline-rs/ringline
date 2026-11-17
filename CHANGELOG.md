@@ -1390,7 +1390,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with `nosmt`, where every odd CPU is offline (#974). Releases from 0.2.0
   have this. On such a host, two or more workers with `pin_to_core` on (the
   default) failed `launch()` pinning a worker to an offline CPU, in every
-  release; with more workers than online cores this still happens.
+  release; when `core_offset` plus the worker count exceeds the physical
+  cores, this still happens.
 - io_uring: the `ringline/bytes` counter with `op=sent` now counts every
   TLS record a connection sends, handshake and alert records and every
   ciphertext chunk of an application send (#846). Every 0.6 release counted
