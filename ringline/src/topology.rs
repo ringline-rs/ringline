@@ -1,10 +1,11 @@
-/// Returns the number of physical CPU cores available to this process.
+/// Returns the number of physical CPU cores among the online CPUs.
 ///
 /// On Linux, reads `/sys/devices/system/cpu/cpu*/topology/physical_package_id`
 /// and `core_id` for each CPU in `/sys/devices/system/cpu/online` to count
 /// unique (socket, core) pairs, counting hyperthreading siblings once.
 /// Falls back to the logical CPU count when no CPU's topology can be read,
-/// and on non-Linux platforms.
+/// and on non-Linux platforms. The process's CPU affinity (`taskset`, a
+/// cpuset cgroup) and `isolcpus` are not taken into account.
 ///
 /// # Why physical cores for thread-per-core
 ///
@@ -64,14 +65,13 @@ fn linux_first_siblings() -> Option<Vec<usize>> {
 }
 
 /// The first logical CPU of each unique (physical_package_id, core_id) pair
-/// under `root` (`/sys/devices/system/cpu` on Linux), in ascending CPU order.
+/// under `root` (`/sys/devices/system/cpu` on Linux), in the order `online`
+/// lists them, which the kernel writes ascending.
 ///
 /// Visits the CPUs in `root/online` and skips any whose topology cannot be
-/// read. An offline CPU has a `cpuN` directory and no `topology/`, so a walk
-/// that stopped there would miss every CPU above it, as under `nosmt`, where
-/// every odd CPU is offline. Without a readable `online` list it counts up
-/// from cpu0 and stops at the first CPU without topology. `None` when no CPU
-/// has readable topology.
+/// read. An offline CPU has a `cpuN` directory and no `topology/`. Without a
+/// readable, well-formed `online` list it counts up from cpu0 and stops at
+/// the first CPU without topology. `None` when no CPU has readable topology.
 #[cfg(any(target_os = "linux", test))]
 fn first_siblings_in(root: &std::path::Path) -> Option<Vec<usize>> {
     use std::collections::HashSet;
@@ -114,8 +114,8 @@ fn first_siblings_in(root: &std::path::Path) -> Option<Vec<usize>> {
     }
 }
 
-/// Parse a kernel CPU list such as `0,2-5,8` into ascending CPU ids. `None`
-/// for an empty or malformed list.
+/// Parse a kernel CPU list such as `0,2-5,8` into CPU ids, in the order
+/// listed. `None` for an empty or malformed list.
 #[cfg(any(target_os = "linux", test))]
 fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
     let mut cpus = Vec::new();
@@ -212,6 +212,15 @@ mod tests {
             ],
         );
         assert_eq!(first_siblings_in(&root), Some(vec![0, 2, 4]));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // A CPU listed online without topology is skipped, not the end.
+        let root = fake_sysfs(
+            "online-no-topology",
+            Some("0,2,4"),
+            &[(0, Some((0, 0))), (2, None), (4, Some((0, 2)))],
+        );
+        assert_eq!(first_siblings_in(&root), Some(vec![0, 4]));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
