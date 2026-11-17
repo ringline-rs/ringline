@@ -4999,7 +4999,9 @@ pub type BatchAdmitted<'a> = Result<(usize, SendCompletion), BatchRefused<'a>>;
 ///
 /// The send-slab entry a zero-copy batch needs is not part of admission:
 /// the batch takes it once admitted, and a full slab refuses the batch.
-/// Releasing a slab entry wakes nothing.
+/// Releasing a slab entry wakes nothing, and `writable` waits for socket
+/// room, not for a slab entry: after a slab refusal, a caller copies the
+/// parts' bytes or aborts.
 ///
 /// # Refusals
 ///
