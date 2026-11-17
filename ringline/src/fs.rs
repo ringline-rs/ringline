@@ -974,9 +974,10 @@ pub(crate) fn release_orphans(
 /// with `buf` unchanged: [`io::ErrorKind::WouldBlock`] when the command slab
 /// or the in-flight bound is full, which a later retry with the same buffer
 /// can pass; [`io::ErrorKind::InvalidInput`] for a `buf` with no spare
-/// capacity or more than `u32::MAX` bytes of it, and on io_uring for a `buf`
-/// whose range is not inside the region its [`IoBuf::region`] names; and an
-/// error of kind `Other` otherwise, for example for a stale handle. The
+/// capacity or more than `u32::MAX` bytes of it. On io_uring it is also
+/// `InvalidInput` for a `buf` whose range is not inside the region its
+/// [`IoBuf::region`] names. Any other refusal is an error of kind `Other`,
+/// for example for a stale handle. The
 /// read's length is the whole spare capacity; to read fewer bytes, pass a
 /// buffer with that much spare capacity (an `AlignedBuf`'s capacity is
 /// exact). A spare capacity above `i32::MAX` is refused by macOS with

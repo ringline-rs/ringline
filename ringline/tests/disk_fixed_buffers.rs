@@ -24,7 +24,7 @@ const REGION_LEN: usize = 16384;
 static REGION: OnceLock<(usize, RegionId)> = OnceLock::new();
 static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
-/// `len` bytes of capacity at `ptr`, which may or may not be inside
+/// `cap` bytes of capacity at `ptr`, which may or may not be inside
 /// `region`; `init` of them initialized.
 struct RegionSlice {
     ptr: *mut u8,
