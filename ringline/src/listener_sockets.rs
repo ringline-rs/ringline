@@ -41,11 +41,10 @@ impl ListenerSockets {
     /// Stop every socket accepting connections, leaving the fds open.
     /// Idempotent.
     ///
-    /// On Linux `shutdown(SHUT_RD)` on a listening socket wakes a thread
-    /// blocked in `accept4` (with `EINVAL`), fails a multishot accept armed on
-    /// it, and takes the socket out of the listening state. On macOS it does
-    /// not wake a blocked `accept`, so the acceptor there polls and checks the
-    /// shutdown flag.
+    /// On Linux `shutdown(SHUT_RD)` on a listening socket fails a multishot
+    /// accept armed on it and takes the socket out of the listening state.
+    /// The acceptor thread does not depend on it: it waits in `poll` on the
+    /// runtime's stop signal (`crate::acceptor::StopSignal`).
     ///
     /// `SO_REUSEADDR` is set first. `SHUT_RD` does nothing to a socket that
     /// never listened, such as a deferred listener that was never opened, so

@@ -50,7 +50,7 @@
 //!                              ▼
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │        Acceptor Thread, one per listener (TCP or Unix)          │
-//! │      blocking accept4() -> round-robin to worker channels       │
+//! │  accept4() until EAGAIN, poll -> round-robin to worker channels │
 //! └─────────────────────────────────────────────────────────────────┘
 //!                              │
 //!              ┌───────────────┼───────────────┐

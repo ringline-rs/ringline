@@ -404,6 +404,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   served per worker. Sends on one connection keep their order. Set
   `ConfigBuilder::send_admission_order(SendAdmissionOrder::Strict)` to keep
   strict order across connections.
+- `Runtime::shutdown` (and dropping the `Runtime`) returns once every
+  pool-mode acceptor thread has exited, so a pool-mode listener's port is
+  free when it returns. It may block for up to 10 ms while an acceptor
+  finishes.
 - **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` (on
   `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`, resolving with
   `data.len()`, instead of `io::Result<()>`. `send_parts().build(f)`
@@ -1987,7 +1991,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   part followed the gap: 2,392,576 bytes of a 3 MiB part arrived on loopback.
   The kernel now retries it, and a chain that still sends fewer bytes than it
   holds fails (#734).
-- macOS: an acceptor thread exits at shutdown within about 100 ms. It used to
+- macOS: an acceptor thread exits at once at shutdown. It used to
   stay blocked in `accept` until a peer connected, and its listener kept the
   port until then (#560).
 - The acceptor thread no longer closes a connection when every worker's accept
