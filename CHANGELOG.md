@@ -49,6 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `IoBufAligned` marks a buffer whose start is a multiple of 4096 bytes;
   direct I/O reads and writes take only such buffers, such as `AlignedBuf`
   and `AlignedBytes`.
+- `IoBuf::region`: a disk buffer whose memory is in a region registered
+  with `Runtime::register_region` returns its `RegionId` (#841). On
+  io_uring, fs and direct I/O reads and writes from it are then
+  `IORING_OP_READ_FIXED` / `IORING_OP_WRITE_FIXED`, and NVMe commands set
+  `IORING_URING_CMD_FIXED`, so a direct I/O or NVMe operation does not pin
+  and unpin the buffer's pages. A buffered fs read or write pins nothing
+  either way. A buffer whose range is not inside the region it names is
+  refused with `InvalidInput`. The method defaults to
+  `RegionId::UNREGISTERED`. The mio backend ignores it.
 - `nvme_lba_size(device)` returns the namespace's logical block size, which
   `open_nvme_device` now reads with Identify Namespace.
 - `SendHalf::send_admitted` and `Connection::send_admitted`, returning an

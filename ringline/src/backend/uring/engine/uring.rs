@@ -1256,11 +1256,20 @@ impl Sqe {
     /// The 128-byte entry the ring's submission queue holds.
     pub(crate) fn encode(&self) -> Entry128 {
         let e: Entry128 = match self.op {
-            Op::UringCmd80 { fd, cmd_op, cmd } => {
+            Op::UringCmd80 {
+                fd,
+                cmd_op,
+                cmd,
+                buf_index,
+            } => {
                 let e = match fd {
-                    Fd::Fixed(i) => opcode::UringCmd80::new(Fixed(i), cmd_op).cmd(cmd).build(),
+                    Fd::Fixed(i) => opcode::UringCmd80::new(Fixed(i), cmd_op)
+                        .cmd(cmd)
+                        .buf_index(buf_index)
+                        .build(),
                     Fd::Raw(f) => opcode::UringCmd80::new(types::Fd(f), cmd_op)
                         .cmd(cmd)
+                        .buf_index(buf_index)
                         .build(),
                 };
                 e.user_data(self.user_data)
@@ -1355,6 +1364,28 @@ impl Sqe {
                 offset,
             } => {
                 on!(fd, |t| opcode::Write::new(t, buf, len)
+                    .offset(offset)
+                    .build())
+            }
+            Op::ReadFixed {
+                fd,
+                buf,
+                len,
+                offset,
+                buf_index,
+            } => {
+                on!(fd, |t| opcode::ReadFixed::new(t, buf, len, buf_index)
+                    .offset(offset)
+                    .build())
+            }
+            Op::WriteFixed {
+                fd,
+                buf,
+                len,
+                offset,
+                buf_index,
+            } => {
+                on!(fd, |t| opcode::WriteFixed::new(t, buf, len, buf_index)
                     .offset(offset)
                     .build())
             }
@@ -1621,6 +1652,32 @@ mod encode_tests {
                 e(opcode::Write::new(fx, p, 4096).offset(8192).build()),
             ),
             (
+                Sqe::new(
+                    Op::ReadFixed {
+                        fd: Fd::Fixed(9),
+                        buf: p,
+                        len: 4096,
+                        offset: 8192,
+                        buf_index: 3,
+                    },
+                    ud,
+                ),
+                e(opcode::ReadFixed::new(fx, p, 4096, 3).offset(8192).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::WriteFixed {
+                        fd: Fd::Fixed(9),
+                        buf: p,
+                        len: 4096,
+                        offset: 8192,
+                        buf_index: 3,
+                    },
+                    ud,
+                ),
+                e(opcode::WriteFixed::new(fx, p, 4096, 3).offset(8192).build()),
+            ),
+            (
                 Sqe::new(Op::Fsync { fd: Fd::Fixed(9) }, ud),
                 e(opcode::Fsync::new(fx).build()),
             ),
@@ -1773,11 +1830,28 @@ mod encode_tests {
                         fd: Fd::Fixed(9),
                         cmd_op: 0x42,
                         cmd,
+                        buf_index: None,
                     },
                     ud,
                 ),
                 opcode::UringCmd80::new(fx, 0x42)
                     .cmd(cmd)
+                    .build()
+                    .user_data(ud),
+            ),
+            (
+                Sqe::new(
+                    Op::UringCmd80 {
+                        fd: Fd::Fixed(9),
+                        cmd_op: 0x42,
+                        cmd,
+                        buf_index: Some(3),
+                    },
+                    ud,
+                ),
+                opcode::UringCmd80::new(fx, 0x42)
+                    .cmd(cmd)
+                    .buf_index(Some(3))
                     .build()
                     .user_data(ud),
             ),

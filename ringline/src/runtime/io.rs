@@ -6113,7 +6113,9 @@ fn nvme_transfer_len(
 /// A command that cannot be submitted resolves at once to `(Err(e), buf)`:
 /// [`io::ErrorKind::WouldBlock`] when the NVMe command slab is full, which a
 /// later retry with the same buffer can pass; [`io::ErrorKind::InvalidInput`]
-/// if `buf`'s spare capacity is smaller than the transfer; the Identify
+/// if `buf`'s spare capacity is smaller than the transfer, or if the
+/// transfer's range is not inside the region `buf`'s
+/// [`IoBuf::region`](crate::buf::IoBuf::region) names; the Identify
 /// Namespace error if the LBA size is unknown ([`nvme_lba_size`]); and
 /// `Unsupported` on the mio backend.
 ///
@@ -6147,7 +6149,15 @@ pub fn nvme_read<B: crate::buf::IoBufMut>(
         // Safety: the future owns `buf`, or parks it on drop until the
         // command completes.
         match crate::fs::submit_with_key(executor, |key| unsafe {
-            ctx.nvme_read(device, lba, num_blocks, ptr as u64, data_len, key)
+            ctx.nvme_read(
+                device,
+                lba,
+                num_blocks,
+                ptr as u64,
+                data_len,
+                buf.region(),
+                key,
+            )
         }) {
             Ok((key, target)) => ReadFuture::new(key, target, initial_len, Some(data_len), buf),
             Err(e) => ReadFuture::failed(e, buf),
@@ -6218,7 +6228,15 @@ pub fn nvme_write<B: crate::buf::IoBuf>(
         // Safety: the future owns `buf`, or parks it on drop until the
         // command completes.
         match crate::fs::submit_with_key(executor, |key| unsafe {
-            ctx.nvme_write(device, lba, num_blocks, ptr as u64, data_len, key)
+            ctx.nvme_write(
+                device,
+                lba,
+                num_blocks,
+                ptr as u64,
+                data_len,
+                buf.region(),
+                key,
+            )
         }) {
             Ok((key, target)) => WriteFuture::new(key, target, Some(data_len), buf),
             Err(e) => WriteFuture::failed(e, buf),
