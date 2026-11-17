@@ -244,6 +244,10 @@ pub struct Config {
     /// one per CQE instead. Guard sends fail with `Other("send slab
     /// exhausted")` while it is full. Default: 512.
     pub(crate) send_slab_slots: u16,
+    /// The order in which each worker's admission FIFO admits bounded sends;
+    /// see [`ConfigBuilder::send_admission_order`]. Default: `Budget` with
+    /// 32 slots.
+    pub(crate) send_admission_order: crate::SendAdmissionOrder,
     /// Deadline-based flush interval in microseconds during CQE processing.
     /// When non-SQPOLL, if this many microseconds elapse since the last submit
     /// while processing a CQE batch, pending SQEs are flushed mid-iteration.
@@ -336,7 +340,7 @@ pub struct Config {
     /// Maximum parts in one `send_chain` (`SendChainBuilder::copy` and
     /// `ChainPartsBuilder::add` each count one). A chain that would exceed
     /// it fails with `InvalidInput`. 0 refuses every chain. It does not
-    /// affect `send`, `send_nowait` or `send_parts`. Default: 16.
+    /// affect `send` or `send_parts`. Default: 16.
     pub(crate) max_chain_length: u16,
     /// Maximum number of standalone async tasks (not bound to connections)
     /// per worker. Used with [`spawn()`](crate::spawn).
@@ -526,6 +530,7 @@ impl Default for Config {
             send_copy_slot_size: 16448,
             send_zc_threshold: 4096,
             send_slab_slots: 512,
+            send_admission_order: crate::SendAdmissionOrder::Budget { slots: 32 },
             flush_interval_us: 100,
             tick_timeout_us: 10_000,
             tls: None,
@@ -673,6 +678,11 @@ impl Config {
         if self.send_copy_count == 0 {
             return Err(crate::error::Error::RingSetup(
                 "send_copy_count must be > 0".into(),
+            ));
+        }
+        if let crate::SendAdmissionOrder::Budget { slots: 0 } = self.send_admission_order {
+            return Err(crate::error::Error::RingSetup(
+                "SendAdmissionOrder::Budget needs slots > 0".into(),
             ));
         }
         self.validate_tls_slot_size()?;
@@ -1316,6 +1326,33 @@ impl ConfigBuilder {
     /// Set the number of scatter-gather send slab slots.
     pub fn send_slab_slots(mut self, n: u16) -> Self {
         self.config.send_slab_slots = n;
+        self
+    }
+
+    /// Set the order in which each worker admits bounded sends
+    /// ([`send_admitted`](crate::SendHalf::send_admitted) and
+    /// [`send_backpressured`](crate::SendHalf::send_backpressured)) to its
+    /// send copy pool.
+    ///
+    /// A bounded send that does not fit the pool's free slots waits in a FIFO
+    /// shared by the worker's connections. Under
+    /// [`Strict`](crate::SendAdmissionOrder::Strict) only the oldest waiter
+    /// is admitted, so a small send waits behind a large one that does not
+    /// fit. Under [`Budget`](crate::SendAdmissionOrder::Budget) a waiter that
+    /// fits can be admitted ahead of an older waiter on another connection,
+    /// while the slots held by sends admitted that way, with its own, are at
+    /// most min(`slots`, P - H) (P the pool's slot count, H the slots the
+    /// FIFO's head needs), and only onto a connection with no send queued or
+    /// in flight whose last send did not wait for room in the socket. The
+    /// sends on one connection are admitted in the order they were made under
+    /// either order.
+    ///
+    /// [`build`](Self::build) refuses `Budget { slots: 0 }`. A `slots` larger
+    /// than the pool's slot count admits as the slot count does.
+    ///
+    /// Default: `Budget { slots: 32 }`.
+    pub fn send_admission_order(mut self, order: crate::SendAdmissionOrder) -> Self {
+        self.config.send_admission_order = order;
         self
     }
 
@@ -2046,6 +2083,24 @@ mod tests {
     #[test]
     fn validate_send_copy_count_zero_rejected() {
         assert!(config_with(|c| c.send_copy_count = 0).validate().is_err());
+    }
+
+    /// `Budget` needs at least one slot; any larger budget is accepted,
+    /// above the pool's slot count too, and so is `Strict`.
+    #[test]
+    fn validate_budget_needs_a_slot() {
+        let with = |order| config_with(|c| c.send_admission_order = order).validate();
+        let budget = |slots| crate::SendAdmissionOrder::Budget { slots };
+        let err = with(budget(0)).expect_err("a budget of 0");
+        assert!(err.to_string().contains("slots > 0"), "{err}");
+        assert!(with(budget(1)).is_ok());
+        assert!(with(budget(u16::MAX)).is_ok(), "above the 1024 slots");
+        assert!(with(crate::SendAdmissionOrder::Strict).is_ok());
+        assert_eq!(
+            Config::default().send_admission_order,
+            budget(32),
+            "the default"
+        );
     }
 
     #[test]

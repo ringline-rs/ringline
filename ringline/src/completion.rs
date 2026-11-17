@@ -112,6 +112,18 @@ pub enum OpTag {
     /// completion releases the hold on the `Close`. Payload = connection
     /// generation.
     Disconnect = 39,
+    /// One-shot `POLL_ADD` for `POLLOUT` that a `SendHalf::writable` future
+    /// arms while the connection's `SendPollOut` is multishot, which reports
+    /// only changes. After the peer half-closes it completes at
+    /// once, with `POLLOUT` if the socket is writable then; otherwise it
+    /// completes when the socket becomes writable. A connection arms one at a
+    /// time (`ConnSendState::send_probe`), and its `Close` cancels it.
+    /// Payload = connection generation.
+    SendPollProbe = 40,
+    /// The `FixedFdInstall` of `send_buffer_size`: a real fd for the
+    /// connection's socket, read with `getsockopt(SO_SNDBUF)` and closed in
+    /// the completion. Payload = connection generation.
+    SendBufInstall = 41,
 }
 
 impl OpTag {
@@ -145,6 +157,8 @@ impl OpTag {
             37 => Some(OpTag::HangupPoll),
             38 => Some(OpTag::HangupPeek),
             39 => Some(OpTag::Disconnect),
+            40 => Some(OpTag::SendPollProbe),
+            41 => Some(OpTag::SendBufInstall),
             _ => None,
         }
     }
@@ -186,6 +200,8 @@ impl OpTag {
             OpTag::HangupPoll => "hangup_poll",
             OpTag::HangupPeek => "hangup_peek",
             OpTag::Disconnect => "disconnect",
+            OpTag::SendPollProbe => "send_poll_probe",
+            OpTag::SendBufInstall => "send_buf_install",
         }
     }
 }

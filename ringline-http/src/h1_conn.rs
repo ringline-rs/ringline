@@ -388,7 +388,7 @@ impl H1Conn {
             req.extend_from_slice(b);
         }
 
-        self.tx.send_nowait(&req)?;
+        self.tx.send(&req)?;
 
         // Parse response headers. Cap the header section size to bound a
         // peer that dribbles bytes forever.

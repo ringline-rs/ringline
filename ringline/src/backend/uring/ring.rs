@@ -295,13 +295,15 @@ impl Ring {
 
     /// Submit a direct receive: a one-shot recv of `len` bytes into `ptr`,
     /// the spare capacity of a connection's accumulator buffer held by
-    /// `Driver::direct_recvs[slot]` until the CQE.
+    /// `Driver::direct_recvs[slot]` until the CQE. `poll_first` sets
+    /// `IORING_RECVSEND_POLL_FIRST` (`Op::Recv`).
     pub fn submit_recv_direct(
         &mut self,
         conn_index: u32,
         ptr: *mut u8,
         len: u32,
         slot: u32,
+        poll_first: bool,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvDirect, conn_index, slot);
         let entry = Sqe::new(
@@ -310,6 +312,7 @@ impl Ring {
                 buf: ptr,
                 len,
                 flags: 0,
+                poll_first,
             },
             user_data.raw(),
         );
@@ -355,6 +358,7 @@ impl Ring {
                 buf,
                 len: 1,
                 flags: libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                poll_first: false,
             },
             user_data.raw(),
         );
@@ -745,6 +749,17 @@ impl Ring {
         Ok(())
     }
 
+    /// A real fd for the connection's socket, for `send_buffer_size`. The
+    /// completion closes it.
+    pub fn submit_send_buf_install(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let ud = UserData::encode(OpTag::SendBufInstall, conn_index, generation);
+        let entry = Sqe::new(Op::FixedFdInstall { index: conn_index }, ud.raw());
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
     /// Recover a real fd for a connection whose recv is already cancelled.
     pub fn submit_park_install(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         let ud = UserData::encode(OpTag::ParkInstall, conn_index, generation);
@@ -940,6 +955,40 @@ impl Ring {
             self.push_sqe(&entry)?;
         }
         Ok(())
+    }
+
+    /// Submit the one-shot `POLL_ADD` for `POLLOUT` that a
+    /// `SendHalf::writable` future arms while the connection's
+    /// [`submit_send_pollout`](Self::submit_send_pollout) poll is multishot
+    /// (`OpTag::SendPollProbe`).
+    pub fn submit_send_probe(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::SendPollProbe, conn_index, generation);
+        let entry = Sqe::new(
+            Op::PollAdd {
+                fd: sqe::Fd::Fixed(conn_index),
+                mask: libc::POLLOUT as u32,
+                multi: false,
+            },
+            user_data.raw(),
+        );
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
+    /// Cancel the [`submit_send_probe`](Self::submit_send_probe) of
+    /// `conn_index`, if it is still in the kernel.
+    pub fn submit_cancel_send_probe(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let target = UserData::encode(OpTag::SendPollProbe, conn_index, generation);
+        let ud = UserData::encode(OpTag::Cancel, conn_index, 0);
+        let entry = Sqe::new(
+            Op::Cancel {
+                target: target.raw(),
+            },
+            ud.raw(),
+        );
+        unsafe { self.push_sqe(&entry) }
     }
 
     /// Cancel the armed [`submit_send_pollout`](Self::submit_send_pollout) of

@@ -10,6 +10,11 @@ use crate::runtime::send_completion::SendId;
 #[must_use = "an unfilled reservation must be returned with release_reservation"]
 pub struct SlotReservation {
     remaining: usize,
+    /// Taken by a send admitted past a waiting head (see
+    /// [`SendCopyPool::begin_passing`]): its unfilled remainder counts
+    /// towards [`SendCopyPool::passing_held`], and the slots filled from it
+    /// are marked as passing.
+    passing: bool,
 }
 
 impl SlotReservation {
@@ -72,6 +77,20 @@ pub struct SendCopyPool {
     // taking a slot, so a reservation is honoured even if another allocation
     // interleaves with it.
     reserved: usize,
+    // Per slot: whether a send admitted past a waiting head holds it. Empty
+    // unless `track_passing` was called, which the drivers do only when the
+    // worker's `SendAdmissionOrder` is `Budget`; `release` reads it only
+    // while `passing_held` is non-zero.
+    passing: Vec<bool>,
+    // The slots passing sends hold, B in `docs/send-admission-design.md`:
+    // marked slots in use plus the unfilled remainder of passing
+    // reservations. Never more than the slots in use (`debug_assert`ed).
+    passing_held: usize,
+    // The largest `passing_held` has been.
+    passing_peak: usize,
+    // Set between `begin_passing` and `end_passing`: every slot and
+    // reservation taken meanwhile is marked as passing.
+    marking: bool,
 }
 
 impl SendCopyPool {
@@ -98,6 +117,96 @@ impl SendCopyPool {
             in_use: vec![false; n],
             slot_send_id: vec![None; n],
             reserved: 0,
+            passing: Vec::new(),
+            passing_held: 0,
+            passing_peak: 0,
+            marking: false,
+        }
+    }
+
+    /// Keep a mark on each slot a send admitted past a waiting head takes, so
+    /// that [`passing_held`](Self::passing_held) counts them. The drivers
+    /// call this at creation when the worker's `SendAdmissionOrder` is
+    /// `Budget`; without it no slot is ever marked.
+    pub(crate) fn track_passing(&mut self) {
+        self.passing = vec![false; self.count as usize];
+    }
+
+    /// Mark every slot and reservation taken from now until
+    /// [`end_passing`](Self::end_passing) as held by a passing send.
+    /// `Admission` sets it around the `send_bounded` call of a send admitted
+    /// past a waiting head, so every allocation path inside that call marks.
+    pub(crate) fn begin_passing(&mut self) {
+        debug_assert_eq!(
+            self.passing.len(),
+            self.count as usize,
+            "begin_passing on a pool that does not track passing slots"
+        );
+        self.marking = true;
+    }
+
+    /// Stop marking; see [`begin_passing`](Self::begin_passing).
+    pub(crate) fn end_passing(&mut self) {
+        self.marking = false;
+    }
+
+    /// Stop marking for an allocation inside a passing send's call that is
+    /// not the send's own (a close_notify queued by the close that a failed
+    /// encryption forces), and return whether marking was on, for
+    /// [`resume_passing`](Self::resume_passing).
+    pub(crate) fn pause_passing(&mut self) -> bool {
+        std::mem::take(&mut self.marking)
+    }
+
+    /// Restore the marking [`pause_passing`](Self::pause_passing) returned.
+    pub(crate) fn resume_passing(&mut self, marking: bool) {
+        self.marking = marking;
+    }
+
+    /// The slots held by sends admitted past a waiting head: marked slots
+    /// not yet released, plus the unfilled remainder of their reservations
+    /// (mio holds a bounded send's whole permit unfilled until the send
+    /// completes).
+    pub(crate) fn passing_held(&self) -> usize {
+        self.passing_held
+    }
+
+    /// The largest [`passing_held`](Self::passing_held) has been since the
+    /// pool was created.
+    pub(crate) fn passing_peak(&self) -> usize {
+        self.passing_peak
+    }
+
+    /// Count `n` more slots as held by passing sends. The slots are already
+    /// taken (popped or reserved), so the count stays within the slots in
+    /// use.
+    fn take_passing(&mut self, n: usize) {
+        self.passing_held += n;
+        self.passing_peak = self.passing_peak.max(self.passing_held);
+        debug_assert!(
+            self.passing_held <= self.slot_count() - self.free_count(),
+            "passing sends hold {} slots but only {} are in use",
+            self.passing_held,
+            self.slot_count() - self.free_count(),
+        );
+    }
+
+    /// Count `n` fewer slots as held by passing sends.
+    fn return_passing(&mut self, n: usize) {
+        debug_assert!(
+            n <= self.passing_held,
+            "returning {n} passing slots but only {} are held",
+            self.passing_held
+        );
+        self.passing_held -= n;
+    }
+
+    /// Mark the just-popped slot `idx` as passing if a passing send is
+    /// allocating.
+    fn mark_if_passing(&mut self, idx: u16) {
+        if self.marking {
+            self.passing[idx as usize] = true;
+            self.take_passing(1);
         }
     }
 
@@ -155,6 +264,7 @@ impl SendCopyPool {
             return None;
         }
         let idx = self.pop_unreserved()?;
+        self.mark_if_passing(idx);
         Some(self.fill_slot(idx, data))
     }
 
@@ -172,6 +282,7 @@ impl SendCopyPool {
             return None;
         }
         let idx = self.pop_unreserved()?;
+        self.mark_if_passing(idx);
         let base = idx as usize * self.slot_size as usize;
         let mut dest_offset = 0;
         for &(ptr, len) in parts {
@@ -195,6 +306,7 @@ impl SendCopyPool {
     /// Returns `None` if no unreserved slots are free.
     pub fn alloc_raw(&mut self) -> Option<(u16, *mut u8, u32)> {
         let idx = self.pop_unreserved()?;
+        self.mark_if_passing(idx);
         let offset = idx as usize * self.slot_size as usize;
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = 0;
@@ -217,7 +329,11 @@ impl SendCopyPool {
     /// side effects (other than the `SEND_EXHAUSTED` metric on
     /// [`ReserveError::Exhausted`]). `n == 0` succeeds with an empty
     /// reservation. While the reservation is outstanding, `copy_in`,
-    /// `copy_in_gather` and `alloc_raw` see `n` fewer free slots.
+    /// `copy_in_gather` and `alloc_raw` see `n` fewer free slots. A
+    /// reservation taken while marking ([`begin_passing`](Self::begin_passing))
+    /// is a passing one: its `n` slots count towards
+    /// [`passing_held`](Self::passing_held) until they are filled and
+    /// released, or returned unfilled.
     pub fn reserve_slots(&mut self, n: usize) -> Result<SlotReservation, ReserveError> {
         let capacity = self.slot_count();
         if n > capacity {
@@ -231,14 +347,23 @@ impl SendCopyPool {
             return Err(ReserveError::Exhausted);
         }
         self.reserved += n;
-        Ok(SlotReservation { remaining: n })
+        let passing = self.marking;
+        if passing {
+            self.take_passing(n);
+        }
+        Ok(SlotReservation {
+            remaining: n,
+            passing,
+        })
     }
 
     /// Pop one promised slot and copy `data` into it; same fill as `copy_in`.
     /// Returns (slot_index, ptr, len). `data.len()` must be `<= slot_size` and
     /// the reservation must have slots remaining (both `debug_assert`ed; the
     /// caller iterates `chunks(slot_size)` over a buffer whose chunk count it
-    /// reserved).
+    /// reserved). A slot filled from a passing reservation is marked as
+    /// passing, and moves from the reservation's count to the slot's, so
+    /// [`passing_held`](Self::passing_held) does not change.
     pub fn copy_in_reserved(
         &mut self,
         r: &mut SlotReservation,
@@ -255,6 +380,9 @@ impl SendCopyPool {
             .expect("reserved slot missing from free list");
         r.remaining -= 1;
         self.reserved -= 1;
+        if r.passing {
+            self.passing[idx as usize] = true;
+        }
         self.fill_slot(idx, data)
     }
 
@@ -293,15 +421,23 @@ impl SendCopyPool {
         );
         self.reserved -= returned;
         r.remaining -= returned;
+        if r.passing {
+            self.return_passing(returned);
+        }
     }
 
-    /// Return the unfilled remainder of a reservation to the pool.
+    /// Return the unfilled remainder of a reservation to the pool. A passing
+    /// reservation's remainder stops counting towards
+    /// [`passing_held`](Self::passing_held).
     pub fn release_reservation(&mut self, mut r: SlotReservation) {
         debug_assert!(
             r.remaining() <= self.reserved,
             "reservation remainder exceeds the pool's outstanding reservations"
         );
         self.reserved -= r.remaining;
+        if r.passing {
+            self.return_passing(r.remaining);
+        }
         r.remaining = 0; // satisfies the Drop debug_assert
     }
 
@@ -322,6 +458,12 @@ impl SendCopyPool {
     /// disposal path produces. The clear is unconditional for the same reason,
     /// so a release build degrades to a lost completion rather than to a
     /// recycled slot that still names a dead operation.
+    ///
+    /// Every path that returns a slot to the free list comes through here, so
+    /// this is where a passing slot's mark is cleared and
+    /// [`passing_held`](Self::passing_held) drops: a completion, an abort's
+    /// `release_queued_sends`, the release of a coalesced run's slots, and
+    /// worker exit alike.
     pub fn release(&mut self, idx: u16) {
         debug_assert!((idx as usize) < self.count as usize);
         let carried = self.slot_send_id[idx as usize].take();
@@ -332,6 +474,11 @@ impl SendCopyPool {
         );
         if !self.in_use[idx as usize] {
             return; // already released — prevent double-free
+        }
+        // `passing` is empty unless the pool tracks passing slots, and no
+        // slot is marked while `passing_held` is zero.
+        if self.passing_held != 0 && std::mem::take(&mut self.passing[idx as usize]) {
+            self.return_passing(1);
         }
         self.in_use[idx as usize] = false;
         self.slot_offset[idx as usize] = 0;
@@ -884,6 +1031,121 @@ mod tests {
         let (idx, _ptr, _len) = pool.copy_in(b"unsettled").unwrap();
         pool.set_send_id(idx, id, 9);
         pool.release(idx);
+    }
+
+    /// A pool that does not track passing slots (the `Strict` order) counts
+    /// nothing, whatever it allocates.
+    #[test]
+    fn an_untracked_pool_counts_no_passing_slots() {
+        let mut pool = SendCopyPool::new(4, 8);
+        let (a, _p, _l) = pool.copy_in(b"a").unwrap();
+        let r = pool.reserve_slots(2).unwrap();
+        assert_eq!(pool.passing_held(), 0);
+        pool.release_reservation(r);
+        pool.release(a);
+        assert_eq!(pool.passing_held(), 0);
+    }
+
+    /// Every allocator marks while marking, nothing marks after
+    /// `end_passing`, and `release` returns exactly the marked slots, once
+    /// each.
+    #[test]
+    fn passing_slots_count_until_released() {
+        let mut pool = SendCopyPool::new(8, 8);
+        pool.track_passing();
+        pool.begin_passing();
+        let (a, _p, _l) = pool.copy_in(b"a").unwrap();
+        let data = b"g";
+        let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
+        let (b, _p, _l) = unsafe { pool.copy_in_gather(parts, data.len()) }.unwrap();
+        let (c, _p, _cap) = pool.alloc_raw().unwrap();
+        pool.end_passing();
+        let (plain, _p, _l) = pool.copy_in(b"p").unwrap();
+        assert_eq!(
+            pool.passing_held(),
+            3,
+            "the three slots taken while marking"
+        );
+
+        pool.release(plain);
+        assert_eq!(pool.passing_held(), 3, "an unmarked slot is not counted");
+        pool.release(a);
+        pool.release(a);
+        assert_eq!(pool.passing_held(), 2, "a second release returns nothing");
+        pool.release(b);
+        pool.release(c);
+        assert_eq!(pool.passing_held(), 0);
+        assert_eq!(pool.passing_peak(), 3);
+
+        // The marks were cleared: the slots come back unmarked.
+        let (again, _p, _l) = pool.copy_in(b"x").unwrap();
+        pool.release(again);
+        assert_eq!(pool.passing_held(), 0);
+    }
+
+    /// An allocation made while marking is paused is not counted, and
+    /// marking resumes as it was.
+    #[test]
+    fn a_paused_passing_send_does_not_mark() {
+        let mut pool = SendCopyPool::new(8, 8);
+        pool.track_passing();
+        pool.begin_passing();
+        let marking = pool.pause_passing();
+        pool.copy_in(b"alert").unwrap();
+        assert_eq!(pool.passing_held(), 0, "taken while paused");
+        pool.resume_passing(marking);
+        pool.copy_in(b"reply").unwrap();
+        assert_eq!(pool.passing_held(), 1, "marking resumed");
+        pool.end_passing();
+        assert!(!pool.pause_passing(), "nothing to pause after end_passing");
+    }
+
+    /// A passing reservation counts its whole size at once, as mio's permit
+    /// does; filling it moves the count to the slots, and the unfilled
+    /// remainder goes when the reservation is returned.
+    #[test]
+    fn a_passing_reservation_counts_until_its_slots_return() {
+        let mut pool = SendCopyPool::new(8, 8);
+        pool.track_passing();
+        pool.begin_passing();
+        let mut r = pool.reserve_slots(3).unwrap();
+        pool.end_passing();
+        assert_eq!(pool.passing_held(), 3);
+
+        let (a, _p, _l) = pool.copy_in_reserved(&mut r, b"a");
+        let (b, _p, _l) = pool.copy_in_reserved(&mut r, b"b");
+        assert_eq!(
+            pool.passing_held(),
+            3,
+            "filling moves the count to the slot"
+        );
+        pool.release_reservation(r);
+        assert_eq!(pool.passing_held(), 2, "the unfilled slot is returned");
+        pool.release(a);
+        pool.release(b);
+        assert_eq!(pool.passing_held(), 0);
+
+        // A reservation taken after marking ended is not passing.
+        let r = pool.reserve_slots(2).unwrap();
+        assert_eq!(pool.passing_held(), 0);
+        pool.release_reservation(r);
+    }
+
+    /// mio narrows a TLS permit once the ciphertext exists; the slots it
+    /// gives back stop counting.
+    #[test]
+    #[cfg(not(has_io_uring))]
+    fn shrinking_a_passing_reservation_returns_its_slots() {
+        let mut pool = SendCopyPool::new(8, 8);
+        pool.track_passing();
+        pool.begin_passing();
+        let mut r = pool.reserve_slots(4).unwrap();
+        pool.end_passing();
+        pool.shrink_reservation(&mut r, 1);
+        assert_eq!(pool.passing_held(), 1);
+        pool.release_reservation(r);
+        assert_eq!(pool.passing_held(), 0);
+        assert_eq!(pool.passing_peak(), 4);
     }
 
     /// In a release build the tripwire is compiled out, so the documented

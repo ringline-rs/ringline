@@ -92,7 +92,7 @@ impl AsyncEventHandler for Client {
                         }
                         drop(value);
                     }
-                    conn.send_nowait(b"n").map_err(|e| format!("send: {e}"))?;
+                    conn.send(b"n").map_err(|e| format!("send: {e}"))?;
                 }
                 Ok(LARGE.load(Ordering::Relaxed) - start)
             }

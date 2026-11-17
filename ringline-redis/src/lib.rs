@@ -938,7 +938,7 @@ impl Client {
         // awaiting a response that will never come.
         let send_outcome: Result<(), Error> = if self.write_guards.is_empty() {
             self.tx
-                .send_nowait(&self.write_buf)
+                .send(&self.write_buf)
                 .map(|_| ())
                 .map_err(Error::from)
         } else {
@@ -1031,7 +1031,7 @@ impl Client {
             self.encode_buf.clear();
             encode_get_into(names, key, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
-            self.tx.send_nowait(&self.encode_buf)?;
+            self.tx.send(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             encode_get_into(names, key, &mut self.write_buf);
@@ -1068,7 +1068,7 @@ impl Client {
             self.encode_buf.clear();
             encode_set_into(names, key, value, opt, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
-            self.tx.send_nowait(&self.encode_buf)?;
+            self.tx.send(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             encode_set_into(names, key, value, opt, &mut self.write_buf);
@@ -1157,7 +1157,7 @@ impl Client {
             self.encode_buf.clear();
             encode_set_into(names, key, value, opt, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
-            self.tx.send_nowait(&self.encode_buf)?;
+            self.tx.send(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             encode_set_into(names, key, value, opt, &mut self.write_buf);
@@ -1240,7 +1240,7 @@ impl Client {
             self.encode_buf.clear();
             Self::encode_request_into(&req, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
-            self.tx.send_nowait(&self.encode_buf)?;
+            self.tx.send(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             Self::encode_request_into(&req, &mut self.write_buf);
@@ -1686,7 +1686,8 @@ impl Client {
                     .build(|b| b.copy(prefix).copy(value).copy(suffix).submit())
             }
         };
-        if let Err(e) = sent {
+        // Drop the completion now rather than hold it across the read.
+        if let Err(e) = sent.map(drop) {
             return (Err(e.into()), 0, None);
         }
         map_reply(self.read_reply().await, redis_error)
@@ -2763,8 +2764,8 @@ impl Client {
                 .submit()
         });
         // A send error is recorded too, with nothing read.
-        let (resp, rx_bytes, arrival) = match sent {
-            Ok(_) => self.read_reply().await,
+        let (resp, rx_bytes, arrival) = match sent.map(drop) {
+            Ok(()) => self.read_reply().await,
             Err(e) => (Err(e.into()), 0, None),
         };
         let latency_ns = elapsed_ns(start);
@@ -2835,8 +2836,8 @@ impl Client {
                 .submit()
         });
         // A send error is recorded too, with nothing read.
-        let (resp, rx_bytes, arrival) = match sent {
-            Ok(_) => self.read_reply().await,
+        let (resp, rx_bytes, arrival) = match sent.map(drop) {
+            Ok(()) => self.read_reply().await,
             Err(e) => (Err(e.into()), 0, None),
         };
         let latency_ns = elapsed_ns(start);
@@ -2964,7 +2965,7 @@ impl Client {
         self.encode_buf.clear();
         let set_name = self.command_names.as_deref().map(|n| &*n.set);
         append_set_prefix(&mut self.encode_buf, set_name, key, len, SetOpt::Plain);
-        self.tx.send_nowait(&self.encode_buf)?;
+        self.tx.send(&self.encode_buf)?;
 
         // Stream the value body, enforcing the length contract.
         let mut sent = 0usize;
@@ -2988,7 +2989,7 @@ impl Client {
         }
 
         // Trailing `\r\n`, then the `+OK` reply.
-        self.tx.send_nowait(b"\r\n")?;
+        self.tx.send(b"\r\n")?;
         self.read_value().await
     }
 }

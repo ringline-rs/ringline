@@ -113,6 +113,106 @@ pub(crate) struct ConnSendState {
     /// io_uring only.
     #[cfg(has_io_uring)]
     pub disconnect: Disconnect,
+    /// The task of a `SendHalf::writable` future that waits on this
+    /// connection for room in its socket. Taken when the task is woken: on
+    /// io_uring by the completion that ends the wait (a `POLLOUT`, an error,
+    /// a hangup or a cancel) and by the completion or push that leaves no
+    /// send queued or waiting, on mio by any event on the connection and by
+    /// the flush that empties its queue, and on both by `abort`, by `close`,
+    /// by a close that dropping the last half requests, and at the slot's
+    /// release. The future registers again if it is polled before its wait
+    /// has ended.
+    pub writable_task: Option<u32>,
+    /// io_uring: what ended a `writable` future's wait, for its next poll,
+    /// and the task it was for. The future clears its own when it starts to
+    /// wait on the socket, so only an event that arrives while it waits
+    /// counts.
+    #[cfg(has_io_uring)]
+    pub writable_event: Option<(u32, WritableEvent)>,
+    /// io_uring: the resubmit of the send that waited for room, or the plain
+    /// re-send of a zero-copy send that got `ENOMEM`, is on a retry list, the
+    /// SQ having had no room for it: as for a queued send, a `writable`
+    /// future waits until its push goes through.
+    #[cfg(has_io_uring)]
+    pub resubmit_queued: bool,
+    /// io_uring: the registered `writable` future waits for the
+    /// connection's queued and waiting sends, not yet on the socket; the
+    /// completion that leaves none wakes it.
+    #[cfg(has_io_uring)]
+    pub writable_blocked: bool,
+    /// io_uring: the state of the connection's `SendPollProbe`, the one-shot
+    /// `POLLOUT` poll a `writable` future arms while the connection's
+    /// `SendPollOut` is multishot.
+    #[cfg(has_io_uring)]
+    pub send_probe: SendProbe,
+    /// io_uring: the task of a `send_buffer_size` future whose
+    /// `FixedFdInstall` is in flight (`OpTag::SendBufInstall`). The completion
+    /// stores `send_buf_result` and wakes it; the slot's release wakes it too.
+    #[cfg(has_io_uring)]
+    pub send_buf_task: Option<u32>,
+    /// io_uring: `SO_SNDBUF` read by that completion, or the errno that
+    /// failed it, for the future's next poll.
+    #[cfg(has_io_uring)]
+    pub send_buf_result: Option<Result<u32, i32>>,
+    /// The connection's most recent send waited for room in the socket, so
+    /// `SendAdmissionOrder::Budget` lets no send on it pass a waiting head.
+    /// Kept only while the driver's `track_room_waits` is set.
+    ///
+    /// Both backends keep it by one rule. It is set as soon as a send waits
+    /// for room, and at each completion that settles awaited sends it becomes
+    /// whether any send since the previous such completion waited
+    /// (`send_waited`). When every send on the connection is awaited, as a
+    /// server's replies with `send_admitted` are, that is whether its most
+    /// recent send waited. A send without an id ends nothing: its wait
+    /// carries to the next awaited send, and the flag stays set meanwhile.
+    ///
+    /// What counts as having waited follows how each backend writes. On
+    /// io_uring a send waited if an SQE of it came back short or with
+    /// `EAGAIN` (`wait_for_room`); the sends queued behind it had not been
+    /// submitted. On mio a send waited if it was queued when a `writev`
+    /// returned `WouldBlock` (`waited_entries`): that write carried the
+    /// queued sends, up to the 1024 iovecs one `writev` takes, and mio counts
+    /// every queued send, those past the first 1024 too.
+    pub room_waited: bool,
+    /// A send since the last completion that settled an awaited send waited
+    /// for room. On io_uring `wait_for_room` sets it and
+    /// `Driver::end_logical_send` moves it into `room_waited`; on mio a send
+    /// that completes after waiting sets it, and an awaited one moves it.
+    /// Kept only while the driver's `track_room_waits` is set.
+    pub send_waited: bool,
+    /// mio: how many sends at the front of the queue were queued when a
+    /// `writev` last returned `WouldBlock`, and so waited for room; each
+    /// that completes counts one off. Kept only while the driver's
+    /// `track_room_waits` is set.
+    #[cfg(not(has_io_uring))]
+    pub waited_entries: usize,
+}
+
+/// What ended a `writable` future's wait on io_uring.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WritableEvent {
+    /// The socket reported `POLLOUT`.
+    Room,
+    /// A send that waited for room was resubmitted, on the `POLLOUT` the
+    /// future waited for or by the backstop, or a send parked on a retry
+    /// list was pushed, and it may take the room: the future looks again,
+    /// from its check for queued and waiting sends, and waits for that send
+    /// to leave the kernel before it arms.
+    Recheck,
+    /// An error, a hangup or a cancel, with its errno.
+    Failed(i32),
+}
+
+/// The state of a connection's `SendPollProbe`.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendProbe {
+    None,
+    /// Queued on `Driver::pending_send_probe_retries`: the SQ was full.
+    Pending,
+    /// In the kernel.
+    Armed,
 }
 
 /// The `IORING_OP_CONNECT` with an `AF_UNSPEC` address that `abort` submits
@@ -172,6 +272,23 @@ impl ConnSendState {
             aborted: false,
             #[cfg(has_io_uring)]
             disconnect: Disconnect::None,
+            writable_task: None,
+            #[cfg(has_io_uring)]
+            writable_event: None,
+            #[cfg(has_io_uring)]
+            writable_blocked: false,
+            #[cfg(has_io_uring)]
+            resubmit_queued: false,
+            #[cfg(has_io_uring)]
+            send_probe: SendProbe::None,
+            #[cfg(has_io_uring)]
+            send_buf_task: None,
+            #[cfg(has_io_uring)]
+            send_buf_result: None,
+            room_waited: false,
+            send_waited: false,
+            #[cfg(not(has_io_uring))]
+            waited_entries: 0,
         }
     }
 
@@ -446,6 +563,11 @@ pub(crate) struct DriverCtx<'a> {
     /// future, because a TLS chain does not use `chain_table`, so
     /// `chain_table.carries` is false for it.
     pub(crate) tls_chain_carried: bool,
+    /// Set when a [`SendBuilder`] with an awaited id gave the id to
+    /// `attach_send_id`. `AsyncSendBuilder::build` reads it after its
+    /// closure returns: a closure that returned `Ok` without a successful
+    /// `submit` left the id with nothing to settle it.
+    pub(crate) parts_id_carried: bool,
 }
 
 /// The refusal of a TLS send made after this side's close_notify was queued:
@@ -568,7 +690,13 @@ impl<'a> DriverCtx<'a> {
             Err(e) => {
                 // `encrypt_to_sends` released every slot it took, but any
                 // record it sealed first spent a sequence number.
+                //
+                // The close queues a close_notify into pool slots. Those
+                // belong to no passing send, so a send that was passing a
+                // head stops marking around it.
+                let marking = self.send_copy_pool.pause_passing();
                 self.close(conn);
+                self.send_copy_pool.resume_passing(marking);
                 Err(e)
             }
         }
@@ -585,7 +713,9 @@ impl<'a> DriverCtx<'a> {
     /// here. The TLS branch admits against the ciphertext bound before
     /// rustls mutates, so the same holds there (see `encrypt_tls_send`,
     /// which also names the one case that stays fatal). The user-facing
-    /// contract lives on `SendHalf::send`.
+    /// contract lives on `SendHalf::send`. Every public send attaches an id
+    /// (`send_awaited`), so only tests call this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<()> {
         self.send_inner(conn, data, None, false)
     }
@@ -964,6 +1094,19 @@ impl<'a> DriverCtx<'a> {
         id: crate::runtime::send_completion::SendId,
     ) -> SendChainBuilder<'_, 'a> {
         let mut builder = self.send_chain(conn);
+        builder.send_id = Some(id);
+        builder
+    }
+
+    /// [`send_parts`](Self::send_parts), with `id` settled by the send's
+    /// completion once `submit` queues it. `submit` refuses an empty batch
+    /// with `InvalidInput`.
+    pub(crate) fn send_parts_awaited(
+        &mut self,
+        conn: ConnId,
+        id: crate::runtime::send_completion::SendId,
+    ) -> SendBuilder<'_, 'a> {
+        let mut builder = self.send_parts(conn);
         builder.send_id = Some(id);
         builder
     }
@@ -2409,7 +2552,9 @@ impl<'a> DriverCtx<'a> {
     /// flushes it when the socket becomes writable.
     ///
     /// On a TLS connection the data is encrypted into a `Vec` and queued the
-    /// same way; nothing is written in this call.
+    /// same way; nothing is written in this call. Every public send attaches
+    /// an id (`send_awaited`), so only tests call this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<()> {
         self.send_inner(conn, data, None)
     }
@@ -3621,16 +3766,17 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     fn commit(&mut self, built: BuiltSend) {
         if let Some(id) = self.send_id {
             self.ctx.attach_send_id(Some(&built), id, self.total_len);
+            self.ctx.parts_id_carried = true;
         }
         self.ctx.submit_or_queue(self.conn.index, built);
     }
 
     /// Submit the scatter-gather send.
     ///
-    /// A batch with no parts, or whose parts carry no bytes, queues nothing
-    /// and returns `Ok(())` on a live connection; a stale or closing
-    /// connection is reported as `NotConnected`, or `ConnectionAborted` after
-    /// `abort`, as for any batch.
+    /// A batch with no parts, or whose parts carry no bytes, is refused with
+    /// `InvalidInput` on a live connection; a stale or closing connection is
+    /// reported as `NotConnected`, or `ConnectionAborted` after `abort`, as
+    /// for any batch.
     pub fn submit(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             return Err(e);
@@ -3656,10 +3802,14 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
 
         // Nothing to send: build no SQE. A zero-length Send SQE completes
         // with 0, which `handle_send` reads as a failed send and drains the
-        // queue behind it. An awaited id (crate-internal) settles `Ok(0)`.
+        // queue behind it. A builder with an awaited id (every public one)
+        // refuses the batch; one without (crate-internal) queues nothing.
         if self.part_count == 0 || self.total_len == 0 {
-            if let Some(id) = self.send_id {
-                self.ctx.attach_send_id(None, id, 0);
+            if self.send_id.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "empty send batch",
+                ));
             }
             return Ok(());
         }
@@ -3718,6 +3868,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         let sends = self.ctx.encrypt_tls_send(self.conn, &plaintext)?;
         if let Some(id) = self.send_id {
             self.ctx.attach_send_id(sends.last(), id, self.total_len);
+            self.ctx.parts_id_carried = true;
         }
         self.ctx.queue_built_sends(self.conn.index, sends);
         Ok(())

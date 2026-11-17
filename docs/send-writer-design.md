@@ -9,19 +9,18 @@ Status: proposal. Prototype and measurement pending (see "Measurement").
 
 An application that builds its response bytes pays one copy more on
 ringline than on a readiness runtime. It encodes into its own buffer, and
-`send` / `send_nowait` copy that buffer into `SendCopyPool` slots. A tokio
+`send` copies that buffer into `SendCopyPool` slots. A tokio
 server writes from its own buffer, and the only copy is the kernel's.
 
 The profile that showed this ran a RESP server benchmark
-(`ringline-bench/src/bin/resp-server.rs` on the `exp/oneshot-ab` branch of
-the brayniac/ringline fork, commit 9b72617, not merged). Server and load
-generator ran in VMs on two hypervisors, connected through Intel X710 NICs,
-with Debian 13 guests (Linux 6.12): 8 server workers, 2048 connections,
-pipeline depth 16, 80/20 GET/SET. The ringline
-arm used a 1024-buffer receive ring, so it had no receive-ring starvation.
-It was compared with the same server on tokio, one current-thread runtime
-per core. SystemsLab experiments `01a12a6d-1a82-71a5-329e-d642483b6a9a`
-(4 KiB values) and `01a12a6d-1af9-7140-3d1a-8074bb4a0b7b` (64 KiB values):
+(`ringline-bench/src/bin/resp-server.rs` on an experiment branch, not in the
+repository). Server and load generator ran in VMs on two hypervisors, connected
+through Intel X710 NICs, with Debian 13 guests (Linux 6.12): 8 server workers,
+2048 connections, pipeline depth 16, 80/20 GET/SET. The ringline arm used a
+1024-buffer receive ring, so it had no receive-ring starvation. It was compared
+with the same server on tokio, one current-thread runtime per core. SystemsLab
+experiments `01a12a6d-1a82-71a5-329e-d642483b6a9a` (4 KiB values) and
+`01a12a6d-1af9-7140-3d1a-8074bb4a0b7b` (64 KiB values):
 
 | Values | Runtime | ops/s | system CPU per op | user `memmove` per op | kernel `rep_movs_alternative` per op |
 |---|---|---|---|---|---|
@@ -125,7 +124,7 @@ A RESP response loop changes from
 ```rust
 let mut out = Vec::new();
 encode_responses(&requests, &mut out);
-tx.send_nowait(&out)?;
+tx.send(&out)?;
 ```
 
 to
@@ -311,7 +310,7 @@ which stays at a fixed address for the life of the worker
 goes through `with_state`, once per slot.
 
 A `send_with` inside a `with_data` closure reaches the driver from inside
-that closure's `with_state`, as `send_nowait` already does in the
+that closure's `with_state`, as `send` already does in the
 documented split-echo pattern (`Connection::split`). Whether that nesting
 is sound under Rust's aliasing rules has not been checked; `send_with`
 nests the same way.
@@ -389,7 +388,7 @@ with nothing queued, and the closure's `R` is dropped.
 ## Protocol clients
 
 `ringline-redis` and `ringline-memcache` encode a request into a reused
-scratch buffer and copy it into the pool with `send_nowait`. With
+scratch buffer and copy it into the pool with `send`. With
 `max_batch_size` 1 (the default), `fire_*` can encode with `send_with`,
 which removes that copy.
 
@@ -404,7 +403,7 @@ client's recovery path (`pending.truncate`).
 
 ## Relation to the other send methods
 
-`send`, `send_nowait`, `send_backpressured`, `send_parts`, `send_chain`,
+`send`, `send_backpressured`, `send_parts`, `send_chain`,
 `forward_recv_buf` and `forward_to_conn` are unchanged. The writer is for
 bytes the application produces. Bytes that already exist in memory the
 application owns go through `send` (one copy) or a guard (no copy, at or
@@ -417,18 +416,18 @@ beyond the encode (plaintext; TLS as `send`)".
 
 ## Measurement
 
-The prototype goes on an experiment branch with the io_uring path only. It
-adds a `--writer` arm to the RESP server benchmark that encodes responses
-with `send_with` through `io::Write`: header with `write!`, value with
-`write_all`, as the server's copy arm builds its buffer today. The prototype
-is based on main, where the copy arm receives directly and sends a
-multi-slot send as one `sendmsg` (#697, #699); the profile above predates
-both. The experiment branch takes `resp-server.rs` from `exp/oneshot-ab`
-without its `--stream-sets` option (`set_recv_sink`, removed by #699). Runs:
-the rig setup of the profile above, 4 KiB and 64 KiB values, the writer arm
-against the copy arm and the zero-copy arm, with tokio for context, three
-reps each, with a server profile per arm. Every comparison is against arms
-from the same experiments.
+The prototype goes on an experiment branch with the io_uring path only. It adds
+a `--writer` arm to the RESP server benchmark that encodes responses with
+`send_with` through `io::Write`: header with `write!`, value with `write_all`,
+as the server's copy arm builds its buffer today. The prototype is based on
+main, where the copy arm receives directly and sends a multi-slot send as one
+`sendmsg` (#697, #699); the profile above predates both. The experiment branch
+takes the profiled `resp-server.rs` (see the top of this document) without its
+`--stream-sets` option (`set_recv_sink`, removed by #699). Runs: the rig setup
+of the profile above, 4 KiB and 64 KiB values, the writer arm against the copy
+arm and the zero-copy arm, with tokio for context, three reps each, with a
+server profile per arm. Every comparison is against arms from the same
+experiments.
 
 Predictions, recorded before the runs:
 

@@ -57,7 +57,7 @@ impl AsyncEventHandler for OneReplyServer {
                     if data.len() < GET_K.len() {
                         return ParseResult::NeedMore;
                     }
-                    let _ = tx.send_nowait(b"$1\r\nv\r\n");
+                    let _ = tx.send(b"$1\r\nv\r\n");
                     ParseResult::Consumed(GET_K.len())
                 })
                 .await;

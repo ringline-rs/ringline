@@ -74,11 +74,11 @@ Everything a request needs rides inside those batched enters as SQEs and CQEs:
 | Operation | Syscalls per event | Mechanism |
 |---|---:|---|
 | Receive a message | **0** | A plaintext connection submits a one-shot `RECV` into its accumulator when a read parks (`docs/recv-direct-design.md`): 1 SQE per completion, plus one `POLL_ADD(POLLRDHUP)` per connection, armed when it opens. When the poll fires with no receive in flight, a `MSG_PEEK` recv checks for bytes queued ahead of the end. A TLS connection submits the same one-shot `RECV`, into its TLS engine's ciphertext buffer, 1 SQE per completion, submitted by the iteration's shared enter. During the handshake it is re-armed when it completes; after it, when a read parks. It arms the same `POLL_ADD(POLLRDHUP)`, and when the poll fires a receive reads the rest of the stream; there is no peek. |
-| Send a response | **0 dedicated** | `send()`/`send_nowait()` push an `opcode::Send` SQE (`MSG_DONTWAIT`, so a short send waits for `POLLOUT` and resubmits, one more ring pass each time), and a send wider than one send-pool slot goes out as `opcode::SendMsg` SQEs of up to 32 slots each (per-slot `opcode::Send`s if the send slab is full); coalesced sends are one `opcode::SendMsg` SQE gathering several queued sends; zero-copy sends are `opcode::SendMsgZc`. All are submitted by the iteration's shared enter. |
+| Send a response | **0 dedicated** | `send()` pushes an `opcode::Send` SQE (`MSG_DONTWAIT`, so a short send waits for `POLLOUT` and resubmits, one more ring pass each time), and a send wider than one send-pool slot goes out as `opcode::SendMsg` SQEs of up to 32 slots each (per-slot `opcode::Send`s if the send slab is full); coalesced sends are one `opcode::SendMsg` SQE gathering several queued sends; zero-copy sends are `opcode::SendMsgZc`. All are submitted by the iteration's shared enter. |
 | Zero-copy notification | **0** | The "DMA done, guard can drop" signal is a second CQE on the same SQE, not a syscall. |
 | Timer arm/fire | **0** | A deadline in the worker's heap. The earliest deadline, or the next tick if sooner, is the timeout of the blocking `io_uring_enter` (`IORING_ENTER_EXT_ARG`); no SQE or CQE. |
 | Outbound connect | **0 dedicated** | Connect SQE. A connect timeout is a deadline that bounds the worker's wait; when it passes, an `ASYNC_CANCEL` of the connect. A plaintext connection then arms one `POLL_ADD(POLLRDHUP)` SQE (`docs/recv-direct-design.md`). |
-| Accept | 1 per connection | The dedicated acceptor thread runs blocking `accept4()` and hands the fd to a worker over a channel, waking it via eventfd write. The worker's side of that wake is an eventfd-read *SQE* — no syscall on the worker. This is one-time per connection, not per request. |
+| Accept | 1 per connection, plus a failing `accept4()` and a `poll` each time the backlog empties | The dedicated acceptor thread runs non-blocking `accept4()` until `EAGAIN`, then one `poll` on the listener and the stop signal, and hands the fd to a worker over a channel, waking it via eventfd write. The worker's side of that wake is an eventfd-read *SQE* — no syscall on the worker. This is one-time per connection, not per request. |
 
 So in steady state:
 
@@ -111,7 +111,7 @@ loop can apply:
 | Wait | 1 per iteration | `poll.poll()` (`epoll_wait`/`kevent`) with a timer-heap-derived timeout. Amortizes over every ready connection in the batch. |
 | Drain a readable connection | N per wake on Linux TCP when the last read is short; otherwise N+1 | mio registrations are edge-triggered, so `handle_readable` drains the socket. On Linux TCP a read that leaves its 8192-byte buffer unfilled ends the drain, and a later FIN or urgent mark raises its own event. The reads run on to `WouldBlock` or `0` when the event reports either of those, on TLS, on a Unix socket, on other platforms, and when the last read fills the buffer. Pipelined requests arriving together share one read. |
 | Flush sends | ≥1 per dirty connection per pass | `Driver::flush_sends` gathers the connection's whole pending queue into one `writev()` (up to 1024 iovecs), looping only if the queue didn't fit or until `WouldBlock`. |
-| Accept | 1 per connection | Same acceptor thread, which on macOS makes a `poll` before each `accept` and one `poll` every 100 ms while idle; the wake pipe's read end is registered in the poll, so the worker pays a `read()` to drain it per wake (coalescing any number of pending accepts). |
+| Accept | 1 per connection on Linux (`accept4()`), 5 on macOS (`accept()` and four `fcntl()`), plus a failing accept and a `poll` each time the backlog empties | Same acceptor thread, which accepts until `EAGAIN`, then one `poll`; the wake pipe's read end is registered in the poll, so the worker pays a `read()` to drain it per wake (coalescing any number of pending accepts). |
 
 A request-response exchange on an otherwise idle Linux TCP connection therefore
 costs 3 syscalls: a read, a writev and an `epoll_wait`, measured on Linux 7.2
@@ -192,7 +192,7 @@ fully zero-copy.
 
 | Method | Copies | Mechanism |
 |---|---:|---|
-| `send()` / `send_nowait()` | 1 | User data → pre-allocated `SendCopyPool` slot. The pool exists because SQE-referenced memory must outlive the operation; the runtime owns the slot until the CQE. |
+| `send()` | 1 | User data → pre-allocated `SendCopyPool` slot. The pool exists because SQE-referenced memory must outlive the operation; the runtime owns the slot until the CQE. |
 | `send_parts()` with `.copy()` parts | 1 | All copy parts gathered into one pool slot. |
 | `send_parts()` with `.guard()` parts | 0 | `SendMsgZc` iovecs point at the caller's memory; the `SendGuard` is held in `InFlightSendSlab` until the kernel's notification CQE confirms the DMA. Routed through the copy path below `send_zc_threshold` (default 4096 — measured crossover is 1–4 KiB). On a Unix-domain connection, which refuses `SENDMSG_ZC`, a plain `sendmsg` of the same iovecs: the kernel copies the guard's bytes into the socket, and the guard drops when the send completes (#829). |
 | Mixed `.copy()` + `.guard()` | 1 (copy parts only) | Copy parts → pool slot; guard parts zero-copy via iovec (on a Unix-domain connection, a plain `sendmsg`, as above). |

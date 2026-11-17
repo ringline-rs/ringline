@@ -18,7 +18,7 @@
 //!             let (mut tx, mut rx) = conn.split();
 //!             loop {
 //!                 let n = rx.with_data(|data| {
-//!                     tx.send_nowait(data).ok();
+//!                     let _ = tx.send(data);
 //!                     ParseResult::Consumed(data.len())
 //!                 }).await;
 //!                 if n == 0 { break; }
@@ -50,7 +50,7 @@
 //!                              ▼
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │        Acceptor Thread, one per listener (TCP or Unix)          │
-//! │      blocking accept4() -> round-robin to worker channels       │
+//! │  accept4() until EAGAIN, poll -> round-robin to worker channels │
 //! └─────────────────────────────────────────────────────────────────┘
 //!                              │
 //!              ┌───────────────┼───────────────┐
@@ -89,7 +89,7 @@
 //!   returns a future that runs for the connection's lifetime.
 //!
 //! - **[`Connection`]** — An owned connection, from `on_accept` or [`connect`].
-//!   `with_data()`/`with_bytes()` for recv, `send()`/`send_nowait()` for send, and
+//!   `with_data()`/`with_bytes()` for recv, `send()` for send, and
 //!   `split()` for independently borrowable halves. Internally indexes into the driver's
 //!   connection table via `(conn_index, generation)`.
 //!
@@ -416,6 +416,15 @@ pub use runtime::select::Select3;
 pub use runtime::select::select;
 /// Poll three futures concurrently, returning whichever completes first.
 pub use runtime::select::select3;
+/// What admission did on a worker: sends that passed a waiting head and the
+/// slots they hold.
+#[doc(hidden)]
+pub use runtime::send_completion::SendAdmissionCounters;
+/// The order in which each worker admits bounded sends to its send copy pool.
+pub use runtime::send_completion::SendAdmissionOrder;
+/// The current worker's admission counters.
+#[doc(hidden)]
+pub use runtime::send_completion::send_admission_counters;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
 /// Why a task's handle did not produce a value: it panicked or was cancelled.

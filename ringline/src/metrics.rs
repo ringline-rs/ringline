@@ -399,7 +399,10 @@ pub mod recv_direct {
     /// Connections closed because their hangup peek found the stream ended
     /// with no receive in flight and nothing buffered.
     pub const HANGUP: usize = 6;
-    pub const COUNT: usize = 7;
+    /// Of `ARMED`, receives armed with `IORING_RECVSEND_POLL_FIRST`, because
+    /// the connection's previous receive left its socket empty.
+    pub const POLL_FIRST: usize = 7;
+    pub const COUNT: usize = 8;
 }
 
 /// Slot indices for `RECV_ARRIVAL`.
@@ -419,14 +422,14 @@ pub mod recv_arrival {
 /// Slot indices for per-`OpTag` completion counters: the slot *is* the
 /// discriminant.
 pub mod cqe_tag {
-    /// One past the largest `OpTag` discriminant (`Disconnect = 39`).
+    /// One past the largest `OpTag` discriminant (`SendBufInstall = 41`).
     ///
     /// Deliberately not derived from the enum: `ShardedCounterGroup::new` needs
     /// a const, and there is no const way to ask an enum for its maximum
     /// discriminant. `count_covers_every_tag` in the tests below fails if a new
     /// tag is added above this, which is the case that would otherwise drop
     /// completions silently.
-    pub const COUNT: usize = 40;
+    pub const COUNT: usize = 42;
 }
 
 /// Counter slot indices for pool exhaustion metrics.
@@ -501,6 +504,7 @@ pub fn init_metadata() {
         "pool_allocated".into(),
     );
     RECV_DIRECT.insert_metadata(recv_direct::HANGUP, "op".into(), "hangup".into());
+    RECV_DIRECT.insert_metadata(recv_direct::POLL_FIRST, "op".into(), "poll_first".into());
     RECV_RING.insert_metadata(recv_ring::BYTES_COPIED, "op".into(), "bytes_copied".into());
     CONNECTIONS.insert_metadata(conn::ACCEPTED, "op".into(), "accepted".into());
     CONNECTIONS.insert_metadata(conn::CLOSED, "op".into(), "closed".into());

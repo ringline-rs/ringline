@@ -37,15 +37,14 @@ decision 15 extends it to accepted connections.
 
 ## Evidence
 
-All runs below are cachecannon with 16 client workers and 1,000 connections
-(62 or 63 per worker) against Valkey (RESP) and memcached, on two VMs, at a
-fixed request rate per cell, in `experiments/segviews-screen.toml` on branch
-`feat/segment-clients`. Client CPU is the cachecannon process's user plus
-system time for the run. Each build runs in every cell of a SystemsLab
-experiment, and the three experiments rotate the build order. The ringline
-commits named below (06c6c43, ff61e77, c67d328) are the measured builds,
-from before this branch was rebased onto main; they are on branch
-`exp/segviews-c8-ringline` of `brayniac/ringline`.
+All runs below are cachecannon with 16 client workers and 1,000 connections (62
+or 63 per worker) against Valkey (RESP) and memcached, on two VMs, at a fixed
+request rate per cell, in `experiments/segviews-screen.toml` (not in the
+repository). Client CPU is the cachecannon process's user plus system time for
+the run. Each build runs in every cell of a SystemsLab experiment, and the
+three experiments rotate the build order. The ringline builds C3 to C8 below
+are from before this change was rebased onto main, and are not in the
+repository; each is identified by its SystemsLab binaries or experiments.
 
 ### What the ring path copies
 
@@ -67,11 +66,11 @@ and the incremental ring added about 1 GiB of peak RSS
 
 ### Direct receive (build C)
 
-Build C is cachecannon `exp/segviews-c2` on ringline `exp/segviews-c2`
-(`feat/recv-direct` on the commit build A used), binaries
+Build C is cachecannon's segment-views client on this change's first prototype,
+based on the ringline commit build A used, binaries
 `01a154c2-7be1-7364-667e-192b469e7a14`. In the screen, `c` connects with
-`recv_direct(true)`, `c0` is the same binary on the multishot ring, and `c1`
-is the same binary with one-shot ring receives (`recv_multishot(false)`).
+`recv_direct(true)`, `c0` is the same binary on the multishot ring, and `c1` is
+the same binary with one-shot ring receives (`recv_multishot(false)`).
 Experiments `01a154c2-aff0-713a-2088-c31a3277e2ed`,
 `01a154c2-b062-71ec-499e-2eb343075ee1` and
 `01a154c2-b0c7-718f-7432-8370282733f8`.
@@ -106,7 +105,7 @@ received:
   and glibc trimmed the thread's heap on the free (see "Reusing a consumed
   buffer"). Counted on loopback with an `LD_PRELOAD` allocator shim: 92,594
   allocations of 32 KiB or more in 66,315 direct receives, against 641 on the
-  ring. Commit 06c6c43 fixed it: in build C3, `c` at memcache 64 B was 1.004
+  ring. A later commit fixed it: in build C3, `c` at memcache 64 B was 1.004
   of `c0`'s CPU, mean of three runs (`01a1556b-604f-710c-e4bc-1f4aaa2ee165`,
   `01a1556b-60d2-716b-893f-80d6a1500614`,
   `01a1556b-6146-7100-d5c4-9bfde714bafe`).
@@ -119,7 +118,7 @@ received:
 
 ### The pool (builds C5 to C8)
 
-Build C5 is ringline ff61e77: the per-worker pool, a 32 KiB own buffer, no
+Build C5 is the per-worker pool, a 32 KiB own buffer, no
 `MSG_WAITALL`. Its screen adds two cells: 1 MiB values at 100 requests per
 second, which leaves most connections idle after a large value, and mixed
 values, where all 400 keys hold 1 MiB and then the first 300 are rewritten at
@@ -160,10 +159,10 @@ holds. The client hosts run THP in mode `always` with `defrag` `madvise`.
   the whole receive size with `BytesMut::reserve`, which doubles the
   allocation. A few buffers of about 5 MiB filled each worker's 16 MiB of
   free buffers, no borrow could use them, and every buffer given back after
-  that was freed. Commit c67d328 sizes a grown buffer to the receive size and
+  that was freed. A later commit sizes a grown buffer to the receive size and
   evicts the largest free buffers (see Buffers).
 
-Build C7 is c67d328 with the diagnostic counters (experiments
+Build C7 is that commit with the diagnostic counters (experiments
 `01a159d3-e857-71bf-0a65-6c6903c6bb6e`,
 `01a159d3-e8ce-718e-c651-340efa5fda70`,
 `01a159d3-e946-7148-afb8-545333526581`). At mixed depth 16, CPU is 0.936 of
@@ -174,7 +173,7 @@ a borrow accepts a free buffer up to twice the size it needs, so those
 buffers stay in use. Moving partial messages raised copies there from 0.19 to
 0.74 bytes per byte. The other C7 cells match C5 within 1%.
 
-Build C8 is c67d328 without the counters (binaries
+Build C8 is that commit without the counters (binaries
 `01a159f3-e054-73af-bc3f-8b6ea08f60b1`).
 
 - Throughput with no rate limit (`01a159f3-edbf-7115-c5dd-6d420d46108d`,
@@ -201,8 +200,8 @@ Build C8 is c67d328 without the counters (binaries
   The first three are 1 to 9% higher; RESP 64 B is 12 to 31% higher, in a
   cell where A's own p99 varies by 75% between runs. In the other nine
   cells `c`'s p99 is above A's in at most two runs.
-- Throughput with the hosts swapped (`experiments/segviews-screen-flip.toml`
-  on `feat/segment-clients`: client on the Zen 1 host with 12 threads,
+- Throughput with the hosts swapped (`experiments/segviews-screen-flip.toml`,
+  not in the repository: client on the Zen 1 host with 12 threads,
   servers on the Zen 2 host), one run (`01a15aad-c9c5-7104-23a5-5be594d89ccd`).
   A's client uses 597 to 604 CPU-seconds, all 12 cores for the 50 s of
   warmup and measurement, in six cells; at memcache 64 KiB depth 16,
@@ -282,14 +281,14 @@ stayed (`recv-buffering-approaches.md`).
 
 ### Accepted connections (RESP server, 1,000 and 8,000 connections)
 
-These runs used a prototype of this change (brayniac/ringline d960afe; specs
-at 060260f) that had neither the hangup poll nor the single-`sendmsg`
-multi-slot send (#697). The poll's cost is not measured. #697 changes only
-the GET 4 KiB depth-16 cells at 16 KiB send slots, where a flush spans up to
-5 slots. Both ringline arms send through the same path, so #697 is expected
-to affect them alike; this is not measured.
+These runs used a prototype of this change that had neither the hangup poll nor
+the single-`sendmsg` multi-slot send (#697); the prototype and its specs are
+not in the repository. The poll's cost is not measured. #697 changes only the
+GET 4 KiB depth-16 cells at 16 KiB send slots, where a flush spans up to 5
+slots. Both ringline arms send through the same path, so #697 is expected to
+affect them alike; this is not measured.
 
-A RESP server (`ringline-bench` `resp-server` at d960afe, bins
+A RESP server (`ringline-bench` `resp-server` on that prototype, bins
 `01a164ab-e6aa-73c2-fd0b-2feb02733191`) ran with 8 workers on one VM and
 cachecannon with 16 threads on another, no rate limit, at 1,000 and 8,000
 connections. Arms: `ring` (one-shot receives from the provided-buffer ring),
@@ -327,6 +326,27 @@ cells), and by 0 to 5% in the cells below.
 - The server's per-connection flush counts per 5 s interval show no
   starved connection in any arm: the least-served connection had 84 to 98%
   of the median in the ring and direct arms.
+
+### Poll first (#840)
+
+Prototype of `POLL_FIRST` behind an environment variable, the same rule as
+the code, with an echo benchmark that is not in the tree; SystemsLab run
+`01a1e0bf-8cd0-71a3-237a-f8832eec5588`. hv03, Linux 6.12, one worker, 64
+TCP connections over loopback, each echoing one message at a time, 4
+windows of 8 s per arm in the order A B B A A B B A, server CPU per KB
+echoed:
+
+| Message | Without | With | Change | Spread without | Spread with |
+|---|---|---|---|---|---|
+| 64 B | 150,847 ns | 147,922 ns | −1.9% | 2.8% | 1.2% |
+| 16 KiB | 739.1 ns | 729.9 ns | −1.2% | 0.8% | 0.6% |
+
+Each of the 4 adjacent A/B pairs at each size was lower with `POLL_FIRST`.
+At 64 B the arms' ranges overlap, and the run without it rose from 148.4k to
+152.6k ns over the run; the order cancels a linear drift. No A-against-A run
+measured the floor. The server ran at 99.9% CPU in every window, so
+throughput rose by about the same fractions. The result is from one run on
+one host and one kernel.
 
 ## Mechanism
 
@@ -404,6 +424,39 @@ Invariant 8 in CLAUDE.md).
 Arming after the parse means no receive is outstanding while `with_bytes`
 holds the accumulator frozen, so the remainder the parser left can be taken
 back without a copy (below).
+
+### Poll first after an empty socket
+
+A receive tries the socket when it is issued and, if the socket is empty,
+arms a poll and tries again when data arrives. After a receive that returned
+bytes and whose completion did not carry `IORING_CQE_F_SOCK_NONEMPTY`, the
+socket was empty, and a request/response peer usually sends nothing more
+until it gets an answer. So the next receive on that connection is armed
+with `IORING_RECVSEND_POLL_FIRST` (Linux 5.19), which arms the poll without
+the first attempt (`ConnectionState::recv_direct_drained`, set in
+`handle_recv_direct`). A receive whose completion carried `SOCK_NONEMPTY`,
+returned 0 or failed leaves the flag clear, as does a new connection. If
+bytes are already queued when a `POLL_FIRST` receive is armed, arming the
+poll finds the socket readable and the kernel issues the receive from
+task_work without waiting for the socket's wakeup. A Unix-domain connection
+never polls first: af_unix reports no `msg_inq` before 6.17, so on those
+kernels io_uring does not report `SOCK_NONEMPTY` for it, and ringline
+excludes Unix-domain connections on every kernel. `SOCK_NONEMPTY` is also
+set when only a FIN is queued (`tcp_inq_hint` reports 1 after a FIN); the
+next receive then tries first and returns 0.
+
+If the kernel cannot allocate the poll, it hands the receive to io-wq,
+which issues it once and, since `POLL_FIRST` refuses the first attempt,
+completes it with `-EAGAIN`. That result closes nothing: the reader is
+woken and arms a receive without `POLL_FIRST` when it parks again, and a
+TLS connection that receives after each completion (during the handshake,
+or after a hangup) re-arms at once.
+
+The saving is measured at depth 1 only (Evidence, "Poll first"). A
+connection whose next bytes arrive between a completion that emptied the
+socket and the next arm (a pipelining client, or a message larger than one
+receive) takes the poll arm and a task_work issue in place of a plain
+receive; that cost is not measured.
 
 ### The buffer in flight
 
@@ -510,7 +563,7 @@ its `capacity()` leaves out the bytes before it. `put` moves its start back
 to the start of the allocation (`try_reclaim`) before keeping it; without
 that, a buffer that had held several messages measured under 64 KiB and was
 freed, and every batch of 16 × 4 KiB allocated a new one (C5's 1.94 million
-allocations per run before ff61e77, 0 after).
+allocations per run before `try_reclaim` was added, 0 after).
 
 A receive that ends inside a message leaves that part to be moved to the
 front of the buffer at the next growth. Sizing receives to several messages
@@ -675,7 +728,8 @@ those, receives into a buffer grown for a `NeedAtLeast` of at least
 `POOL_ALLOCATED` (borrowed buffers that came from the pool, and ones
 allocated because none fit), `HANGUP` (connections closed because a hangup
 peek found the stream ended with no receive in flight and nothing
-buffered). Copies on a direct connection still count in
+buffered), `POLL_FIRST` (of `ARMED`, receives armed with
+`IORING_RECVSEND_POLL_FIRST`). Copies on a direct connection still count in
 `ringline/recv_ring` `BYTES_COPIED`.
 
 ## Tests
@@ -747,6 +801,15 @@ buffered). Copies on a direct connection still count in
   counters): 70,000-byte messages in 64 KiB and 1 MiB writes copy at most a
   quarter of a byte per byte received; 500 B messages at most 1/20; 1 MiB
   messages at most 1/5, with at least one known-length receive.
+- `POLL_FIRST` (`event_loop.rs`, `engine/uring.rs`, `connection.rs` unit
+  tests): a receive that returned bytes without `SOCK_NONEMPTY` arms the
+  next one with `POLL_FIRST`, read from the SQE the ring took; one with
+  `SOCK_NONEMPTY` does not; a Unix-domain connection never does; a
+  `-EAGAIN` completion keeps the connection open and the next receive is
+  plain, on an established TLS connection too, and on a TLS connection
+  mid-handshake it is re-armed at once;
+  the flag clears with the slot; the encoded SQE differs from a plain
+  receive only in `ioprio` bit 0. Each fails with its rule removed.
 - `event_loop.rs` unit tests: a synthetic `RecvDirect` completion with data
   for a connection whose generation moved on is not attached to the slot's
   new occupant, and its slab entry is freed (fails with the generation
@@ -795,8 +858,8 @@ Made by the owner on 2026-10-19:
    byte without one.
 5. Opt-in per connection, off by default, until C3 and the scale run show no
    cell where it costs more than the ring.
-6. Segment views: the client switch on `feat/segment-clients` and the proto
-   releases it needs are not pursued.
+6. Segment views: the client switch in the segment-views prototype and the
+   proto releases it needs are not pursued.
 
 Made by the owner on 2026-10-20:
 
@@ -858,6 +921,10 @@ closed or merged without a release.
   more runs agree.
 - Why `c` costs 2 to 4% more CPU per GET at 64 B depth 1 (Evidence,
   "Scale").
+- The cost of `POLL_FIRST` to a connection whose next bytes arrive before
+  the receive is armed (a pipelining client, or a message larger than one
+  receive), and its saving beyond loopback (Mechanism,
+  "Poll first after an empty socket").
 - A `ForwardToFuture` dropped by `handle_close` (which tears down another
   connection's task without `CURRENT_DRIVER` set) cannot clear
   `direct_forwarding`, so later forwards from its source are refused with

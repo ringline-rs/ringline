@@ -43,7 +43,7 @@ impl AsyncEventHandler for Echo {
                 if n == 0 {
                     return;
                 }
-                let _ = conn.send_nowait(&echo);
+                let _ = conn.send(&echo);
             }
         }
     }

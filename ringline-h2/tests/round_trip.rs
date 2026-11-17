@@ -113,7 +113,7 @@ impl AsyncEventHandler for H2Server {
                         settings: Settings::default(),
                     };
                     settings_frame.encode(&mut send_buf);
-                    let _ = conn.send_nowait(&send_buf);
+                    let _ = conn.send(&send_buf);
                     settings_sent = true;
                 }
 
@@ -132,7 +132,7 @@ impl AsyncEventHandler for H2Server {
                                             settings: Settings::default(),
                                         }
                                         .encode(&mut buf);
-                                        let _ = conn.send_nowait(&buf);
+                                        let _ = conn.send(&buf);
                                     } else {
                                         settings_acked = true;
                                     }
@@ -174,7 +174,7 @@ impl AsyncEventHandler for H2Server {
                                             end_stream: true,
                                         }
                                         .encode(&mut send_buf);
-                                        let _ = conn.send_nowait(&send_buf);
+                                        let _ = conn.send(&send_buf);
                                     }
                                 }
                                 Frame::Data {
@@ -203,7 +203,7 @@ impl AsyncEventHandler for H2Server {
                                         end_stream: true,
                                     }
                                     .encode(&mut send_buf);
-                                    let _ = conn.send_nowait(&send_buf);
+                                    let _ = conn.send(&send_buf);
                                 }
                                 Frame::WindowUpdate { .. }
                                 | Frame::Ping { .. }
@@ -220,7 +220,7 @@ impl AsyncEventHandler for H2Server {
                                             opaque_data,
                                         }
                                         .encode(&mut buf);
-                                        let _ = conn.send_nowait(&buf);
+                                        let _ = conn.send(&buf);
                                     }
                                 }
                                 _ => {}

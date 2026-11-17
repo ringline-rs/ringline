@@ -62,7 +62,7 @@ impl AsyncEventHandler for BadRedisServer {
                     // Respond with something that looks like RESP but isn't valid.
                     // A valid RESP value starts with +, -, :, $, or *.
                     // This starts with 'X' which is not a valid RESP type byte.
-                    let _ = tx.send_nowait(b"XGARBAGE_NOT_RESP\r\n");
+                    let _ = tx.send(b"XGARBAGE_NOT_RESP\r\n");
                     ParseResult::Consumed(data.len())
                 })
                 .await;

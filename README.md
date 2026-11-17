@@ -35,7 +35,7 @@ impl AsyncEventHandler for Echo {
             let (mut tx, mut rx) = conn.split();
             loop {
                 let n = rx.with_data(|data| {
-                    tx.send_nowait(data).ok();
+                    let _ = tx.send(data);
                     ParseResult::Consumed(data.len())
                 }).await;
                 if n == 0 { break; }
@@ -68,7 +68,7 @@ The io_uring backend has this worker-local shape:
 ```
                       ┌─────────────────────────────┐
                       │        Acceptor Thread       │
-                      │   blocking accept4() loop    │
+                      │ accept4() until EAGAIN, poll │
                       └──────────┬──────────────────┘
                                  │ round-robin
           ┌──────────────────────┼──────────────────────┐
@@ -111,7 +111,7 @@ handler instance. On the io_uring backend, each worker also owns:
 | Type | Description |
 |------|-------------|
 | `AsyncEventHandler` | Trait: `on_accept(Connection) -> Future` — one task per connection |
-| `Connection` | An owned connection: `send()`, `send_nowait()`, `with_data()`; `split()` gives `SendHalf` and `RecvHalf` |
+| `Connection` | An owned connection: `send()`, `with_data()`; `split()` gives `SendHalf` and `RecvHalf` |
 | `ParseResult` | Closure return type: `Consumed(n)` or `NeedMore` |
 | `ConfigBuilder` | Discoverable builder: `ConfigBuilder::default().workers(4).build()` |
 | `RinglineBuilder` | Launch builder: `RinglineBuilder::new(config).bind(addr).launch::<H>()` |

@@ -150,7 +150,7 @@ fn run_tcp_echo_chunked(addr: &str, payload: &[u8], chunk_size: usize) -> (Durat
 
 /// Echoes via [`ConnStream`] so write calls block on send-pool
 /// availability rather than silently dropping bytes — required for
-/// sustained-throughput round-trips. (`with_data` + `send_nowait`
+/// sustained-throughput round-trips. (`with_data` + `send`
 /// loses bytes when the pool fills, which is fine for tiny payloads
 /// but breaks 8 MiB transfers.)
 struct AsyncTcpEcho;

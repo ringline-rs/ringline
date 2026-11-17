@@ -186,10 +186,7 @@ async fn send_all<const MODE: u8>(conn: &mut Connection) {
         },
         _ => {
             let guard = GuardBox::new(VecGuard(payload(0, len)));
-            match conn
-                .send_parts()
-                .submit_batch_await(vec![SendPart::Guard(guard)])
-            {
+            match conn.send_parts().submit_batch(vec![SendPart::Guard(guard)]) {
                 Ok((_, fut)) => fut.await,
                 Err(e) => Err(e),
             }

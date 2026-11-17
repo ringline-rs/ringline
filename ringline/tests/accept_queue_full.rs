@@ -28,7 +28,7 @@ impl AsyncEventHandler for BusyEcho {
                 ParseResult::Consumed(data.len())
             })
             .await;
-            let _ = conn.send_nowait(&received);
+            let _ = conn.send(&received);
         }
     }
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {

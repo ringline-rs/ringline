@@ -111,7 +111,7 @@ impl AsyncEventHandler for GrpcEchoServer {
                         settings: Settings::default(),
                     }
                     .encode(&mut send_buf);
-                    let _ = conn.send_nowait(&send_buf);
+                    let _ = conn.send(&send_buf);
                     settings_sent = true;
                 }
 
@@ -127,7 +127,7 @@ impl AsyncEventHandler for GrpcEchoServer {
                                         settings: Settings::default(),
                                     }
                                     .encode(&mut buf);
-                                    let _ = conn.send_nowait(&buf);
+                                    let _ = conn.send(&buf);
                                 }
                                 Frame::Headers {
                                     stream_id: _,
@@ -204,7 +204,7 @@ impl AsyncEventHandler for GrpcEchoServer {
                                     }
                                     .encode(&mut send_buf);
 
-                                    let _ = conn.send_nowait(&send_buf);
+                                    let _ = conn.send(&send_buf);
                                 }
                                 Frame::WindowUpdate { .. } | Frame::Ping { .. } => {
                                     if let Frame::Ping {
@@ -218,7 +218,7 @@ impl AsyncEventHandler for GrpcEchoServer {
                                             opaque_data,
                                         }
                                         .encode(&mut buf);
-                                        let _ = conn.send_nowait(&buf);
+                                        let _ = conn.send(&buf);
                                     }
                                 }
                                 _ => {}

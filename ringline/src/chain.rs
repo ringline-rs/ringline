@@ -35,7 +35,8 @@ pub(crate) struct ChainState {
     /// Outstanding SendMsgZc NOTIF CQEs.
     zc_notifs_pending: u16,
     /// The awaited send this chain settles (`SendHalf::send_chain`), with
-    /// `bytes_sent` on success; `None` for `send_chain_nowait`.
+    /// `bytes_sent` on success; `None` for a chain built through
+    /// `DriverCtx::send_chain`.
     pub(crate) send_id: Option<SendId>,
 }
 

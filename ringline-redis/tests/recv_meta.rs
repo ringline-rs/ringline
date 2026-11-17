@@ -100,11 +100,11 @@ impl AsyncEventHandler for MetaStubServer {
                                             }
                                             _ => b"-ERR value mismatch\r\n",
                                         };
-                                        let _ = tx.send_nowait(reply);
+                                        let _ = tx.send(reply);
                                     } else if verb.eq_ignore_ascii_case(b"DEL") {
-                                        let _ = tx.send_nowait(b":1\r\n");
+                                        let _ = tx.send(b":1\r\n");
                                     } else if let Some(Value::BulkString(key)) = items.get(1) {
-                                        let _ = tx.send_nowait(&reply_for_key(&key[..]));
+                                        let _ = tx.send(&reply_for_key(&key[..]));
                                     }
                                 }
                                 ParseResult::Consumed(consumed)
