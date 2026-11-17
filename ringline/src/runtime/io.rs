@@ -5012,8 +5012,8 @@ pub type BatchAdmitted<'a> = Result<(usize, SendCompletion), BatchRefused<'a>>;
 /// - On a plaintext io_uring connection also, with `InvalidInput`: more than
 ///   32 parts or 8 guards, more than `u32::MAX` bytes, copy parts over one
 ///   slot, and a guard outside its registered region, checked whatever the
-///   batch's size. A full send slab is refused with `Other` ("send slab
-///   exhausted") once the batch is admitted.
+///   batch's size. A full send slab is refused with `WouldBlock` ("send
+///   slab exhausted") once the batch is admitted.
 ///
 /// Pool exhaustion is not a refusal: the batch waits.
 ///

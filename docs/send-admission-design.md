@@ -1078,7 +1078,7 @@ that does not want them back.
   total length.
 - The send-slab entry is not part of the FIFO's admission (Alternatives). It
   is taken when the batch is admitted, and a full slab then refuses the
-  batch.
+  batch with `WouldBlock`.
 - On mio, where `submit_batch` copies the whole batch and takes no slots,
   the method waits as `send_admitted` does for the batch's total length.
 - A refusal returns every part to the caller, guards included, and every

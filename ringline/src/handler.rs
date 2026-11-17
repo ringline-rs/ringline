@@ -1212,7 +1212,10 @@ impl<'a> DriverCtx<'a> {
                 && total <= self.send_copy_pool.slot_size() as usize
                 && free >= 1;
             if !gathers && !self.send_slab.has_free() {
-                return Err(io::Error::other("send slab exhausted"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "send slab exhausted",
+                ));
             }
         }
         Ok(())

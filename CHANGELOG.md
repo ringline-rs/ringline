@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   an `io::Error`; `BatchAdmission::into_parts` takes the parts back from a
   waiting batch, after a timeout for example. On a plaintext io_uring
   connection a full send slab, checked once the batch is admitted, is refused
-  with `Other`. `submit_batch` is unchanged.
+  with `WouldBlock`. `submit_batch` is unchanged.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been
   handed to the kernel, without taking a send-pool slot. A server that sends

@@ -641,7 +641,7 @@ fn a_guard_outside_its_region_is_refused_with_its_parts() {
 fn a_full_slab_refuses_a_batch_with_its_parts() {
     let _serial = serial();
     let outcome = run(SLAB_FULL, 1);
-    assert_refused(&outcome, io::ErrorKind::Other, 2, &[GUARD_LEN as u32]);
+    assert_refused(&outcome, io::ErrorKind::WouldBlock, 2, &[GUARD_LEN as u32]);
 }
 
 /// The pool is full of sends to a client that does not read. The batch's
