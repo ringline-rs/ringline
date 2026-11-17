@@ -64,6 +64,7 @@
 #   tcp_wmem_max    the cap on net.ipv4.tcp_wmem, in bytes
 #   pool_slots      the server's send-pool slots
 #   slot_size       the server's send-pool slot bytes
+#   host            the hypervisor the guest runs on
 #
 # Measured by admission-server, over requests scheduled in the window: per
 # reply class (small to fast readers, small to slow readers, large), the
@@ -122,10 +123,11 @@ outside_size   = "256"
 tcp_wmem_max   = "1048576"
 pool_slots     = "512"
 slot_size      = "16384"
+host           = "hv03"
 
 [[jobs]]
 name = "vm"
-tags = ["host:hv03"]
+tags = ["host:{host}"]
 
 [[jobs.steps]]
 uses = "anvil-vm"
@@ -162,7 +164,7 @@ kill -0 $srv 2>/dev/null || { echo "admission-server exited before the load star
 taskset -c 2-$last ./out/admission-load --addr 127.0.0.1:7979 --duration {duration} --warmup {warmup} --within-ms {admit_ms} --episode-ms {episode_ms} --small-conns {small_conns} --small-rate {small_rate} --small-size {small_size} --stall-peers {stall_peers} --stall-size {stall_size} --large-size {large_size} --large-delay-ms {large_delay_ms} --slow-conns {slow_conns} --slow-rate {slow_rate} --slow-size {slow_size} --slow-read-bps {slow_read_bps} --slow-rcvbuf {slow_rcvbuf} --drainers {drainers} --drain-size {drain_size} --drain-read-bps {drain_read_bps} --drain-rcvbuf {drain_rcvbuf} --outside-conns {outside_conns} --outside-rate {outside_rate} --outside-size {outside_size} $load_tls > results/load.json 2> results/load.log
 rc=$?
 kill -INT $srv; wait $srv
-echo "RUN workload={workload} small_send={small_send} order={order} budget={budget} tls={tls} admit_ms={admit_ms} settle_ms={settle_ms} pipeline={pipeline} tcp_wmem_max={tcp_wmem_max} small_conns={small_conns} small_rate={small_rate} small_size={small_size} stall_peers={stall_peers} stall_size={stall_size} large_size={large_size} slow_conns={slow_conns} slow_rate={slow_rate} slow_size={slow_size} slow_read_bps={slow_read_bps} slow_rcvbuf={slow_rcvbuf} drainers={drainers} drain_size={drain_size} drain_read_bps={drain_read_bps} drain_rcvbuf={drain_rcvbuf} outside_conns={outside_conns} outside_rate={outside_rate} outside_size={outside_size} pool_slots={pool_slots} slot_size={slot_size} rep={rep} load_rc=$rc"
+echo "RUN workload={workload} small_send={small_send} order={order} budget={budget} tls={tls} admit_ms={admit_ms} settle_ms={settle_ms} pipeline={pipeline} tcp_wmem_max={tcp_wmem_max} small_conns={small_conns} small_rate={small_rate} small_size={small_size} stall_peers={stall_peers} stall_size={stall_size} large_size={large_size} slow_conns={slow_conns} slow_rate={slow_rate} slow_size={slow_size} slow_read_bps={slow_read_bps} slow_rcvbuf={slow_rcvbuf} drainers={drainers} drain_size={drain_size} drain_read_bps={drain_read_bps} drain_rcvbuf={drain_rcvbuf} outside_conns={outside_conns} outside_rate={outside_rate} outside_size={outside_size} pool_slots={pool_slots} slot_size={slot_size} host={host} rep={rep} load_rc=$rc"
 echo "LOAD $(cat results/load.json)"
 echo "SERVER $(cat results/server.json)"
 tail -3 results/server.log results/load.log
