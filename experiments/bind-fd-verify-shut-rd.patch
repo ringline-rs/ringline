@@ -1,0 +1,14 @@
+diff --git a/ringline/src/listener_sockets.rs b/ringline/src/listener_sockets.rs
+index b475cacf..61433ce6 100644
+--- a/ringline/src/listener_sockets.rs
++++ b/ringline/src/listener_sockets.rs
+@@ -75,9 +75,6 @@ impl ListenerSockets {
+     /// it, such as systemd's fd store, and reset the connections in its
+     /// backlog. Its acceptor exits on the runtime's stop signal instead.
+     pub(crate) fn shut_down(&self) {
+-        if self.from_fd {
+-            return;
+-        }
+         let reuse: libc::c_int = 1;
+         for fd in self.fds() {
+             unsafe {
