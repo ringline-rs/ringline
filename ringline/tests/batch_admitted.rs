@@ -93,6 +93,100 @@ const OUT_OF_REGION: u8 = b'r';
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 const SLAB_FULL: u8 = b'f';
 const WAITS: u8 = b'w';
+const TIMED_OUT: u8 = b't';
+const PASS_PANIC: u8 = b'x';
+
+/// The idle peer the passing scenario connects to; it reads everything.
+static READER: Mutex<Option<std::net::SocketAddr>> = Mutex::new(None);
+/// Calls of `PanicGuard::as_ptr_len`.
+static PANIC_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// What the passing scenario saw: whether the batch's task panicked, and B
+/// straight after a send admitted at the head once the panic was contained.
+static PANIC_SEEN: Mutex<Option<(bool, u64)>> = Mutex::new(None);
+
+/// A guard whose `as_ptr_len` panics from its third call on. A batch's first
+/// poll calls it twice before the admission decision on both backends
+/// (`total_part_len`, then `batch_plain_slots` on io_uring or nothing on mio
+/// and the gather's `total_part_len`), so the third call is inside the
+/// submit of a batch admitted past the head.
+struct PanicGuard([u8; 64]);
+
+impl SendGuard for PanicGuard {
+    fn as_ptr_len(&self) -> (*const u8, u32) {
+        if PANIC_CALLS.fetch_add(1, Ordering::SeqCst) >= 2 {
+            panic!("guard code panicked");
+        }
+        (self.0.as_ptr(), self.0.len() as u32)
+    }
+    fn region(&self) -> RegionId {
+        RegionId::UNREGISTERED
+    }
+}
+
+/// B on this worker now.
+fn passing_held() -> u64 {
+    ringline::send_admission_counters().passing_held
+}
+
+/// Poll `f` once from the current task.
+async fn poll_once<F: Future + Unpin>(f: &mut F) -> Poll<F::Output> {
+    std::future::poll_fn(|cx| Poll::Ready(std::pin::Pin::new(&mut *f).poll(cx))).await
+}
+
+/// More than the socket buffers take, on a connection whose peer does not
+/// read: a zero-copy guard on io_uring, 16 MiB of plain sends (which take no
+/// pool slot) on mio.
+#[cfg(has_io_uring)]
+fn fill_socket(conn: &mut Connection) {
+    let big = vec![SendPart::Guard(guard(8 << 20))];
+    conn.send_parts().submit_batch(big).expect("fill accepted");
+}
+
+#[cfg(not(has_io_uring))]
+fn fill_socket(conn: &mut Connection) {
+    for _ in 0..256 {
+        conn.send(&[1; 1 << 16]).expect("queued");
+    }
+}
+
+/// On `conn`, whose peer does not read: a full socket, four bounded sends
+/// behind it holding four of the eight slots, and a head that needs six and
+/// waits. A batch on an idle connection then passes the head, and its
+/// guard panics in the submit. Once that task's panic is contained, a send
+/// admitted at the head on another connection must not count as passing.
+async fn pass_and_panic(conn: &mut Connection) {
+    static QUEUED: [u8; SLOT as usize] = [1; SLOT as usize];
+    static HEAD: [u8; 6 * SLOT as usize] = [2; 6 * SLOT as usize];
+    static SMALL: [u8; 100] = [3; 100];
+    let reader = READER.lock().unwrap().expect("reader");
+    fill_socket(conn);
+    let mut queued = Vec::new();
+    for _ in 0..4 {
+        queued.push(conn.send_admitted(&QUEUED).await.expect("admitted"));
+    }
+    let mut head = conn.send_admitted(&HEAD);
+    assert!(poll_once(&mut head).await.is_pending(), "the head waits");
+
+    let task = ringline::spawn_with_handle(async move {
+        let mut idle = ringline::connect(reader).await.expect("connect the reader");
+        let parts = vec![
+            SendPart::Copy(b"h"),
+            SendPart::Guard(GuardBox::new(PanicGuard([4; 64]))),
+        ];
+        let _ = idle.send_parts().submit_batch_admitted(parts).await;
+    })
+    .expect("spawn");
+    let panicked = task.await.is_err();
+    drop(head);
+
+    let mut other = ringline::connect(reader).await.expect("connect the reader");
+    let mut sent = other.send_admitted(&SMALL);
+    let first = poll_once(&mut sent).await;
+    let held = passing_held();
+    assert!(matches!(first, Poll::Ready(Ok(_))), "admitted at the head");
+    *PANIC_SEEN.lock().unwrap() = Some((panicked, held));
+    conn.abort();
+}
 
 /// The batch the waiting scenario sends once admitted.
 const HEADER: &[u8] = b"HDR:";
@@ -134,9 +228,8 @@ fn record(scenario: u8, outcome: Outcome) {
     OUTCOMES.lock().unwrap().push((scenario, outcome));
 }
 
-fn refused_outcome(refused: ringline::BatchRefused<'_>, waited: bool) -> Outcome {
-    let guard_lens = refused
-        .parts
+fn parts_outcome(refused: Option<io::ErrorKind>, parts: &[SendPart<'_>], waited: bool) -> Outcome {
+    let guard_lens = parts
         .iter()
         .filter_map(|p| match p {
             SendPart::Guard(g) => Some(g.as_ptr_len().1),
@@ -144,11 +237,15 @@ fn refused_outcome(refused: ringline::BatchRefused<'_>, waited: bool) -> Outcome
         })
         .collect();
     Outcome {
-        refused: Some(refused.error.kind()),
-        parts_back: refused.parts.len(),
+        refused,
+        parts_back: parts.len(),
         guard_lens,
         waited,
     }
+}
+
+fn refused_outcome(refused: ringline::BatchRefused<'_>, waited: bool) -> Outcome {
+    parts_outcome(Some(refused.error.kind()), &refused.parts, waited)
 }
 
 /// Fill the send pool with bounded sends until one has to wait. The client
@@ -242,6 +339,31 @@ impl AsyncEventHandler for Scenarios {
                         .await
                         > 0
                     {}
+                    return;
+                }
+                TIMED_OUT => {
+                    fill_pool(&mut conn).await;
+                    let mut batch = conn.send_parts().submit_batch_admitted(parts_for(WAITS));
+                    let outcome =
+                        match ringline::timeout(Duration::from_millis(50), &mut batch).await {
+                            Ok(Ok(_)) => Outcome {
+                                refused: None,
+                                parts_back: 0,
+                                guard_lens: Vec::new(),
+                                waited: false,
+                            },
+                            Ok(Err(r)) => refused_outcome(r, false),
+                            Err(_elapsed) => {
+                                let parts = batch.into_parts();
+                                parts_outcome(Some(io::ErrorKind::TimedOut), &parts, true)
+                            }
+                        };
+                    record(TIMED_OUT, outcome);
+                    conn.abort();
+                    return;
+                }
+                PASS_PANIC => {
+                    pass_and_panic(&mut conn).await;
                     return;
                 }
                 _ => {}
@@ -550,4 +672,51 @@ fn a_tls_batch_longer_than_the_pool_is_refused_with_its_parts() {
         2,
         &[SLOT * SLOTS as u32 + 1],
     );
+}
+
+/// A waiting batch whose wait expires gives every part back through
+/// `into_parts`.
+#[test]
+fn a_timed_out_batch_gives_its_parts_back() {
+    let _serial = serial();
+    let outcome = run(TIMED_OUT, 64);
+    assert_refused(&outcome, io::ErrorKind::TimedOut, 2, &[GUARD_LEN as u32]);
+}
+
+/// A guard that panics in the submit of a batch admitted past the head
+/// leaves the pool marking nothing as passing afterwards.
+#[test]
+fn a_guard_panic_while_passing_leaves_no_slot_marked() {
+    let _serial = serial();
+    PANIC_CALLS.store(0, Ordering::SeqCst);
+    *PANIC_SEEN.lock().unwrap() = None;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the reader");
+    *READER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            std::thread::spawn(move || {
+                let mut sink = Vec::new();
+                let _ = stream.expect("accept").read_to_end(&mut sink);
+            });
+        }
+    });
+    let (runtime, handles) = launch(64, None);
+    let mut stream = TcpStream::connect(runtime.bound_addr().expect("bound address")).unwrap();
+    stream.write_all(&[PASS_PANIC]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let seen = loop {
+        if let Some(seen) = *PANIC_SEEN.lock().unwrap() {
+            break seen;
+        }
+        assert!(Instant::now() < deadline, "the scenario never finished");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(stream);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+    assert!(
+        PANIC_CALLS.load(Ordering::SeqCst) >= 3,
+        "the guard's third call ran"
+    );
+    assert_eq!(seen, (true, 0), "(the batch's task panicked, B after it)");
 }

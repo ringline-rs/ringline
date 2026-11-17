@@ -1111,8 +1111,8 @@ impl<'a> DriverCtx<'a> {
         builder
     }
 
-    /// The send-pool slots a waiting batch of `parts` on plaintext connection
-    /// `conn` waits for, or the refusal [`SendBuilder::submit`] would give it
+    /// The send-pool slots a waiting batch of `parts` on a plaintext
+    /// connection waits for, or the refusal [`SendBuilder::submit`] would give it
     /// for its shape: one slot if it has copy parts, none if it has only
     /// guards. Reads the parts and consumes nothing, so a refusal can return
     /// every part.

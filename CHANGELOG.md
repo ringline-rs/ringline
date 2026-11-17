@@ -26,9 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   guards alone joins no FIFO, and a TLS batch waits for the ciphertext bound
   of its length; on mio a batch waits for its length. A refusal is a
   `BatchRefused`, which returns every part, guards included, and converts to
-  an `io::Error`. The refusals are `submit_batch`'s, including a full send
-  slab, which is checked once the batch is admitted, and `send_admitted`'s.
-  `submit_batch` is unchanged.
+  an `io::Error`; `BatchAdmission::into_parts` takes the parts back from a
+  waiting batch, after a timeout for example. On a plaintext io_uring
+  connection a full send slab, checked once the batch is admitted, is refused
+  with `Other`. `submit_batch` is unchanged.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been
   handed to the kernel, without taking a send-pool slot. A server that sends

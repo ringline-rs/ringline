@@ -5004,20 +5004,48 @@ pub type BatchAdmitted<'a> = Result<(usize, SendCompletion), BatchRefused<'a>>;
 /// # Refusals
 ///
 /// Every refusal returns all the parts in [`BatchRefused::parts`]: each check
-/// reads the parts before any is consumed. The refusals are those of
-/// [`submit_batch`](AsyncSendBuilder::submit_batch) for the same batch (an
-/// empty batch, more than 32 parts or 8 guards, copy parts over one slot, a
-/// guard outside its registered region, a full send slab), and those of
-/// [`Admission`] (`InvalidInput` for a batch that can never fit the pool,
-/// `BrokenPipe`, `ConnectionAborted`, `NotConnected`). Pool exhaustion is not
-/// a refusal: the batch waits.
+/// reads the parts before any is consumed.
+///
+/// - On either backend, an empty batch (`InvalidInput`), and the refusals of
+///   [`Admission`]: `InvalidInput` for a batch that can never fit the pool,
+///   `BrokenPipe`, `ConnectionAborted` and `NotConnected`.
+/// - On a plaintext io_uring connection also, with `InvalidInput`: more than
+///   32 parts or 8 guards, more than `u32::MAX` bytes, copy parts over one
+///   slot, and a guard outside its registered region, checked whatever the
+///   batch's size. A full send slab is refused with `Other` ("send slab
+///   exhausted") once the batch is admitted.
+///
+/// Pool exhaustion is not a refusal: the batch waits.
+///
+/// # Ordering
+///
+/// A batch of guards alone joins no FIFO, so it can be sent before an
+/// earlier waiting send on the same connection. Below `send_zc_threshold` it
+/// is copied into a free pool slot if there is one.
 ///
 /// # Cancellation
 ///
 /// Dropping the future while it waits removes its entry from the FIFO and
 /// drops the parts. Bound the wait (an unbounded waiter at the head holds back
-/// every bounded send the order does not let pass), and copy or abort if it
-/// expires.
+/// every bounded send the order does not let pass). To keep the parts when
+/// the wait expires, poll the future through a reference and take them back
+/// with [`into_parts`](Self::into_parts):
+///
+/// ```no_run
+/// # async fn example(tx: &mut ringline::SendHalf, parts: Vec<ringline::SendPart<'_>>) {
+/// use std::time::Duration;
+/// let mut batch = tx.send_parts().submit_batch_admitted(parts);
+/// match ringline::timeout(Duration::from_millis(100), &mut batch).await {
+///     Ok(Ok((_n, sent))) => drop(sent),
+///     Ok(Err(refused)) => drop(refused.parts),
+///     Err(_elapsed) => {
+///         let parts = batch.into_parts();
+///         // Copy the parts' bytes, or abort the connection.
+///         # drop(parts);
+///     }
+/// }
+/// # }
+/// ```
 ///
 /// `!Send`, as [`Admission`] is.
 ///
@@ -5038,6 +5066,16 @@ pub struct BatchAdmission<'a> {
 }
 
 impl<'a> BatchAdmission<'a> {
+    /// The batch's parts, taking its entry out of the FIFO if it is waiting.
+    /// Empty once the future has resolved: the result carried the parts or
+    /// the batch was submitted.
+    ///
+    /// Call it on the worker that polled the future.
+    pub fn into_parts(mut self) -> Vec<crate::handler::SendPart<'a>> {
+        // `Drop` removes a waiting entry.
+        std::mem::take(&mut self.parts)
+    }
+
     fn new(token: ConnId, parts: Vec<crate::handler::SendPart<'a>>) -> Self {
         BatchAdmission {
             conn_index: token.index,
@@ -5073,13 +5111,19 @@ impl<'a> BatchAdmission<'a> {
         let submitted = {
             let mut ctx = driver.make_ctx();
             if passing.is_some() {
+                // The submit runs the guards' code (`SendGuard::as_ptr_len`
+                // and `region`). A panic there must not leave the pool
+                // marking every later allocation as passing, so marking ends
+                // before the panic continues.
                 ctx.send_copy_pool.begin_passing();
-            }
-            let submitted = submit_batch_parts(&mut ctx, token, &mut self.parts, id);
-            if passing.is_some() {
+                let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    submit_batch_parts(&mut ctx, token, &mut self.parts, id)
+                }));
                 ctx.send_copy_pool.end_passing();
+                submitted.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            } else {
+                submit_batch_parts(&mut ctx, token, &mut self.parts, id)
             }
-            submitted
         };
         match submitted {
             Ok(n) => {

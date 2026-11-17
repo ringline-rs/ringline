@@ -134,8 +134,9 @@ impl SendCopyPool {
 
     /// Mark every slot and reservation taken from now until
     /// [`end_passing`](Self::end_passing) as held by a passing send.
-    /// `Admission` sets it around the `send_bounded` call of a send admitted
-    /// past a waiting head, so every allocation path inside that call marks.
+    /// `Admission` and `BatchAdmission` set it around the submit of a send
+    /// admitted past a waiting head, so every allocation path inside that
+    /// submit marks.
     pub(crate) fn begin_passing(&mut self) {
         debug_assert_eq!(
             self.passing.len(),
