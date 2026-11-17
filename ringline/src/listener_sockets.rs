@@ -75,8 +75,8 @@ impl ListenerSockets {
     /// Does nothing to a socket from `RinglineBuilder::bind_fd`. `SHUT_RD`
     /// would take it out of the listening state for every process holding
     /// it, such as systemd holding it in the fd store, and reset the
-    /// connections in its
-    /// backlog. Its acceptor exits on the runtime's stop signal instead.
+    /// connections in its backlog. Its acceptor exits on the runtime's stop
+    /// signal instead.
     pub(crate) fn shut_down(&self) {
         if self.from_fd {
             return;

@@ -160,8 +160,8 @@ impl Runtime {
 
     /// The actual TCP address of the **first** TCP listener, if any. Returns
     /// `Some` for a TCP `bind()` (the port may have been zero-resolved) or an
-    /// inet `bind_fd()`, and
-    /// `None` for client-only mode or when every listener is a Unix socket.
+    /// inet `bind_fd()`, and `None` for client-only mode or when every
+    /// listener is a Unix socket.
     ///
     /// With more than one listener, prefer [`bound_addr_of`] or
     /// [`bound_addrs`]: this returns the first TCP bind and cannot express
@@ -1187,11 +1187,11 @@ impl RinglineBuilder {
     ///
     /// The runtime never calls `shutdown(SHUT_RD)` on this socket, which
     /// would take it out of the listening state for every process holding it
-    /// and reset the connections in its backlog. When its acceptor exits, at
-    /// [`Runtime::shutdown`](crate::Runtime::shutdown) or because every
-    /// worker has exited, it keeps listening, and connections wait in its
-    /// backlog until another holder accepts them or the last holder closes
-    /// it. Connections already taken from the backlog are closed at shutdown,
+    /// and reset the connections in its backlog. When its acceptor exits for
+    /// any reason, such as [`Runtime::shutdown`](crate::Runtime::shutdown),
+    /// every worker exiting, or a fatal accept error, it keeps listening, and
+    /// connections wait in its backlog until another holder accepts them or
+    /// the last holder closes it. Connections already taken from the backlog are closed at shutdown,
     /// including any not yet handed to a handler, and the acceptor can take
     /// one more if it is in `accept` when the shutdown begins.
     ///
@@ -2196,8 +2196,9 @@ impl RinglineBuilder {
                             // An acceptor that stops on its own, because every
                             // worker has exited, must not leave the socket
                             // listening with nothing accepting. A socket from
-                            // `bind_fd` is left listening: other processes may
-                            // hold it, and its clients queue in the backlog.
+                            // `bind_fd` is left listening whatever ended the
+                            // acceptor: other processes may hold it, and its
+                            // clients queue in the backlog.
                             acceptor_sockets.shut_down();
                         })
                 };
