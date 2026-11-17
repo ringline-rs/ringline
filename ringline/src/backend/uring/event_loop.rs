@@ -7415,9 +7415,9 @@ mod tests {
     /// as `READ_FIXED` / `WRITE_FIXED` with the region's index and moves the
     /// data; the same file with an unregistered buffer gets a plain `WRITE`;
     /// and a buffer outside the region it names is refused before anything
-    /// is pushed and without taking a command slot (#841). The slab holds
-    /// one command, so a slot taken by a refusal would make the write after
-    /// it fail with `WouldBlock`.
+    /// is pushed and without taking a command slot, for a read and for a
+    /// write (#841). The slab holds one command, so a slot taken by a
+    /// refusal would make the operation after it fail with `WouldBlock`.
     #[test]
     fn a_buffer_in_a_registered_region_uses_the_fixed_opcodes() {
         use crate::backend::uring::sqe::Op;
@@ -7529,25 +7529,41 @@ mod tests {
         assert_eq!(wait_for_result(&mut el, plain_key), 4096, "plain write");
 
         el.driver.ring.last_pushed = None;
-        for _ in 0..2 {
+        for read in [false, true, false, true] {
             let outside_key = el.executor.begin_disk_io(0);
+            let mut ctx = el.driver.make_ctx();
+            // Safety: refused before anything is pushed, so the kernel never
+            // sees `plain` through these calls.
             let refused = unsafe {
-                el.driver.make_ctx().file_write(
-                    kind,
-                    index,
-                    generation,
-                    0,
-                    plain.as_ptr(),
-                    4096,
-                    rid,
-                    outside_key,
-                )
+                if read {
+                    ctx.file_read(
+                        kind,
+                        index,
+                        generation,
+                        0,
+                        plain.as_ptr().cast_mut(),
+                        4096,
+                        rid,
+                        outside_key,
+                    )
+                } else {
+                    ctx.file_write(
+                        kind,
+                        index,
+                        generation,
+                        0,
+                        plain.as_ptr(),
+                        4096,
+                        rid,
+                        outside_key,
+                    )
+                }
             }
             .expect_err("a buffer outside the region it names");
-            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "read {read}");
             assert!(
                 el.driver.ring.last_pushed.is_none(),
-                "nothing was pushed for the refused write"
+                "read {read}: nothing was pushed for the refused operation"
             );
         }
         let after_key = el.executor.begin_disk_io(0);
