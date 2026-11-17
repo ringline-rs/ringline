@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   in flight and its last send did not wait for room in the socket. Sends on
   one connection are admitted in order under either. `build()` refuses
   `Budget { slots: 0 }`.
+- `AsyncSendBuilder::submit_batch_admitted`: a batch of `SendPart`s that
+  waits in the worker's admission FIFO for its own send-pool cost, as
+  `send_admitted` waits for a copied send's, and is submitted once admitted.
+  On io_uring a plaintext batch with copy parts waits for one slot, a batch of
+  guards alone joins no FIFO, and a TLS batch waits for the ciphertext bound
+  of its length; on mio a batch waits for its length. A refusal is a
+  `BatchRefused`, which returns every part, guards included, and converts to
+  an `io::Error`. The refusals are `submit_batch`'s, including a full send
+  slab, which is checked once the batch is admitted, and `send_admitted`'s.
+  `submit_batch` is unchanged.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been
   handed to the kernel, without taking a send-pool slot. A server that sends

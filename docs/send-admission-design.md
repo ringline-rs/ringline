@@ -1225,5 +1225,6 @@ The fast-path specification changes one default and adds API:
   connections sets the order to strict. Sends on one connection keep their
   order either way.
 - A configuration with an O7w budget of 0 fails validation.
-- `writable`, `send_buffer_size` and the waiting batch method are new; no
-  existing signature changes.
+- `writable`, `send_buffer_size` and the waiting batch method
+  (`AsyncSendBuilder::submit_batch_admitted`) are new; no existing signature
+  changes.
