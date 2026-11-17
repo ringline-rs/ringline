@@ -1385,6 +1385,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `physical_core_count()`, and so the default worker count, is no longer 1
+  on a Linux host with an offline CPU below its highest online one, such as
+  one booted with `nosmt`, where every odd CPU is offline (#974). The sysfs
+  walk stopped at the first CPU without topology; every release since 0.2.0
+  has it. It now visits the CPUs in
+  `/sys/devices/system/cpu/online`. SMT-aware pinning (`pin_to_core`) reads
+  the same list; on such a host it fell back to raw logical CPU ids for
+  more than one worker.
 - io_uring: the `ringline/bytes` counter with `op=sent` now counts every
   TLS record a connection sends, handshake and alert records and every
   ciphertext chunk of an application send (#846). Every 0.6 release counted
