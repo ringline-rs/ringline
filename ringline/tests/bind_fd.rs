@@ -265,8 +265,26 @@ fn an_unbound_socket_is_refused() {
     assert!(msg.contains("not bound"), "{msg}");
 }
 
-/// `launch()` refuses a listener from an fd in merged accept mode, which
-/// needs one socket per worker.
+/// `launch()` refuses a Unix-domain socket that was never bound.
+#[test]
+fn an_unbound_unix_socket_is_refused() {
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    assert!(raw >= 0, "socket: {}", std::io::Error::last_os_error());
+    // SAFETY: `socket` returned a fresh descriptor this test owns.
+    let msg = refused(unsafe { OwnedFd::from_raw_fd(raw) });
+    assert!(msg.contains("not bound"), "{msg}");
+}
+
+/// `launch()` refuses a connected stream socket, which cannot listen.
+#[test]
+fn a_connected_socket_is_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let client = TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+    let msg = refused(client.into());
+    assert!(msg.contains("connected"), "{msg}");
+}
+
+/// `launch()` refuses a listener from an fd in merged accept mode.
 #[cfg(all(feature = "unstable-accept", has_io_uring))]
 #[test]
 fn a_listener_from_an_fd_is_refused_in_merged_mode() {

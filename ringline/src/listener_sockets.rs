@@ -7,8 +7,9 @@
 //! valid for as long as anything that passes it to a syscall holds the `Arc`.
 //!
 //! Shutdown does not close the sockets. [`ListenerSockets::shut_down`] stops
-//! them accepting, `RuntimeShutdown` and the gates drop their `Arc`s, and the
-//! sockets close when the threads accepting on them exit.
+//! them accepting (except a socket from `RinglineBuilder::bind_fd`, which
+//! stays listening), `RuntimeShutdown` and the gates drop their `Arc`s, and
+//! the sockets close when the threads accepting on them exit.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
@@ -52,7 +53,8 @@ impl ListenerSockets {
         self.fds.iter().map(AsRawFd::as_raw_fd)
     }
 
-    /// Stop every socket accepting connections, leaving the fds open.
+    /// Stop every socket accepting connections, leaving the fds open, except a
+    /// socket from `RinglineBuilder::bind_fd`, which is left listening.
     /// Idempotent.
     ///
     /// On Linux `shutdown(SHUT_RD)` on a listening socket fails a multishot
@@ -72,7 +74,8 @@ impl ListenerSockets {
     ///
     /// Does nothing to a socket from `RinglineBuilder::bind_fd`. `SHUT_RD`
     /// would take it out of the listening state for every process holding
-    /// it, such as systemd's fd store, and reset the connections in its
+    /// it, such as systemd holding it in the fd store, and reset the
+    /// connections in its
     /// backlog. Its acceptor exits on the runtime's stop signal instead.
     pub(crate) fn shut_down(&self) {
         if self.from_fd {

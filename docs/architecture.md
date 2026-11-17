@@ -306,7 +306,7 @@ the stop signal the acceptors poll, sets `SO_REUSEADDR` and calls
 `shutdown(SHUT_RD)` on each listener socket, wakes every worker, and joins the
 acceptor threads. On Linux `SHUT_RD` takes the socket out of the listening
 state. A listener from `RinglineBuilder::bind_fd` is left listening, since
-other processes, such as systemd's fd store, may hold it. An acceptor in
+other processes, such as systemd holding it in the fd store, may hold it. An acceptor in
 `poll` wakes on the stop signal; one holding a connection no worker has room
 for sees the flag within about 1 ms, and one backing off
 after an accept error within 10 ms. Each listener's sockets are owned
