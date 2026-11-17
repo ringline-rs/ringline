@@ -1,10 +1,10 @@
 diff --git a/ringline/src/listener_sockets.rs b/ringline/src/listener_sockets.rs
-index b475cacf..61433ce6 100644
+index 6869f028..298a72eb 100644
 --- a/ringline/src/listener_sockets.rs
 +++ b/ringline/src/listener_sockets.rs
-@@ -75,9 +75,6 @@ impl ListenerSockets {
-     /// it, such as systemd's fd store, and reset the connections in its
-     /// backlog. Its acceptor exits on the runtime's stop signal instead.
+@@ -78,9 +78,6 @@ impl ListenerSockets {
+     /// connections in its backlog. Its acceptor exits on the runtime's stop
+     /// signal instead.
      pub(crate) fn shut_down(&self) {
 -        if self.from_fd {
 -            return;
