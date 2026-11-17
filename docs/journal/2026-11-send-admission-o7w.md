@@ -106,9 +106,8 @@ With 1,024 slots the heads waited at most 4.1 ms, too short to tell the
 orders apart. The prediction that the 512-slot cell might time out was wrong.
 That cell was chosen, and W1 at N = 16 and W2 with six slow readers ran there
 at ratio 2, four rounds per order. C2's seven cells and the W1 cell with sends
-outside the FIFO also ran once
-per order over TLS as the specification states (32 runs, `01a1e6e7-a1cd` to
-`-af12`, all `success`).
+outside the FIFO also ran once per order over TLS as the specification
+states. The TLS runs total 32 (`01a1e6e7-a1cd` to `-af12`, all `success`).
 
 | cell | O0 heads timed out | O0 head max | O0 fast p99 | O7w heads timed out | O7w head max | O7w fast p99 |
 | --- | --- | --- | --- | --- | --- | --- |

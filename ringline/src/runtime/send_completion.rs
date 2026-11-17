@@ -145,8 +145,11 @@ pub enum SendAdmissionOrder {
     ///   connection's last settled send did not wait for room in the socket.
     ///
     /// The second condition bounds how long the head waits on passing
-    /// sends: once the sends that did not pass hold at most P - H - L slots,
-    /// the head fits whatever the passing sends hold. The third keeps a send
+    /// sends. Passing sends never hold more than `slots`, and when `slots` is
+    /// at most P - H, the head fits once the sends that did not pass hold at
+    /// most P - H - `slots` slots, whatever the passing sends hold. A head
+    /// that needs more than P - `slots` can also wait for slots that sends
+    /// passing an earlier head still hold. The third keeps a send
     /// from passing onto a connection whose peer is not reading, where its
     /// slots could stay held until the peer reads. Waiters that may pass are
     /// admitted oldest first. A `slots` above the pool's slot count admits as

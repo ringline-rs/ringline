@@ -539,8 +539,9 @@ struct Passing {
     /// A send on a fourth, idle connection, polled once while the head
     /// waited: `Some(passed_head)` if it was admitted.
     idler: Option<bool>,
-    /// B just before `abort` on that connection, which runs before the send
-    /// reaches the socket, and once the send settles.
+    /// B just before `abort` on that connection, and once the send's slot has
+    /// returned: on mio `abort` releases it, and on io_uring, where the send
+    /// is already submitted, its completion does.
     idler_held: Option<(u64, u64)>,
     /// That send's result after the abort.
     idler_settled: Option<String>,
@@ -672,6 +673,10 @@ async fn pass_the_head(conn: &mut Connection) -> Passing {
             let before = passing_held();
             idler.abort();
             out.idler_settled = Some(outcome(completion.await));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while passing_held() != 0 && Instant::now() < deadline {
+                ringline::sleep(Duration::from_millis(1)).await;
+            }
             out.idler_held = Some((before, passing_held()));
         }
         Poll::Ready(Err(e)) => out.idler_settled = Some(format!("refused: {e}")),
@@ -691,7 +696,7 @@ async fn pass_the_head(conn: &mut Connection) -> Passing {
 }
 
 /// Run [`Passer`] on one worker under `order`, with a peer that reads and
-/// one that does not for its outbound connections, and return what it saw.
+/// two that do not for its outbound connections, and return what it saw.
 fn run_order(order: ringline::SendAdmissionOrder) -> Passing {
     let _serial = serial();
     *PASSING.lock().unwrap() = None;
@@ -700,7 +705,7 @@ fn run_order(order: ringline::SendAdmissionOrder) -> Passing {
     let idler = TcpListener::bind("127.0.0.1:0").expect("bind the idler");
     *PEERS.lock().unwrap() = Some((reader.local_addr().unwrap(), staller.local_addr().unwrap()));
     *IDLER.lock().unwrap() = Some(idler.local_addr().unwrap());
-    // Neither thread is joined: each blocks in `accept` if the handler never
+    // No thread is joined: each blocks in `accept` if the handler never
     // connects, and the wait below fails the test instead.
     std::thread::spawn(move || {
         let (mut stream, _) = reader.accept().expect("accept the reader");
@@ -806,6 +811,11 @@ fn budget_passes_only_from_an_idle_connection() {
     assert_eq!(passing.staller, None, "{passing:?}");
     assert_eq!(passing.idler, Some(true), "{passing:?}");
     assert_eq!(passing.idler_held, Some((1, 0)), "{passing:?}");
+    assert_eq!(
+        passing.idler_settled.as_deref(),
+        Some(ABORTED),
+        "{passing:?}"
+    );
     assert_eq!(passing.counters.passing_admissions, 2, "{passing:?}");
     assert_eq!(passing.counters.passing_slots, 2, "{passing:?}");
     assert_eq!(passing.counters.passing_held, 0, "{passing:?}");

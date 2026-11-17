@@ -9,15 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `SendAdmissionOrder` and `ConfigBuilder::send_admission_order`: the order
-  in which each worker admits `send_admitted` and `send_backpressured` sends
-  that wait for send-pool capacity. `Strict` admits only the oldest waiter.
+- `SendAdmissionOrder` and `ConfigBuilder::send_admission_order`: the order in
+  which each worker admits `send_admitted` and `send_backpressured` sends that
+  wait for send-pool capacity. `Strict` admits only the oldest waiter.
   `Budget { slots }` (default 32) also admits a waiter that fits ahead of an
-  older waiter on another connection that does not. Sends admitted that way
-  hold at most min(`slots`, pool slots - the older waiter's need). A waiter
-  is admitted that way only when its connection has no send queued or in
-  flight and its last send did not wait for room in the socket. Sends on one
-  connection are admitted in order under either. `build()` refuses
+  older waiter on another connection that does not. A waiter passes only while
+  the slots held by passed sends, with its own, are at most min(`slots`, pool
+  slots - the head's need), and only when its connection has no send queued or
+  in flight and its last send did not wait for room in the socket. Sends on
+  one connection are admitted in order under either. `build()` refuses
   `Budget { slots: 0 }`.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been

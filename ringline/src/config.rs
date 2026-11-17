@@ -1340,10 +1340,10 @@ impl ConfigBuilder {
     /// is admitted, so a small send waits behind a large one that does not
     /// fit. Under [`Budget`](crate::SendAdmissionOrder::Budget) a waiter that
     /// fits can be admitted ahead of an older waiter on another connection,
-    /// while the sends admitted that way hold at most min(`slots`, P - H)
-    /// slots (P the pool's slot count, H the older waiter's need), and only
-    /// onto a connection with no send queued or in flight whose last send did
-    /// not wait for room in the socket. The sends on one connection are
+    /// while the slots held by sends admitted that way, with its own, are at
+    /// most min(`slots`, P - H) (P the pool's slot count, H the slots the
+    /// FIFO's head needs), and only onto a connection with no send queued or
+    /// in flight whose last send did not wait for room in the socket. The sends on one connection are
     /// admitted in the order they were made under either order.
     ///
     /// [`build`](Self::build) refuses `Budget { slots: 0 }`. A `slots` larger

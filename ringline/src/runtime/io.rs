@@ -4926,18 +4926,20 @@ enum BackpressuredState<'a> {
 /// Nothing happens until the first poll: building the future touches no
 /// runtime state, so dropping one you never awaited is a no-op. On the first
 /// poll the message's worst-case pool cost is computed and the future joins
-/// the FIFO; it is released when it reaches the head *and* the pool can cover
-/// that cost. Under [`SendAdmissionOrder::Strict`] admission is
+/// the FIFO; it is released when it reaches the head and the pool can cover
+/// that cost, or earlier when the worker's [`SendAdmissionOrder`] lets it
+/// pass (below). Under [`SendAdmissionOrder::Strict`] admission is
 /// first-come-first-served per worker, so a large message cannot be starved
 /// by a stream of small ones. Under [`SendAdmissionOrder::Budget`], the
 /// default, a waiter that fits can also be admitted ahead of an older waiter
-/// on another connection that does not fit. Sends admitted that way hold at
-/// most min(`slots`, P - H) slots, where P is the pool's slot count and H the
-/// older waiter's need. The older waiter is admitted once the sends that did
-/// not pass hold at most P - H - min(`slots`, P - H) slots. While they hold
-/// more, a stream of passing sends can keep it waiting past the point at
-/// which `Strict` would admit it. Sends on one connection are admitted in
-/// order either way.
+/// on another connection that does not fit. A waiter passes only while the
+/// slots held by sends that passed a head, with its own, are at most
+/// min(`slots`, P - H), where P is the pool's slot count and H the slots the
+/// FIFO's head needs, so those sends never hold more than `slots`. When
+/// `slots` is at most P - H, the head is admitted once the sends that did not
+/// pass hold at most P - H - `slots`; while they hold more, a stream of
+/// passing sends can keep it waiting past the point at which `Strict` would
+/// admit it. Sends on one connection are admitted in order either way.
 ///
 /// The entry at the head submits only when its task polls the future, so a
 /// head entry whose task is woken but does not poll holds every bounded send
