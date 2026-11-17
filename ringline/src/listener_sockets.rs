@@ -17,11 +17,25 @@ use std::sync::Arc;
 /// worker in merged mode, where the worker at index `i` accepts on socket `i`.
 pub(crate) struct ListenerSockets {
     fds: Vec<OwnedFd>,
+    /// The socket came from `RinglineBuilder::bind_fd`: other processes may
+    /// hold it, so `shut_down` leaves it listening.
+    from_fd: bool,
 }
 
 impl ListenerSockets {
     pub(crate) fn new(fds: Vec<OwnedFd>) -> Arc<Self> {
-        Arc::new(ListenerSockets { fds })
+        Arc::new(ListenerSockets {
+            fds,
+            from_fd: false,
+        })
+    }
+
+    /// The one socket of a listener from `RinglineBuilder::bind_fd`.
+    pub(crate) fn from_fd(fd: OwnedFd) -> Arc<Self> {
+        Arc::new(ListenerSockets {
+            fds: vec![fd],
+            from_fd: true,
+        })
     }
 
     /// The fd of socket `i`. Valid for as long as `self` is.
@@ -55,7 +69,15 @@ impl ListenerSockets {
     /// Call it after [`ListenGates::shutdown`](crate::listen_gate::ListenGates::shutdown),
     /// which stops the gates calling `listen(2)`: a socket that starts
     /// listening after its `SHUT_RD` keeps accepting.
+    ///
+    /// Does nothing to a socket from `RinglineBuilder::bind_fd`. `SHUT_RD`
+    /// would take it out of the listening state for every process holding
+    /// it, such as systemd's fd store, and reset the connections in its
+    /// backlog. Its acceptor exits on the runtime's stop signal instead.
     pub(crate) fn shut_down(&self) {
+        if self.from_fd {
+            return;
+        }
         let reuse: libc::c_int = 1;
         for fd in self.fds() {
             unsafe {

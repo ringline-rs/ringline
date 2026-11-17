@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `RinglineBuilder::bind_fd`: a listener on a socket the caller made or
+  received, such as one systemd passes in `LISTEN_FDS` or keeps in its fd
+  store. It must be a bound `SOCK_STREAM` socket in `AF_INET`, `AF_INET6` or
+  `AF_UNIX`, and may already be listening. The runtime never calls
+  `shutdown(SHUT_RD)` on it, so it keeps listening after
+  `Runtime::shutdown` and connections wait in its backlog for the next
+  process. It works with `defer_listen()`; `launch()` refuses it with
+  `AcceptMode::Merged` on io_uring.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been
   handed to the kernel, without taking a send-pool slot. A server that sends
