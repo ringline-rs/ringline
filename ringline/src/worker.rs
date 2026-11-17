@@ -1191,9 +1191,10 @@ impl RinglineBuilder {
     /// any reason, such as [`Runtime::shutdown`](crate::Runtime::shutdown),
     /// every worker exiting, or a fatal accept error, it keeps listening, and
     /// connections wait in its backlog until another holder accepts them or
-    /// the last holder closes it. Connections already taken from the backlog are closed at shutdown,
-    /// including any not yet handed to a handler, and the acceptor can take
-    /// one more if it is in `accept` when the shutdown begins.
+    /// the last holder closes it. Connections already taken from the backlog
+    /// are closed at shutdown, including any not yet handed to a handler, and
+    /// the acceptor can take one more if it is in `accept` when the shutdown
+    /// begins.
     ///
     /// With `defer_listen()`, a socket that is already listening defers only
     /// `accept`: the kernel completes handshakes and queues them, so a TCP

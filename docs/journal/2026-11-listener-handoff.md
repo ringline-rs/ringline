@@ -236,10 +236,12 @@ difference lowers the rate, and both arms share it.
 Built as planned. Review added two refusals the plan did not have: a
 Unix-domain socket that is not bound, and any connected socket. Both passed
 the planned checks and failed later with a bare `EINVAL`, or, with
-`defer_listen()`, launched a listener whose gate then failed to open. The
+`defer_listen()`, launched a listener whose gate then failed to open
+(measured on macOS for an unbound Unix socket; the rest from kernel and
+ringline source). The
 merged-mode refusal stays, without the reason the plan gave: a listener from
 an fd would take the acceptor path a Unix listener takes there, which is not
-built or tested for it.
+tested for a listener from an fd.
 
 `launch()` applies `SO_REUSEADDR` and `listen(Config::backlog)` to every
 listener from an fd, not only when a deferred gate opens: an ungated
@@ -254,7 +256,10 @@ SystemsLab experiment 01a1e6e8-1c6d-71b6-0573-50fc4794908f (Linux
 6.12.116, io_uring, at 4f6bd505) the eight tests passed, the merged-mode
 refusal test passed with `unstable-accept`, the patched tree failed
 `a_listener_from_an_fd_keeps_listening_after_shutdown`, and the full ringline
-suite, fmt, clippy and doc gates passed (measured).
+suite, fmt, clippy and doc gates passed (measured). An earlier run,
+01a1e6db-2a09-71ef-8138-d4b6993fb743 at 260797da, passed every step but the
+mutation, whose patch no longer applied after that commit's doc edits; the
+patch was regenerated in 4f6bd505.
 
 ## Tests planned
 
