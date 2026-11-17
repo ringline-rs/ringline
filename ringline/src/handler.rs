@@ -154,6 +154,38 @@ pub(crate) struct ConnSendState {
     /// failed it, for the future's next poll.
     #[cfg(has_io_uring)]
     pub send_buf_result: Option<Result<u32, i32>>,
+    /// The connection's most recent send waited for room in the socket, so
+    /// `SendAdmissionOrder::Budget` lets no send on it pass a waiting head.
+    /// Kept only while the driver's `track_room_waits` is set.
+    ///
+    /// Both backends keep it by one rule. It is set as soon as a send waits
+    /// for room, and at each completion that settles awaited sends it becomes
+    /// whether any send since the previous such completion waited
+    /// (`send_waited`). When every send on the connection is awaited, as a
+    /// server's replies with `send_admitted` are, that is whether its most
+    /// recent send waited. A send without an id ends nothing: its wait
+    /// carries to the next awaited send, and the flag stays set meanwhile.
+    ///
+    /// What counts as having waited follows how each backend writes. On
+    /// io_uring a send waited if an SQE of it came back short or with
+    /// `EAGAIN` (`wait_for_room`); the sends queued behind it had not been
+    /// submitted. On mio a send waited if it was queued when a `writev`
+    /// returned `WouldBlock` (`waited_entries`): that write carried the
+    /// queued sends, up to the 1024 iovecs one `writev` takes, and mio counts
+    /// every queued send, those past the first 1024 too.
+    pub room_waited: bool,
+    /// A send since the last completion that settled an awaited send waited
+    /// for room. On io_uring `wait_for_room` sets it and
+    /// `Driver::end_logical_send` moves it into `room_waited`; on mio a send
+    /// that completes after waiting sets it, and an awaited one moves it.
+    /// Kept only while the driver's `track_room_waits` is set.
+    pub send_waited: bool,
+    /// mio: how many sends at the front of the queue were queued when a
+    /// `writev` last returned `WouldBlock`, and so waited for room; each
+    /// that completes counts one off. Kept only while the driver's
+    /// `track_room_waits` is set.
+    #[cfg(not(has_io_uring))]
+    pub waited_entries: usize,
 }
 
 /// What ended a `writable` future's wait on io_uring.
@@ -253,6 +285,10 @@ impl ConnSendState {
             send_buf_task: None,
             #[cfg(has_io_uring)]
             send_buf_result: None,
+            room_waited: false,
+            send_waited: false,
+            #[cfg(not(has_io_uring))]
+            waited_entries: 0,
         }
     }
 
@@ -654,7 +690,13 @@ impl<'a> DriverCtx<'a> {
             Err(e) => {
                 // `encrypt_to_sends` released every slot it took, but any
                 // record it sealed first spent a sequence number.
+                //
+                // The close queues a close_notify into pool slots. Those
+                // belong to no passing send, so a send that was passing a
+                // head stops marking around it.
+                let marking = self.send_copy_pool.pause_passing();
                 self.close(conn);
+                self.send_copy_pool.resume_passing(marking);
                 Err(e)
             }
         }

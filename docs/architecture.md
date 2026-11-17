@@ -219,10 +219,13 @@ others decide at call time and fail if the send-copy pool is exhausted; this
 one joins a per-worker FIFO and submits at its turn, when the pool can cover
 the message's worst-case slot cost. That makes the peer, rather than the
 pool, set the pace — the shape a proxy forwarding a fast source to a slow
-sink wants. Admission is strictly first-come-first-served, so a large message
-cannot be starved by a stream of small ones, and it is the whole reason the
-cost is computed up front: the queue will not release a waiter until the pool
-can satisfy the number it was admitted with.
+sink wants. Under `SendAdmissionOrder::Strict` admission is first come first
+served, so a large message cannot be starved by a stream of small ones. Under
+`SendAdmissionOrder::Budget`, the default, a waiter that fits may be admitted
+ahead of an older one on another connection that does not fit, while the
+sends admitted that way hold at most the budget's slots. Either way the queue
+will not release a waiter until the pool can satisfy the number it was
+admitted with, which is why the cost is computed up front.
 
 Two consequences follow from that ordering. Nothing is submitted until the
 future is polled, so the message is read at submission time rather than

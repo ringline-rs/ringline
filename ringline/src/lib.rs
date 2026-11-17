@@ -416,6 +416,15 @@ pub use runtime::select::Select3;
 pub use runtime::select::select;
 /// Poll three futures concurrently, returning whichever completes first.
 pub use runtime::select::select3;
+/// What admission did on a worker: sends that passed a waiting head and the
+/// slots they hold.
+#[doc(hidden)]
+pub use runtime::send_completion::SendAdmissionCounters;
+/// The order in which each worker admits bounded sends to its send copy pool.
+pub use runtime::send_completion::SendAdmissionOrder;
+/// The current worker's admission counters.
+#[doc(hidden)]
+pub use runtime::send_completion::send_admission_counters;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
 /// Why a task's handle did not produce a value: it panicked or was cancelled.

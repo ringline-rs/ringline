@@ -986,6 +986,11 @@ pub(crate) struct Driver {
     /// leave teardown's released slots unsignalled until after a
     /// `submit_and_wait` that can block.
     pub(crate) capacity_released: bool,
+    /// Keep each connection's `room_waited` and `send_waited`, and set
+    /// `capacity_released` when a connection's sends go idle: the worker's
+    /// order is `SendAdmissionOrder::Budget`, which reads them
+    /// (`send_idle`). Off under `Strict`.
+    pub(crate) track_room_waits: bool,
     /// Connections whose Close is owed to the event loop's end-of-iteration
     /// drain, which runs `try_finalize_close` for each. `close_connection`
     /// (read error, task exit, setup failure) registers a
@@ -1242,6 +1247,9 @@ impl Driver {
         } else {
             send_copy_pool.no_huge_pages();
         }
+        if config.send_admission_order.lets_pass() {
+            send_copy_pool.track_passing();
+        }
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
         let mut accumulators = AccumulatorTable::new_with_max(
             config.max_connections,
@@ -1418,6 +1426,7 @@ impl Driver {
             settled_sends: VecDeque::new(),
             recv_aborts: VecDeque::new(),
             capacity_released: false,
+            track_room_waits: config.send_admission_order.lets_pass(),
             pending_finalize_closes: Vec::new(),
             resubmit_retry_scratch: Vec::new(),
             send_retry_scratch: Vec::new(),
@@ -1583,6 +1592,10 @@ impl Driver {
         state.send_probe = SendProbe::None;
         state.send_buf_task = None;
         state.send_buf_result = None;
+        if self.track_room_waits {
+            state.room_waited = false;
+            state.send_waited = false;
+        }
         self.disarm_close_notify_deadline(conn_index);
         // A previous occupant's awaited send can still be sitting in the
         // queue here (its close abandoned the drain); the new occupant must
@@ -2511,6 +2524,36 @@ impl Driver {
         self.submit_next_queued_inner(conn_index)
     }
 
+    /// A completion on `conn_index` settled one or more awaited sends, which
+    /// ends them whatever number of SQEs carried their chunks. Call it once
+    /// per completion, not once per send it settles: the sends of one
+    /// completion waited or not together, and a second call would clear
+    /// what the first recorded. Under `SendAdmissionOrder::Budget`, whether
+    /// any SQE since the previous call waited for room becomes the
+    /// connection's `room_waited`, and the next send starts with none. A
+    /// send without an id (a TLS handshake record or close_notify) ends
+    /// nothing here: a wait of its carries to the next completion that does,
+    /// and the `room_waited` that `wait_for_room` set stays meanwhile.
+    pub(crate) fn end_logical_send(&mut self, conn_index: u32) {
+        if self.track_room_waits {
+            let state = &mut self.send_queues[conn_index as usize];
+            state.room_waited = std::mem::take(&mut state.send_waited);
+        }
+    }
+
+    /// Whether `conn_index` has no send queued or in flight, no chain
+    /// active, and its most recent send did not wait for room in the
+    /// socket: the condition `SendAdmissionOrder::Budget` puts on the
+    /// connection of a send that passes a waiting head. Meaningful only
+    /// while `track_room_waits` is set.
+    pub(crate) fn send_idle(&self, conn_index: u32) -> bool {
+        let state = &self.send_queues[conn_index as usize];
+        state.queue.is_empty()
+            && !state.in_flight
+            && !state.room_waited
+            && !self.chain_table.is_active(conn_index)
+    }
+
     /// [`submit_next_queued`](Self::submit_next_queued) without clearing the
     /// finished send's wait state, for `drain_send_retries`, which re-pushes
     /// a parked head and has no finished send.
@@ -2561,6 +2604,12 @@ impl Driver {
         // Queue empty: the connection is idle.
         state.in_flight = false;
         state.parked = false;
+        // Under `SendAdmissionOrder::Budget` a waiter on this connection may
+        // now pass a waiting head; the end-of-iteration capacity wake looks
+        // for it.
+        if self.track_room_waits {
+            self.capacity_released = true;
+        }
         // Submit a deferred shutdown_write now that the queue is drained.
         if let Some(cs) = self.connections.get_mut(conn_index)
             && matches!(cs.write, WriteHalf::ShutdownPending)

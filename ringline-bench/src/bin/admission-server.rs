@@ -23,12 +23,32 @@
 //! # Sending
 //!
 //! - A reply of at most `--small-max` bytes is small. It is sent with the call
-//!   `--small-send` names: `send_admitted`, which waits in the FIFO (order O0
-//!   in the design), or `send`, which takes no place in it (O1). A `send` the
-//!   pool refuses aborts the connection.
+//!   `--small-send` names: `send_admitted`, which waits in the FIFO, or
+//!   `send`, which takes no place in it (order O1 in the design). A `send`
+//!   the pool refuses aborts the connection.
 //! - A larger reply is large, and is always sent with `send_admitted`.
+//! - `--order` sets the runtime's `SendAdmissionOrder`, which decides what
+//!   `send_admitted` does while the FIFO's head does not fit: `strict`
+//!   (O0 with `--small-send admitted`) admits only the head; `budget` (O7w)
+//!   also admits a waiter that fits ahead of the head, while the slots held
+//!   by such passing sends stay within `--budget` slots and the waiter's
+//!   connection has nothing queued and did not last wait for socket room.
+//!   The default is `strict`, so a run that does not name an order measures
+//!   O0 or O1 as before; the runtime's own default is `budget` with 32.
 //! - Every wait for admission is bounded by `--admit-limit-ms`. A connection
 //!   whose reply is not admitted within it is aborted.
+//!
+//! # TLS
+//!
+//! With `--tls` the listener serves TLS, with a certificate for `localhost`
+//! generated at start, and `--tls-cert-out` writes that certificate as PEM
+//! for `admission-load --tls-ca`. The record layer needs a send-pool slot
+//! that holds one whole TLS record, at least 16,413 bytes (16,384 of
+//! plaintext and 29 of record overhead), so `--slot-size` must be at least
+//! that; the server refuses to start otherwise. Admission counts a TLS
+//! reply's slots as one per record plus one, `ceil(len / 16384) + 1`, rather
+//! than `ceil(len / --slot-size)`, and the held-slot samples below count it
+//! the same way.
 //!
 //! # Settling, and `--pipeline`
 //!
@@ -71,10 +91,16 @@
 //!   or the reason it was not admitted, how it ended once admitted, and the
 //!   mean of each class's held slots (below) over the samples from its
 //!   scheduled time to its admission or removal.
+//! - By class, the admitted replies the runtime admitted past a waiting head
+//!   (`SendCompletion::passed_head`), and for those that settled, the time
+//!   from admission to settlement. Always zero under `--order strict`.
 //! - Every 10 ms a standalone task samples the send-pool slots held by each
-//!   class. A reply counts `ceil(len / --slot-size)` slots from its admission
-//!   until its task sees it settle, its connection is aborted, or the task
-//!   stops watching it. That over-counts: the runtime returns each slot of a
+//!   class, and B, the slots held by sends admitted past a head as the
+//!   runtime counts them (`SendAdmissionCounters::passing_held`), and keeps
+//!   the runtime's admission counters from the last sample. A reply counts
+//!   `ceil(len / --slot-size)` slots (with `--tls`, as in TLS above) from its
+//!   admission until its task sees it settle, its connection is aborted, or
+//!   the task stops watching it. That over-counts: the runtime returns each slot of a
 //!   reply as the kernel takes the slot's bytes, before the reply settles, and
 //!   a settled reply is counted until its task is next polled. An aborted
 //!   connection's replies stop counting at the abort, before the runtime gets
@@ -89,6 +115,7 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
@@ -108,6 +135,33 @@ enum SmallSend {
     Send,
 }
 
+/// The runtime's admission order for `send_admitted`
+/// (`ringline::SendAdmissionOrder`), with the design's name for each.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Order {
+    /// O0 with `--small-send admitted`: only the FIFO's head is admitted.
+    Strict,
+    /// O7w: a waiter that fits may pass a head that does not, within
+    /// `--budget` slots.
+    Budget,
+}
+
+impl Order {
+    fn runtime(self, budget: u16) -> ringline::SendAdmissionOrder {
+        match self {
+            Order::Strict => ringline::SendAdmissionOrder::Strict,
+            Order::Budget => ringline::SendAdmissionOrder::Budget { slots: budget },
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Order::Strict => "strict",
+            Order::Budget => "budget",
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "admission-server",
@@ -116,12 +170,19 @@ enum SmallSend {
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7979")]
     addr: SocketAddr,
-    /// How replies of at most `--small-max` bytes are sent: `admitted` is
-    /// order O0, `send` is O1. The other orders need a runtime option; a flag
-    /// that selects one belongs beside this one, and `send_reply` chooses the
+    /// How replies of at most `--small-max` bytes are sent: `admitted` waits
+    /// in the FIFO under `--order`, `send` is O1. `send_reply` chooses the
     /// call for small and large replies.
     #[arg(long, value_enum)]
     small_send: SmallSend,
+    /// The order `send_admitted` admits under: `strict` (O0) or `budget`
+    /// (O7w).
+    #[arg(long, value_enum, default_value = "strict")]
+    order: Order,
+    /// The most slots sends admitted past a head may hold at once, for
+    /// `--order budget`.
+    #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..))]
+    budget: u16,
     #[arg(long, default_value_t = 4096)]
     small_max: u32,
     #[arg(long)]
@@ -135,12 +196,21 @@ struct Args {
     /// Send-pool slots.
     #[arg(long, default_value_t = 512)]
     pool_slots: u16,
-    /// Send-pool slot size in bytes.
+    /// Send-pool slot size in bytes. With `--tls`, at least 16413: one whole
+    /// TLS record.
     #[arg(long, default_value_t = 16384)]
     slot_size: u32,
     /// Pin the worker to this CPU.
     #[arg(long, default_value_t = 0)]
     cpu: usize,
+    /// Serve TLS with a self-signed certificate for `localhost`, generated at
+    /// start. Needs `--slot-size` of at least 16413.
+    #[arg(long)]
+    tls: bool,
+    /// Write the `--tls` certificate here as PEM, before listening, for
+    /// `admission-load --tls-ca`.
+    #[arg(long, requires = "tls")]
+    tls_cert_out: Option<PathBuf>,
 }
 
 struct Settings {
@@ -150,6 +220,7 @@ struct Settings {
     settle_limit: Duration,
     pipeline: usize,
     slot_size: usize,
+    tls: bool,
 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
@@ -163,6 +234,21 @@ const FLAG_SLOW: u32 = 1;
 const FLAG_OUTSIDE: u32 = 1 << 1;
 const FLAG_WINDOW: u32 = 1 << 2;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+/// Plaintext bytes in one TLS record at rustls' default fragment size.
+const TLS_RECORD_PLAINTEXT: usize = 16384;
+
+/// The send-pool slots admission counts for a reply of `len` bytes: one per
+/// record plus one under TLS (ringline's bound for its unbuffered record
+/// layer, which writes one record per slot), `ceil(len / --slot-size)`
+/// otherwise.
+fn reply_slots(len: usize) -> u64 {
+    let s = settings();
+    if s.tls {
+        (len.div_ceil(TLS_RECORD_PLAINTEXT) + 1) as u64
+    } else {
+        len.div_ceil(s.slot_size) as u64
+    }
+}
 
 /// Reply classes, the index of every per-class array.
 const FAST: usize = 0;
@@ -280,6 +366,9 @@ struct LargeRecord {
 struct Sample {
     at_ns: u64,
     held: [u64; 3],
+    /// B: the slots held by sends admitted past a head, as the runtime
+    /// counts them (`SendAdmissionCounters::passing_held`).
+    passing_held: u64,
 }
 
 /// What `main` prints at shutdown, beyond the counters. Only requests with
@@ -300,6 +389,13 @@ struct Recorder {
     samples: Vec<Sample>,
     /// The earliest and latest scheduled time of a recorded request.
     window_ns: Option<(u64, u64)>,
+    /// Per class, admitted replies the runtime admitted past a head.
+    passed: [u64; 3],
+    /// Per class, for those that settled, the time from admission to
+    /// settlement, in microseconds.
+    passing_hold_us: [Vec<u32>; 3],
+    /// The runtime's admission counters at the last sample.
+    counters: Option<ringline::SendAdmissionCounters>,
 }
 
 static RECORDER: Mutex<Recorder> = Mutex::new(Recorder {
@@ -310,6 +406,9 @@ static RECORDER: Mutex<Recorder> = Mutex::new(Recorder {
     large: Vec::new(),
     samples: Vec::new(),
     window_ns: None,
+    passed: [0; 3],
+    passing_hold_us: [Vec::new(), Vec::new(), Vec::new()],
+    counters: None,
 });
 
 fn recorder() -> std::sync::MutexGuard<'static, Recorder> {
@@ -351,6 +450,10 @@ struct Pending {
     recorded: bool,
     /// Its index in `Recorder::large`.
     large: Option<usize>,
+    /// Whether the runtime admitted it past a waiting head.
+    passed: bool,
+    /// When it was admitted.
+    admitted: Instant,
 }
 
 impl Drop for Pending {
@@ -410,13 +513,20 @@ impl Unsettled {
         large: Option<usize>,
     ) {
         HELD[class].fetch_add(slots, Relaxed);
+        let passed = sent.passed_head();
+        if passed && recorded {
+            recorder().passed[class] += 1;
+        }
+        let now = Instant::now();
         self.queue.push_back(Pending {
             sent,
-            since: Instant::now(),
+            since: now,
             class,
             slots,
             recorded,
             large,
+            passed,
+            admitted: now,
         });
     }
 
@@ -481,6 +591,10 @@ impl Unsettled {
         if ok {
             count(&COUNTERS.replies, front.class);
             record_end(&front, Ended::Settled);
+            if front.passed && front.recorded {
+                let held = u32::try_from(front.admitted.elapsed().as_micros()).unwrap_or(u32::MAX);
+                recorder().passing_hold_us[front.class].push(held);
+            }
         } else {
             count(&COUNTERS.failed, front.class);
             record_end(&front, Ended::Failed);
@@ -624,7 +738,7 @@ async fn send_reply(
         .flatten();
     match admitted {
         Ok(sent) => {
-            let slots = reply.len().div_ceil(s.slot_size) as u64;
+            let slots = reply_slots(reply.len());
             unsettled.push(sent, class, slots, req.recorded(), large);
             true
         }
@@ -698,6 +812,7 @@ async fn sample_held() {
     loop {
         next = (next + interval).max(mono_ns());
         ringline::sleep(Duration::from_nanos(next.saturating_sub(mono_ns()))).await;
+        let counters = ringline::send_admission_counters();
         let sample = Sample {
             at_ns: mono_ns(),
             held: [
@@ -705,8 +820,11 @@ async fn sample_held() {
                 HELD[SLOW].load(Relaxed),
                 HELD[LARGE].load(Relaxed),
             ],
+            passing_held: counters.passing_held,
         };
-        recorder().samples.push(sample);
+        let mut r = recorder();
+        r.samples.push(sample);
+        r.counters = Some(counters);
     }
 }
 
@@ -746,6 +864,7 @@ fn spread(v: &mut [u32]) -> Value {
 /// to `to_ns`, and how many there were.
 fn held_mean(samples: &[Sample], from_ns: u64, to_ns: u64) -> Value {
     let mut sum = [0u64; 3];
+    let mut passing = 0u64;
     let mut n = 0u64;
     for s in samples
         .iter()
@@ -754,6 +873,7 @@ fn held_mean(samples: &[Sample], from_ns: u64, to_ns: u64) -> Value {
         for (total, held) in sum.iter_mut().zip(s.held) {
             *total += held;
         }
+        passing += s.passing_held;
         n += 1;
     }
     let mean = |c: usize| (n > 0).then(|| sum[c] as f64 / n as f64);
@@ -761,6 +881,7 @@ fn held_mean(samples: &[Sample], from_ns: u64, to_ns: u64) -> Value {
         "small_fast": mean(FAST),
         "small_slow": mean(SLOW),
         "large": mean(LARGE),
+        "passing_held": (n > 0).then(|| passing as f64 / n as f64),
         "samples": n,
     })
 }
@@ -782,6 +903,8 @@ fn statistics(r: &mut Recorder, admit_limit_ms: u64) -> Value {
                 "scheduled_us": spread(&mut r.scheduled_us[c]),
                 "wait_us": spread(&mut r.wait_us[c]),
                 "beyond_admit_limit": beyond,
+                "passed": r.passed[c],
+                "passing_hold_us": spread(&mut r.passing_hold_us[c]),
                 "not_admitted": {
                     "admit_timeout": not[Unadmitted::AdmitTimeout as usize],
                     "refused": not[Unadmitted::Refused as usize],
@@ -821,9 +944,38 @@ fn statistics(r: &mut Recorder, admit_limit_ms: u64) -> Value {
         "classes": classes,
         "large_replies": large,
         "held_run": held_mean(&r.samples, 0, u64::MAX),
+        "admission_counters": r.counters.map(|c| json!({
+            "passing_admissions": c.passing_admissions,
+            "passing_slots": c.passing_slots,
+            "passing_held": c.passing_held,
+            "passing_held_max": c.passing_held_max,
+            "wake_scans": c.wake_scans,
+            "scan_wakes": c.scan_wakes,
+            "main_free": c.main_free,
+        })),
         "held_window": window,
         "window_ns": r.window_ns.map(|(lo, hi)| [lo, hi]),
     })
+}
+
+/// A TLS config with a self-signed certificate for `localhost`, written as
+/// PEM to `cert_out` if given.
+fn self_signed(cert_out: Option<&std::path::Path>) -> ringline::TlsConfig {
+    use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate self-signed cert");
+    if let Some(path) = cert_out {
+        std::fs::write(path, cert.cert.pem()).unwrap_or_else(|e| {
+            eprintln!("admission-server: write {}: {e}", path.display());
+            std::process::exit(2);
+        });
+    }
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let chain = vec![CertificateDer::from(cert.cert)];
+    ringline::TlsConfig::builder()
+        .cert(chain, key.into())
+        .build()
+        .expect("valid server config")
 }
 
 fn main() {
@@ -835,17 +987,28 @@ fn main() {
         settle_limit: Duration::from_millis(args.settle_limit_ms),
         pipeline: args.pipeline as usize,
         slot_size: args.slot_size as usize,
+        tls: args.tls,
     };
     // Set once, before any connection reads it.
     let _ = SETTINGS.set(settings);
-    let config = ConfigBuilder::new()
+    let builder = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(true)
         .core_offset(args.cpu)
         .max_connections(4096)
         .send_pool(args.pool_slots, args.slot_size)
-        .build()
-        .expect("valid config");
+        // The default here is strict, not the runtime's default, so a run
+        // that does not name an order measures O0 or O1.
+        .send_admission_order(args.order.runtime(args.budget));
+    let builder = if args.tls {
+        builder.tls(self_signed(args.tls_cert_out.as_deref()))
+    } else {
+        builder
+    };
+    let config = builder.build().unwrap_or_else(|e| {
+        eprintln!("admission-server: {e}");
+        std::process::exit(2);
+    });
     let (runtime, handles) = RinglineBuilder::new(config)
         .bind(args.addr)
         .launch::<Handler>()
@@ -856,8 +1019,14 @@ fn main() {
         "admitted"
     };
     eprintln!(
-        "admission-server: ready on {} (small_send={small_send}, admit={} ms, settle={} ms, pipeline={})",
-        args.addr, args.admit_limit_ms, args.settle_limit_ms, args.pipeline
+        "admission-server: ready on {} (small_send={small_send}, order={}, budget={}, tls={}, admit={} ms, settle={} ms, pipeline={})",
+        args.addr,
+        args.order.name(),
+        args.budget,
+        args.tls,
+        args.admit_limit_ms,
+        args.settle_limit_ms,
+        args.pipeline
     );
     runtime.wait_on_signal();
     for h in handles {
@@ -890,6 +1059,9 @@ fn main() {
                 "failed": OUTSIDE[2].load(Relaxed),
             },
             "small_send": small_send,
+            "order": args.order.name(),
+            "budget": args.budget,
+            "tls": args.tls,
             "admit_limit_ms": args.admit_limit_ms,
             "settle_limit_ms": args.settle_limit_ms,
             "pipeline": args.pipeline,
