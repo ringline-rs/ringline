@@ -7415,7 +7415,9 @@ mod tests {
     /// as `READ_FIXED` / `WRITE_FIXED` with the region's index and moves the
     /// data; the same file with an unregistered buffer gets a plain `WRITE`;
     /// and a buffer outside the region it names is refused before anything
-    /// is pushed (#841).
+    /// is pushed and without taking a command slot, for a read and for a
+    /// write (#841). The slab holds one command, so a slot taken by a
+    /// refusal would make the operation after it fail with `WouldBlock`.
     #[test]
     fn a_buffer_in_a_registered_region_uses_the_fixed_opcodes() {
         use crate::backend::uring::sqe::Op;
@@ -7429,7 +7431,7 @@ mod tests {
         let region = unsafe { MemoryRegion::new(base, 16384) };
         let mut el = make_test_loop_with_config(
             test_config_builder()
-                .direct_io(crate::direct_io::DirectIoConfig::default())
+                .direct_io(crate::direct_io::DirectIoConfig::default().max_commands_in_flight(1))
                 .registered_regions(vec![region])
                 .max_registered_regions(4)
                 .build()
@@ -7527,25 +7529,51 @@ mod tests {
         assert_eq!(wait_for_result(&mut el, plain_key), 4096, "plain write");
 
         el.driver.ring.last_pushed = None;
-        let outside_key = el.executor.begin_disk_io(0);
-        let refused = unsafe {
-            el.driver.make_ctx().file_write(
-                kind,
-                index,
-                generation,
-                0,
-                plain.as_ptr(),
-                4096,
-                rid,
-                outside_key,
-            )
+        for read in [false, true, false, true] {
+            let outside_key = el.executor.begin_disk_io(0);
+            let mut ctx = el.driver.make_ctx();
+            // Safety: refused before anything is pushed, so the kernel never
+            // sees `plain` through these calls.
+            let refused = unsafe {
+                if read {
+                    ctx.file_read(
+                        kind,
+                        index,
+                        generation,
+                        0,
+                        plain.as_ptr().cast_mut(),
+                        4096,
+                        rid,
+                        outside_key,
+                    )
+                } else {
+                    ctx.file_write(
+                        kind,
+                        index,
+                        generation,
+                        0,
+                        plain.as_ptr(),
+                        4096,
+                        rid,
+                        outside_key,
+                    )
+                }
+            }
+            .expect_err("a buffer outside the region it names");
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "read {read}");
+            assert!(
+                el.driver.ring.last_pushed.is_none(),
+                "read {read}: nothing was pushed for the refused operation"
+            );
         }
-        .expect_err("a buffer outside the region it names");
-        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            el.driver.ring.last_pushed.is_none(),
-            "nothing was pushed for the refused write"
-        );
+        let after_key = el.executor.begin_disk_io(0);
+        unsafe {
+            el.driver
+                .make_ctx()
+                .file_write(kind, index, generation, 0, base, 4096, rid, after_key)
+        }
+        .expect("the refusals left the one command slot free");
+        assert_eq!(wait_for_result(&mut el, after_key), 4096, "write after");
 
         let _ = el.driver.make_ctx().file_close(kind, index, generation);
         let _ = std::fs::remove_file(&path);
@@ -7554,9 +7582,10 @@ mod tests {
     /// An NVMe read or write from a buffer that names a registered region
     /// pushes its `URING_CMD` with that region's index
     /// (`IORING_URING_CMD_FIXED`), and one from an unregistered buffer with
-    /// none (#841). The device slot is filled in by hand and has no device
-    /// behind it, so the kernel fails the commands; only what was pushed is
-    /// checked.
+    /// none (#841). A buffer outside the region it names is refused with
+    /// `InvalidInput`, with nothing pushed and no command slot taken. The
+    /// device slot is filled in by hand and has no device behind it, so the
+    /// kernel fails the commands; only what was pushed is checked.
     #[test]
     fn an_nvme_command_from_a_registered_region_sets_the_fixed_index() {
         use crate::backend::uring::sqe::Op;
@@ -7606,6 +7635,32 @@ mod tests {
                 other => panic!("expected a URING_CMD, got {other:?}"),
             }
             let _ = wait_for_result(&mut el, key);
+        }
+
+        let outside = crate::buf::AlignedBuf::zeroed(4096, 4096);
+        for write in [false, true] {
+            el.driver.ring.last_pushed = None;
+            let key = el.executor.begin_disk_io(0);
+            let mut ctx = el.driver.make_ctx();
+            // Safety: refused before anything is pushed, so the kernel never
+            // sees `outside`.
+            let refused = unsafe {
+                if write {
+                    ctx.nvme_write(device, 0, 1, outside.as_ptr() as u64, 4096, rid, key)
+                } else {
+                    ctx.nvme_read(device, 0, 1, outside.as_ptr() as u64, 4096, rid, key)
+                }
+            }
+            .expect_err("a buffer outside the region it names");
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "write {write}");
+            assert!(
+                el.driver.ring.last_pushed.is_none(),
+                "write {write}: nothing was pushed"
+            );
+            assert!(
+                !el.driver.nvme_cmd_slab.as_ref().unwrap().has_in_flight(),
+                "write {write}: no command slot was taken"
+            );
         }
     }
 
