@@ -5019,9 +5019,10 @@ pub type BatchAdmitted<'a> = Result<(usize, SendCompletion), BatchRefused<'a>>;
 ///
 /// # Ordering
 ///
-/// A batch of guards alone joins no FIFO, so it can be sent before an
-/// earlier waiting send on the same connection. Below `send_zc_threshold` it
-/// is copied into a free pool slot if there is one.
+/// On a plaintext io_uring connection a batch of guards alone joins no FIFO,
+/// so it can be sent before an earlier waiting send on the same connection.
+/// If it is shorter than `send_zc_threshold` and fits one slot, it is copied
+/// into a free pool slot when there is one.
 ///
 /// # Cancellation
 ///
@@ -5069,8 +5070,6 @@ impl<'a> BatchAdmission<'a> {
     /// The batch's parts, taking its entry out of the FIFO if it is waiting.
     /// Empty once the future has resolved: the result carried the parts or
     /// the batch was submitted.
-    ///
-    /// Call it on the worker that polled the future.
     pub fn into_parts(mut self) -> Vec<crate::handler::SendPart<'a>> {
         // `Drop` removes a waiting entry.
         std::mem::take(&mut self.parts)

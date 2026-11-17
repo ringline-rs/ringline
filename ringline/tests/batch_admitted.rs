@@ -107,11 +107,13 @@ static PANIC_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// straight after a send admitted at the head once the panic was contained.
 static PANIC_SEEN: Mutex<Option<(bool, u64)>> = Mutex::new(None);
 
-/// A guard whose `as_ptr_len` panics from its third call on. A batch's first
-/// poll calls it twice before the admission decision on both backends
-/// (`total_part_len`, then `batch_plain_slots` on io_uring or nothing on mio
-/// and the gather's `total_part_len`), so the third call is inside the
-/// submit of a batch admitted past the head.
+/// A guard whose `as_ptr_len` panics from its third call on. Before the
+/// admission decision a batch's first poll calls it once on mio
+/// (`total_part_len`) and twice on io_uring (`total_part_len`, then
+/// `batch_plain_slots`). The submit's first call is the second on mio (the
+/// gather's `total_part_len`) and the third on io_uring
+/// (`batch_plain_ready`), so the third call falls inside the submit of a
+/// batch admitted past the head on both backends.
 struct PanicGuard([u8; 64]);
 
 impl SendGuard for PanicGuard {
@@ -759,7 +761,7 @@ fn a_tls_batch_is_delivered() {
 }
 
 /// A plaintext batch is delivered in part order, and a batch of guards
-/// alone, which joins no FIFO, is delivered too.
+/// alone (which joins no FIFO on io_uring) is delivered too.
 #[test]
 fn plaintext_batches_are_delivered() {
     let _serial = serial();
