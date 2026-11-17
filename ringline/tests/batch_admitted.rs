@@ -94,6 +94,9 @@ const OUT_OF_REGION: u8 = b'r';
 const SLAB_FULL: u8 = b'f';
 const WAITS: u8 = b'w';
 const TIMED_OUT: u8 = b't';
+const WAIT_SHUT: u8 = b'W';
+const SENT: u8 = b'S';
+const GUARDS_ONLY: u8 = b'o';
 const PASS_PANIC: u8 = b'x';
 
 /// The idle peer the passing scenario connects to; it reads everything.
@@ -219,7 +222,10 @@ fn parts_for(scenario: u8) -> Vec<SendPart<'static>> {
             }))]
         }
         SLAB_FULL => vec![SendPart::Copy(b"h"), SendPart::Guard(guard(GUARD_LEN))],
-        WAITS => vec![SendPart::Copy(HEADER), SendPart::Guard(guard(GUARD_LEN))],
+        WAITS | WAIT_SHUT | SENT => {
+            vec![SendPart::Copy(HEADER), SendPart::Guard(guard(GUARD_LEN))]
+        }
+        GUARDS_ONLY => vec![SendPart::Guard(guard(GUARD_LEN))],
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -334,6 +340,51 @@ impl AsyncEventHandler for Scenarios {
                         Err(r) => refused_outcome(r, waited),
                     };
                     record(WAITS, outcome);
+                    while conn
+                        .with_data(|data| ParseResult::Consumed(data.len()))
+                        .await
+                        > 0
+                    {}
+                    return;
+                }
+                WAIT_SHUT => {
+                    fill_pool(&mut conn).await;
+                    let mut batch = conn
+                        .send_parts()
+                        .submit_batch_admitted(parts_for(WAIT_SHUT));
+                    let waited = poll_once(&mut batch).await.is_pending();
+                    conn.shutdown_write();
+                    let outcome = match batch.await {
+                        Ok(_) => Outcome {
+                            refused: None,
+                            parts_back: 0,
+                            guard_lens: Vec::new(),
+                            waited,
+                        },
+                        Err(r) => refused_outcome(r, waited),
+                    };
+                    record(WAIT_SHUT, outcome);
+                    conn.abort();
+                    return;
+                }
+                SENT | GUARDS_ONLY => {
+                    let outcome = match conn
+                        .send_parts()
+                        .submit_batch_admitted(parts_for(trigger))
+                        .await
+                    {
+                        Ok((n, sent)) => {
+                            sent.await.expect("the batch settles");
+                            Outcome {
+                                refused: None,
+                                parts_back: n,
+                                guard_lens: Vec::new(),
+                                waited: false,
+                            }
+                        }
+                        Err(r) => refused_outcome(r, false),
+                    };
+                    record(trigger, outcome);
                     while conn
                         .with_data(|data| ParseResult::Consumed(data.len()))
                         .await
@@ -634,15 +685,17 @@ fn a_waiting_batch_is_admitted_when_slots_return() {
     common::join_workers(&runtime, handles);
 }
 
-/// Over TLS every part is copied and the batch waits for the ciphertext
-/// bound of its length, so one longer than the pool is refused, with its
-/// parts.
-#[test]
-fn a_tls_batch_longer_than_the_pool_is_refused_with_its_parts() {
+type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+
+/// A runtime with TLS and a client connected to it.
+fn launch_tls() -> (
+    ringline::Runtime,
+    Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>,
+    TlsStream,
+) {
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
     use std::sync::Arc;
 
-    let _serial = serial();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let der = CertificateDer::from(cert.cert);
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
@@ -660,7 +713,20 @@ fn a_tls_batch_longer_than_the_pool_is_refused_with_its_parts() {
     let client = rustls::ClientConnection::new(Arc::new(client_config), server_name).unwrap();
     let sock = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut stream = rustls::StreamOwned::new(client, sock);
+    (runtime, handles, rustls::StreamOwned::new(client, sock))
+}
+
+fn expected_value() -> Vec<u8> {
+    (0..GUARD_LEN).map(|i| (i % 251) as u8).collect()
+}
+
+/// Over TLS every part is copied and the batch waits for the ciphertext
+/// bound of its length, so one longer than the pool is refused, with its
+/// parts.
+#[test]
+fn a_tls_batch_longer_than_the_pool_is_refused_with_its_parts() {
+    let _serial = serial();
+    let (runtime, handles, mut stream) = launch_tls();
     stream.write_all(&[TOO_LARGE]).expect("handshake and write");
     let outcome = wait_outcome(TOO_LARGE);
     drop(stream);
@@ -672,6 +738,58 @@ fn a_tls_batch_longer_than_the_pool_is_refused_with_its_parts() {
         2,
         &[SLOT * SLOTS as u32 + 1],
     );
+}
+
+/// A TLS batch is admitted, encrypted and delivered in part order.
+#[test]
+fn a_tls_batch_is_delivered() {
+    let _serial = serial();
+    let (runtime, handles, mut stream) = launch_tls();
+    stream.write_all(&[SENT]).expect("handshake and write");
+    let mut got = vec![0u8; HEADER.len() + GUARD_LEN];
+    stream.read_exact(&mut got).expect("the batch delivered");
+    let outcome = wait_outcome(SENT);
+    drop(stream);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+    assert_eq!(outcome.refused, None, "{outcome:?}");
+    assert_eq!(outcome.parts_back, 2);
+    assert_eq!(&got[..HEADER.len()], HEADER);
+    assert_eq!(&got[HEADER.len()..], &expected_value()[..]);
+}
+
+/// A plaintext batch is delivered in part order, and a batch of guards
+/// alone, which joins no FIFO, is delivered too.
+#[test]
+fn plaintext_batches_are_delivered() {
+    let _serial = serial();
+    for (scenario, prefix) in [(SENT, HEADER), (GUARDS_ONLY, &b""[..])] {
+        let (runtime, handles) = launch(64, None);
+        let mut stream = TcpStream::connect(runtime.bound_addr().expect("bound address")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(&[scenario]).unwrap();
+        let mut got = vec![0u8; prefix.len() + GUARD_LEN];
+        stream.read_exact(&mut got).expect("the batch delivered");
+        let outcome = wait_outcome(scenario);
+        drop(stream);
+        runtime.shutdown();
+        common::join_workers(&runtime, handles);
+        assert_eq!(outcome.refused, None, "{outcome:?}");
+        assert_eq!(&got[..prefix.len()], prefix);
+        assert_eq!(&got[prefix.len()..], &expected_value()[..]);
+    }
+}
+
+/// A batch waiting for slots when the write half is shut down is refused
+/// with its parts.
+#[test]
+fn a_waiting_batch_refused_by_shutdown_write_returns_its_parts() {
+    let _serial = serial();
+    let outcome = run(WAIT_SHUT, 64);
+    assert!(outcome.waited, "the batch waited first: {outcome:?}");
+    assert_refused(&outcome, io::ErrorKind::BrokenPipe, 2, &[GUARD_LEN as u32]);
 }
 
 /// A waiting batch whose wait expires gives every part back through
