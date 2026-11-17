@@ -1849,6 +1849,18 @@ impl AsyncSendBuilder {
             ))
         })
     }
+
+    /// Submit a batch as [`submit_batch`](Self::submit_batch) does, after
+    /// waiting in the worker's admission FIFO for its send-pool cost; a
+    /// refusal returns every part. See [`BatchAdmission`].
+    ///
+    /// Nothing happens until the future is first polled.
+    pub fn submit_batch_admitted<'a>(
+        self,
+        parts: Vec<crate::handler::SendPart<'a>>,
+    ) -> BatchAdmission<'a> {
+        BatchAdmission::new(self.token, parts)
+    }
 }
 
 /// Withdraws a registered send id when dropped, unless disarmed.
@@ -1882,7 +1894,6 @@ impl Drop for WithdrawUnlessDisarmed {
 }
 
 /// Total byte length carried by a batch of send parts.
-#[cfg(has_io_uring)]
 fn total_part_len(parts: &[crate::handler::SendPart<'_>]) -> usize {
     use crate::handler::SendPart;
     parts
@@ -2014,6 +2025,18 @@ impl AsyncSendBuilder {
                 SendCompletion::pending(conn_index, self.token.generation, id),
             ))
         })
+    }
+
+    /// Submit a batch as [`submit_batch`](Self::submit_batch) does, after
+    /// waiting in the worker's admission FIFO for its send-pool cost; a
+    /// refusal returns every part. See [`BatchAdmission`].
+    ///
+    /// Nothing happens until the future is first polled.
+    pub fn submit_batch_admitted<'a>(
+        self,
+        parts: Vec<crate::handler::SendPart<'a>>,
+    ) -> BatchAdmission<'a> {
+        BatchAdmission::new(self.token, parts)
     }
 }
 
@@ -4827,20 +4850,8 @@ impl Admission<'_> {
         first_poll: bool,
         cx: &Context<'_>,
     ) -> Poll<io::Result<SendCompletion>> {
-        let passing = if executor.send_admission_order() == SendAdmissionOrder::Strict {
-            let free = driver.send_copy_pool.free_count();
-            if !executor.send_capacity_turn(id, free) {
-                return pending(cx);
-            }
-            None
-        } else {
-            let pool = PoolView::of(&driver.send_copy_pool);
-            match executor.send_capacity_admit(id, pool, first_poll, |conn| driver.send_idle(conn))
-            {
-                Admit::Wait => return pending(cx),
-                Admit::Head => None,
-                Admit::Pass { slots } => Some(slots),
-            }
+        let Some(passing) = admission_decision(driver, executor, id, first_poll) else {
+            return pending(cx);
         };
         let token = ConnId::new(self.conn_index, self.generation);
         let submit = {
@@ -4879,6 +4890,33 @@ impl Admission<'_> {
     }
 }
 
+/// Whether waiting entry `id` is admitted now: `None` to keep waiting,
+/// `Some(None)` when it is admitted at the head, `Some(Some(slots))` when the
+/// worker's order lets it pass the head with `slots`.
+///
+/// Under `Strict` the queue's [`turn`](Executor::send_capacity_turn)
+/// decides, and under `Budget` [`admit`](Executor::send_capacity_admit) does.
+/// The caller submits a passing send between `SendCopyPool::begin_passing`
+/// and `end_passing`, then marks it with `Executor::mark_send_passed`.
+fn admission_decision(
+    driver: &Driver,
+    executor: &mut Executor,
+    id: SendId,
+    first_poll: bool,
+) -> Option<Option<usize>> {
+    if executor.send_admission_order() == SendAdmissionOrder::Strict {
+        let free = driver.send_copy_pool.free_count();
+        executor.send_capacity_turn(id, free).then_some(None)
+    } else {
+        let pool = PoolView::of(&driver.send_copy_pool);
+        match executor.send_capacity_admit(id, pool, first_poll, |conn| driver.send_idle(conn)) {
+            Admit::Wait => None,
+            Admit::Head => Some(None),
+            Admit::Pass { slots } => Some(Some(slots)),
+        }
+    }
+}
+
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
         let AdmissionState::Waiting(id) = self.state else {
@@ -4893,6 +4931,384 @@ impl Drop for Admission<'_> {
         let state = unsafe { non_null.as_mut() };
         let executor = unsafe { &mut *state.executor.as_mut() };
         // Removed, and the next waiter takes the head.
+        executor.cancel_send(id);
+    }
+}
+
+// ── BatchAdmission ───────────────────────────────────────────────────
+
+/// The refusal of a waiting batch ([`AsyncSendBuilder::submit_batch_admitted`]),
+/// with every part of the batch.
+///
+/// `From<BatchRefused> for io::Error` returns [`error`](Self::error) and drops
+/// the parts, for a caller that does not want them back.
+#[non_exhaustive]
+pub struct BatchRefused<'a> {
+    /// Why the batch was refused.
+    pub error: io::Error,
+    /// Every part of the batch, in the order given, guards included.
+    pub parts: Vec<crate::handler::SendPart<'a>>,
+}
+
+impl fmt::Debug for BatchRefused<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BatchRefused")
+            .field("error", &self.error)
+            .field("parts", &self.parts.len())
+            .finish()
+    }
+}
+
+impl fmt::Display for BatchRefused<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "send batch refused: {}", self.error)
+    }
+}
+
+impl std::error::Error for BatchRefused<'_> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<BatchRefused<'_>> for io::Error {
+    fn from(refused: BatchRefused<'_>) -> Self {
+        refused.error
+    }
+}
+
+/// What a [`BatchAdmission`] resolves to: the number of parts submitted
+/// (always all of them) and the batch's [`SendCompletion`], or its refusal
+/// with every part.
+pub type BatchAdmitted<'a> = Result<(usize, SendCompletion), BatchRefused<'a>>;
+
+/// Future returned by [`AsyncSendBuilder::submit_batch_admitted`]: a batch
+/// of [`SendPart`](crate::SendPart)s that waits in the worker's admission
+/// FIFO for its own send-pool cost, as [`Admission`] waits for a copied
+/// send's, and submits once admitted.
+///
+/// # Pool cost
+///
+/// - On io_uring, a plaintext batch with copy parts waits for one slot,
+///   since its copy parts may not exceed one slot together. A batch of
+///   guards alone joins no FIFO and is submitted on its first poll.
+/// - On io_uring, a TLS batch is copied and encrypted, and waits for the
+///   ciphertext bound of its total length, as `send_admitted` does.
+/// - On mio the batch is copied, and waits for its total length, as
+///   `send_admitted` does.
+///
+/// The send-slab entry a zero-copy batch needs is not part of admission:
+/// the batch takes it once admitted, and a full slab refuses the batch.
+/// Releasing a slab entry wakes nothing.
+///
+/// # Refusals
+///
+/// Every refusal returns all the parts in [`BatchRefused::parts`]: each check
+/// reads the parts before any is consumed. The refusals are those of
+/// [`submit_batch`](AsyncSendBuilder::submit_batch) for the same batch (an
+/// empty batch, more than 32 parts or 8 guards, copy parts over one slot, a
+/// guard outside its registered region, a full send slab), and those of
+/// [`Admission`] (`InvalidInput` for a batch that can never fit the pool,
+/// `BrokenPipe`, `ConnectionAborted`, `NotConnected`). Pool exhaustion is not
+/// a refusal: the batch waits.
+///
+/// # Cancellation
+///
+/// Dropping the future while it waits removes its entry from the FIFO and
+/// drops the parts. Bound the wait (an unbounded waiter at the head holds back
+/// every bounded send the order does not let pass), and copy or abort if it
+/// expires.
+///
+/// `!Send`, as [`Admission`] is.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::BatchAdmission<'static>>();
+/// ```
+#[must_use = "a batch admission future does nothing until polled"]
+pub struct BatchAdmission<'a> {
+    conn_index: u32,
+    /// See `WithDataFuture` for the role of `generation`.
+    generation: u32,
+    parts: Vec<crate::handler::SendPart<'a>>,
+    state: AdmissionState,
+    /// Makes the type `!Send`: a poll on another worker would index that
+    /// worker's tables.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<'a> BatchAdmission<'a> {
+    fn new(token: ConnId, parts: Vec<crate::handler::SendPart<'a>>) -> Self {
+        BatchAdmission {
+            conn_index: token.index,
+            generation: token.generation,
+            parts,
+            state: AdmissionState::Fresh,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Resolve with `error` and every part.
+    fn refuse(&mut self, error: io::Error) -> Poll<BatchAdmitted<'a>> {
+        self.state = AdmissionState::Done;
+        Poll::Ready(Err(BatchRefused {
+            error,
+            parts: std::mem::take(&mut self.parts),
+        }))
+    }
+
+    /// Submit the batch under `id`. `fifo` is false for an id from
+    /// `register_send` (a batch that joined no FIFO), true for one from
+    /// `enqueue_send_capacity`; `passing` is the admission decision's slots
+    /// for a batch that passed the head.
+    fn submit(
+        &mut self,
+        driver: &mut Driver,
+        executor: &mut Executor,
+        id: SendId,
+        fifo: bool,
+        passing: Option<usize>,
+    ) -> Poll<BatchAdmitted<'a>> {
+        let token = ConnId::new(self.conn_index, self.generation);
+        let submitted = {
+            let mut ctx = driver.make_ctx();
+            if passing.is_some() {
+                ctx.send_copy_pool.begin_passing();
+            }
+            let submitted = submit_batch_parts(&mut ctx, token, &mut self.parts, id);
+            if passing.is_some() {
+                ctx.send_copy_pool.end_passing();
+            }
+            submitted
+        };
+        match submitted {
+            Ok(n) => {
+                let mut sent = SendCompletion::pending(self.conn_index, self.generation, id);
+                if fifo {
+                    match passing {
+                        None => executor.mark_send_submitted(id),
+                        Some(slots) => {
+                            executor.mark_send_passed(id, slots);
+                            sent.passed_head = true;
+                        }
+                    }
+                }
+                self.state = AdmissionState::Done;
+                Poll::Ready(Ok((n, sent)))
+            }
+            Err(e) => {
+                // Nothing was queued and no completion is coming.
+                if fifo {
+                    executor.cancel_send(id);
+                } else {
+                    executor.withdraw_send(id);
+                }
+                self.refuse(e)
+            }
+        }
+    }
+}
+
+/// The send-pool slots a waiting batch waits for, or why it is refused
+/// before it waits. Reads the parts and consumes none.
+fn batch_slots(
+    driver: &mut Driver,
+    conn_index: u32,
+    parts: &[crate::handler::SendPart<'_>],
+    total: usize,
+) -> io::Result<usize> {
+    let ctx = driver.make_ctx();
+    #[cfg(has_io_uring)]
+    if !batch_is_tls(&ctx, conn_index) {
+        return ctx.batch_plain_slots(parts);
+    }
+    #[cfg(not(has_io_uring))]
+    let _ = parts;
+    crate::handler::bounded_send_slots(ctx.send_copy_pool, ctx.tls_table, conn_index, total)
+}
+
+/// Whether `conn_index` is a TLS connection, whose batches are copied and
+/// encrypted.
+#[cfg(has_io_uring)]
+fn batch_is_tls(ctx: &crate::handler::DriverCtx<'_>, conn_index: u32) -> bool {
+    // SAFETY: read-only probe; see the `tls_table` field's contract.
+    !ctx.tls_table.is_null() && unsafe { (*ctx.tls_table).has(conn_index) }
+}
+
+/// Submit an admitted batch's `parts` under `id`, and return how many were
+/// submitted. On `Err`, `parts` holds every part: each check runs before a
+/// part is consumed.
+///
+/// A plaintext io_uring batch goes through `SendBuilder` once
+/// `batch_plain_ready` has checked everything `submit` refuses. Any other
+/// batch is gathered into one buffer, borrowing the guards, and sent with
+/// `send_bounded`; the parts are dropped once it is queued.
+fn submit_batch_parts(
+    ctx: &mut crate::handler::DriverCtx<'_>,
+    token: ConnId,
+    parts: &mut Vec<crate::handler::SendPart<'_>>,
+    id: SendId,
+) -> io::Result<usize> {
+    use crate::handler::SendPart;
+    #[cfg(has_io_uring)]
+    if !batch_is_tls(ctx, token.index) {
+        ctx.batch_plain_ready(token, parts)?;
+        let n = parts.len();
+        let mut builder = ctx.send_parts(token);
+        for part in parts.drain(..) {
+            builder = match part {
+                SendPart::Copy(data) => builder.copy(data),
+                SendPart::Guard(guard) => builder.guard(guard),
+            };
+        }
+        let submitted = builder.submit_awaited(id);
+        debug_assert!(
+            submitted.is_ok(),
+            "batch_plain_ready passed a batch that submit refused: {submitted:?}"
+        );
+        return submitted.map(|()| n);
+    }
+    let mut buf = Vec::with_capacity(total_part_len(parts));
+    for part in parts.iter() {
+        match part {
+            SendPart::Copy(data) => buf.extend_from_slice(data),
+            SendPart::Guard(guard) => {
+                let (ptr, len) = guard.as_ptr_len();
+                // SAFETY: the guard owns this memory and is alive for the
+                // borrow; `SendGuard` promises the pointer is valid for `len`.
+                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
+            }
+        }
+    }
+    ctx.send_bounded(token, &buf, id)?;
+    let n = parts.len();
+    parts.clear();
+    Ok(n)
+}
+
+impl<'a> Future for BatchAdmission<'a> {
+    type Output = BatchAdmitted<'a>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<BatchAdmitted<'a>> {
+        let this = self.get_mut();
+        with_state(|driver, executor| {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match this.state {
+                AdmissionState::Done => panic!("BatchAdmission polled after completion"),
+
+                AdmissionState::Fresh => {
+                    // The checks `Admission` makes on its first poll, in the
+                    // same order.
+                    if driver.connections.generation(this.conn_index) != this.generation {
+                        return this.refuse(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "connection closed",
+                        ));
+                    }
+                    if let Some(e) = driver.send_queues[this.conn_index as usize].closing_refusal()
+                    {
+                        return this.refuse(e);
+                    }
+                    if let Some(conn) = driver.connections.get(this.conn_index)
+                        && conn.write != crate::connection::WriteHalf::Open
+                    {
+                        return this.refuse(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "write half is shut down",
+                        ));
+                    }
+                    #[cfg(has_io_uring)]
+                    if driver
+                        .tls_table
+                        .as_ref()
+                        .is_some_and(|t| t.close_notify_sent(this.conn_index))
+                    {
+                        return this.refuse(crate::handler::close_notify_sent_error());
+                    }
+                    let total = total_part_len(&this.parts);
+                    if total == 0 {
+                        return this.refuse(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "empty send batch",
+                        ));
+                    }
+                    let needed = match batch_slots(driver, this.conn_index, &this.parts, total) {
+                        Ok(n) => n,
+                        Err(e) => return this.refuse(e),
+                    };
+                    if needed == 0 {
+                        // Guards alone take no pool slot: submit now, as
+                        // `submit_batch` does.
+                        let id = executor.register_send(this.conn_index);
+                        #[cfg(has_io_uring)]
+                        let unwinding = WithdrawUnlessDisarmed(Some(id));
+                        let done = this.submit(driver, executor, id, false, None);
+                        #[cfg(has_io_uring)]
+                        unwinding.disarm();
+                        return done;
+                    }
+                    let id = executor.enqueue_send_capacity(
+                        this.conn_index,
+                        this.generation,
+                        needed,
+                        task_id,
+                    );
+                    this.state = AdmissionState::Waiting(id);
+                    this.poll_waiting(driver, executor, id, true, cx)
+                }
+
+                AdmissionState::Waiting(id) => {
+                    executor.set_send_owner(id, task_id);
+                    // Teardown and `shutdown_write` take waiting entries out
+                    // of the FIFO with an error result.
+                    if let Some(result) = executor.take_send_result(id) {
+                        let e = match result {
+                            Err(e) => e,
+                            Ok(_) => io::Error::other("a waiting batch settled without a send"),
+                        };
+                        return this.refuse(e);
+                    }
+                    if driver.connections.generation(this.conn_index) != this.generation {
+                        executor.cancel_send(id);
+                        return this.refuse(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "connection closed",
+                        ));
+                    }
+                    this.poll_waiting(driver, executor, id, false, cx)
+                }
+            }
+        })
+    }
+}
+
+impl<'a> BatchAdmission<'a> {
+    /// The waiting half of `poll`, as `Admission::poll_waiting`.
+    fn poll_waiting(
+        &mut self,
+        driver: &mut Driver,
+        executor: &mut Executor,
+        id: SendId,
+        first_poll: bool,
+        cx: &Context<'_>,
+    ) -> Poll<BatchAdmitted<'a>> {
+        let Some(passing) = admission_decision(driver, executor, id, first_poll) else {
+            return pending(cx);
+        };
+        self.submit(driver, executor, id, true, passing)
+    }
+}
+
+impl Drop for BatchAdmission<'_> {
+    fn drop(&mut self) {
+        let AdmissionState::Waiting(id) = self.state else {
+            return;
+        };
+        let Some(mut non_null) = CURRENT_DRIVER.with(|c| c.get()) else {
+            return;
+        };
+        let state = unsafe { non_null.as_mut() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
         executor.cancel_send(id);
     }
 }

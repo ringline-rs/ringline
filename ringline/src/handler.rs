@@ -1111,6 +1111,113 @@ impl<'a> DriverCtx<'a> {
         builder
     }
 
+    /// The send-pool slots a waiting batch of `parts` on plaintext connection
+    /// `conn` waits for, or the refusal [`SendBuilder::submit`] would give it
+    /// for its shape: one slot if it has copy parts, none if it has only
+    /// guards. Reads the parts and consumes nothing, so a refusal can return
+    /// every part.
+    #[cfg(has_io_uring)]
+    pub(crate) fn batch_plain_slots(&self, parts: &[SendPart<'_>]) -> io::Result<usize> {
+        if parts.len() > MAX_IOVECS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many send parts (max 32)",
+            ));
+        }
+        let mut copy_len = 0usize;
+        let mut guards = 0usize;
+        let mut total = 0u64;
+        for part in parts {
+            match part {
+                SendPart::Copy(data) => {
+                    copy_len += data.len();
+                    total += data.len() as u64;
+                }
+                SendPart::Guard(guard) => {
+                    guards += 1;
+                    let (ptr, len) = guard.as_ptr_len();
+                    total += u64::from(len);
+                    let region = guard.region();
+                    if region != crate::buffer::fixed::RegionId::UNREGISTERED {
+                        self.fixed_buffers
+                            .validate_region_ptr(region, ptr, len)
+                            .map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+                            })?;
+                    }
+                }
+            }
+        }
+        if guards > MAX_GUARDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many guards (max 8)",
+            ));
+        }
+        if total > u64::from(u32::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send batch longer than u32::MAX bytes",
+            ));
+        }
+        if copy_len > self.send_copy_pool.slot_size() as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "total copy data exceeds send pool slot size",
+            ));
+        }
+        Ok(usize::from(copy_len > 0))
+    }
+
+    /// Whether [`SendBuilder::submit`] can queue a waiting batch of `parts`
+    /// on plaintext connection `conn` now, checked without consuming a part:
+    /// the connection checks, [`batch_plain_slots`](Self::batch_plain_slots),
+    /// a free pool slot for copy parts, and a free send-slab entry for a
+    /// batch with guards that does not fit the small-send gather. On `Ok`,
+    /// `submit` does not refuse the batch.
+    #[cfg(has_io_uring)]
+    pub(crate) fn batch_plain_ready(&self, conn: ConnId, parts: &[SendPart<'_>]) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
+        }
+        let needed = self.batch_plain_slots(parts)?;
+        let free = self.send_copy_pool.free_count();
+        if free < needed {
+            return Err(io::Error::other("send copy pool exhausted"));
+        }
+        let has_guards = parts.iter().any(|p| matches!(p, SendPart::Guard(_)));
+        if has_guards {
+            let total: usize = parts
+                .iter()
+                .map(|p| match p {
+                    SendPart::Copy(d) => d.len(),
+                    SendPart::Guard(g) => g.as_ptr_len().1 as usize,
+                })
+                .sum();
+            // `submit_small_gather` takes one slot when one is free and the
+            // whole batch fits it; otherwise the batch needs a slab entry.
+            let threshold = self.send_zc_threshold as usize;
+            let gathers = threshold > 0
+                && total < threshold
+                && total <= self.send_copy_pool.slot_size() as usize
+                && free >= 1;
+            if !gathers && !self.send_slab.has_free() {
+                return Err(io::Error::other("send slab exhausted"));
+            }
+        }
+        Ok(())
+    }
+
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
     pub fn send_parts(&mut self, conn: ConnId) -> SendBuilder<'_, 'a> {
         SendBuilder {

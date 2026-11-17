@@ -390,6 +390,7 @@ pub use runtime::io::try_timeout;
 pub use runtime::io::try_timeout_at;
 /// Return control to the worker's event loop once.
 pub use runtime::io::yield_now;
+pub use runtime::io::{BatchAdmission, BatchAdmitted, BatchRefused};
 /// Future returned by [`join()`].
 pub use runtime::join::Join;
 /// Future returned by [`join3()`].
