@@ -1343,8 +1343,9 @@ impl ConfigBuilder {
     /// while the slots held by sends admitted that way, with its own, are at
     /// most min(`slots`, P - H) (P the pool's slot count, H the slots the
     /// FIFO's head needs), and only onto a connection with no send queued or
-    /// in flight whose last send did not wait for room in the socket. The sends on one connection are
-    /// admitted in the order they were made under either order.
+    /// in flight whose last send did not wait for room in the socket. The
+    /// sends on one connection are admitted in the order they were made under
+    /// either order.
     ///
     /// [`build`](Self::build) refuses `Budget { slots: 0 }`. A `slots` larger
     /// than the pool's slot count admits as the slot count does.

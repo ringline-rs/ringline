@@ -539,10 +539,11 @@ struct Passing {
     /// A send on a fourth, idle connection, polled once while the head
     /// waited: `Some(passed_head)` if it was admitted.
     idler: Option<bool>,
-    /// B just before `abort` on that connection, and once the send's slot has
-    /// returned: on mio `abort` releases it, and on io_uring, where the send
-    /// is already submitted, its completion does.
-    idler_held: Option<(u64, u64)>,
+    /// B just before `abort` on that connection, straight after it, and once
+    /// the send's slot has returned (waited for up to 2 s): on mio `abort`
+    /// releases it, and on io_uring, where the send is already submitted, its
+    /// completion does.
+    idler_held: Option<(u64, u64, u64)>,
     /// That send's result after the abort.
     idler_settled: Option<String>,
     /// The head was still waiting at the end.
@@ -672,12 +673,13 @@ async fn pass_the_head(conn: &mut Connection) -> Passing {
             out.idler = Some(completion.passed_head());
             let before = passing_held();
             idler.abort();
+            let after_abort = passing_held();
             out.idler_settled = Some(outcome(completion.await));
             let deadline = Instant::now() + Duration::from_secs(2);
             while passing_held() != 0 && Instant::now() < deadline {
                 ringline::sleep(Duration::from_millis(1)).await;
             }
-            out.idler_held = Some((before, passing_held()));
+            out.idler_held = Some((before, after_abort, passing_held()));
         }
         Poll::Ready(Err(e)) => out.idler_settled = Some(format!("refused: {e}")),
         Poll::Pending => {
@@ -794,8 +796,9 @@ fn strict_admits_nothing_past_a_waiting_head() {
 /// Under `Budget` the send to the reading peer passes the waiting head, and
 /// the slot it holds counts in B until it settles. The send queued behind a
 /// full socket, on a connection with a send in flight, does not pass. The
-/// send on the idle fourth connection passes, and once its connection is
-/// aborted and the send settles, B is 0 again.
+/// send on the idle fourth connection passes; once its connection is
+/// aborted, the send settles with ConnectionAborted and B returns to 0: at
+/// the abort on mio, and at the send's completion on io_uring.
 #[test]
 fn budget_passes_only_from_an_idle_connection() {
     let order = ringline::SendAdmissionOrder::Budget { slots: 2 };
@@ -810,7 +813,10 @@ fn budget_passes_only_from_an_idle_connection() {
     assert_eq!(passing.held_after_settle, Some(0), "settled: {passing:?}");
     assert_eq!(passing.staller, None, "{passing:?}");
     assert_eq!(passing.idler, Some(true), "{passing:?}");
-    assert_eq!(passing.idler_held, Some((1, 0)), "{passing:?}");
+    #[cfg(not(has_io_uring))]
+    assert_eq!(passing.idler_held, Some((1, 0, 0)), "{passing:?}");
+    #[cfg(has_io_uring)]
+    assert_eq!(passing.idler_held, Some((1, 1, 0)), "{passing:?}");
     assert_eq!(
         passing.idler_settled.as_deref(),
         Some(ABORTED),
