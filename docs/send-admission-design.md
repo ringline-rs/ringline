@@ -1041,8 +1041,8 @@ pieces passed.
   admission counters are `#[doc(hidden)] pub`, and stay so (Decisions).
 - Neither Experiment C nor D sent TLS replies. Under O7w a TLS reply is a
   whole reply: in D, O7w with whole replies completed no 7 MiB reply in W4 or
-  W5, and its fast small p99 was 25.4 ms in W4 at 256 KiB. A TLS reply needs at least two slots, so R admits fewer TLS
-  passers than plaintext ones.
+  W5, and its fast small p99 was 25.4 ms in W4 at 256 KiB. A TLS reply needs
+  at least two slots, so R admits fewer TLS passers than plaintext ones.
 - The part is done when C2's seven cells and the W1 cell with sends outside
   the FIFO, rerun on the ported code, give, under O7w, each cell's largest
   head delay within the larger of 10% of C2's O7w figure and the spread
@@ -1052,12 +1052,12 @@ pieces passed.
   under strict order, the same against C2's O0 figures; and the echo check
   puts the default build within the floor of main.
 - Because O7w is the default and C and D sent no TLS replies,
-  `admission-server` and `admission-load` gain TLS, with a pool slot of at least one whole record
-  (16,413 bytes; `validate_tls_slot_size` refuses C's 16 KiB), and the W1 and
-  W2 cells run once with TLS under both orders. By two of C's conditions, O7w
-  must time out no more heads than strict order and keep W1's fast small p99 at
-  or below 10 ms. Otherwise the default goes back to the owner before the pull
-  request merges.
+  `admission-server` and `admission-load` gain TLS, with a pool slot of at
+  least one whole record (16,413 bytes; `validate_tls_slot_size` refuses C's
+  16 KiB), and the W1 and W2 cells run once with TLS under both orders. By two
+  of C's conditions, O7w must time out no more heads than strict order and
+  keep W1's fast small p99 at or below 10 ms. Otherwise the default goes back
+  to the owner before the pull request merges.
 - Part 2's runs, against these criteria, are in
   `docs/journal/2026-11-send-admission-o7w.md`.
 

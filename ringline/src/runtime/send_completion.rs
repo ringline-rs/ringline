@@ -1033,12 +1033,7 @@ impl SendCompletions {
     ///
     /// So within one iteration it is quadratic in the waiters that pass: each
     /// walks the ones ahead of it, including those that passed already and
-    /// left their ids. Measured with `n` one-slot waiters behind a head that
-    /// does not fit, all passing in one iteration, best of five, release
-    /// build on macOS: `n` = 1000 took 0.14 ms polled oldest first and 1.4 ms
-    /// newest first; `n` = 4000 took 1.9 ms and 23 ms. No cheaper form was
-    /// found that keeps the order exact: an admitted waiter has to count
-    /// every older one that could pass.
+    /// left their ids.
     fn left_after_older_passers(
         &self,
         head_needs: usize,

@@ -4931,10 +4931,13 @@ enum BackpressuredState<'a> {
 /// first-come-first-served per worker, so a large message cannot be starved
 /// by a stream of small ones. Under [`SendAdmissionOrder::Budget`], the
 /// default, a waiter that fits can also be admitted ahead of an older waiter
-/// on another connection that does not fit. The budget bounds the slots
-/// those passing sends hold, so a stream of small sends cannot keep the large
-/// one waiting either. Sends on one connection are admitted in order either
-/// way.
+/// on another connection that does not fit. Sends admitted that way hold at
+/// most min(`slots`, P - H) slots, where P is the pool's slot count and H the
+/// older waiter's need. The older waiter is admitted once the sends that did
+/// not pass hold at most P - H - min(`slots`, P - H) slots. While they hold
+/// more, a stream of passing sends can keep it waiting past the point at
+/// which `Strict` would admit it. Sends on one connection are admitted in
+/// order either way.
 ///
 /// The entry at the head submits only when its task polls the future, so a
 /// head entry whose task is woken but does not poll holds every bounded send

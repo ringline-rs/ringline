@@ -1,8 +1,11 @@
 # O7w as the default order: the fast-path specification's Part 2 runs
 
-- **Status:** closed. On the ported code O7w meets Part 2's criteria in every
-  plaintext cell on the hosts C2 used, admits every head strict order admits
-  over TLS, and costs no CPU per operation beyond main's floor.
+- **Status:** closed. On the ported code O7w met Part 2's criteria in C2's
+  seven cells, and in the cell with sends outside the FIFO once it ran on
+  C2's host. It admitted every head strict order admitted over TLS and cost
+  no CPU per operation beyond main's floor. Strict order missed the 0.3 ms
+  fast p99 bar against C2's O0 in five cells, by 1.0 to 2.1 ms; the two of
+  them rerun on C2's hosts met it.
 - **Span:** Nov 2026 · follows #967 (the specification) and #969 (Part 1)
   · SystemsLab context `send-admission-expC`
 - **Code:** `SendAdmissionOrder` and the harness changes are in the pull
@@ -42,7 +45,9 @@ whatever the submission asked. C2 ran the W1 cells on hv01, the W1 cell with
 sends outside the FIFO and W2 with no slow readers on hv02. This pull request
 makes the host a parameter.
 
-Largest head delay and the median of the per-run fast small p99, in ms:
+Largest head delay and the median of the per-run fast small p99, in ms.
+Ratio 2 is an `admit_limit` of 2,000 ms against a `settle_limit` of
+1,000 ms, as in journal C; the other cells use 1,000 ms for both.
 
 | cell | O0 | O7w | C2 O0 | C2 O7w |
 | --- | --- | --- | --- | --- |
@@ -62,8 +67,10 @@ Every head was admitted, and no fast small reply went beyond `admit_limit`.
   same runs was 1.9 ms below C2's O0.
 - Strict order met the head bar everywhere. Its fast p99 was 1.0 to 2.1 ms
   off C2's O0 in the four W1 cells and 1.4 ms off in W2 with two slow
-  readers, against a 0.3 ms bar. C2's own O0 per-run fast p99s spread by up
-  to 2.6 ms, so the bar is tighter than O0's run-to-run spread.
+  readers, against a 0.3 ms bar. C2's own O0 per-run fast p99s were within
+  2.6 ms of their median, so the bar is tighter than O0's run-to-run spread.
+  C2 ran W2 with two slow readers on hv03 too, so the host does not explain
+  that miss.
 
 ### Host-matched rerun
 
@@ -76,9 +83,10 @@ runs per order (`01a1e758-355e` to `-37e9`), all `success`:
 | W1, N = 16, hv01 | 807.8, 765.0 | 808.3, 0.4 |
 | W1, sends outside the FIFO, hv02 | 810.4, 766.5 | 810.2, 0.6 |
 
-Both cells meet every bar on C2's hosts, under both orders. The misses above
-followed the host, not the order. The other two W1 cells and W2 with no slow
-readers were not rerun on C2's hosts.
+On C2's hosts both rerun cells meet every bar under both orders, so the
+misses in those two cells followed the host. Strict order's misses in W1 at
+N = 1 and at ratio 2 were not rerun on hv01, nor was W2 with no slow readers
+rerun on hv02.
 
 ## TLS
 
@@ -94,22 +102,24 @@ Calibration, strict order only:
 | 1,024 slots, 1,000 ms (`01a1e687-f996`) | 10 of 10 | 1.7 ms | 0.4 ms |
 | 512 slots, 2,000 ms (`01a1e687-faa4`) | 10 of 10 | 1,800 ms | 1,954 ms |
 
-The 1,024-slot pool never filled. The prediction that the 512-slot cell might
-time out was wrong. That cell was chosen, and W1 at N = 16 and W2 with six
-slow readers ran there four rounds per order; C2's eight cells also ran once
+With 1,024 slots the heads waited at most 4.1 ms, too short to tell the
+orders apart. The prediction that the 512-slot cell might time out was wrong.
+That cell was chosen, and W1 at N = 16 and W2 with six slow readers ran there
+at ratio 2, four rounds per order. C2's seven cells and the W1 cell with sends
+outside the FIFO also ran once
 per order over TLS as the specification states (32 runs, `01a1e6e7-a1cd` to
 `-af12`, all `success`).
 
 | cell | O0 heads timed out | O0 head max | O0 fast p99 | O7w heads timed out | O7w head max | O7w fast p99 |
 | --- | --- | --- | --- | --- | --- | --- |
-| W1, N = 1, 1,000 ms | 10 of 10 | - | 1,157.2 | 10 of 10 | - | 0.5 |
-| W1, N = 16, 1,000 ms | 10 of 10 | - | 1,155.1 | 10 of 10 | - | 0.4 |
+| W1, N = 1 | 10 of 10 | - | 1,157.2 | 10 of 10 | - | 0.5 |
+| W1, N = 16 | 10 of 10 | - | 1,155.1 | 10 of 10 | - | 0.4 |
 | W1, sends outside the FIFO | 10 of 10 | - | 1,154.4 | 10 of 10 | - | 0.4 |
-| W1, N = 16, 2,000 ms | 0 of 50 | 1,800.9 | 1,954.2 | 0 of 50 | 1,800.0 | 0.4 |
+| W1, N = 16, ratio 2 | 0 of 50 | 1,800.9 | 1,954.2 | 0 of 50 | 1,800.0 | 0.4 |
 | W2, no slow readers | 0 of 10 | 732.9 | 693.1 | 0 of 10 | 732.0 | 0.4 |
 | W2, 2 slow | 0 of 10 | 735.1 | 694.6 | 0 of 10 | 733.5 | 0.4 |
 | W2, 6 slow | 0 of 10 | 737.6 | 695.9 | 0 of 10 | 733.4 | 0.4 |
-| W2, 6 slow, 2,000 ms | 0 of 50 | 738.0 | 696.0 | 0 of 50 | 733.5 | 0.4 |
+| W2, 6 slow, ratio 2 | 0 of 50 | 738.0 | 696.0 | 0 of 50 | 733.5 | 0.4 |
 
 O7w timed out no more heads than strict order in any cell and kept W1's fast
 small p99 at or below 0.5 ms, the two conditions the specification sets. In

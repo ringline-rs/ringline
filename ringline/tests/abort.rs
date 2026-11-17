@@ -189,7 +189,7 @@ fn fill_awaited(conn: &mut Connection) -> ringline::SendCompletion {
 #[cfg(not(has_io_uring))]
 fn fill_awaited(conn: &mut Connection) -> ringline::SendCompletion {
     for _ in 0..255 {
-        let _ = conn.send(&[1; 1 << 16]).expect("queued");
+        conn.send(&[1; 1 << 16]).expect("queued");
     }
     conn.send(&[1; 1 << 16]).expect("queued")
 }
@@ -536,6 +536,14 @@ struct Passing {
     held_around_abort: Option<(u64, u64)>,
     /// That send's result after the abort.
     staller_settled: Option<String>,
+    /// A send on a fourth, idle connection, polled once while the head
+    /// waited: `Some(passed_head)` if it was admitted.
+    idler: Option<bool>,
+    /// B just before `abort` on that connection, which runs before the send
+    /// reaches the socket, and once the send settles.
+    idler_held: Option<(u64, u64)>,
+    /// That send's result after the abort.
+    idler_settled: Option<String>,
     /// The head was still waiting at the end.
     head_waited_last: bool,
     /// The worker's counters at the end.
@@ -547,6 +555,9 @@ static PASSING: Mutex<Option<Passing>> = Mutex::new(None);
 /// The test thread's listeners: the first one's peer reads, the second's
 /// does not.
 static PEERS: Mutex<Option<(SocketAddr, SocketAddr)>> = Mutex::new(None);
+
+/// A third listener for [`pass_the_head`], whose peer does not read.
+static IDLER: Mutex<Option<SocketAddr>> = Mutex::new(None);
 
 /// Holds the pool's slots behind a waiting head on its connection and tries
 /// sends that could pass it; see [`pass_the_head`].
@@ -589,13 +600,15 @@ fn passing_held() -> u64 {
 /// four bounded sends queued behind it holding four of the pool's eight
 /// slots, and a head that needs six and waits. Then, while the head waits,
 /// one poll each of a waiter behind it on `conn`, a send on a connection
-/// whose peer reads, and a send queued behind a full socket on a third
-/// connection, which is then aborted.
+/// whose peer reads, a send queued behind a full socket on a third
+/// connection, which is then aborted, and a send on an idle fourth
+/// connection, which is aborted straight after its admission.
 async fn pass_the_head(conn: &mut Connection) -> Passing {
     static QUEUED: [u8; SLOT] = [1; SLOT];
     static HEAD: [u8; 6 * SLOT] = [2; 6 * SLOT];
     static SMALL: [u8; SLOT] = [3; SLOT];
     let (reader_addr, staller_addr) = PEERS.lock().unwrap().expect("peers");
+    let idler_addr = IDLER.lock().unwrap().expect("idler");
     let mut out = Passing::default();
 
     fill(conn);
@@ -648,6 +661,29 @@ async fn pass_the_head(conn: &mut Connection) -> Passing {
         }
     }
 
+    let mut idler = ringline::connect(idler_addr)
+        .await
+        .expect("connect the idler");
+    let mut sent = idler.send_admitted(&SMALL);
+    let first = poll_once(&mut sent).await;
+    match first {
+        Poll::Ready(Ok(completion)) => {
+            out.idler = Some(completion.passed_head());
+            let before = passing_held();
+            idler.abort();
+            out.idler_settled = Some(outcome(completion.await));
+            out.idler_held = Some((before, passing_held()));
+        }
+        Poll::Ready(Err(e)) => out.idler_settled = Some(format!("refused: {e}")),
+        Poll::Pending => {
+            idler.abort();
+            out.idler_settled = Some(match sent.await {
+                Ok(_) => "admitted after the abort".to_string(),
+                Err(e) => format!("{:?}: {e}", e.kind()),
+            });
+        }
+    }
+
     out.head_waited_last = poll_once(&mut head).await.is_pending();
     out.counters = ringline::send_admission_counters();
     conn.abort();
@@ -661,7 +697,9 @@ fn run_order(order: ringline::SendAdmissionOrder) -> Passing {
     *PASSING.lock().unwrap() = None;
     let reader = TcpListener::bind("127.0.0.1:0").expect("bind the reader");
     let staller = TcpListener::bind("127.0.0.1:0").expect("bind the staller");
+    let idler = TcpListener::bind("127.0.0.1:0").expect("bind the idler");
     *PEERS.lock().unwrap() = Some((reader.local_addr().unwrap(), staller.local_addr().unwrap()));
+    *IDLER.lock().unwrap() = Some(idler.local_addr().unwrap());
     // Neither thread is joined: each blocks in `accept` if the handler never
     // connects, and the wait below fails the test instead.
     std::thread::spawn(move || {
@@ -673,6 +711,11 @@ fn run_order(order: ringline::SendAdmissionOrder) -> Passing {
     std::thread::spawn(move || {
         let (_stream, _) = staller.accept().expect("accept the staller");
         let _ = held.recv_timeout(Duration::from_secs(20));
+    });
+    let (release_idler, idler_held) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let (_stream, _) = idler.accept().expect("accept the idler");
+        let _ = idler_held.recv_timeout(Duration::from_secs(20));
     });
 
     let config = ConfigBuilder::new()
@@ -703,6 +746,7 @@ fn run_order(order: ringline::SendAdmissionOrder) -> Passing {
         std::thread::sleep(Duration::from_millis(1));
     };
     let _ = release.send(());
+    let _ = release_idler.send(());
     drop(peer);
     runtime.shutdown();
     common::join_workers(&runtime, handles);
@@ -732,6 +776,7 @@ fn strict_admits_nothing_past_a_waiting_head() {
     assert_head_kept(order, &passing);
     assert_eq!(passing.reader, None, "{passing:?}");
     assert_eq!(passing.staller, None, "{passing:?}");
+    assert_eq!(passing.idler, None, "{passing:?}");
     assert_eq!(
         passing.counters,
         ringline::SendAdmissionCounters {
@@ -743,7 +788,9 @@ fn strict_admits_nothing_past_a_waiting_head() {
 
 /// Under `Budget` the send to the reading peer passes the waiting head, and
 /// the slot it holds counts in B until it settles. The send queued behind a
-/// full socket, on a connection with a send in flight, does not pass.
+/// full socket, on a connection with a send in flight, does not pass. The
+/// send on the idle fourth connection passes, and once its connection is
+/// aborted and the send settles, B is 0 again.
 #[test]
 fn budget_passes_only_from_an_idle_connection() {
     let order = ringline::SendAdmissionOrder::Budget { slots: 2 };
@@ -757,8 +804,10 @@ fn budget_passes_only_from_an_idle_connection() {
     );
     assert_eq!(passing.held_after_settle, Some(0), "settled: {passing:?}");
     assert_eq!(passing.staller, None, "{passing:?}");
-    assert_eq!(passing.counters.passing_admissions, 1, "{passing:?}");
-    assert_eq!(passing.counters.passing_slots, 1, "{passing:?}");
+    assert_eq!(passing.idler, Some(true), "{passing:?}");
+    assert_eq!(passing.idler_held, Some((1, 0)), "{passing:?}");
+    assert_eq!(passing.counters.passing_admissions, 2, "{passing:?}");
+    assert_eq!(passing.counters.passing_slots, 2, "{passing:?}");
     assert_eq!(passing.counters.passing_held, 0, "{passing:?}");
     assert_eq!(passing.counters.passing_held_max, 1, "{passing:?}");
 }

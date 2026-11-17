@@ -2,7 +2,7 @@
 # runtime under order O0, O1 or O7w, in workload W1 or W2, over plaintext or
 # TLS, measured with the instruments of Experiment C.
 #
-# One cell and one repetition per experiment, in one guest on hv03:
+# One cell and one repetition per experiment, in one guest on {host}:
 # admission-server (one worker, pinned to CPU 0) and admission-load (CPUs 2
 # and up) over loopback. net.ipv4.tcp_wmem is capped at {tcp_wmem_max} B,
 # which bounds each socket's send buffer, so a reply to a peer that reads
