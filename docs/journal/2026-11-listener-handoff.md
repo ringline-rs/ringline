@@ -1,6 +1,6 @@
 # 2026-11 — Handing a listening socket to the next process
 
-- **Status:** open — PR 1 (the acceptor) built and GO; PRs 2 to 4 not started
+- **Status:** open — PR 1 (the acceptor) merged (#971) and GO; PR 2 (`bind_fd`) built; PRs 3 and 4 not started
 - **Span:** Nov 2026 · tree 911e0497 (`main`) · intent #970 · PR 1 · SystemsLab experiments listed under "What happened"
 
 ## Goal
@@ -230,6 +230,31 @@ The rate is lower than the 32,000 conns/s the queue-full poll entry measured
 at 4509097c with the same image. That run had a 16 vCPU guest on hv03; these
 ran in an 8 vCPU guest on hv01 (`nproc` in each log). They did not test which
 difference lowers the rate, and both arms share it.
+
+### PR 2: a listener from an fd
+
+Built as planned. Review added two refusals the plan did not have: a
+Unix-domain socket that is not bound, and any connected socket. Both passed
+the planned checks and failed later with a bare `EINVAL`, or, with
+`defer_listen()`, launched a listener whose gate then failed to open. The
+merged-mode refusal stays, without the reason the plan gave: a listener from
+an fd would take the acceptor path a Unix listener takes there, which is not
+built or tested for it.
+
+`launch()` applies `SO_REUSEADDR` and `listen(Config::backlog)` to every
+listener from an fd, not only when a deferred gate opens: an ungated
+listener's gate is opened by `launch()` itself. On a socket systemd created,
+that replaces its `Backlog=`.
+
+macOS keeps a listener listening after `SHUT_RD`, so there the test that a
+listener from an fd still accepts after shutdown passes with or without the
+change. `experiments/bind-fd-verify.toml` runs the tests on Linux with
+`experiments/bind-fd-verify-shut-rd.patch`, which puts `SHUT_RD` back. In
+SystemsLab experiment 01a1e6e8-1c6d-71b6-0573-50fc4794908f (Linux
+6.12.116, io_uring, at 4f6bd505) the eight tests passed, the merged-mode
+refusal test passed with `unstable-accept`, the patched tree failed
+`a_listener_from_an_fd_keeps_listening_after_shutdown`, and the full ringline
+suite, fmt, clippy and doc gates passed (measured).
 
 ## Tests planned
 
