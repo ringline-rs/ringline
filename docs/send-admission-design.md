@@ -1124,19 +1124,24 @@ pieces were partly sent to stalled peers and held the pool (fast small p99
 counts as partly sent when a send of it came back short
 (`SendCompletion::waited_for_room`). 85 KiB pieces, a third of that buffer,
 passed the three cells they ran in. A piece of a third of the send buffer, at
-most 128 KiB, passed in every cell E ran it in, all with 512 slots. With 512
+most 128 KiB, passed in every cell E ran it in: at 85 KiB with 512 slots of
+16 KiB, and at 128 KiB with that pool and with 128 slots of 64 KiB. With 512
 slots, pieces of 16, 32 and 64 KiB passed every rule cell over both
 transports, at more CPU per byte the smaller they were (2.77 times whole
 replies over plaintext and 2.23 over TLS at 16 KiB).
 
 In W2, with six slow readers, a pool of 128 slots failed (fast small p99
 about 445 ms) with 16 KiB and with 64 KiB slots, and a pool of 512 slots
-passed with either. A small reply occupies one slot whatever the slot's
-size, and a slow reader keeps up to the benchmark server's pipeline depth
-(16) of admitted, unsettled replies, so the slots those replies take depend
-on the slot count, not the pool's bytes. No run counted the slots each
-connection held, and the 512-slot runs' peak use (106 to 141 slots) does
-not by itself explain why 128 slots fail for TLS 32 KiB pieces.
+passed with either. A small reply takes one slot over plaintext and, as
+admission counts it, two over TLS, whatever the slot's size. A slow reader
+keeps up to the benchmark server's pipeline depth (16) of admitted,
+unsettled replies, so the six slow readers' replies take a share of the
+pool set by its slot count, not its bytes. The server's per-class samples
+show the slow readers at that depth throughout: 96 slots over plaintext and
+192 over TLS, as admission counts them. Over TLS that exceeds a 128-slot
+pool; over plaintext it does not, and why 128 slots fail there is not
+known. The samples count a reply until its task sees it settle, so they
+over-count against the pool.
 
 #### Decisions
 

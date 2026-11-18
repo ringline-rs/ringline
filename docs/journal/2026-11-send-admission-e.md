@@ -1,7 +1,7 @@
 # Experiment E: TLS replies in gated pieces under strict order
 
-- **Status:** closed. TLS O0 gated 64 and 128 KiB pieces pass D's decision
-  rule in every rule cell; 128 KiB fails W4 at `tcp_wmem` 256 KiB (929 ms),
+- **Status:** closed. With 512 slots of 16 KiB, TLS O0 gated 64 and 128 KiB
+  pieces pass D's decision rule in every rule cell; 128 KiB fails W4 at `tcp_wmem` 256 KiB (929 ms),
   where 85 KiB (a third of the send buffer) and every smaller piece pass.
   With 512 slots, pieces of 16 to 128 KiB pass every rule cell over both
   transports; CPU per byte rises as they shrink (Addenda 2 and 3). In W2
@@ -252,8 +252,8 @@ encrypts the next, which whole replies do not allow.
 ## Outcome
 
 - Over TLS, with 512 slots of 16 KiB, gated pieces under O0 pass D's
-  decision rule at 64 and 128 KiB (Addenda 3 and 4: with 128 slots every
-  gated arm fails W2).
+  decision rule at 64 and 128 KiB (Addenda 3 and 4: with 128 slots and
+  pipeline depth 16, every gated arm fails W2).
   Strict order with gated TLS pieces kept small replies at or below 0.6 ms
   in every rule cell and completed every large reply, which O7w with whole
   replies did not do in W1, W4 or W5.
@@ -387,10 +387,10 @@ TLS:
 - In W2, pieces to the three drainers waited for room at 64 KiB over
   plaintext (3,600 of 3,840), as over TLS and at 128 KiB, and at no piece
   size of 32 KiB or less over either transport.
-- The 7 MiB reply's median rose as pieces shrank in every cell: over
-  plaintext from 4.1 to 6.0 ms at 128 KiB to 8.3 to 12.7 ms at 16 KiB, over
-  TLS from 5.3 to 8.4 ms (leaving out W4 at 256 KiB, 755 ms) to 9.3 to
-  15.5 ms.
+- The 7 MiB reply's median rose as pieces shrank in every cell but TLS W4
+  at 256 KiB, where 128 KiB pieces failed (755 ms): over plaintext from 4.1
+  to 6.0 ms at 128 KiB to 8.3 to 12.7 ms at 16 KiB, over TLS from 5.3 to
+  8.4 ms to 9.3 to 15.5 ms.
 
 U, worker CPU per byte against whole replies of the same transport and pool:
 
@@ -541,21 +541,26 @@ Against the prediction:
   fewest, so 49 taken where the slow readers could hold at most 24).
 - Neither refutation condition held. In W2 the slot count decides the result
   and the slot size does not: at 128 slots both sizes fail, at 512 both pass.
-- The candidate mechanism, admitted and unsettled small replies to slow
-  readers each holding one slot up to the pipeline depth, is not
-  established. No run counted the slots each connection held. Pipeline
-  depth 4 also limits the fast connections and the drainers, so that arm
-  does not single out the slow readers. The 512-slot runs' fewest free
-  slots put TLS 32 KiB's use at 106 to 108 slots, about 20 fewer than 128,
-  yet 128 slots of 16 KiB failed with that arm; the fewest free is sampled
-  every 10 ms and at admission, so the peak may be higher than recorded.
+- Why 128 slots are too few is not established. No run counted slots per
+  connection, but the server's per-class samples (`held_window.small_slow`
+  in `server-summary.json`) show the six slow readers at the pipeline depth
+  for the whole window: 96.0 slots with pipeline 16 and 24.0 with pipeline
+  4 in every plaintext run with 512 slots or pipeline 4, and 192.0 over TLS
+  with 512 slots, where admission counts each small reply as 2. With 128
+  slots the same samples were 84.8 to 85.8 (plaintext) and 168.7 to 170.0
+  (TLS). The samples count a reply until its task sees it settle, so they
+  over-count against the pool, whose fewest free slots put TLS 32 KiB's use
+  at 106 to 108 of 512. Over TLS, the slow readers' replies as admission
+  counts them (192) exceed a 128-slot pool; over plaintext (96) they do
+  not, and the samples do not show why 128 slots fail there.
 
 ## Outcome of the addenda
 
 - Every piece size from 16 to 128 KiB passed every rule cell with 512
   slots, over both transports. Only one cell separated the sizes, TLS in
-  W4 at 256 KiB, where 128 KiB failed and 85 KiB and smaller passed; a piece of a third of the send buffer, at most 128 KiB,
-  passed everywhere it ran.
+  W4 at 256 KiB, where 128 KiB failed and 85 KiB and smaller passed; a
+  piece of a third of the send buffer, at most 128 KiB, passed everywhere
+  it ran.
 - Smaller pieces cost more CPU per byte (plaintext 1.43 to 2.77 times whole
   replies from 128 down to 16 KiB, TLS 1.26 to 2.23) and made the 7 MiB
   reply slower, and, apart from that cell, gave fast small replies a lower
@@ -567,5 +572,5 @@ Against the prediction:
   most 16 KiB of TLS ciphertext. In W2 the slot count decided the result;
   why 128 slots are too few there is not established (Addendum 4).
 - Not measured: piece sizes between 64 and 128 KiB other than 85 KiB (for
-  example 80 KiB, five whole TLS records), pools other than 128 and 512 slots, and how many
-  slots each connection held.
+  example 80 KiB, five whole TLS records), pools other than 128 and 512
+  slots, and how many slots each connection held.
