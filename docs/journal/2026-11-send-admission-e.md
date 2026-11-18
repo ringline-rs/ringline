@@ -323,7 +323,12 @@ pool has. The unbuffered TLS engine writes one record per slot, so a 64 KiB
 slot carries 16 KiB of TLS ciphertext, and TLS O0 whole has no 64 KiB-slot
 control; TLS arms here are read against the plaintext control and against
 the same piece size with 16 KiB slots. The report puts slot size and pool
-count in the cell key with TLS.
+count in the cell key with TLS. (Corrected after the runs: the unbuffered
+engine's `encrypt_chunk` writes as many whole records as fit into a slot, so
+a 64 KiB slot holds three records, 49,218 bytes. Admission
+(`CiphertextCapacity::slots_unbuffered`) still reserves one slot per record,
+so with 64 KiB slots a TLS reply reserves about three times the slots its
+ciphertext fills.)
 
 Prediction:
 
@@ -570,9 +575,11 @@ Against the prediction:
   p99 only in two plaintext W4 cells, where every size was at most 4 ms.
 - At equal pool memory, 64 KiB slots made plaintext whole replies 4%
   cheaper per byte, pieces up to 4% cheaper, and divided the slot count by
-  four. A reply smaller than a slot still takes a whole slot, and over TLS
-  each slot carries one record of at most 16 KiB, so a 64 KiB slot holds at
-  most 16 KiB of TLS ciphertext. In W2 the slot count decided the result;
+  four. A reply smaller than a slot still takes a whole slot. Over TLS a
+  64 KiB slot holds three whole records, but admission reserves one slot
+  per record, so a TLS reply is admitted against about three times the
+  slots its ciphertext fills; a 16,448-byte slot holds one record, and the
+  reservation matches. In W2 the slot count decided the result;
   why 128 slots are too few there is not established (Addendum 4).
 - Not measured: piece sizes between 64 and 128 KiB other than 85 KiB (for
   example 80 KiB, five whole TLS records), pools other than 128 and 512
