@@ -1,8 +1,9 @@
 # Experiment E: TLS replies in gated pieces under strict order
 
 - **Status:** closed. With 512 slots of 16 KiB, TLS O0 gated 64 and 128 KiB
-  pieces pass D's decision rule in every rule cell; 128 KiB fails W4 at `tcp_wmem` 256 KiB (929 ms),
-  where 85 KiB (a third of the send buffer) and every smaller piece pass.
+  pieces pass D's decision rule in every rule cell; 128 KiB fails W4 at
+  `tcp_wmem` 256 KiB (929 ms), where 85 KiB (a third of the send buffer)
+  and every smaller piece pass.
   With 512 slots, pieces of 16 to 128 KiB pass every rule cell over both
   transports; CPU per byte rises as they shrink (Addenda 2 and 3). In W2
   the pool's slot count decides the result, not its slot size: a pool of
@@ -544,15 +545,17 @@ Against the prediction:
 - Why 128 slots are too few is not established. No run counted slots per
   connection, but the server's per-class samples (`held_window.small_slow`
   in `server-summary.json`) show the six slow readers at the pipeline depth
-  for the whole window: 96.0 slots with pipeline 16 and 24.0 with pipeline
-  4 in every plaintext run with 512 slots or pipeline 4, and 192.0 over TLS
-  with 512 slots, where admission counts each small reply as 2. With 128
-  slots the same samples were 84.8 to 85.8 (plaintext) and 168.7 to 170.0
-  (TLS). The samples count a reply until its task sees it settle, so they
-  over-count against the pool, whose fewest free slots put TLS 32 KiB's use
-  at 106 to 108 of 512. Over TLS, the slow readers' replies as admission
-  counts them (192) exceed a 128-slot pool; over plaintext (96) they do
-  not, and the samples do not show why 128 slots fail there.
+  with 512 slots: 96.0 in every gated plaintext run with 512 slots, 24.0 in
+  every pipeline-4 run, and 192.0 in every gated TLS run with 512 slots,
+  where the sample counts 2 per reply. With 128 slots, in the gated runs of
+  Addenda 3 and 4, the samples were 84.7 to 85.8 (plaintext) and 168.5 to
+  171.8 (TLS). The samples count a reply from admission until its task sees
+  it settle, and over TLS also count the slot admission reserves and then
+  returns, while a sent TLS reply holds one slot; so they over-count, and
+  with 128 slots the TLS samples exceed the pool. They do not show why 128
+  slots fail over either transport. With 512 slots the pool's fewest free
+  put total use at 106 to 108 (TLS 32 KiB) and 121 (plaintext 128 KiB on
+  64 KiB slots).
 
 ## Outcome of the addenda
 

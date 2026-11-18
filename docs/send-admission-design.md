@@ -1132,16 +1132,16 @@ replies over plaintext and 2.23 over TLS at 16 KiB).
 
 In W2, with six slow readers, a pool of 128 slots failed (fast small p99
 about 445 ms) with 16 KiB and with 64 KiB slots, and a pool of 512 slots
-passed with either. A small reply takes one slot over plaintext and, as
-admission counts it, two over TLS, whatever the slot's size. A slow reader
-keeps up to the benchmark server's pipeline depth (16) of admitted,
-unsettled replies, so the six slow readers' replies take a share of the
-pool set by its slot count, not its bytes. The server's per-class samples
-show the slow readers at that depth throughout: 96 slots over plaintext and
-192 over TLS, as admission counts them. Over TLS that exceeds a 128-slot
-pool; over plaintext it does not, and why 128 slots fail there is not
-known. The samples count a reply until its task sees it settle, so they
-over-count against the pool.
+passed with either. A small reply needs one free slot to be admitted over
+plaintext and two over TLS (records plus one), and once sent holds one slot
+on either transport, whatever the slot's size. A slow reader keeps up to
+the benchmark server's pipeline depth (16) of admitted, unsettled replies.
+The server's per-class held-slot samples count them at that depth with 512
+slots and gated pieces (96 over plaintext, 192 over TLS at two per reply),
+but they count a reply from admission until its task sees it settle, and
+over TLS count the slot admission reserves and returns, so they over-count.
+With 128 slots the TLS samples (about 170) exceed the pool. Why 128 slots
+fail in W2 is not known over either transport.
 
 #### Decisions
 
