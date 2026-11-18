@@ -92,6 +92,12 @@ const TOO_MANY_GUARDS: u8 = b'g';
 const OUT_OF_REGION: u8 = b'r';
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 const SLAB_FULL: u8 = b'f';
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+const OVER_CAP: u8 = b'h';
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+const OVER_CAP_PLAIN: u8 = b'H';
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+const OVER_CAP_CHAIN: u8 = b'k';
 const WAITS: u8 = b'w';
 const TIMED_OUT: u8 = b't';
 const WAIT_SHUT: u8 = b'W';
@@ -193,6 +199,61 @@ async fn pass_and_panic(conn: &mut Connection) {
     conn.abort();
 }
 
+/// A send's error kind and message, or `None` if it was accepted.
+type SendError = Option<(io::ErrorKind, String)>;
+
+/// The outcomes of the over-cap scenario's sends that are not a
+/// `submit_batch_admitted`.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+static OVER_CAP_ERRORS: Mutex<Vec<(u8, SendError)>> = Mutex::new(Vec::new());
+
+/// Three zero-copy batches larger than the socket takes, to a client that
+/// does not read, hold three of the slab's four entries. A zero-copy batch on
+/// the same connection is then tried three ways: `submit_batch_admitted`
+/// (recorded as `OVER_CAP`), `submit_batch` (`OVER_CAP_PLAIN`) and a chain
+/// (`OVER_CAP_CHAIN`).
+#[cfg(has_io_uring)]
+async fn over_cap(conn: &mut Connection) {
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        let big = vec![SendPart::Guard(guard(8 << 20))];
+        held.push(conn.send_parts().submit_batch(big).expect("held batch"));
+    }
+    let outcome = match conn
+        .send_parts()
+        .submit_batch_admitted(parts_for(OVER_CAP))
+        .await
+    {
+        Ok((n, _sent)) => Outcome {
+            refused: None,
+            parts_back: n,
+            guard_lens: Vec::new(),
+            waited: false,
+        },
+        Err(r) => refused_outcome(r, false),
+    };
+    record(OVER_CAP, outcome);
+    let plain = conn
+        .send_parts()
+        .submit_batch(parts_for(OVER_CAP_PLAIN))
+        .map(drop)
+        .err()
+        .map(|e| (e.kind(), e.to_string()));
+    let chain = conn
+        .send_chain(|c| c.parts().guard(guard(GUARD_LEN)).add().finish())
+        .map(drop)
+        .err()
+        .map(|e| (e.kind(), e.to_string()));
+    let mut errors = OVER_CAP_ERRORS.lock().unwrap();
+    errors.push((OVER_CAP_PLAIN, plain));
+    errors.push((OVER_CAP_CHAIN, chain));
+    drop(errors);
+    conn.abort();
+}
+
+#[cfg(not(has_io_uring))]
+async fn over_cap(_conn: &mut Connection) {}
+
 /// The batch the waiting scenario sends once admitted.
 const HEADER: &[u8] = b"HDR:";
 
@@ -223,7 +284,9 @@ fn parts_for(scenario: u8) -> Vec<SendPart<'static>> {
                 region: id,
             }))]
         }
-        SLAB_FULL => vec![SendPart::Copy(b"h"), SendPart::Guard(guard(GUARD_LEN))],
+        SLAB_FULL | OVER_CAP | OVER_CAP_PLAIN => {
+            vec![SendPart::Copy(b"h"), SendPart::Guard(guard(GUARD_LEN))]
+        }
         WAITS | WAIT_SHUT | SENT => {
             vec![SendPart::Copy(HEADER), SendPart::Guard(guard(GUARD_LEN))]
         }
@@ -315,6 +378,10 @@ impl AsyncEventHandler for Scenarios {
                         Err(r) => refused_outcome(r, false),
                     };
                     record(SLAB_FULL, outcome);
+                    return;
+                }
+                OVER_CAP => {
+                    over_cap(&mut conn).await;
                     return;
                 }
                 WAITS => {
@@ -450,7 +517,19 @@ fn launch(
     ringline::Runtime,
     Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>,
 ) {
+    launch_capped(slab_slots, 16, tls)
+}
+
+fn launch_capped(
+    slab_slots: u16,
+    zero_copy_hold_cap: usize,
+    tls: Option<ringline::TlsConfig>,
+) -> (
+    ringline::Runtime,
+    Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>,
+) {
     let mut builder = ConfigBuilder::new()
+        .zero_copy_hold_cap(zero_copy_hold_cap)
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
@@ -642,6 +721,58 @@ fn a_full_slab_refuses_a_batch_with_its_parts() {
     let _serial = serial();
     let outcome = run(SLAB_FULL, 1);
     assert_refused(&outcome, io::ErrorKind::WouldBlock, 2, &[GUARD_LEN as u32]);
+}
+
+/// Runs the over-cap scenario with a four-entry slab and `cap`, and returns
+/// the admitted batch's outcome and the plain batch's and the chain's errors.
+#[cfg(has_io_uring)]
+fn run_over_cap(cap: usize) -> (Outcome, SendError, SendError) {
+    OVER_CAP_ERRORS.lock().unwrap().clear();
+    let (runtime, handles) = launch_capped(4, cap, None);
+    let mut stream = TcpStream::connect(runtime.bound_addr().expect("bound address")).unwrap();
+    stream.write_all(&[OVER_CAP]).unwrap();
+    let outcome = wait_outcome(OVER_CAP);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while OVER_CAP_ERRORS.lock().unwrap().len() < 2 {
+        assert!(Instant::now() < deadline, "the over-cap sends never ran");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(stream);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+    let errors = std::mem::take(&mut *OVER_CAP_ERRORS.lock().unwrap());
+    let find = |s: u8| errors.iter().find(|(k, _)| *k == s).unwrap().1.clone();
+    (outcome, find(OVER_CAP_PLAIN), find(OVER_CAP_CHAIN))
+}
+
+/// A connection holds three of four slab entries, so the slab is over half
+/// used, and `zero_copy_hold_cap` is 2. A zero-copy batch on it is refused
+/// although an entry is free: `submit_batch_admitted` returns its parts with
+/// `WouldBlock`, and `submit_batch` and a chain fail with `Other`.
+#[cfg(has_io_uring)]
+#[test]
+fn a_connection_at_the_zero_copy_cap_is_refused_with_a_free_entry() {
+    let _serial = serial();
+    let (outcome, plain, chain) = run_over_cap(2);
+    assert_refused(&outcome, io::ErrorKind::WouldBlock, 2, &[GUARD_LEN as u32]);
+    for (what, error) in [("submit_batch", plain), ("chain", chain)] {
+        let (kind, message) = error.unwrap_or_else(|| panic!("{what} was accepted"));
+        assert_eq!(kind, io::ErrorKind::Other, "{what}: {message}");
+        assert!(message.contains("zero_copy_hold_cap"), "{what}: {message}");
+    }
+}
+
+/// The same connection with `zero_copy_hold_cap` 4: the batch takes the free
+/// entry, and the plain batch after it finds the slab full.
+#[cfg(has_io_uring)]
+#[test]
+fn a_connection_below_the_zero_copy_cap_takes_the_free_entry() {
+    let _serial = serial();
+    let (outcome, plain, _chain) = run_over_cap(4);
+    assert_eq!(outcome.refused, None, "{outcome:?}");
+    let (kind, message) = plain.expect("the slab is full");
+    assert_eq!(kind, io::ErrorKind::Other, "{message}");
+    assert!(message.contains("send slab exhausted"), "{message}");
 }
 
 /// The pool is full of sends to a client that does not read. The batch's

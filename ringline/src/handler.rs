@@ -346,6 +346,12 @@ impl ConnId {
 /// (io_uring), with its close_notify, and a close before the handshake
 /// completes (both backends), with the rest of the handshake flight and any
 /// alert.
+/// The message of a zero-copy send refused because its connection holds
+/// `zero_copy_hold_cap` send slab entries while the slab is over half used.
+#[cfg(has_io_uring)]
+pub(crate) const ZERO_COPY_CAP_REFUSAL: &str =
+    "send slab entries held by the connection at zero_copy_hold_cap";
+
 pub(crate) const CLOSE_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Identifies which listener a connection arrived on.
@@ -491,6 +497,10 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) tcp_nodelay: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
+    /// Send slab entries a connection may hold before its zero-copy sends are
+    /// refused, once the slab is over half used
+    /// (`ConfigBuilder::zero_copy_hold_cap`).
+    pub(crate) zero_copy_hold_cap: usize,
     /// The worker's connect deadlines (io_uring only).
     #[cfg(has_io_uring)]
     pub(crate) connect_deadlines:
@@ -1172,9 +1182,10 @@ impl<'a> DriverCtx<'a> {
     /// Whether [`SendBuilder::submit`] can queue a waiting batch of `parts`
     /// on plaintext connection `conn` now, checked without consuming a part:
     /// the connection checks, [`batch_plain_slots`](Self::batch_plain_slots),
-    /// a free pool slot for copy parts, and a free send-slab entry for a
-    /// batch with guards that does not fit the small-send gather. On `Ok`,
-    /// `submit` does not refuse the batch.
+    /// a free pool slot for copy parts, and, for a batch with guards that
+    /// does not fit the small-send gather, a free send-slab entry the
+    /// connection may take (`zero_copy_over_cap`). On `Ok`, `submit` does not
+    /// refuse the batch.
     #[cfg(has_io_uring)]
     pub(crate) fn batch_plain_ready(&self, conn: ConnId, parts: &[SendPart<'_>]) -> io::Result<()> {
         let conn_state = self
@@ -1217,8 +1228,22 @@ impl<'a> DriverCtx<'a> {
                     "send slab exhausted",
                 ));
             }
+            if !gathers && self.zero_copy_over_cap(conn) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    ZERO_COPY_CAP_REFUSAL,
+                ));
+            }
         }
         Ok(())
+    }
+
+    /// Whether a zero-copy send on `conn` is refused: the connection holds
+    /// `zero_copy_hold_cap` send slab entries and the slab is over half used.
+    #[cfg(has_io_uring)]
+    pub(crate) fn zero_copy_over_cap(&self, conn: ConnId) -> bool {
+        self.send_slab
+            .zero_copy_over_cap(conn.index, conn.generation, self.zero_copy_hold_cap)
     }
 
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
@@ -3947,7 +3972,11 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             return Ok(());
         }
 
-        // With guards: build iovecs mixing copy pool subranges and guard pointers.
+        // With guards: build iovecs mixing copy pool subranges and guard
+        // pointers, in a slab entry the connection may take.
+        if self.ctx.zero_copy_over_cap(self.conn) {
+            return Err(io::Error::other(ZERO_COPY_CAP_REFUSAL));
+        }
         self.submit_with_guards()
     }
 
@@ -4715,6 +4744,15 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
             } else {
                 None
             };
+
+        // A zero-copy link takes a slab entry the connection may not take.
+        if folded.is_none()
+            && self.guard_count > 0
+            && self.chain.ctx.zero_copy_over_cap(self.chain.conn)
+        {
+            self.chain.error = Some(io::Error::other(ZERO_COPY_CAP_REFUSAL));
+            return self.chain;
+        }
 
         let built = if let Some(built) = folded {
             built

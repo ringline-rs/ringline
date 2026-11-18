@@ -12466,6 +12466,46 @@ mod tests {
         assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
     }
 
+    /// Once the send slab is over half used, a whole-accumulator forward on a
+    /// connection that holds `zero_copy_hold_cap` entries is sent as a copy
+    /// and takes no further entry.
+    #[test]
+    fn forward_recv_buf_over_the_zero_copy_cap_copies() {
+        let config = test_config_builder()
+            .zero_copy_hold_cap(2)
+            .build()
+            .expect("valid config");
+        let mut el = make_test_loop_with_config(config);
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let current = ConnCtx::new(conn_index, generation);
+        // Above `send_zc_threshold`, so a zero-copy forward takes a slab entry.
+        let message = vec![9u8; 5000];
+        let mut copied = None;
+        for attempt in 0..8 {
+            assert!(el.driver.accumulators.append(conn_index, &message));
+            let data = el.driver.accumulators.data(conn_index);
+            // SAFETY: the accumulator is not touched before the call below.
+            let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+            with_driver_state(&mut el, || current.forward_recv_buf(view).map(drop))
+                .unwrap_or_else(|e| panic!("forward {attempt} refused: {e}"));
+            if el.driver.forward_zc_consumed[conn_index as usize] == 0 {
+                copied = Some(attempt);
+                break;
+            }
+            el.driver.forward_zc_consumed[conn_index as usize] = 0;
+        }
+        // Eight entries: the fifth zero-copy forward puts the slab over half
+        // used, and the sixth is copied.
+        assert_eq!(copied, Some(5));
+        assert_eq!(el.driver.send_slab.held_by(conn_index, generation), 5);
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            &message[..],
+            "the copy left the accumulator for the delivery path to consume"
+        );
+    }
+
     /// `len` bytes of `9` whose allocation sets the returned flag when it is
     /// freed.
     fn drop_flagged_bytes(

@@ -1231,8 +1231,10 @@ impl ConnCtx {
             // detach is a single `take_frozen` with no remainder to put back,
             // and "forwarded" and "consumed" cannot disagree about which bytes
             // went out. Anything else keeps the copy path.
+            // Over `zero_copy_hold_cap` the guarded send would be refused, so
+            // the buffer is copied instead.
             #[cfg(has_io_uring)]
-            if !closing {
+            if !closing && !driver.zero_copy_over_cap(conn_index) {
                 let whole = {
                     let acc = driver.accumulators.data(conn_index);
                     !acc.is_empty()
@@ -1801,6 +1803,10 @@ impl AsyncSendBuilder {
     /// call never consumes a prefix. Callers wanting larger batches should
     /// split them (ringline-redis flushes at 8 guards or 17 iovecs). A batch
     /// that is empty or carries no bytes is rejected with `InvalidInput`.
+    /// A batch that needs a send slab entry is rejected with `Other` when the
+    /// slab is full, or when the connection holds
+    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap)
+    /// entries while the slab is over half used.
     ///
     /// Awaiting the future parks the task until the kernel signals the send,
     /// which returns control to the event loop so completions are reaped and
@@ -3636,8 +3642,11 @@ impl SendHalf {
     ///
     /// On io_uring, if `data` is exactly the connection's whole recv
     /// accumulator, the accumulator is detached and sent under a guard
-    /// (copied into the send pool below `send_zc_threshold`). Otherwise
-    /// `data` is copied as by [`send`](Self::send).
+    /// (copied into the send pool below `send_zc_threshold`), unless the
+    /// connection holds
+    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap) send
+    /// slab entries while the slab is over half used. Otherwise `data` is
+    /// copied as by [`send`](Self::send).
     ///
     /// On mio, `data` is always copied as by `send`, encrypted first
     /// on a TLS connection. On io_uring a TLS connection is always encrypted
@@ -4998,7 +5007,10 @@ pub type BatchAdmitted<'a> = Result<(usize, SendCompletion), BatchRefused<'a>>;
 ///   `send_admitted` does.
 ///
 /// The send-slab entry a zero-copy batch needs is not part of admission:
-/// the batch takes it once admitted, and a full slab refuses the batch.
+/// the batch takes it once admitted. A full slab refuses the batch, and so
+/// does a connection that holds
+/// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap) entries
+/// while the slab is over half used.
 /// Releasing a slab entry wakes nothing, and `writable` waits for socket
 /// room, not for a slab entry: after a slab refusal, a caller copies the
 /// parts' bytes or aborts.
@@ -5014,8 +5026,9 @@ pub type BatchAdmitted<'a> = Result<(usize, SendCompletion), BatchRefused<'a>>;
 /// - On a plaintext io_uring connection also, with `InvalidInput`: more than
 ///   32 parts or 8 guards, more than `u32::MAX` bytes, copy parts over one
 ///   slot, and a guard outside its registered region, checked whatever the
-///   batch's size. A full send slab is refused with `WouldBlock` ("send
-///   slab exhausted") once the batch is admitted.
+///   batch's size. Once the batch is admitted, a full send slab is refused
+///   with `WouldBlock` ("send slab exhausted"), and so is a connection at
+///   `zero_copy_hold_cap` while the slab is over half used.
 ///
 /// Pool exhaustion is not a refusal: the batch waits.
 ///

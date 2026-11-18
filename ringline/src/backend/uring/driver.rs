@@ -132,6 +132,15 @@ impl Driver {
             && self.send_slab.held_by(conn_index, generation) >= self.forward_hold_cap
     }
 
+    /// Whether a zero-copy send on the connection would be refused: it holds
+    /// `zero_copy_hold_cap` send slab entries, and the slab is over half
+    /// used.
+    pub(crate) fn zero_copy_over_cap(&self, conn_index: u32) -> bool {
+        let generation = self.connections.generation(conn_index);
+        self.send_slab
+            .zero_copy_over_cap(conn_index, generation, self.zero_copy_hold_cap)
+    }
+
     /// Arm a direct receive on `conn_index` if it is a direct connection (a
     /// plaintext TCP or Unix connection) or a TLS connection, open, and has
     /// none in flight, no park of it is pending, and `forward_recv_over_cap` does
@@ -620,6 +629,10 @@ pub(crate) struct Driver {
     /// hold before it stops receiving, once the slab is over half used. See
     /// `ConfigBuilder::forward_hold_cap`.
     pub(crate) forward_hold_cap: usize,
+    /// Send slab entries a connection may hold before its zero-copy sends are
+    /// refused, once the slab is over half used. See
+    /// `ConfigBuilder::zero_copy_hold_cap`.
+    pub(crate) zero_copy_hold_cap: usize,
     /// Per-connection: a `forward_recv_buf` of the whole accumulator has
     /// queued a send.
     pub(crate) forwards_recv_buf: Vec<bool>,
@@ -1331,6 +1344,7 @@ impl Driver {
             forward_zc_consumed: vec![0; config.max_connections as usize],
             forward_zc_held: vec![None; config.max_connections as usize],
             forward_hold_cap: config.forward_hold_cap,
+            zero_copy_hold_cap: config.zero_copy_hold_cap,
             forwards_recv_buf: vec![false; config.max_connections as usize],
             forward_recv_held: vec![false; config.max_connections as usize],
             forward_recv_held_conns: Vec::new(),
@@ -1523,6 +1537,7 @@ impl Driver {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             send_zc_threshold: self.send_zc_threshold,
+            zero_copy_hold_cap: self.zero_copy_hold_cap,
             connect_deadlines: &mut self.connect_deadlines,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
