@@ -1,0 +1,21 @@
+{
+  "about": "Experiment E's arms and cells for send-admission-e.toml (docs/journal/2026-11-send-admission-e.md). An experiment is one cell's parameters with one arm's, plus bins_artifact and rep. The cells are Experiment D's rule cells, W4 at 256 KiB and U, without the W4 cells at k = 4 and 56, which no D arm failed; each W4 cell runs on hv03, where D ran W4 at 1 MiB. The TLS arms use a 16,448-byte slot, which holds one whole TLS record. The plaintext arms repeat D's O0 whole and O0 gated 128 KiB on this build. budget is O7w, R = 32, the runtime's default order.",
+  "arms": {
+    "plain-O0-whole": {"tls": "off", "order": "strict", "stream_piece": "0", "stream_gate": "off", "slot_size": "16384"},
+    "plain-O0-gated-128k": {"tls": "off", "order": "strict", "stream_piece": "131072", "stream_gate": "on", "slot_size": "16384"},
+    "tls-O0-whole": {"tls": "on", "order": "strict", "stream_piece": "0", "stream_gate": "off", "slot_size": "16448"},
+    "tls-O7w-whole": {"tls": "on", "order": "budget", "budget": "32", "stream_piece": "0", "stream_gate": "off", "slot_size": "16448"},
+    "tls-O0-gated-64k": {"tls": "on", "order": "strict", "stream_piece": "65536", "stream_gate": "on", "slot_size": "16448"},
+    "tls-O0-gated-128k": {"tls": "on", "order": "strict", "stream_piece": "131072", "stream_gate": "on", "slot_size": "16448"}
+  },
+  "cells": {
+    "U": {"workload": "U", "host": "hv01", "closed_loop": "1000", "closed_warmup": "10", "head_rcvbuf": "524288", "large_size": "7340032", "small_conns": "0", "small_rate": "0", "stall_peers": "0", "tcp_wmem_max": "1048576"},
+    "W1": {"workload": "W1", "host": "hv01", "stall_peers": "3", "stall_size": "3145728", "tcp_wmem_max": "1048576"},
+    "W2-s6": {"workload": "W2", "host": "hv02", "stall_peers": "0", "drainers": "3", "drain_size": "2097152", "drain_read_bps": "2097152", "drain_rcvbuf": "4096", "slow_conns": "6", "slow_rate": "100", "slow_size": "4096", "slow_read_bps": "131072", "slow_rcvbuf": "4096", "tcp_wmem_max": "262144"},
+    "W4-k72": {"workload": "W4", "host": "hv03", "stall_peers": "72", "stall_size": "3145728", "tcp_wmem_max": "1048576"},
+    "W4-k128": {"workload": "W4", "host": "hv03", "stall_peers": "128", "stall_size": "3145728", "tcp_wmem_max": "1048576"},
+    "W4-k128-256k": {"workload": "W4", "host": "hv03", "stall_peers": "128", "stall_size": "3145728", "tcp_wmem_max": "262144"},
+    "W5": {"workload": "W5", "host": "hv02", "stall_peers": "0", "drainers": "4", "drain_size": "3145728", "drain_read_bps": "524288", "drain_rcvbuf": "4096", "episode_ms": "8000", "duration": "80", "tcp_wmem_max": "1048576"}
+  },
+  "repetitions": {"default": 4, "plain-O0-whole": 2, "tls-O0-whole": 2}
+}
