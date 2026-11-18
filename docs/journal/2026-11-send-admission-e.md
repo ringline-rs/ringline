@@ -1,8 +1,12 @@
 # Experiment E: TLS replies in gated pieces under strict order
 
-- **Status:** closed. TLS O0 gated 64 and 128 KiB pass D's decision rule in
-  every rule cell; 128 KiB fails W4 at `tcp_wmem` 256 KiB (929 ms), where
-  64 KiB and 85 KiB (a third of the send buffer) pass.
+- **Status:** closed. TLS O0 gated 64 and 128 KiB pieces pass D's decision
+  rule in every rule cell; 128 KiB fails W4 at `tcp_wmem` 256 KiB (929 ms),
+  where 85 KiB (a third of the send buffer) and every smaller piece pass.
+  With 512 slots, pieces of 16 to 128 KiB pass every rule cell over both
+  transports; CPU per byte rises as they shrink (Addenda 2 and 3). In W2 the pool's slot count
+  decides the result, not its slot size: 128 slots fail at 16 KiB and 64 KiB
+  alike, and 512 pass (Addendum 4).
 - **Span:** Nov 2026 · follows Experiment D (`2026-11-send-admission-d.md`)
   and the fast-path specification's Parts 1 to 3 · SystemsLab context
   `send-admission-expE`
@@ -498,3 +502,57 @@ Refuted, and the pool's byte size rather than its slot count decides W2, if
 128 slots of 16 KiB pass, or 512 slots of 64 KiB fail. If pipeline depth 4
 still leaves no slot free, the slow readers' queued replies are not what holds
 the slots.
+
+### Addendum 4 results
+
+Runs `01a1ef1d-e6a5` to `01a1ef1d-f11a`, 22 of 22 `success`, same binaries.
+W2 with six slow readers, fast small p99 median [range] in ms, the 7 MiB
+reply's median, and the fewest free slots during a 7 MiB reply:
+
+| pool | arm | fast small p99 | 7 MiB median | fewest free |
+| --- | --- | --- | --- | --- |
+| 128 x 64 KiB (control, 2 runs) | plaintext gated 128 KiB | 446.4 [446.1-446.6] | 515 ms | 0 of 128 |
+| 512 x 64 KiB | plaintext gated 128 KiB | 0.5 [0.5-0.6] | 6.1 ms | 391 of 512 |
+| 512 x 64 KiB | TLS gated 32 KiB | 0.5 [0.5-0.5] | 10.1 ms | 406 of 512 |
+| 128 x 16 KiB | plaintext gated 128 KiB | 443.7 [441.7-446.4] | 714 ms | 0 of 128 |
+| 128 x 16 KiB | TLS gated 32 KiB | 450.3 [449.8-451.2] | 500 ms | 1 of 128 |
+| 128 x 64 KiB, pipeline 4 | plaintext gated 128 KiB | 0.5 [0.5-0.5] | 6.0 ms | 79 of 128 |
+
+Every arm completed every 7 MiB reply and every drainer's reply, and had no
+fast small reply past `admit_limit`.
+
+Against the prediction:
+
+- The control fails again (446 ms): agrees.
+- 512 slots of 64 KiB pass, with at least 371 slots free: agrees (391 and
+  406, against 371 to 404 with 512 slots of 16 KiB).
+- 128 slots of 16 KiB fail as 128 slots of 64 KiB did, with no slot free:
+  agrees (0 and 1 free).
+- Pipeline depth 4 passes, with slots free: agrees (79 of 128 free at the
+  fewest, so 49 taken where the slow readers could hold at most 24).
+- Neither refutation condition held. In W2 the slot count decides the result
+  and the slot size does not: at 128 slots both sizes fail, at 512 both pass.
+  The candidate mechanism, small replies queued to slow readers each holding
+  one slot up to the pipeline depth, fits the pipeline-depth arm; no run
+  counted the slots each connection held, so it rests on those two
+  interventions and the arithmetic above.
+
+## Outcome of the addenda
+
+- Every piece size from 16 to 128 KiB passed every rule cell with 512
+  slots, over both transports. Below 128 KiB the only cell that separated
+  the sizes was TLS in W4 at 256 KiB, where 128 KiB failed and 85 KiB and
+  smaller passed; a piece of a third of the send buffer, at most 128 KiB,
+  passed everywhere it ran.
+- Smaller pieces cost more CPU per byte (plaintext 1.43 to 2.77 times whole
+  replies from 128 down to 16 KiB, TLS 1.26 to 2.23) and made the 7 MiB
+  reply slower, and gave fast small replies a lower p99 only in two
+  plaintext W4 cells, where every size was at most 4 ms.
+- At equal pool memory, 64 KiB slots made plaintext whole replies 4%
+  cheaper per byte, pieces up to 4% cheaper, and divided the slot count by
+  four. A reply smaller than a slot still takes a whole slot, and over TLS
+  each slot carries one record of at most 16 KiB, so a 64 KiB slot holds at
+  most 16 KiB of TLS ciphertext. In W2 the slot count decided the result.
+- Not measured: piece sizes between 85 and 128 KiB other than 85 KiB, 80 KiB
+  (five whole TLS records), pools other than 128 and 512 slots, and how many
+  slots each connection held.
