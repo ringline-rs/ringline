@@ -60,7 +60,7 @@ async fn run(addr: SocketAddr) -> Result<(), String> {
     for i in 0..SETS {
         match client.recv().await.map_err(|e| format!("recv {i}: {e}"))? {
             CompletedOp::Set { result, .. } => result.map_err(|e| format!("SET {i}: {e}"))?,
-            other => return Err(format!("reply {i}: {other:?}")),
+            _ => return Err(format!("reply {i} is not a SET")),
         }
     }
     Ok(())
