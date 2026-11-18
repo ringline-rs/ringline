@@ -22,8 +22,9 @@ use ringline::{
 use ringline_redis::{Client, CompletedOp};
 
 /// Above the client's default `zc_threshold` (4096), so each guarded SET is
-/// a zero-copy batch.
-const VALUE_LEN: usize = 65536;
+/// a zero-copy batch, and more than the stub's receive buffer takes, so a
+/// batch's last bytes stay unacknowledged while the stub does not read.
+const VALUE_LEN: usize = 1 << 20;
 /// Guarded SETs fired, each flushed alone.
 const SETS: u64 = 10;
 
@@ -112,15 +113,18 @@ fn stub(listener: TcpListener) {
 }
 
 /// The client runtime's slab has four entries and `zero_copy_hold_cap` is 1.
-/// The stub's receive buffer is small and it does not read until every SET
-/// is flushed, so the first zero-copy batches stay unacknowledged and hold
-/// their entries; with three held the slab is over half used and the
+/// The stub's receive buffer is smaller than a value and it does not read
+/// until every SET is flushed, so the first zero-copy batches stay
+/// unacknowledged and hold their entries; with three held the slab is over half used and the
 /// connection is at the cap. The later flushes are copied, and every SET is
 /// answered.
 #[test]
 fn guarded_sets_at_the_zero_copy_cap_are_copied() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let rcvbuf: libc::c_int = 4096;
+    // Above loopback's MSS (about 64 KiB): a smaller buffer cannot open its
+    // window by a whole segment, and the sender then waits on its probe
+    // timer once the stub reads.
+    let rcvbuf: libc::c_int = 256 << 10;
     // SAFETY: setsockopt on a descriptor the listener owns.
     let set = unsafe {
         libc::setsockopt(
