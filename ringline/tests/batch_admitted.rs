@@ -763,16 +763,17 @@ fn a_connection_at_the_zero_copy_cap_is_refused_with_a_free_entry() {
 }
 
 /// The same connection with `zero_copy_hold_cap` 4: the batch takes the free
-/// entry, and the plain batch after it finds the slab full.
+/// entry. The connection then holds four, so the plain batch after it is
+/// refused at the cap.
 #[cfg(has_io_uring)]
 #[test]
 fn a_connection_below_the_zero_copy_cap_takes_the_free_entry() {
     let _serial = serial();
     let (outcome, plain, _chain) = run_over_cap(4);
     assert_eq!(outcome.refused, None, "{outcome:?}");
-    let (kind, message) = plain.expect("the slab is full");
+    let (kind, message) = plain.expect("the connection is at the cap");
     assert_eq!(kind, io::ErrorKind::Other, "{message}");
-    assert!(message.contains("send slab exhausted"), "{message}");
+    assert!(message.contains("zero_copy_hold_cap"), "{message}");
 }
 
 /// The pool is full of sends to a client that does not read. The batch's
