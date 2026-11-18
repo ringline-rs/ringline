@@ -121,9 +121,9 @@ fn stub(listener: TcpListener) {
 #[test]
 fn guarded_sets_at_the_zero_copy_cap_are_copied() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    // A 4 KiB buffer hangs the test once the stub reads, with the cap on or
-    // off; 256 KiB, above loopback's MSS of about 64 KiB, does not. The cause
-    // is not known.
+    // With a 4 KiB buffer the test hung once the stub read, with the cap on
+    // or off; 256 KiB, above loopback's MSS of about 64 KiB, does not. The
+    // cause is not known.
     let rcvbuf: libc::c_int = 256 << 10;
     // SAFETY: setsockopt on a descriptor the listener owns.
     let set = unsafe {

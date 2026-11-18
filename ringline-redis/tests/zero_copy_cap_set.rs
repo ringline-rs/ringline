@@ -1,8 +1,9 @@
 //! `set_with_guard` on a connection at ringline's `zero_copy_hold_cap` sends
 //! its value as a copy.
 //!
-//! Linux only: on mio a guard is copied and takes no send slab entry.
-#![cfg(target_os = "linux")]
+//! Linux io_uring only (not `force-mio`): on mio a guard is copied and takes
+//! no send slab entry, so the connection never reaches the cap.
+#![cfg(all(target_os = "linux", not(feature = "force-mio")))]
 
 mod common;
 
@@ -151,7 +152,9 @@ fn set_with_guard_at_the_zero_copy_cap_is_copied() {
         .launch::<ClientHandler>()
         .expect("client launch failed");
     common::join_workers(&runtime, handles);
-    server.join().expect("stub panicked");
+    if server.join().is_err() {
+        panic!("stub panicked; client result: {:?}", RESULT.get());
+    }
 
     let result = RESULT.get().expect("client did not set a result");
     if let Err(e) = result {

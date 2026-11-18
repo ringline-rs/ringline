@@ -3426,9 +3426,9 @@ impl SendHalf {
         self.conn.send_parts()
     }
 
-    /// Whether a guarded send on this connection that would go out zero-copy
-    /// (at or above `send_zc_threshold`, or below it when no pool slot can
-    /// take the gather) would be refused now at
+    /// Whether a guarded send on this connection that would take a send slab
+    /// entry (at or above `send_zc_threshold`, or below it when no pool slot
+    /// can take the gather) would be refused now at
     /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap): the
     /// connection holds that many send slab entries and the worker's slab is
     /// over half used. A caller that cannot get its parts back from a refusal
