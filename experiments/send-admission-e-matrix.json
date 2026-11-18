@@ -1,5 +1,5 @@
 {
-  "about": "Experiment E's arms and cells for send-admission-e.toml (docs/journal/2026-11-send-admission-e.md). An experiment is one cell's parameters with one arm's, plus bins_artifact and rep. The cells are Experiment D's rule cells, W4 at 256 KiB and U, without the W4 cells at k = 4 and 56, which every D arm that sent pieces passed; each W4 cell runs on hv03, where D ran W4 at 1 MiB. The TLS arms use a 16,448-byte slot, which holds one whole TLS record. The plaintext arms repeat D's O0 whole and O0 gated 128 KiB on this build. budget is O7w, R = 32, the runtime's default order. tls-O0-gated-85k (a third of a 256 KiB send buffer) runs only in W4-k128-256k, W2-s6 and W4-k128 (journal, Addendum). plain-O0-gated-64k, plain-O0-gated-32k and tls-O0-gated-32k run in every cell (journal, Addendum 2).",
+  "about": "Experiment E's arms and cells for send-admission-e.toml (docs/journal/2026-11-send-admission-e.md). An experiment is one cell's parameters with one arm's, plus bins_artifact and rep. The cells are Experiment D's rule cells, W4 at 256 KiB and U, without the W4 cells at k = 4 and 56, which every D arm that sent pieces passed; each W4 cell runs on hv03, where D ran W4 at 1 MiB. The TLS arms use a 16,448-byte slot, which holds one whole TLS record. The plaintext arms repeat D's O0 whole and O0 gated 128 KiB on this build. budget is O7w, R = 32, the runtime's default order. tls-O0-gated-85k (a third of a 256 KiB send buffer) runs only in W4-k128-256k, W2-s6 and W4-k128 (journal, Addendum). plain-O0-gated-64k, plain-O0-gated-32k and tls-O0-gated-32k run in every cell (journal, Addendum 2). The 16k arms and the s64k arms (128 slots of 64 KiB, 8 MiB as 512 x 16 KiB is) run in every cell (journal, Addendum 3).",
   "arms": {
     "plain-O0-whole": {
       "tls": "off",
@@ -71,6 +71,52 @@
       "stream_piece": "32768",
       "stream_gate": "on",
       "slot_size": "16448"
+    },
+    "plain-O0-gated-16k": {
+      "tls": "off",
+      "order": "strict",
+      "stream_piece": "16384",
+      "stream_gate": "on",
+      "slot_size": "16384"
+    },
+    "tls-O0-gated-16k": {
+      "tls": "on",
+      "order": "strict",
+      "stream_piece": "16384",
+      "stream_gate": "on",
+      "slot_size": "16448"
+    },
+    "plain-O0-whole-s64k": {
+      "tls": "off",
+      "order": "strict",
+      "stream_piece": "0",
+      "stream_gate": "off",
+      "slot_size": "65536",
+      "pool_slots": "128"
+    },
+    "plain-O0-gated-128k-s64k": {
+      "tls": "off",
+      "order": "strict",
+      "stream_piece": "131072",
+      "stream_gate": "on",
+      "slot_size": "65536",
+      "pool_slots": "128"
+    },
+    "tls-O0-gated-128k-s64k": {
+      "tls": "on",
+      "order": "strict",
+      "stream_piece": "131072",
+      "stream_gate": "on",
+      "slot_size": "65536",
+      "pool_slots": "128"
+    },
+    "tls-O0-gated-32k-s64k": {
+      "tls": "on",
+      "order": "strict",
+      "stream_piece": "32768",
+      "stream_gate": "on",
+      "slot_size": "65536",
+      "pool_slots": "128"
     }
   },
   "cells": {
@@ -145,6 +191,7 @@
   "repetitions": {
     "default": 4,
     "plain-O0-whole": 2,
-    "tls-O0-whole": 2
+    "tls-O0-whole": 2,
+    "plain-O0-whole-s64k": 2
   }
 }

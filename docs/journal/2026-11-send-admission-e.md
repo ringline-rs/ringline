@@ -10,8 +10,9 @@
   Experiment D's pieces, gate, closed loop and records added to main's
   versions, which serve TLS. Spec `experiments/send-admission-e.toml`, cells
   and arms `experiments/send-admission-e-matrix.json`, report
-  `experiments/send-admission-e-report.py` (D's report with TLS as a cell
-  key, and the decision and U cost run per transport).
+  `experiments/send-admission-e-report.py` (D's report with TLS and the
+  send pool as cell keys, and the decision and U cost run per transport and
+  pool).
 
 ## Goal
 
@@ -295,3 +296,48 @@ Prediction:
 
 Refuted if a 32 KiB arm fails a rule cell, or if any stalled peer's 32 or
 64 KiB piece waits for room.
+
+## Addendum 3: 16 KiB pieces, and 64 KiB slots
+
+Written before these arms ran, while Addendum 2's runs were still running.
+
+16 KiB pieces: plaintext and TLS O0 gated 16 KiB, four runs in each of the
+seven cells, 56 runs. A 16 KiB piece is one TLS record, which admission
+counts as two slots.
+
+Slot size at equal pool memory, 8 MiB: the arms above use 512 slots of
+16 KiB (16,448 bytes over TLS); these use 128 slots of 64 KiB, the slot size
+of the cache server this design is for. Arms: plaintext O0 whole (two runs
+per cell, the control for these cells), plaintext O0 gated 128 KiB, and TLS
+O0 gated 128 KiB and 32 KiB, in each of the seven cells, 98 runs. TLS whole
+replies cannot run here: a 7 MiB TLS reply needs 449 slots, more than the
+pool has. The unbuffered TLS engine writes one record per slot, so a 64 KiB
+slot carries 16 KiB of TLS ciphertext, and TLS O0 whole has no 64 KiB-slot
+control; TLS arms here are read against the plaintext control and against
+the same piece size with 16 KiB slots. The report puts slot size and pool
+count in the cell key with TLS.
+
+Prediction:
+
+- 16 KiB pieces pass D's rule in every rule cell and in W4 at 256 KiB, over
+  both transports, with no stalled peer's piece waiting for room.
+- U: CPU per byte against whole replies of the same transport, 2.3 to 4.0
+  for plaintext 16 KiB (above 2, so that size would go to the owner under
+  D's rule) and 1.8 to 2.8 for TLS 16 KiB; the 7 MiB reply's median in
+  every cell is higher than with 32 KiB pieces.
+- Fast small p99 with 16 KiB pieces is no lower than with 128 KiB pieces in
+  any cell by more than run-to-run spread.
+- 64 KiB slots, plaintext: O0 whole fails as with 16 KiB slots (fast small
+  p99 above 100 ms in W1, W4 and W5). Gated 128 KiB passes every rule cell.
+  U: plaintext whole costs 5 to 15% less CPU per byte than with 16 KiB
+  slots, since a run of 32 slots is one `sendmsg` of 2 MiB instead of
+  512 KiB; gated 128 KiB pieces cost the same as with 16 KiB slots within
+  spread, since each piece is one `sendmsg` either way.
+- 64 KiB slots, TLS: gated 32 KiB passes every cell including W4 at 256 KiB.
+  Gated 128 KiB passes the rule cells and fails W4 at 256 KiB, as with
+  16 KiB slots, with fewer free slots relative to the pool, since 9 slots
+  are 7% of 128. TLS U figures equal the 16 KiB-slot ones within spread.
+
+Refuted if a 16 KiB arm fails a rule cell, if 64 KiB slots change a gated
+arm's pass or fail in any cell against 16 KiB slots, or if plaintext whole
+U does not get cheaper with 64 KiB slots.
