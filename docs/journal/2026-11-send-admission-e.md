@@ -342,6 +342,120 @@ Refuted if a 16 KiB arm fails a rule cell, if 64 KiB slots change a gated
 arm's pass or fail in any cell against 16 KiB slots, or if plaintext whole
 U does not get cheaper with 64 KiB slots.
 
+## Results of Addenda 2 and 3
+
+Addendum 2 runs `01a1ee93-4fcb` to `01a1ee93-74b2`, 84 of 84 `success`;
+Addendum 3 runs `01a1ee99-5bb0` to `01a1ee99-ad0f`, 154 of 154 `success`.
+Same binaries as above. Summarised by `experiments/send-admission-e-report.py`
+over all 390 runs. No run recorded TCP memory pressure.
+
+Fast small replies' p99 with 512 slots of 16 KiB, median over runs and the
+largest run in brackets (ms). Every arm in these tables completed every 7 MiB
+reply and every W5 slow reader's reply, and had no fast small reply past
+`admit_limit`, except TLS 128 KiB in W4 at 256 KiB (above). Plaintext:
+
+| cell | 16 KiB | 32 KiB | 64 KiB | 128 KiB |
+| --- | --- | --- | --- | --- |
+| W1 | 0.3 (0.4) | 0.3 (0.3) | 0.3 (0.3) | 0.2 (0.3) |
+| W2, 6 slow | 0.5 (0.5) | 0.5 (0.5) | 0.5 (0.5) | 0.5 (0.5) |
+| W4, 1 MiB, k = 72 | 0.8 (4.0) | 0.7 (0.8) | 2.2 (3.0) | 0.8 (1.1) |
+| k = 128 | 0.8 (0.9) | 0.9 (1.0) | 1.2 (1.2) | 2.4 (2.8) |
+| W4, 256 KiB, k = 128 | 0.8 (0.9) | 0.8 (0.9) | 1.0 (1.1) | 1.2 (1.4) |
+| W5 | 0.5 (0.5) | 0.5 (0.5) | 0.5 (0.5) | 0.5 (0.5) |
+
+TLS:
+
+| cell | 16 KiB | 32 KiB | 64 KiB | 128 KiB |
+| --- | --- | --- | --- | --- |
+| W1 | 0.3 (0.5) | 0.2 (0.3) | 0.2 (0.5) | 0.2 (0.4) |
+| W2, 6 slow | 0.5 (0.5) | 0.5 (0.5) | 0.5 (0.5) | 0.5 (0.5) |
+| W4, 1 MiB, k = 72 | 0.5 (0.5) | 0.5 (0.6) | 0.5 (0.6) | 0.5 (0.6) |
+| k = 128 | 0.5 (0.5) | 0.5 (0.5) | 0.5 (0.6) | 0.4 (0.5) |
+| W4, 256 KiB, k = 128 | 0.5 (0.5) | 0.5 (0.5) | 0.5 (0.5) | 928.4 (929.1) |
+| W5 | 0.5 (0.5) | 0.5 (0.5) | 0.5 (0.6) | 0.5 (0.5) |
+
+- No stalled peer's piece waited for room at 16, 32 or 64 KiB, over either
+  transport, in any W4 cell (0 of 220,160 at 16 KiB in W4 at 1 MiB with 128
+  stalled peers).
+- In W2, pieces to the three drainers waited for room at 64 KiB over
+  plaintext (3,600 of 3,840), as over TLS and at 128 KiB, and at no piece
+  size of 32 KiB or less over either transport.
+- The 7 MiB reply's median rose as pieces shrank in every cell: over
+  plaintext from 4.1 to 6.0 ms at 128 KiB to 8.3 to 12.7 ms at 16 KiB, over
+  TLS from 5.3 to 8.4 ms to 9.3 to 15.5 ms.
+
+U, worker CPU per byte against whole replies of the same transport and pool:
+
+| arm | plaintext, ns (ratio) | TLS, ns (ratio) |
+| --- | --- | --- |
+| whole | 0.385 (1.00) | 0.602 (1.00) |
+| gated 128 KiB | 0.551 (1.43) | 0.758 (1.26) |
+| gated 64 KiB | 0.613 (1.59) | 0.791 (1.31) |
+| gated 32 KiB | 0.701 (1.82) | 0.896 (1.49) |
+| gated 16 KiB | 1.067 (2.77) | 1.340 (2.23) |
+
+Each piece adds 9.6 to 21.8 µs of worker CPU, the most at 128 KiB. Over
+plaintext a reply in pieces took longer (p50 4.1 ms at 128 KiB, 7.9 ms at
+16 KiB, against 2.9 ms whole); over TLS it was faster down to 32 KiB (6.6 ms
+against 7.0 ms) and slower at 16 KiB (9.9 ms).
+
+128 slots of 64 KiB (8 MiB, as 512 of 16 KiB), fast small p99 median
+(largest) in ms, and the fewest free slots during a 7 MiB reply:
+
+| cell | plaintext whole | plaintext gated 128 KiB | TLS gated 32 KiB | TLS gated 128 KiB |
+| --- | --- | --- | --- | --- |
+| W1 | 1152.0 (1152.2), 0/20 7 MiB | 0.2 (0.3) | 0.3 (0.4) | 0.3 (0.4) |
+| W2, 6 slow | 1156.5 (1158.2), 2/20 7 MiB | 446.1 (447.6), 0 free | 449.3 (449.6), 1 free | 443.9 (444.5), 1 free |
+| W4, 1 MiB, k = 72 | 1164.2 (1164.8) | 0.7 (0.8) | 0.5 (0.5) | 0.5 (0.6) |
+| k = 128 | 1172.0 (1173.1) | 2.5 (2.8) | 0.5 (0.5) | 0.5 (0.5) |
+| W4, 256 KiB, k = 128 | 1167.6 (1170.9) | 1.2 (1.3) | 0.5 (0.6) | 945.3 (945.7), 6 free |
+| W5 | 1115.8 (1115.9) | 0.5 (0.5) | 0.5 (0.6) | 0.5 (0.6) |
+
+- Every gated arm with 64 KiB slots failed W2: fast small p99 about 445 ms,
+  the 7 MiB replies completed at about 500 ms (median), and no more than one
+  slot free at the fewest. The same arms with 16 KiB slots had 371 to 404 of
+  512 free there. Addendum 4 tests why.
+- TLS 128 KiB with 64 KiB slots failed W4 at 256 KiB as with 16 KiB slots
+  (945 ms; 1,605 of 10,240 stalled peers' pieces waited for room).
+- U with 64 KiB slots: plaintext whole 0.369 ns per byte (0.385 with 16 KiB
+  slots, 4% less), plaintext gated 128 KiB 0.541 (0.551, 2% less), TLS gated
+  128 KiB 0.751 (0.758), TLS gated 32 KiB 0.858 (0.896, 4% less). The
+  report's decision for the TLS 64 KiB-slot arms prints "no O0 whole runs to
+  compare", because TLS whole cannot run with that pool; their fast small
+  replies past `admit_limit` were 0.
+
+### Addenda 2 and 3 against their predictions
+
+- Addendum 2, all three arms pass every rule cell and W4 at 256 KiB with no
+  stalled peer's piece waiting: agrees.
+- Fast small p99 no lower than with 128 KiB pieces by more than spread:
+  refuted over plaintext in W4 with 128 stalled peers, where 16, 32 and
+  64 KiB pieces gave 0.8, 0.9 and 1.2 ms against 2.4 ms (2.3 to 2.8), and in
+  W4 at 256 KiB (0.8 ms at 16 and 32 KiB against 1.2, 1.1 to 1.4). Holds in
+  every other cell and over TLS. Every figure was at most 4.0 ms.
+- U ratios: plaintext 64 KiB 1.59 (predicted 1.5 to 1.7), plaintext 32 KiB
+  1.82 (1.7 to 2.1), TLS 32 KiB 1.49 (1.4 to 1.7), plaintext 16 KiB 2.77
+  (2.3 to 4.0), TLS 16 KiB 2.23 (1.8 to 2.8): agree. Plaintext 16 KiB costs
+  more than twice whole replies, which sends that size to the owner under
+  D's rule; the TLS 16 KiB ratio is also above 2.
+- The 7 MiB reply's median rises as pieces shrink, in every cell: agrees.
+- Addendum 3, 16 KiB pieces pass every rule cell and W4 at 256 KiB with no
+  stalled peer's piece waiting: agrees.
+- 64 KiB slots, plaintext O0 whole fails in W1, W4 and W5: agrees.
+- 64 KiB slots, plaintext gated 128 KiB passes every rule cell: refuted, it
+  fails W2.
+- 64 KiB slots, plaintext whole U 5 to 15% cheaper: it was 4% cheaper, below
+  the range; the refutation condition (not cheaper) does not hold. Gated
+  128 KiB pieces cost the same within spread: refuted narrowly, 2% less with
+  the runs' ranges not overlapping (0.538 to 0.543 against 0.546 to 0.563).
+- 64 KiB slots, TLS gated 32 KiB passes every cell: refuted, it fails W2.
+  TLS gated 128 KiB fails W4 at 256 KiB: agrees; it also fails W2. The
+  predicted fewer free slots relative to the pool there did not hold: 6 of
+  128 against 7 of 512. TLS U equal within spread: holds at 128 KiB, refuted
+  at 32 KiB (0.858 against 0.896, ranges not overlapping).
+- The refutation condition "64 KiB slots change a gated arm's pass or fail
+  in any cell" holds: every gated arm changed from pass to fail in W2.
+
 ## Addendum 4: slot count or slot bytes in W2
 
 Written after Addendum 2's and 3's runs, before these ran. With 128 slots of
