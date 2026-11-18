@@ -1396,6 +1396,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Linux: `physical_core_count()`, and so the default worker count, counted
+  only the cores below the lowest-numbered offline CPU: 1 on a host booted
+  with `nosmt`, where every odd CPU is offline (#974). Releases from 0.2.0
+  have this. On such a host, two or more workers with `pin_to_core` on (the
+  default) failed `launch()` pinning a worker to an offline CPU, in every
+  release; when `core_offset` plus the worker count exceeds the physical
+  cores, this still happens.
 - io_uring: the `ringline/bytes` counter with `op=sent` now counts every
   TLS record a connection sends, handshake and alert records and every
   ciphertext chunk of an application send (#846). Every 0.6 release counted
