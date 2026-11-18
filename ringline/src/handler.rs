@@ -341,17 +341,17 @@ impl ConnId {
     }
 }
 
-/// How long a close waits for its queued sends to drain before the
-/// connection is closed without them: a close after a fatal encrypt error
-/// (io_uring), with its close_notify, and a close before the handshake
-/// completes (both backends), with the rest of the handshake flight and any
-/// alert.
-/// The message of a zero-copy send refused because its connection holds
+/// The message of a guarded send refused because its connection holds
 /// `zero_copy_hold_cap` send slab entries while the slab is over half used.
 #[cfg(has_io_uring)]
 pub(crate) const ZERO_COPY_CAP_REFUSAL: &str =
     "send slab entries held by the connection at zero_copy_hold_cap";
 
+/// How long a close waits for its queued sends to drain before the
+/// connection is closed without them: a close after a fatal encrypt error
+/// (io_uring), with its close_notify, and a close before the handshake
+/// completes (both backends), with the rest of the handshake flight and any
+/// alert.
 pub(crate) const CLOSE_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Identifies which listener a connection arrived on.

@@ -31,17 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection a full send slab, checked once the batch is admitted, is refused
   with `WouldBlock`. `submit_batch` is unchanged.
 - `ConfigBuilder::zero_copy_hold_cap` (default 16): once a worker's send
-  slab is over half used, a zero-copy send on a connection that holds that
+  slab is over half used, a guarded send on a connection that holds that
   many slab entries is refused. A zero-copy send holds its entry until the
   peer has acknowledged the bytes, so before this cap peers that stopped
   reading could take every entry, and every zero-copy send on the worker
-  failed. With the defaults, 17 such peers fill the 512 entries.
-  `submit_batch_admitted` returns the parts with `WouldBlock`, so the caller
-  can send their bytes as a copy; `submit_batch`, `build` and a send chain
-  fail with `Other`. A `forward_recv_buf` over the cap copies the buffer
-  instead of sending it under a guard. A connection that sends many
-  zero-copy batches while other connections keep the slab over half used
-  now has the ones past the cap refused.
+  failed. With the defaults, as few as 17 such peers can fill the 512
+  entries. `submit_batch_admitted` returns the parts with `WouldBlock`, so
+  the caller can send their bytes as a copy; `submit_batch`, `build` and a
+  send chain fail with `Other`. Entries of coalesced copy sends and of
+  `forward_recv_buf` count toward the cap; `forward_recv_buf` itself is not
+  refused at it. A connection that sends many guarded batches while other
+  connections keep the slab over half used now has the ones past the cap
+  refused, and ringline-redis's `Client::flush` and `set_with_guard` return
+  that error as `Error::Io`. `usize::MAX` turns the cap off.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been
   handed to the kernel, without taking a send-pool slot. A server that sends

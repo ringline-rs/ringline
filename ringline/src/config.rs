@@ -1314,25 +1314,26 @@ impl ConfigBuilder {
     /// with a guard, at or above `send_zc_threshold`) holds a slab entry until
     /// the kernel's notification arrives, which is after the peer has
     /// acknowledged the bytes; its [`SendCompletion`](crate::SendCompletion)
-    /// settles earlier. A peer that stops reading keeps every entry its
-    /// connection holds. Once more than half the slab is in use, a zero-copy
-    /// send on a connection that holds `cap` entries is refused:
+    /// settles earlier. A guarded send on a Unix-domain connection holds an
+    /// entry until its send completes. A peer that stops reading keeps every
+    /// entry its connection holds. Once more than half the slab is in use, a
+    /// guarded send on a connection that holds `cap` entries is refused:
     /// [`submit_batch_admitted`](crate::AsyncSendBuilder::submit_batch_admitted)
     /// returns its parts with `WouldBlock`, as for a full slab, and
-    /// `submit_batch` and `build` return `Other`. The caller can copy the
-    /// parts' bytes and send them with a copy send. A
-    /// [`forward_recv_buf`](crate::SendHalf::forward_recv_buf) over the cap
-    /// copies the buffer instead of sending it under a guard. Entries of every
-    /// kind count, including those of coalesced copy sends and forwards. A
+    /// `submit_batch`, `build` and a send chain return `Other`. The caller can
+    /// copy the parts' bytes and send them with a copy send. Entries of every
+    /// kind count, including those of coalesced copy sends and of
+    /// [`forward_recv_buf`](crate::SendHalf::forward_recv_buf), which is not
+    /// refused at this cap and is bounded by `forward_hold_cap` instead. A
     /// batch below `send_zc_threshold` that is copied into one pool slot
     /// takes no entry and is not refused.
     ///
     /// The cap applies only over half used, so one connection can take half
-    /// the slab and each later one `cap` entries: `1 + (send_slab_slots / 2) /
-    /// cap` connections whose peers do not read fill it (17 with the
-    /// defaults). Each further connection's zero-copy sends are then refused
-    /// for the full slab. On mio, which has no send slab, the cap has no
-    /// effect.
+    /// the slab and each later one `cap` entries: as few as `1 +
+    /// (send_slab_slots / 2) / cap` connections whose peers do not read can
+    /// fill it (17 with the defaults). After that, a guarded send on any
+    /// connection is refused because the slab is full. `usize::MAX` turns the
+    /// cap off. On mio, which has no send slab, the cap has no effect.
     ///
     /// Default: 16.
     pub fn zero_copy_hold_cap(mut self, cap: usize) -> Self {

@@ -132,15 +132,6 @@ impl Driver {
             && self.send_slab.held_by(conn_index, generation) >= self.forward_hold_cap
     }
 
-    /// Whether a zero-copy send on the connection would be refused: it holds
-    /// `zero_copy_hold_cap` send slab entries, and the slab is over half
-    /// used.
-    pub(crate) fn zero_copy_over_cap(&self, conn_index: u32) -> bool {
-        let generation = self.connections.generation(conn_index);
-        self.send_slab
-            .zero_copy_over_cap(conn_index, generation, self.zero_copy_hold_cap)
-    }
-
     /// Arm a direct receive on `conn_index` if it is a direct connection (a
     /// plaintext TCP or Unix connection) or a TLS connection, open, and has
     /// none in flight, no park of it is pending, and `forward_recv_over_cap` does

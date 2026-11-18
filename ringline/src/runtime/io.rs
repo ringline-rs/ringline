@@ -1231,10 +1231,8 @@ impl ConnCtx {
             // detach is a single `take_frozen` with no remainder to put back,
             // and "forwarded" and "consumed" cannot disagree about which bytes
             // went out. Anything else keeps the copy path.
-            // Over `zero_copy_hold_cap` the guarded send would be refused, so
-            // the buffer is copied instead.
             #[cfg(has_io_uring)]
-            if !closing && !driver.zero_copy_over_cap(conn_index) {
+            if !closing {
                 let whole = {
                     let acc = driver.accumulators.data(conn_index);
                     !acc.is_empty()
@@ -3642,11 +3640,8 @@ impl SendHalf {
     ///
     /// On io_uring, if `data` is exactly the connection's whole recv
     /// accumulator, the accumulator is detached and sent under a guard
-    /// (copied into the send pool below `send_zc_threshold`), unless the
-    /// connection holds
-    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap) send
-    /// slab entries while the slab is over half used. Otherwise `data` is
-    /// copied as by [`send`](Self::send).
+    /// (copied into the send pool below `send_zc_threshold`). Otherwise
+    /// `data` is copied as by [`send`](Self::send).
     ///
     /// On mio, `data` is always copied as by `send`, encrypted first
     /// on a TLS connection. On io_uring a TLS connection is always encrypted

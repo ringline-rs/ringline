@@ -100,6 +100,12 @@ fn forward_echo_works(addr: std::net::SocketAddr) -> bool {
 /// `idle_peer_is_throttled_alone` with `peers` idle connections in mode
 /// `mode`, each flooded in turn.
 fn idle_peers_are_throttled_alone(mode: u8, peers: usize) {
+    idle_peers_are_throttled_alone_with(mode, peers, None);
+}
+
+/// `idle_peers_are_throttled_alone`, with `zero_copy_hold_cap` set when it is
+/// `Some`.
+fn idle_peers_are_throttled_alone_with(mode: u8, peers: usize, zero_copy_cap: Option<usize>) {
     const LIMIT: u64 = 64 << 20;
     let mut config = ConfigBuilder::new()
         .workers(1)
@@ -109,6 +115,9 @@ fn idle_peers_are_throttled_alone(mode: u8, peers: usize) {
     if mode == b'R' {
         // Over half used at 33 entries, so three held peers leave room.
         config = config.send_slab_slots(64).forward_hold_cap(8);
+    }
+    if let Some(cap) = zero_copy_cap {
+        config = config.zero_copy_hold_cap(cap);
     }
     let config = config.build().expect("config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -188,6 +197,14 @@ fn an_unread_forward_recv_buf_is_throttled_alone() {
 #[test]
 fn unread_forward_recv_bufs_are_throttled_alone() {
     idle_peers_are_throttled_alone(b'R', 3);
+}
+
+/// The same with `zero_copy_hold_cap` below `forward_hold_cap`: a
+/// `forward_recv_buf` is not refused at the zero-copy cap, so each connection
+/// still reaches the hold cap and stops receiving.
+#[test]
+fn unread_forward_recv_bufs_below_the_zero_copy_cap_are_throttled_alone() {
+    idle_peers_are_throttled_alone_with(b'R', 3, Some(4));
 }
 
 /// A peer that closes during a hold fails its queued sends, which releases their
