@@ -1,4 +1,4 @@
-//! Server for the contended cases of Experiments B, C and D
+//! Server for the contended cases of Experiments B to E
 //! (`docs/send-admission-design.md`, section 4).
 //!
 //! # Requests
@@ -46,9 +46,9 @@
 //! that holds one whole TLS record, at least 16,413 bytes (16,384 of
 //! plaintext and 29 of record overhead), so `--slot-size` must be at least
 //! that; the server refuses to start otherwise. Admission counts a TLS
-//! reply's slots as one per record plus one, `ceil(len / 16384) + 1`, rather
-//! than `ceil(len / --slot-size)`, and the held-slot samples below count it
-//! the same way.
+//! send's slots, a whole reply's or a piece's, as one per record plus one,
+//! `ceil(len / 16384) + 1`, rather than `ceil(len / --slot-size)`, and the
+//! held-slot samples below count them the same way.
 //!
 //! # Pieces, and `--stream-piece`
 //!
@@ -212,7 +212,7 @@ impl Order {
 #[derive(Parser)]
 #[command(
     name = "admission-server",
-    about = "The contended-case server of Experiments B, C and D"
+    about = "The contended-case server of Experiments B to E"
 )]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7979")]

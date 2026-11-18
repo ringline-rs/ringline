@@ -1,4 +1,4 @@
-//! Load for the contended cases of Experiments B, C and D
+//! Load for the contended cases of Experiments B to E
 //! (`docs/send-admission-design.md`, section 4), against `admission-server`.
 //!
 //! Every request is 24 bytes, in the format `admission-server` documents. It
@@ -167,7 +167,7 @@ use serde_json::{Value, json};
 #[derive(Parser, Clone)]
 #[command(
     name = "admission-load",
-    about = "The contended-case load of Experiments B and C"
+    about = "The contended-case load of Experiments B to E"
 )]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7979")]

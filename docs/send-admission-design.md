@@ -1112,12 +1112,13 @@ These are untested, and each is a limit of the specification as written:
 
 TLS replies in pieces ran in Experiment E
 (`docs/journal/2026-11-send-admission-e.md`), on loopback and kernel 6.12.
-Under strict order, gated pieces of 64 KiB, of 128 KiB with a 1 MiB send
-buffer, and of a third of a 256 KiB send buffer (85 KiB) passed Experiment
-D's decision rule over TLS. Pieces of 128 KiB with a 256 KiB send buffer did
-not: they were partly sent to stalled peers, which held the pool, while
-plaintext pieces of 128 KiB were not; why is not known. A piece of a third
-of the send buffer, at most 128 KiB, passed in every cell E ran.
+Under strict order, gated pieces of 64 KiB and 128 KiB passed Experiment D's
+decision rule over TLS. Outside the rule's cells, in W4 with a 256 KiB send
+buffer and 128 stalled peers, 128 KiB pieces were partly sent to stalled
+peers and held the pool (fast small p99 929 ms), while plaintext 128 KiB
+pieces were not; why is not known. 85 KiB pieces, a third of that buffer,
+passed the three cells they ran in. A piece of a third of the send buffer, at
+most 128 KiB, passed in every cell E ran.
 
 #### Decisions
 

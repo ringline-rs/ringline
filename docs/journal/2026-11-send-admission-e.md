@@ -58,7 +58,7 @@ Arms, with TLS in a 16,448-byte slot:
 - TLS O0 gated 128 KiB: the arm under test.
 - TLS O0 gated 64 KiB: the smaller piece, as in D.
 - Plaintext O0 whole and O0 gated 128 KiB: D's arms on this build, which has
-  the gate's fixes made after D, to compare TLS with plaintext on the same
+  the gate as merged in #969, to compare TLS with plaintext on the same
   binaries and hosts.
 
 Four runs per arm and cell, two of each O0 whole arm: 20 runs per cell, 140
@@ -152,7 +152,7 @@ Fast small replies' p99, median over runs and the largest run in brackets
 | W1 | 1152.2 (1154.4), 1/20 | 0.3 (0.4), 1/40 | 0.2 (0.5), 40/40 | - | 0.2 (0.4), 40/40 |
 | W2, 6 slow | 698.5 (698.6), 20/20 | 0.5 (0.5), 40/40 | 0.5 (0.5), 40/40 | 0.5 (0.5), 40/40 | 0.5 (0.5), 40/40 |
 | W4, 1 MiB, k = 72 | 1199.0 (1200.0), 0/20 | 0.5 (0.5), 0/40 | 0.5 (0.6), 40/40 | - | 0.5 (0.6), 40/40 |
-| k = 128 | 1231.6 (1231.7), 0/20 | 0.4 (0.5), 0/40 | 0.5 (0.6), 40/40 | 0.5 (0.5), 40/40 | 0.4 (0.5), 40/40 |
+| k = 128 | 1231.6 (1231.7), 0/20 | 0.5 (0.5), 0/40 | 0.5 (0.6), 40/40 | 0.5 (0.5), 40/40 | 0.4 (0.5), 40/40 |
 | W4, 256 KiB, k = 128 | 1233.3 (1233.5), 0/20 | 0.5 (0.5), 0/40 | 0.5 (0.5), 40/40 | 0.5 (0.5), 40/40 | 928.4 (929.1), 40/40 |
 | W5 | 1113.5 (1114.4), 0/20 | 0.5 (0.6), 0/40 | 0.5 (0.6), 40/40 | - | 0.5 (0.5), 40/40 |
 
@@ -168,12 +168,16 @@ Plaintext, on the same binaries and hosts:
 | W5 | 1112.9 (1113.6), 0/20 | 0.5 (0.5), 40/40 |
 
 - Every gated arm completed every 7 MiB reply in every cell, with medians of
-  4.1 to 9.2 ms, and every W5 slow reader's reply (160 of 160 per arm). No
+  4.1 to 9.2 ms except TLS 128 KiB in W4 at 256 KiB (755 ms, below), and
+  every W5 slow reader's reply (160 of 160 per arm). No
   gated arm had a fast small reply past `admit_limit`; TLS O0 whole had
   3,715 to 5,610 per run in W1, W4 and W5.
 - TLS W4 at 256 KiB with 128 KiB pieces: 2,520 of 10,240 stalled peers'
   pieces waited for room, the fewest free slots during a 7 MiB reply was 7
-  of 512, and the 7 MiB replies took 755 ms (median). The stalled peers'
+  of 512, and the 7 MiB replies took 755 ms (median). A stalled peer's
+  second piece, when partly sent, holds its 9 slots until the kernel takes
+  its last byte; the next piece's gate then timed out (5,080 room-wait
+  aborts against 40 settlement aborts). The stalled peers'
   server-side sockets had `sk_sndbuf` 262,144 and about 235 KB queued
   (`wmem_queued`, from `ss`), in the TLS and plaintext arms alike, and each
   stalled peer was sent two pieces in both. Over plaintext no second piece
@@ -196,9 +200,9 @@ U, one reader, `SO_RCVBUF` reported as 1,048,576, every reply completed:
 | plaintext O0 whole (2 runs) | 2,867 | 3,522 | 0.385 | 1.00 |
 | plaintext O0 gated 128 KiB | 4,091 | 4,454 | 0.551 | 1.43 |
 | TLS O0 whole (2 runs) | 7,042 | 7,478 | 0.602 | 1.00 |
-| TLS O7w whole | 7,054 | 7,470 | 0.601 | 1.00 |
-| TLS O0 gated 64 KiB | 5,847 | 6,330 | 0.791 | 1.31 |
-| TLS O0 gated 128 KiB | 5,654 | 6,011 | 0.758 | 1.26 |
+| TLS O7w whole | 7,061 | 7,480 | 0.601 | 1.00 |
+| TLS O0 gated 64 KiB | 5,848 | 6,334 | 0.791 | 1.31 |
+| TLS O0 gated 128 KiB | 5,652 | 6,032 | 0.758 | 1.26 |
 
 Over TLS, gated pieces made a reply faster (5.7 ms against 7.0 ms median)
 while costing more CPU. Each 128 KiB piece adds 20.5 µs of worker CPU over
@@ -225,7 +229,8 @@ encrypts the next, which whole replies do not allow.
   0.385 ns), and TLS gated 128 KiB costs 1.26 times TLS whole, under 1.42.
   Agrees.
 - Plaintext arms within D's figures: O0 gated 128 KiB at most 2.8 ms in the
-  rule cells (D: 3.0 ms) and 1.2 ms in W4 at 256 KiB on hv03 (D's rerun:
+  rule cells (D: 2.8 ms; the prediction's 3.0 ms is D's largest over all its
+  gated arms) and 1.2 ms in W4 at 256 KiB on hv03 (D's rerun:
   1.3 ms). Agrees.
 - Addendum, 85 KiB pieces: pass in all three cells with no stalled peer's
   piece waiting for room. Agrees.
@@ -237,8 +242,8 @@ encrypts the next, which whole replies do not allow.
   in every rule cell and completed every large reply, which O7w with whole
   replies did not do in W1, W4 or W5.
 - A fixed 128 KiB piece is too large over TLS for a 256 KiB send buffer: the
-  piece is partly sent and each stalled peer's piece holds its 9 slots until
-  the room-wait abort. I do not know why a TLS piece is partly sent where a
+  piece is partly sent and holds its 9 slots until the kernel takes its last
+  byte, and 128 stalled peers' pieces exceed the pool. I do not know why a TLS piece is partly sent where a
   plaintext piece of the same size is not. It is not one send per record:
   on io_uring `submit_coalesced_run` sends a run of up to 32 queued copy
   sends, plaintext or ciphertext, as one `sendmsg`, so a 128 KiB piece is
@@ -248,8 +253,8 @@ encrypts the next, which whole replies do not allow.
   peer in each transport would separate the candidates.
 - A piece of a third of the send buffer, at most 128 KiB, passed in every
   cell it ran, at 85 KiB on 256 KiB buffers and at 128 KiB on 1 MiB buffers.
-  That is the rule spillcache's `--reply-piece-kib` uses (`send_pieces`
-  sizes from `send_buffer_size`). The 85 KiB arm ran only with a send
+  That is the sizing the design specifies, min(`send_buffer_size` / 3,
+  128 KiB) (`docs/send-admission-design.md`, Part 1). The 85 KiB arm ran only with a send
   buffer that had reached 262,144 bytes; a reply sized from a smaller buffer
   read earlier in the connection gets a smaller piece.
 - Not covered: zero-copy replies, which hold send-slab entries rather than
