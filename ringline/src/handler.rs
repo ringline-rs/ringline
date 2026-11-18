@@ -1261,6 +1261,7 @@ impl<'a> DriverCtx<'a> {
             total_len: 0,
             error: None,
             send_id: None,
+            zero_copy_capped: true,
         }
     }
 
@@ -3828,10 +3829,22 @@ pub struct SendBuilder<'b, 'a> {
     error: Option<io::Error>,
     /// Settled by the send's completion; see `submit_awaited`.
     send_id: Option<crate::runtime::send_completion::SendId>,
+    /// Whether `zero_copy_hold_cap` refuses the send. Cleared by
+    /// `forward_recv_buf` (`without_zero_copy_cap`), which `forward_hold_cap`
+    /// bounds instead.
+    zero_copy_capped: bool,
 }
 
 #[cfg(has_io_uring)]
 impl<'b, 'a> SendBuilder<'b, 'a> {
+    /// Exempt the send from `zero_copy_hold_cap`. A connection that forwards
+    /// its receive buffers stops receiving at `forward_hold_cap` entries; a
+    /// refusal below that would leave it receiving into its accumulator.
+    pub(crate) fn without_zero_copy_cap(mut self) -> Self {
+        self.zero_copy_capped = false;
+        self
+    }
+
     /// Add a copy part. The data will be copied into the send pool on `submit()`.
     /// The data reference must outlive the builder (guaranteed by the `'b` lifetime).
     pub fn copy(mut self, data: &'b [u8]) -> Self {
@@ -3974,7 +3987,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
 
         // With guards: build iovecs mixing copy pool subranges and guard
         // pointers, in a slab entry the connection may take.
-        if self.ctx.zero_copy_over_cap(self.conn) {
+        if self.zero_copy_capped && self.ctx.zero_copy_over_cap(self.conn) {
             return Err(io::Error::other(ZERO_COPY_CAP_REFUSAL));
         }
         self.submit_with_guards()

@@ -1258,6 +1258,7 @@ impl ConnCtx {
                     let result = driver
                         .make_ctx()
                         .send_parts(token)
+                        .without_zero_copy_cap()
                         .guard(crate::guard::GuardBox::new(AccumulatorGuard(frozen)))
                         .submit_awaited(id);
                     if let Err(e) = result {
