@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
@@ -18,6 +18,10 @@ use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, Ringli
 /// The first byte picks the mode: `N` never reads again, `R` echoes each
 /// buffer with `forward_recv_buf`, `T` echoes with `forward_to_conn`, and
 /// anything else echoes through `with_data`.
+/// Forwards in mode `T` that failed because the sink was at
+/// `zero_copy_hold_cap`.
+static FORWARD_TO_CAP_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+
 struct Modes;
 
 impl AsyncEventHandler for Modes {
@@ -53,7 +57,17 @@ impl AsyncEventHandler for Modes {
                 }
                 b'T' => {
                     let (mut tx, mut rx) = conn.split();
-                    while rx.forward_to_conn(&mut tx, 1 << 20).await.is_ok() {}
+                    loop {
+                        match rx.forward_to_conn(&mut tx, 1 << 20).await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                if e.to_string().contains("zero_copy_hold_cap") {
+                                    FORWARD_TO_CAP_REFUSALS.fetch_add(1, Ordering::SeqCst);
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
                 _ => {
                     let (mut tx, mut rx) = conn.split();
@@ -118,6 +132,10 @@ fn idle_peers_are_throttled_alone_with(mode: u8, peers: usize, zero_copy_cap: Op
     }
     if let Some(cap) = zero_copy_cap {
         config = config.zero_copy_hold_cap(cap);
+        if mode == b'T' {
+            // Over half used at nine entries, so the cap binds.
+            config = config.send_slab_slots(16);
+        }
     }
     let config = config.build().expect("config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -199,11 +217,21 @@ fn unread_forward_recv_bufs_are_throttled_alone() {
     idle_peers_are_throttled_alone(b'R', 3);
 }
 
+/// The same for `forward_to_conn` with a 16-entry slab and a
+/// `zero_copy_hold_cap` of 1: once the slab is over half used, a sink at the
+/// cap gets its chunks copied, and no forward fails at the cap.
+#[test]
+fn unread_forward_to_peers_at_the_zero_copy_cap_copy_and_are_throttled_alone() {
+    FORWARD_TO_CAP_REFUSALS.store(0, Ordering::SeqCst);
+    idle_peers_are_throttled_alone_with(b'T', 3, Some(1));
+    assert_eq!(FORWARD_TO_CAP_REFUSALS.load(Ordering::SeqCst), 0);
+}
+
 /// The same with `zero_copy_hold_cap` below `forward_hold_cap`: a
 /// `forward_recv_buf` is not refused at the zero-copy cap, so each connection
 /// still reaches the hold cap and stops receiving.
 #[test]
-fn unread_forward_recv_bufs_below_the_zero_copy_cap_are_throttled_alone() {
+fn unread_forward_recv_bufs_are_throttled_alone_with_the_zero_copy_cap_below_the_hold_cap() {
     idle_peers_are_throttled_alone_with(b'R', 3, Some(4));
 }
 

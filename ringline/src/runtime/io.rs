@@ -1394,6 +1394,23 @@ impl ConnCtx {
         }
     }
 
+    /// See [`SendHalf::zero_copy_capped`].
+    #[cfg(has_io_uring)]
+    pub(crate) fn zero_copy_capped(&self) -> bool {
+        with_state(|driver, _| {
+            driver.connections.generation(self.conn_index) == self.generation
+                && !driver
+                    .tls_table
+                    .as_ref()
+                    .is_some_and(|t| t.has(self.conn_index))
+                && driver.send_slab.zero_copy_over_cap(
+                    self.conn_index,
+                    self.generation,
+                    driver.zero_copy_hold_cap,
+                )
+        })
+    }
+
     /// See [`SendHalf::send_parts`].
     #[cfg(has_io_uring)]
     pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
@@ -1935,6 +1952,11 @@ pub struct AsyncSendBuilder {
 
 #[cfg(not(has_io_uring))]
 impl ConnCtx {
+    /// See [`SendHalf::zero_copy_capped`]: mio has no send slab.
+    pub(crate) fn zero_copy_capped(&self) -> bool {
+        false
+    }
+
     /// See [`SendHalf::send_parts`].
     pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
         AsyncSendBuilder {
@@ -2634,8 +2656,11 @@ impl RecvHalf {
     /// source's decrypted plaintext lands there too. The forward takes the
     /// bytes the accumulator holds, up to what is left of `len`, and sends
     /// them on the sink through the sink's send queue under a guard: zero-copy
-    /// at or above `send_zc_threshold`, copied into a pool slot below it. One
-    /// send is in flight at a time, and the source receives the next chunk
+    /// at or above `send_zc_threshold`, copied into a pool slot below it. While
+    /// the sink holds
+    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap) send
+    /// slab entries and the slab is over half used, the chunk is copied into
+    /// the send pool instead. One send is in flight at a time, and the source receives the next chunk
     /// while it is. Because the sends go through the sink's queue, they are
     /// ordered with other sends on the sink. A send the runtime cannot submit,
     /// for example with the worker's send slab
@@ -3051,6 +3076,11 @@ impl Connection {
         self.tx.send_parts()
     }
 
+    /// See [`SendHalf::zero_copy_capped`].
+    pub fn zero_copy_capped(&self) -> bool {
+        self.tx.zero_copy_capped()
+    }
+
     /// See [`SendHalf::send_backpressured`].
     pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSend<'a> {
         self.tx.send_backpressured(data)
@@ -3382,12 +3412,27 @@ impl SendHalf {
     /// included, into one pool slot and sent as a plain send when a slot is
     /// free and the gather fits it; otherwise, and at or above the
     /// threshold, it goes out zero-copy through the send slab. `Other` when
-    /// the pool, or for a zero-copy batch the send slab, has no free entry;
-    /// `NotConnected` as for [`send`](Self::send). A TLS batch is gathered,
+    /// the pool, or for a zero-copy batch the send slab, has no free entry, or
+    /// when the connection holds
+    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap)
+    /// entries while the slab is over half used; `NotConnected` as for
+    /// [`send`](Self::send). A TLS batch is gathered,
     /// encrypted into as many slots as its ciphertext needs, and queued in
     /// order, sent as one run when the send slab has a free entry.
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.conn.send_parts()
+    }
+
+    /// Whether a guarded send on this connection would be refused now at
+    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap): the
+    /// connection holds that many send slab entries and the worker's slab is
+    /// over half used. A caller that cannot get its parts back from a refusal
+    /// (`submit_batch`, `build`) checks this first and sends the bytes as a
+    /// copy instead. False on a TLS connection, whose guarded sends are copied
+    /// and take no entry, on a closed connection, and on mio, which has no
+    /// send slab.
+    pub fn zero_copy_capped(&self) -> bool {
+        self.conn.zero_copy_capped()
     }
 
     /// Send `data`, waiting for send-pool capacity instead of failing when
@@ -4107,11 +4152,18 @@ impl DirectForward {
                 driver.accumulators.note_consumed(source, take);
                 let id = executor.register_send(self.sink_index);
                 let token = ConnId::new(self.sink_index, self.sink_generation);
-                let submitted = driver
-                    .make_ctx()
-                    .send_parts(token)
-                    .guard(crate::guard::GuardBox::new(AccumulatorGuard(chunk.clone())))
-                    .submit_awaited(id);
+                let submitted = {
+                    let mut ctx = driver.make_ctx();
+                    // At `zero_copy_hold_cap` a guarded send is refused, so the
+                    // chunk is copied into the send pool instead.
+                    if ctx.zero_copy_over_cap(token) {
+                        ctx.send_awaited(token, &chunk, id)
+                    } else {
+                        ctx.send_parts(token)
+                            .guard(crate::guard::GuardBox::new(AccumulatorGuard(chunk.clone())))
+                            .submit_awaited(id)
+                    }
+                };
                 match submitted {
                     Ok(()) => DirectStep::Sent(
                         SendCompletion::pending(self.sink_index, self.sink_generation, id),

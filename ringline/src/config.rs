@@ -1319,14 +1319,18 @@ impl ConfigBuilder {
     /// entry its connection holds. Once more than half the slab is in use, a
     /// guarded send on a connection that holds `cap` entries is refused:
     /// [`submit_batch_admitted`](crate::AsyncSendBuilder::submit_batch_admitted)
-    /// returns its parts with `WouldBlock`, as for a full slab, and
-    /// `submit_batch`, `build` and a send chain return `Other`. The caller can
-    /// copy the parts' bytes and send them with a copy send. Entries of every
-    /// kind count, including those of coalesced copy sends and of
+    /// returns its parts with `WouldBlock`, as for a full slab, and the caller
+    /// can send their bytes with a copy send. `submit_batch`, `build` and a
+    /// send chain return `Other` and drop the guards. The check counts the
+    /// connection's own entries, so one connection alone is refused once it
+    /// holds more than half the slab. Entries of every kind count, including
+    /// those of coalesced copy sends and of
     /// [`forward_recv_buf`](crate::SendHalf::forward_recv_buf), which is not
     /// refused at this cap and is bounded by `forward_hold_cap` instead. A
-    /// batch below `send_zc_threshold` that is copied into one pool slot
-    /// takes no entry and is not refused.
+    /// [`forward_to_conn`](crate::RecvHalf::forward_to_conn) whose sink is at
+    /// the cap copies its chunk into the send pool. A batch below
+    /// `send_zc_threshold` that is copied into one pool slot takes no entry
+    /// and is not refused.
     ///
     /// The cap applies only over half used, so one connection can take half
     /// the slab and each later one `cap` entries: as few as `1 +

@@ -1845,6 +1845,7 @@ dependencies = [
  "histogram 0.11.5",
  "itoa",
  "ketama",
+ "libc",
  "resp-proto",
  "ringline",
  "thiserror",

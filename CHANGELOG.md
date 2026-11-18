@@ -38,12 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   failed. With the defaults, as few as 17 such peers can fill the 512
   entries. `submit_batch_admitted` returns the parts with `WouldBlock`, so
   the caller can send their bytes as a copy; `submit_batch`, `build` and a
-  send chain fail with `Other`. Entries of coalesced copy sends and of
-  `forward_recv_buf` count toward the cap; `forward_recv_buf` itself is not
-  refused at it. A connection that sends many guarded batches while other
-  connections keep the slab over half used now has the ones past the cap
-  refused, and ringline-redis's `Client::flush` and `set_with_guard` return
-  that error as `Error::Io`. `usize::MAX` turns the cap off.
+  send chain fail with `Other` and drop the guards. Entries of coalesced copy
+  sends and of `forward_recv_buf` count toward the cap; `forward_recv_buf`
+  itself is not refused at it, and `forward_to_conn` copies a chunk whose
+  sink is at the cap. A connection that sends many guarded batches now has
+  the ones past the cap refused once the slab is over half used, including
+  by that connection alone. `SendHalf::zero_copy_capped` and
+  `Connection::zero_copy_capped` report whether a guarded send would be
+  refused now, so a caller of `submit_batch` or `build` can copy instead.
+  ringline-redis's and ringline-memcache's guarded sets and `Client::flush`
+  do: at the cap they send the bytes as one copy send. `usize::MAX` turns the
+  cap off.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been
   handed to the kernel, without taking a send-pool slot. A server that sends

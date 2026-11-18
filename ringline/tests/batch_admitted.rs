@@ -206,6 +206,11 @@ type SendError = Option<(io::ErrorKind, String)>;
 
 /// The outcomes of the over-cap scenario's sends that are not a
 /// `submit_batch_admitted`.
+/// `zero_copy_capped` on the over-cap scenario's connection once it holds its
+/// three entries.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+static OVER_CAP_CAPPED: Mutex<Option<bool>> = Mutex::new(None);
+
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 static OVER_CAP_ERRORS: Mutex<Vec<(u8, SendError)>> = Mutex::new(Vec::new());
 
@@ -222,6 +227,7 @@ async fn over_cap(conn: &mut Connection) {
         let big = vec![SendPart::Guard(guard(8 << 20))];
         held.push(conn.send_parts().submit_batch(big).expect("held batch"));
     }
+    *OVER_CAP_CAPPED.lock().unwrap() = Some(conn.zero_copy_capped());
     let outcome = match conn
         .send_parts()
         .submit_batch_admitted(parts_for(OVER_CAP))
@@ -738,6 +744,7 @@ fn a_full_slab_refuses_a_batch_with_its_parts() {
 #[cfg(has_io_uring)]
 fn run_over_cap(cap: usize) -> (Outcome, SendError, SendError, SendError) {
     OVER_CAP_ERRORS.lock().unwrap().clear();
+    *OVER_CAP_CAPPED.lock().unwrap() = None;
     let (runtime, handles) = launch_capped(4, cap, None);
     let mut stream = TcpStream::connect(runtime.bound_addr().expect("bound address")).unwrap();
     stream.write_all(&[OVER_CAP]).unwrap();
@@ -770,6 +777,7 @@ fn run_over_cap(cap: usize) -> (Outcome, SendError, SendError, SendError) {
 fn a_connection_at_the_zero_copy_cap_is_refused_with_a_free_entry() {
     let _serial = serial();
     let (outcome, plain, chain, small) = run_over_cap(2);
+    assert_eq!(*OVER_CAP_CAPPED.lock().unwrap(), Some(true));
     assert_refused(&outcome, io::ErrorKind::WouldBlock, 2, &[GUARD_LEN as u32]);
     for (what, error) in [("submit_batch", plain), ("chain", chain)] {
         let (kind, message) = error.unwrap_or_else(|| panic!("{what} was accepted"));
@@ -787,6 +795,7 @@ fn a_connection_at_the_zero_copy_cap_is_refused_with_a_free_entry() {
 fn a_connection_below_the_zero_copy_cap_takes_the_free_entry() {
     let _serial = serial();
     let (outcome, plain, _chain, _small) = run_over_cap(4);
+    assert_eq!(*OVER_CAP_CAPPED.lock().unwrap(), Some(false));
     assert_eq!(outcome.refused, None, "{outcome:?}");
     let (kind, message) = plain.expect("the connection is at the cap");
     assert_eq!(kind, io::ErrorKind::Other, "{message}");
