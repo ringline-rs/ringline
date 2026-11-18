@@ -1139,7 +1139,8 @@ the benchmark server's pipeline depth (16) of admitted, unsettled replies.
 The server's per-class held-slot samples count them at that depth with 512
 slots and gated pieces (96 over plaintext, 192 over TLS at two per reply),
 but they count a reply from admission until its task sees it settle, and
-over TLS count the slot admission reserves and returns, so they over-count.
+over TLS count the two free slots admission requires where a sent reply
+holds one, so they over-count.
 With 128 slots the TLS samples (about 170) exceed the pool. Why 128 slots
 fail in W2 is not known over either transport.
 

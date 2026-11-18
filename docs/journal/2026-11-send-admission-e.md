@@ -45,7 +45,8 @@ Differences from plaintext that could change the result:
   socket, so whether a piece goes into the socket whole after `POLLOUT`
   may differ from plaintext. (Corrected after the runs: on io_uring the
   piece's slots go to the socket as one `sendmsg`, as a plaintext piece's
-  do; see Outcome.)
+  do; see Outcome. One record per slot holds in a 16,448-byte slot; a
+  larger slot holds as many whole records as fit, see Addendum 3.)
 
 ## Design
 
@@ -326,9 +327,9 @@ the same piece size with 16 KiB slots. The report puts slot size and pool
 count in the cell key with TLS. (Corrected after the runs: the unbuffered
 engine's `encrypt_chunk` writes as many whole records as fit into a slot, so
 a 64 KiB slot holds three records, 49,218 bytes. Admission
-(`CiphertextCapacity::slots_unbuffered`) still reserves one slot per record,
-so with 64 KiB slots a TLS reply reserves about three times the slots its
-ciphertext fills.)
+(`CiphertextCapacity::slots_unbuffered`) still counts one slot per record
+plus one, so with 64 KiB slots a TLS piece needs about three times the free
+slots its ciphertext fills (32 KiB: 3 against 1; 128 KiB: 9 against 3).)
 
 Prediction:
 
@@ -549,14 +550,15 @@ Against the prediction:
   and the slot size does not: at 128 slots both sizes fail, at 512 both pass.
 - Why 128 slots are too few is not established. No run counted slots per
   connection, but the server's per-class samples (`held_window.small_slow`
-  in `server-summary.json`) show the six slow readers at the pipeline depth
-  with 512 slots: 96.0 in every gated plaintext run with 512 slots, 24.0 in
-  every pipeline-4 run, and 192.0 in every gated TLS run with 512 slots,
-  where the sample counts 2 per reply. With 128 slots, in the gated runs of
-  Addenda 3 and 4, the samples were 84.7 to 85.8 (plaintext) and 168.5 to
-  171.8 (TLS). The samples count a reply from admission until its task sees
-  it settle, and over TLS also count the slot admission reserves and then
-  returns, while a sent TLS reply holds one slot; so they over-count, and
+  in `server-summary.json`) show the six slow readers at the pipeline depth:
+  96.0 in every gated plaintext run with 512 slots, 192.0 in every gated
+  TLS run with 512 slots (where the sample counts 2 per reply), and 24.0 in
+  every pipeline-4 run (128 slots of 64 KiB). With 128 slots and pipeline
+  16, in the gated runs of Addenda 3 and 4, the samples were 84.7 to 85.8
+  (plaintext) and 168.5 to 171.8 (TLS). The samples count a reply from
+  admission until its task sees it settle, and over TLS count two slots per
+  small reply, the free slots admission requires, while a sent TLS reply
+  holds one; so they over-count, and
   with 128 slots the TLS samples exceed the pool. They do not show why 128
   slots fail over either transport. With 512 slots the pool's fewest free
   put total use at 106 to 108 (TLS 32 KiB) and 121 (plaintext 128 KiB on
@@ -576,10 +578,11 @@ Against the prediction:
 - At equal pool memory, 64 KiB slots made plaintext whole replies 4%
   cheaper per byte, pieces up to 4% cheaper, and divided the slot count by
   four. A reply smaller than a slot still takes a whole slot. Over TLS a
-  64 KiB slot holds three whole records, but admission reserves one slot
-  per record, so a TLS reply is admitted against about three times the
-  slots its ciphertext fills; a 16,448-byte slot holds one record, and the
-  reservation matches. In W2 the slot count decided the result;
+  64 KiB slot holds three whole records, but admission counts one slot per
+  record plus one, so a TLS piece is admitted against about three times the
+  slots its ciphertext fills (a small reply against two); with a
+  16,448-byte slot, which holds one record, admission counts one slot more
+  than the send fills. In W2 the slot count decided the result;
   why 128 slots are too few there is not established (Addendum 4).
 - Not measured: piece sizes between 64 and 128 KiB other than 85 KiB (for
   example 80 KiB, five whole TLS records), pools other than 128 and 512
