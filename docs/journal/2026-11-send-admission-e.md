@@ -57,7 +57,7 @@ Arms, with TLS in a 16,448-byte slot:
   the gate's fixes made after D, to compare TLS with plaintext on the same
   binaries and hosts.
 
-Four runs per arm and cell, two of each O0 whole arm: 18 runs per cell, 126
+Four runs per arm and cell, two of each O0 whole arm: 20 runs per cell, 140
 in all. The report puts TLS in the cell key, so each gated arm is compared
 with the O0 whole arm of its own transport.
 
