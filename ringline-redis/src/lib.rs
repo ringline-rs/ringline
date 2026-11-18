@@ -145,7 +145,7 @@
 //! | **Recv (values)** | **0** | `with_bytes()` + `Value::parse_bytes()`. Bulk strings are `Bytes::slice()` references into the accumulator — zero allocation, O(1) refcount. |
 //! | **Send (commands)** | 1 | `encode_request()` serializes RESP into `Vec<u8>`, then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, standard)** | 1 | All parts gathered into one send-pool slot via `send_parts().copy()`. |
-//! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`] / [`Client::set_ex_with_guard`]: RESP prefix+suffix copied to pool, value stays in-place via `SendGuard`. At ringline's `zero_copy_hold_cap` the request is copied into a buffer and then into the pool: 2 copies. |
+//! | **Send (SET value, guard)** | 0 (value); 2 at `zero_copy_hold_cap` | [`Client::set_with_guard`] / [`Client::set_ex_with_guard`]: RESP prefix+suffix copied to pool, value stays in-place via `SendGuard`. At ringline's `zero_copy_hold_cap` the request is copied into a buffer and then into the pool: 2 copies. |
 //! | **Pipeline** | 1 | All commands accumulated into one `Vec<u8>`, single `conn.send()` to pool. |
 //!
 //! TLS connections add encryption copies on the send path regardless of
@@ -923,8 +923,10 @@ impl Client {
     /// need commands to hit the wire before reading responses (e.g., when
     /// interleaving fire/recv across multiple clients).
     ///
-    /// A batch with guarded values is sent zero-copy, unless the connection is
-    /// at ringline's `zero_copy_hold_cap` (`SendHalf::zero_copy_capped`): then
+    /// A batch holding guards (values at or above the client `zc_threshold`)
+    /// is sent with `submit_batch`, zero-copy on an io_uring plaintext
+    /// connection, unless the connection is at ringline's `zero_copy_hold_cap`
+    /// (`SendHalf::zero_copy_capped`): then
     /// the whole batch, values included, is copied into one buffer and sent
     /// with `send`. That copy fails with `Other` when the send pool cannot take
     /// it now, or `InvalidInput` when it is wider than the whole pool, and the
@@ -2740,7 +2742,8 @@ impl Client {
     /// SET with zero-copy value via SendGuard. The guard pins value memory
     /// until the kernel completes the send. If the connection is at ringline's
     /// `zero_copy_hold_cap`, the value is copied and the send waits for
-    /// send-pool capacity.
+    /// send-pool capacity. The wait has no bound; wrap the call in
+    /// `ringline::timeout` to bound it.
     pub async fn set_with_guard<G: SendGuard>(
         &mut self,
         key: &[u8],

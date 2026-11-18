@@ -736,8 +736,10 @@ impl Client {
     /// need commands to hit the wire before reading responses (e.g., when
     /// interleaving fire/recv across multiple clients).
     ///
-    /// A batch with guarded values is sent zero-copy, unless the connection is
-    /// at ringline's `zero_copy_hold_cap` (`SendHalf::zero_copy_capped`): then
+    /// A batch holding guards (values at or above the client `zc_threshold`)
+    /// is sent with `submit_batch`, zero-copy on an io_uring plaintext
+    /// connection, unless the connection is at ringline's `zero_copy_hold_cap`
+    /// (`SendHalf::zero_copy_capped`): then
     /// the whole batch, values included, is copied into one buffer and sent
     /// with `send`. That copy fails with `Other` when the send pool cannot take
     /// it now, or `InvalidInput` when it is wider than the whole pool, and the
@@ -1595,7 +1597,8 @@ impl Client {
     /// SET with zero-copy value via SendGuard. The guard pins value memory
     /// until the kernel completes the send. If the connection is at ringline's
     /// `zero_copy_hold_cap`, the value is copied and the send waits for
-    /// send-pool capacity.
+    /// send-pool capacity. The wait has no bound; wrap the call in
+    /// `ringline::timeout` to bound it.
     pub async fn set_with_guard<G: SendGuard>(
         &mut self,
         key: &[u8],

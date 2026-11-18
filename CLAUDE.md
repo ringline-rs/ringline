@@ -339,7 +339,7 @@ On the mio backend all of these degrade to copy sends (guards are consumed by co
 | **Recv (values)** | **0** | `with_bytes()` + `resp-proto`'s Bytes-based parser. Bulk strings are `Bytes::slice()` into the accumulator — no allocation, O(1) refcount. Returned `Bytes` stays valid after accumulator advances. |
 | **Send (commands)** | 1 | RESP encoded into a **reused** scratch buffer (`encode_buf`/`write_buf` — no per-op allocation), then `send()` copies into pool. |
 | **Send (SET value, standard)** | 1 | All parts gathered into one pool slot. |
-| **Send (SET value, guard)** | 1 (metadata only) | `set_with_guard()` / `set_ex_with_guard()`: prefix+suffix copied to pool, value stays in-place via `SendGuard` — if the value is ≥ the client `zc_threshold`; smaller guarded values fold into the copy/coalescing buffer. At ringline's `zero_copy_hold_cap` (`SendHalf::zero_copy_capped`) the request, value included, is copied into a buffer and then into the pool: 2 copies. |
+| **Send (SET value, guard)** | 1 (metadata only); 2 at `zero_copy_hold_cap` | `set_with_guard()` / `set_ex_with_guard()`: prefix+suffix copied to pool, value stays in-place via `SendGuard` — if the value is ≥ the client `zc_threshold`; smaller guarded values fold into the copy/coalescing buffer. At ringline's `zero_copy_hold_cap` (`SendHalf::zero_copy_capped`) the request, value included, is copied into a buffer and then into the pool: 2 copies. |
 | **Pipeline** | 1 | All commands accumulated into one buffer, single send to pool. |
 
 **Summary**: Recv is fully zero-copy (refcounted slices). Send always copies the command envelope (key names, RESP framing) into the pool. For large values, `set_with_guard()` avoids copying the value itself, except at ringline's `zero_copy_hold_cap`.
