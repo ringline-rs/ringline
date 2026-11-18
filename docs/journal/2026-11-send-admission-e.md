@@ -261,3 +261,29 @@ encrypts the next, which whole replies do not allow.
   pool slots; network rather than loopback sockets; kernels other than 6.12;
   and buffers between 256 KiB and 1 MiB, where a third of the buffer is
   between 85 and 128 KiB.
+
+## Addendum 2: smaller pieces, 64 and 32 KiB
+
+Written after the 152 runs above, before these arms ran, to choose a piece
+size. Arms: plaintext O0 gated 64 KiB and 32 KiB, and TLS O0 gated 32 KiB,
+four runs in each of the seven cells, 84 runs. A 32 KiB piece is two TLS
+records (three slots as admission counts them); a piece that is a multiple
+of 16 KiB ends on a record boundary, which 85 KiB pieces did not.
+
+Prediction:
+
+- All three arms pass D's rule in every rule cell, and in W4 at 256 KiB, with
+  no stalled peer's piece waiting for room: each is at most a third of the
+  smallest send buffer in the cells (256 KiB).
+- Fast small p99 is no lower than with 128 KiB pieces in any cell by more
+  than run-to-run spread. Plaintext W4 at 1 MiB with 128 stalled peers, where
+  128 KiB gave 2.4 ms, is the cell where it could fall.
+- U costs more per byte as pieces shrink, from the per-piece cost E and D
+  measured (about 12 to 22 µs of worker CPU per piece): plaintext 64 KiB 1.5
+  to 1.7 times plaintext whole (D: 1.57), plaintext 32 KiB 1.7 to 2.1, and
+  TLS 32 KiB 1.4 to 1.7 times TLS whole. A plaintext 32 KiB ratio above 2
+  sends that size to the owner under D's rule.
+- The 7 MiB reply's median rises as pieces shrink, in every cell.
+
+Refuted if a 32 KiB arm fails a rule cell, or if any stalled peer's 32 or
+64 KiB piece waits for room.
