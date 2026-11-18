@@ -106,3 +106,24 @@ What each outcome would lead to:
   figures separate the two.
 - It fails in W1 or W5: look at the pieces that waited for room and the
   room-wait aborts; that would point at the gate under TLS, not the order.
+
+## Addendum: an arm at a third of the send buffer
+
+Written after 107 of the 140 matrix runs, before this arm ran. In W4 with
+`tcp_wmem` at 256 KiB, TLS gated 128 KiB pieces failed (fast small p99 about
+929 ms, 1,890 of 7,680 stalled peers' pieces waited for room), while TLS
+gated 64 KiB and plaintext gated 128 KiB pieces passed. The stalled peers'
+sockets had `sk_sndbuf` 262,144. A server that sizes pieces as a third of
+the send buffer, at most 128 KiB, as Experiment D recommended, sends 85 KiB
+pieces on these sockets, a size the matrix did not run.
+
+Arm: TLS O0 gated 87,381-byte pieces (262,144 / 3), four runs in each cell
+with `tcp_wmem` at 256 KiB (W4 with 128 stalled peers, W2 with six slow
+readers) and in W4 at 1 MiB with 128 stalled peers.
+
+Prediction: it passes in all three cells, with fast small p99 at most 10 ms,
+every 7 MiB reply completed and no stalled peer's piece waiting for room:
+when the gate opens at least a third of the buffer is free, and an 85 KiB
+piece over TLS is six records. Refuted if a stalled peer's piece waits for
+room in W4 at 256 KiB, which would mean a third of the buffer is too large a
+piece over TLS.
