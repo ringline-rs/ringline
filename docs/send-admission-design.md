@@ -784,16 +784,20 @@ and `--stream-gate` for the gate:
   `wmem_queued` is below `sk_sndbuf`, checking only before it starts a new
   segment. Both count truesize: payload plus per-segment overhead. A piece is
   sure to go in whole when its truesize fits in a third of `sk_sndbuf`. A
-  larger piece goes in whole when the gate opens with less queued, which is
-  always the case for a stalled peer's first pieces and never for a reader
-  that keeps its buffer near two thirds full. On loopback `sk_sndbuf` grows to
+  larger piece goes in whole when the gate opens with less queued, which was
+  the case for a stalled peer's first plaintext pieces in Experiment D, and
+  never for a reader that keeps its buffer near two thirds full. Over TLS
+  with a 256 KiB buffer, a stalled peer's second 128 KiB piece waited for
+  room (Experiment E). On loopback `sk_sndbuf` grows to
   the `tcp_wmem` maximum at the handshake, so a third is about 341 KiB at
   1 MiB and about 85 KiB at W2's 256 KiB. Small segments add overhead: a peer
   with a 4 KiB receive window gets about 2 KiB segments, about 61% payload
   (derived from the kernel source, not measured). A piece that does not go in
   whole holds its slots until the socket takes the rest, as an ungated piece
   does. To a reader that drains, that is until it has read enough for the
-  socket to take the rest; to a stalled peer, until `settle_limit`.
+  socket to take the rest; to a stalled peer, until the socket takes the
+  rest or `settle_limit` expires. In Experiment E, 2,480 of 2,520 such TLS
+  pieces were taken before `settle_limit`.
 - The wait for room is bounded by `settle_limit`, and a socket that stays
   unwritable that long is aborted. The gate opens again once the reader has
   taken about one piece, so a reader is aborted when it takes less than about
@@ -1116,7 +1120,8 @@ Under strict order, gated pieces of 64 KiB and 128 KiB passed Experiment D's
 decision rule over TLS. Outside the rule's cells, in W4 with a 256 KiB send
 buffer and 128 stalled peers, 128 KiB pieces were partly sent to stalled
 peers and held the pool (fast small p99 929 ms), while plaintext 128 KiB
-pieces were not; why is not known. 85 KiB pieces, a third of that buffer,
+pieces were not; why is not known. A piece counts as partly sent when a send
+of it came back short (`SendCompletion::waited_for_room`). 85 KiB pieces, a third of that buffer,
 passed the three cells they ran in. A piece of a third of the send buffer, at
 most 128 KiB, passed in every cell E ran.
 

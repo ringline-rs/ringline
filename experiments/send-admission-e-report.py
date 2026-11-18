@@ -2,7 +2,7 @@
 """Summarise Experiment E's runs with send-admission-d-report.py.
 
 Each argument is a directory made by `systemslab artifact download-all <id>`
-for one run of send-admission-e.toml. The report is D's, with two changes:
+for one run of send-admission-e.toml. The report is D's, with three changes:
 
 - tls is a cell key, so TLS and plaintext runs of a workload are separate
   cells, and each gated arm is compared with the O0 whole arm of its own
@@ -15,7 +15,9 @@ for one run of send-admission-e.toml. The report is D's, with two changes:
   admits a passing waiter only from a connection with nothing queued).
 """
 
+import contextlib
 import importlib.util
+import io
 import pathlib
 
 here = pathlib.Path(__file__).resolve().parent
@@ -41,7 +43,15 @@ def u_cost(by_cell):
 def decision(by_cell, ratios, pressured, no_figure):
     for t in TRANSPORTS:
         print(f"\n-- decision, tls={t}")
-        _decision(by_tls(by_cell, t), ratios[t], pressured, no_figure)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _decision(by_tls(by_cell, t), ratios[t], pressured, no_figure)
+        # D's fallback names plaintext; for each transport it is that
+        # transport's own.
+        print(out.getvalue().replace(
+            "Experiment C's outcome stands for plaintext",
+            f"Experiment C's outcome stands for tls={t}",
+        ), end="")
 
 
 # main() looks these names up when it runs.

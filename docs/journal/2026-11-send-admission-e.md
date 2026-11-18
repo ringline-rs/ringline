@@ -11,7 +11,7 @@
   versions, which serve TLS. Spec `experiments/send-admission-e.toml`, cells
   and arms `experiments/send-admission-e-matrix.json`, report
   `experiments/send-admission-e-report.py` (D's report with TLS as a cell
-  key).
+  key, and the decision and U cost run per transport).
 
 ## Goal
 
@@ -43,11 +43,13 @@ Differences from plaintext that could change the result:
 ## Design
 
 Cells: D's rule cells (W1; W2 with six slow readers; W4 at `tcp_wmem` 1 MiB
-with 72 and 128 stalled peers; W5), W4 at 256 KiB with 128 stalled peers,
-and U. D's W4 cells with 4 and 56 stalled peers are left out because every
-D arm except O0 whole passed them. Every W4 cell runs on hv03, where D's W4
-cells at 1 MiB ran; D ran W4 at 256 KiB on hv01, where 128 KiB pieces
-exceeded 10 ms, and on hv03 in a rerun, where they did not.
+with 72 and 128 stalled peers; W5), W4 at 256 KiB with 128 stalled peers, and
+U. D's W4 cells with 4 and 56 stalled peers are left out because every D arm
+that sent pieces, gated or not, passed them. (Corrected after the runs: this
+said every arm but O0 whole; O7w whole completed no 7 MiB reply there.) Every
+W4 cell runs on hv03, where D's W4 cells at 1 MiB ran; D ran W4 at 256 KiB on
+hv01, where 128 KiB pieces exceeded 10 ms, and on hv03 in a rerun, where they
+did not.
 
 Arms, with TLS in a 16,448-byte slot:
 
@@ -135,12 +137,12 @@ piece over TLS.
 ## Results
 
 Binaries: artifact `01a1ee2b-390b`, from build experiment `01a1ee2a-b75b`,
-which records the source it built. Matrix runs `01a1ee34-6fc2` to `01a1ee34-aa3d`: 138 of 140
-`success`. The other two (W4 at 72 stalled peers, rep 2, TLS O0 gated
-128 KiB and plaintext O0 whole) never started: hv03 had 5.7 GiB available
-for an 8 GiB guest. Both were resubmitted once (`01a1ee6c-61c7`,
-`01a1ee6c-622c`, `success`). Addendum runs `01a1ee6d-8643` to
-`01a1ee6d-8a54`, 12 of 12 `success`. Summarised by
+which records the source it built. Matrix runs `01a1ee34-6fc2` to
+`01a1ee34-aa3d`: 138 of 140 `success`. The other two (W4 at 72 stalled peers,
+rep 2, TLS O0 gated 128 KiB and plaintext O0 whole) never started: hv03 had
+5.7 GiB available for an 8 GiB guest. Both were resubmitted once
+(`01a1ee6c-61c7`, `01a1ee6c-622c`, `success`). Addendum runs `01a1ee6d-8643`
+to `01a1ee6d-8a54`, 12 of 12 `success`. Summarised by
 `experiments/send-admission-e-report.py` over the 152 runs. No run recorded
 TCP memory pressure.
 
@@ -176,17 +178,21 @@ Plaintext, on the same binaries and hosts:
   pieces waited for room, the fewest free slots during a 7 MiB reply was 7
   of 512, and the 7 MiB replies took 755 ms (median). A stalled peer's
   second piece, when partly sent, holds its 9 slots until the kernel takes
-  its last byte; the next piece's gate then timed out (5,080 room-wait
-  aborts against 40 settlement aborts). The stalled peers'
+  its last byte (admission counts one slot more than the piece's eight
+  records). The next piece's gate then timed out, as it does for every
+  stalled reply in every gated W4 arm (5,120 room-wait aborts there). Here
+  5,080 ended that way and 40 in a settlement abort, a piece the socket
+  never finished taking. A piece counts as waiting for room when a send of
+  it came back short (`SendCompletion::waited_for_room`). The stalled peers'
   server-side sockets had `sk_sndbuf` 262,144 and about 235 KB queued
   (`wmem_queued`, from `ss`), in the TLS and plaintext arms alike, and each
   stalled peer was sent two pieces in both. Over plaintext no second piece
   waited for room. In every other TLS gated cell, and in the 85 KiB and
   64 KiB arms of this one, no stalled peer's piece waited (0 of 15,360 at
   85 KiB, 0 of 20,480 at 64 KiB).
-- TLS O7w whole kept fast small p99 at 0.3 to 0.5 ms and completed 1 of 40
-  7 MiB replies in W1 and none in W4 or W5, where every slow reader in W5
-  was aborted. TLS O0 whole completed 1 of 20 in W1.
+- TLS O7w whole kept fast small p99 at 0.3 to 0.5 ms (medians) and completed 1
+  of 40 7 MiB replies in W1 and none in W4 or W5, where every slow reader in
+  W5 was aborted. TLS O0 whole completed 1 of 20 in W1.
 - Pieces that waited for room, to readers that drain: TLS W2 drainers 1,800
   of 1,920 (128 KiB), 2,640 of 3,000 (85 KiB), 3,600 of 3,840 (64 KiB); the
   7 MiB reply's pieces 4 of 2,240 at 128 KiB and none at 64 or 85 KiB. Over
@@ -217,9 +223,11 @@ encrypts the next, which whole replies do not allow.
 - TLS gated fast small p99 higher than plaintext gated in W4 at 1 MiB with
   128 stalled peers: refuted. TLS was 0.4 ms (median) against plaintext's
   2.4 ms. I do not know why.
-- No stalled peer's gated TLS piece waits for room in W4: refuted in W4 at
-  256 KiB with 128 KiB pieces (2,520 of 10,240), which also refutes the
-  10 ms and 3/4-free conditions there. Holds in every other W4 cell and arm.
+- No stalled peer's gated TLS piece waits for room in W4: refuted in W4 at 256
+  KiB with 128 KiB pieces (2,520 of 10,240). Fast small p99 there was 928 ms
+  (median), and the report's 3/4-free check, inherited from D, fails (7 of 512
+  free); neither is a condition this prediction set for that cell. Holds in
+  every other W4 cell and arm.
 - TLS O0 whole fails in W1, W4 and W5 (1,114 to 1,233 ms) and completes no
   7 MiB reply there: holds but for one W1 reply of 20. The positive control
   failed, so the cells were contended over TLS.
@@ -243,20 +251,20 @@ encrypts the next, which whole replies do not allow.
   replies did not do in W1, W4 or W5.
 - A fixed 128 KiB piece is too large over TLS for a 256 KiB send buffer: the
   piece is partly sent and holds its 9 slots until the kernel takes its last
-  byte, and 128 stalled peers' pieces exceed the pool. I do not know why a TLS piece is partly sent where a
-  plaintext piece of the same size is not. It is not one send per record:
-  on io_uring `submit_coalesced_run` sends a run of up to 32 queued copy
-  sends, plaintext or ciphertext, as one `sendmsg`, so a 128 KiB piece is
-  one `sendmsg` of eight slots either way (131,072 bytes of plaintext, or
-  eight records of 16,413 bytes). A trace of the bytes each `sendmsg`
-  returned, with `wmem_queued` and `sk_sndbuf` before it, for one stalled
-  peer in each transport would separate the candidates.
-- A piece of a third of the send buffer, at most 128 KiB, passed in every
-  cell it ran, at 85 KiB on 256 KiB buffers and at 128 KiB on 1 MiB buffers.
-  That is the sizing the design specifies, min(`send_buffer_size` / 3,
-  128 KiB) (`docs/send-admission-design.md`, Part 1). The 85 KiB arm ran only with a send
-  buffer that had reached 262,144 bytes; a reply sized from a smaller buffer
-  read earlier in the connection gets a smaller piece.
+  byte, and 128 stalled peers' pieces exceed the pool. I do not know why a TLS
+  piece is partly sent where a plaintext piece of the same size is not. It is
+  not one send per record: on io_uring `submit_coalesced_run` sends a run of
+  up to 32 queued copy sends, plaintext or ciphertext, as one `sendmsg`, so a
+  128 KiB piece is one `sendmsg` of eight slots either way (131,072 bytes of
+  plaintext, or eight records of 16,413 bytes). A trace of the bytes each
+  `sendmsg` returned, with `wmem_queued` and `sk_sndbuf` before it, for one
+  stalled peer in each transport would separate the candidates.
+- A piece of a third of the send buffer, at most 128 KiB, passed in every cell
+  it ran, at 85 KiB on 256 KiB buffers and at 128 KiB on 1 MiB buffers. That
+  is the sizing the design specifies, min(`send_buffer_size` / 3, 128 KiB)
+  (`docs/send-admission-design.md`, Part 1). The 85 KiB arm ran only with a
+  send buffer that had reached 262,144 bytes; a reply sized from a smaller
+  buffer read earlier in the connection gets a smaller piece.
 - Not covered: zero-copy replies, which hold send-slab entries rather than
   pool slots; network rather than loopback sockets; kernels other than 6.12;
   and buffers between 256 KiB and 1 MiB, where a third of the buffer is
