@@ -227,6 +227,11 @@ sends admitted that way hold at most the budget's slots. Either way the queue
 will not release a waiter until the pool can satisfy the number it was
 admitted with, which is why the cost is computed up front.
 
+`send_parts().submit_batch_admitted` waits in the same FIFO for a batch's
+own pool cost: one slot for a plaintext io_uring batch with copy parts, none
+for guards alone, the ciphertext bound of its length on TLS and its length on
+Mio. Its refusal returns every part, guards included.
+
 Two consequences follow from that ordering. Nothing is submitted until the
 future is polled, so the message is read at submission time rather than
 copied when the call is made, and a future that is built and dropped without

@@ -109,6 +109,11 @@ impl InFlightSendSlab {
         }
     }
 
+    /// Whether [`allocate`](Self::allocate) would find a free entry.
+    pub fn has_free(&self) -> bool {
+        !self.free_list.is_empty()
+    }
+
     /// Allocate a slot, store iovecs/guards, and return (slab_index, msghdr_ptr).
     /// Returns `None` if the slab is full.
     ///

@@ -1078,7 +1078,7 @@ that does not want them back.
   total length.
 - The send-slab entry is not part of the FIFO's admission (Alternatives). It
   is taken when the batch is admitted, and a full slab then refuses the
-  batch.
+  batch with `WouldBlock`.
 - On mio, where `submit_batch` copies the whole batch and takes no slots,
   the method waits as `send_admitted` does for the batch's total length.
 - A refusal returns every part to the caller, guards included, and every
@@ -1225,5 +1225,6 @@ The fast-path specification changes one default and adds API:
   connections sets the order to strict. Sends on one connection keep their
   order either way.
 - A configuration with an O7w budget of 0 fails validation.
-- `writable`, `send_buffer_size` and the waiting batch method are new; no
-  existing signature changes.
+- `writable`, `send_buffer_size` and the waiting batch method
+  (`AsyncSendBuilder::submit_batch_admitted`) are new; no existing signature
+  changes.
