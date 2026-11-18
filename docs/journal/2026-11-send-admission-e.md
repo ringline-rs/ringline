@@ -341,3 +341,46 @@ Prediction:
 Refuted if a 16 KiB arm fails a rule cell, if 64 KiB slots change a gated
 arm's pass or fail in any cell against 16 KiB slots, or if plaintext whole
 U does not get cheaper with 64 KiB slots.
+
+## Addendum 4: slot count or slot bytes in W2
+
+Written after Addendum 2's and 3's runs, before these ran. With 128 slots of
+64 KiB, every gated arm failed W2 (fast small p99 about 445 ms, no free slot at
+the fewest), where the same arms with 512 slots of 16 KiB passed. The pools
+hold the same 8 MiB. The candidate mechanism is the slot count: in W2 six slow
+readers each request a 4 KiB reply 100 times a second and read 128 KiB a
+second, 32 replies' worth, so once a slow reader's socket buffer is full its
+replies queue in the runtime, each holding one slot whatever the slot's size,
+up to the pipeline depth of 16: 96 slots. With 16 KiB slots the gated arms
+had 108 to 141 slots taken at the fewest free (371 to 404 of 512 free), which
+fits; 96 of 128 leaves too few for the 7 MiB reply's pieces and the fast
+small replies. W5's slow readers have no small replies and passed with
+64 KiB slots.
+
+Arms, all in W2 with six slow readers, four runs each unless stated:
+
+- 512 slots of 64 KiB (32 MiB): plaintext O0 gated 128 KiB and TLS O0 gated
+  32 KiB.
+- 128 slots of 16 KiB (2 MiB; 16,448 bytes over TLS): the same two arms.
+- 128 slots of 64 KiB with the pipeline depth at 4 (W2-s6-p4): plaintext O0
+  gated 128 KiB.
+- 128 slots of 64 KiB, plaintext O0 gated 128 KiB, two runs: the failing arm
+  of Addendum 3 again, the positive control for this batch.
+
+Prediction:
+
+- The control fails again, fast small p99 above 100 ms.
+- 512 slots of 64 KiB: both arms pass (fast small p99 at most 10 ms, every
+  7 MiB reply completed), with at least 371 slots free at the fewest, as
+  with 512 slots of 16 KiB.
+- 128 slots of 16 KiB: both arms fail as 128 slots of 64 KiB did, with fast
+  small p99 above 100 ms and no slot free at the fewest.
+- Pipeline depth 4: passes, since the slow readers can hold at most 24
+  slots. A pipeline depth of 4 also limits the fast connections, so a fast
+  small p99 above 10 ms here does not by itself refute the mechanism; the
+  fewest free slots does (refuted if it is 0).
+
+Refuted, and the pool's byte size rather than its slot count decides W2, if
+128 slots of 16 KiB pass, or 512 slots of 64 KiB fail. If pipeline depth 4
+still leaves no slot free, the slow readers' queued replies are not what holds
+the slots.
