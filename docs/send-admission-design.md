@@ -1103,13 +1103,21 @@ These are untested, and each is a limit of the specification as written:
   it is about two thirds full, about six 128 KiB pieces at 1 MiB, so about 85
   stalled peers would hold the default 512 entries (derived, not measured),
   and other connections' guarded batches would then be refused;
-- TLS replies in pieces;
 - a network between server and client, where `sk_sndbuf` starts near 85 KiB
   and grows with the congestion window, so a piece can be partly sent early
   in a connection;
 - mio under load: `writable` is tested on mio but did not run on the rack;
 - small replies to a peer that pipelines and stops reading, which still hold
   their slots until `settle_limit` (Non-goals).
+
+TLS replies in pieces ran in Experiment E
+(`docs/journal/2026-11-send-admission-e.md`), on loopback and kernel 6.12.
+Under strict order, gated pieces of 64 KiB, of 128 KiB with a 1 MiB send
+buffer, and of a third of a 256 KiB send buffer (85 KiB) passed Experiment
+D's decision rule over TLS. Pieces of 128 KiB with a 256 KiB send buffer did
+not: they were partly sent to stalled peers, which held the pool, while
+plaintext pieces of 128 KiB were not; why is not known. A piece of a third
+of the send buffer, at most 128 KiB, passed in every cell E ran.
 
 #### Decisions
 

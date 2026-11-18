@@ -36,7 +36,9 @@ Differences from plaintext that could change the result:
   per-piece overhead is a smaller share of it.
 - The runtime writes one record per slot. A piece is several sends to the
   socket, so whether a piece goes into the socket whole after `POLLOUT`
-  may differ from plaintext.
+  may differ from plaintext. (Corrected after the runs: on io_uring the
+  piece's slots go to the socket as one `sendmsg`, as a plaintext piece's
+  do; see Outcome.)
 
 ## Design
 
@@ -132,8 +134,8 @@ piece over TLS.
 
 ## Results
 
-Binaries: artifact `01a1ee2b-390b` (build experiment `01a1ee2a-b75b`, source
-`de16fe58`). Matrix runs `01a1ee34-6fc2` to `01a1ee34-aa3d`: 138 of 140
+Binaries: artifact `01a1ee2b-390b`, from build experiment `01a1ee2a-b75b`,
+which records the source it built. Matrix runs `01a1ee34-6fc2` to `01a1ee34-aa3d`: 138 of 140
 `success`. The other two (W4 at 72 stalled peers, rep 2, TLS O0 gated
 128 KiB and plaintext O0 whole) never started: hv03 had 5.7 GiB available
 for an 8 GiB guest. Both were resubmitted once (`01a1ee6c-61c7`,
@@ -236,11 +238,14 @@ encrypts the next, which whole replies do not allow.
   replies did not do in W1, W4 or W5.
 - A fixed 128 KiB piece is too large over TLS for a 256 KiB send buffer: the
   piece is partly sent and each stalled peer's piece holds its 9 slots until
-  the room-wait abort. I infer, without measuring it, that the cause is the
-  record layer: a TLS piece goes to the socket as one send per 16 KiB
-  record, and the kernel stops accepting records once the buffer is full,
-  while a plaintext piece is one send that the kernel accepts past the
-  buffer's limit.
+  the room-wait abort. I do not know why a TLS piece is partly sent where a
+  plaintext piece of the same size is not. It is not one send per record:
+  on io_uring `submit_coalesced_run` sends a run of up to 32 queued copy
+  sends, plaintext or ciphertext, as one `sendmsg`, so a 128 KiB piece is
+  one `sendmsg` of eight slots either way (131,072 bytes of plaintext, or
+  eight records of 16,413 bytes). A trace of the bytes each `sendmsg`
+  returned, with `wmem_queued` and `sk_sndbuf` before it, for one stalled
+  peer in each transport would separate the candidates.
 - A piece of a third of the send buffer, at most 128 KiB, passed in every
   cell it ran, at 85 KiB on 256 KiB buffers and at 128 KiB on 1 MiB buffers.
   That is the rule spillcache's `--reply-piece-kib` uses (`send_pieces`
