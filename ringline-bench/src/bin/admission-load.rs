@@ -1,4 +1,4 @@
-//! Load for the contended cases of Experiments B and C
+//! Load for the contended cases of Experiments B to E
 //! (`docs/send-admission-design.md`, section 4), against `admission-server`.
 //!
 //! Every request is 24 bytes, in the format `admission-server` documents. It
@@ -38,7 +38,24 @@
 //!   them.
 //! - `--large-delay-ms` later, one connection asks for a `--large-size` reply,
 //!   which needs more slots than are free and waits at the head of the
-//!   server's FIFO, then reads it.
+//!   server's FIFO, then reads it as fast as it can, with `SO_RCVBUF` set to
+//!   `--head-rcvbuf` before the connect (0 leaves it to the kernel). With
+//!   `--large-size 0` the episode has no head.
+//!
+//! With `--ports-file`, each stalled peer, drainer and head appends its local
+//! port to the file as it connects, so that a sampler can pick its socket out
+//! of `ss`.
+//!
+//! # Closed loop
+//!
+//! With `--closed-loop N` the load runs only workload U of Experiment D: one
+//! connection, with `SO_RCVBUF` set to `--head-rcvbuf` before the connect,
+//! writes a request for `--large-size` bytes, reads the reply in full, and
+//! writes the next, `--closed-warmup` times uncounted and then N times. It
+//! prints the `SO_RCVBUF` the kernel reports, each counted reply's time from
+//! its request to its last byte in microseconds, their median, p99 and
+//! maximum, and the window over which they ran. It exits 1 if a reply was not
+//! read in full.
 //!
 //! The head's tag is `u32::MAX`, each drainer's `0x8000_0000` plus its index,
 //! and each stalled peer's its index; `admission-server` records the tag of
@@ -125,11 +142,15 @@
 //! One JSON object: for the fast small connections, the replies offered after
 //! `--warmup` (sent before the drain), delivered within `--within-ms`,
 //! delivered late and lost, their latency percentiles, and each episode's
-//! large-reply outcome, as in Experiment B; the same for the slow connections
+//! head: its time from request to last byte in milliseconds (`large_ms`) and
+//! microseconds (`large_us`), `null` where it was not read in full, and
+//! whether it was (`large_completed`); the same for the slow connections
 //! under `slow`; each drainer's time from request to last byte per episode,
-//! or `null`, under `drainers`; counts for the outside connections under
+//! in milliseconds and microseconds, or `null`, and whether its reply was
+//! read in full, under `drainers`; counts for the outside connections under
 //! `outside`; and the window's start and end in nanoseconds of
-//! `CLOCK_MONOTONIC` under `window_ns`.
+//! `CLOCK_MONOTONIC` under `window_ns`. The closed loop prints its own
+//! object (above).
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
@@ -146,7 +167,7 @@ use serde_json::{Value, json};
 #[derive(Parser, Clone)]
 #[command(
     name = "admission-load",
-    about = "The contended-case load of Experiments B and C"
+    about = "The contended-case load of Experiments B to E"
 )]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7979")]
@@ -224,6 +245,25 @@ struct Args {
     /// --tls-cert-out` writes it.
     #[arg(long, requires = "tls")]
     tls_ca: Option<PathBuf>,
+    /// `SO_RCVBUF` on the head's socket, and on the closed loop's, set
+    /// before the connect; 0 leaves it to the kernel.
+    #[arg(long, default_value_t = 0)]
+    head_rcvbuf: i32,
+    /// Run only a closed loop of this many `--large-size` requests on one
+    /// connection, each written once the reply before it has been read in
+    /// full, and nothing else (Experiment D's workload U).
+    #[arg(long, default_value_t = 0)]
+    closed_loop: u32,
+    /// Replies the closed loop reads before the ones it counts, outside the
+    /// measurement window.
+    #[arg(long, default_value_t = 10)]
+    closed_warmup: u32,
+    /// Append a line for each stalled peer, drainer and head connection to
+    /// this file as it connects: the `CLOCK_MONOTONIC` time in ns, the
+    /// episode, the kind (`stall`, `drain` or `head`), its index, and its
+    /// local port.
+    #[arg(long)]
+    ports_file: Option<std::path::PathBuf>,
 }
 
 const REQUEST_LEN: usize = 24;
@@ -502,6 +542,51 @@ fn connect_wire(addr: SocketAddr, rcvbuf: i32) -> Wire {
 
 fn connect(addr: SocketAddr) -> Wire {
     connect_wire(addr, 0)
+}
+
+/// The `SO_RCVBUF` the kernel reports for `s`: on Linux twice the size set,
+/// capped at `net.core.rmem_max` doubled.
+fn rcvbuf(s: &TcpStream) -> i32 {
+    let mut size: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: `s` is a live socket, and `size` and `len` outlive the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&mut size as *mut i32).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 { size } else { -1 }
+}
+
+/// Where the stalled peers', drainers' and heads' local ports are written
+/// (`--ports-file`).
+#[derive(Clone)]
+struct Ports(Option<Arc<Mutex<std::fs::File>>>);
+
+impl Ports {
+    fn open(path: Option<&std::path::Path>) -> Ports {
+        Ports(path.map(|p| {
+            Arc::new(Mutex::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .expect("open --ports-file"),
+            ))
+        }))
+    }
+
+    fn note(&self, episode: usize, kind: &str, index: usize, s: &TcpStream) {
+        let (Some(f), Ok(local)) = (&self.0, s.local_addr()) else {
+            return;
+        };
+        let line = format!("{} {episode} {kind} {index} {}\n", mono_ns(), local.port());
+        let _ = f.lock().unwrap().write_all(line.as_bytes());
+    }
 }
 
 fn set_rcvbuf(s: &TcpStream, size: i32) {
@@ -924,8 +1009,16 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
 /// One drainer: ask for a `--drain-size` reply and read it at most at
 /// `--drain-read-bps`. Returns the time from the request to the last byte, or
 /// `None` if the connection ended or `until` came first.
-fn drainer(args: &Args, index: usize, until: Instant, clock: Clock) -> Option<Duration> {
+fn drainer(
+    args: &Args,
+    index: usize,
+    until: Instant,
+    clock: Clock,
+    ports: &Ports,
+    episode: usize,
+) -> Option<Duration> {
     let mut s = connect_with_rcvbuf(args.addr, args.drain_rcvbuf);
+    ports.note(episode, "drain", index, s.sock());
     let began = Instant::now();
     let r = request(
         args.drain_size,
@@ -962,7 +1055,9 @@ fn drainer(args: &Args, index: usize, until: Instant, clock: Clock) -> Option<Du
 }
 
 /// One episode's outcome: the large reply's time from request to its last
-/// byte, and each drainer's, or `None` where the connection ended first.
+/// byte, and each drainer's, or `None` where the connection ended first or
+/// the reply was not read in full. `large` is `None` too in an episode with
+/// no head (`--large-size 0`).
 struct Episode {
     large: Option<Duration>,
     drainers: Vec<Option<Duration>>,
@@ -970,18 +1065,20 @@ struct Episode {
 
 /// One episode's drainers, stalled peers and large reply. The stalled peers
 /// stay open until 100 ms before the episode ends, so the server, not this
-/// client, ends them; the drainers stop reading then.
-fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
+/// client, ends them; the drainers stop reading then. With `--large-size 0`
+/// the episode has no head.
+fn episode(args: &Args, at: Instant, clock: Clock, ports: &Ports, number: usize) -> Episode {
     thread::sleep(at.saturating_duration_since(Instant::now()));
     let hold_until = at + Duration::from_millis(args.episode_ms.saturating_sub(100));
     thread::scope(|scope| {
         let drainers: Vec<_> = (0..args.drainers)
-            .map(|i| scope.spawn(move || drainer(args, i, hold_until, clock)))
+            .map(|i| scope.spawn(move || drainer(args, i, hold_until, clock, ports, number)))
             .collect();
         let mut stalled = Vec::new();
         for i in 0..args.stall_peers {
             let mut s = connect(args.addr);
             set_rcvbuf(s.sock(), args.stall_rcvbuf);
+            ports.note(number, "stall", i, s.sock());
             let r = request(
                 args.stall_size,
                 i as u32,
@@ -992,24 +1089,21 @@ fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
             stalled.push(s);
         }
         thread::sleep(Duration::from_millis(args.large_delay_ms));
-        let mut large = connect(args.addr);
-        large
-            .sock()
-            .set_read_timeout(Some(Duration::from_millis(args.episode_ms)))
-            .ok();
-        let began = Instant::now();
-        let r = request(args.large_size, HEAD_TAG, FLAG_WINDOW, clock.ns(began));
-        let took = large.write_all(&r).ok().and_then(|()| {
-            let mut left = args.large_size as usize;
-            let mut buf = vec![0u8; 1 << 20];
-            while left > 0 {
-                match large.read(&mut buf, usize::MAX) {
-                    Ok((0, 0)) | Err(_) => return None,
-                    Ok((_, n)) => left = left.saturating_sub(n),
-                }
-            }
-            Some(began.elapsed())
-        });
+        let took = (args.large_size > 0)
+            .then(|| {
+                let mut large = connect_with_rcvbuf(args.addr, args.head_rcvbuf);
+                ports.note(number, "head", 0, large.sock());
+                large
+                    .sock()
+                    .set_read_timeout(Some(Duration::from_millis(args.episode_ms)))
+                    .ok();
+                let began = Instant::now();
+                let r = request(args.large_size, HEAD_TAG, FLAG_WINDOW, clock.ns(began));
+                large.write_all(&r).ok()?;
+                read_reply(&mut large, args.large_size as usize)?;
+                Some(began.elapsed())
+            })
+            .flatten();
         thread::sleep(hold_until.saturating_duration_since(Instant::now()));
         drop(stalled);
         Episode {
@@ -1019,6 +1113,77 @@ fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
                 .map(|h| h.join().expect("drainer thread"))
                 .collect(),
         }
+    })
+}
+
+/// Read one reply of `len` bytes from `s`. `None` if the connection ended,
+/// failed or timed out first.
+fn read_reply(s: &mut Wire, len: usize) -> Option<()> {
+    let mut left = len.max(8);
+    let mut buf = vec![0u8; 1 << 20];
+    while left > 0 {
+        match s.read(&mut buf[..left.min(1 << 20)], usize::MAX) {
+            Ok((0, 0)) | Err(_) => return None,
+            Ok((_, n)) => left = left.saturating_sub(n),
+        }
+    }
+    Some(())
+}
+
+/// Experiment D's workload U: `--closed-loop` requests for `--large-size`
+/// bytes on one connection, each written once the reply before it has been
+/// read in full, after `--closed-warmup` replies that are not counted. The
+/// socket's `SO_RCVBUF` is `--head-rcvbuf`, set before the connect, and the
+/// size the kernel reports is printed. Only the counted requests carry flag
+/// bit 2, so the server records only them.
+fn closed_loop(args: &Args, clock: Clock) -> Value {
+    let mut s = connect_with_rcvbuf(args.addr, args.head_rcvbuf);
+    let reported = rcvbuf(s.sock());
+    s.sock()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok();
+    let mut us: Vec<u64> = Vec::with_capacity(args.closed_loop as usize);
+    let mut error = None;
+    let mut window = (0u64, 0u64);
+    let total = args.closed_warmup + args.closed_loop;
+    for i in 0..total {
+        let counted = i >= args.closed_warmup;
+        let began = Instant::now();
+        if i == args.closed_warmup {
+            window.0 = clock.ns(began);
+        }
+        let flags = if counted { FLAG_WINDOW } else { 0 };
+        let r = request(args.large_size, HEAD_TAG, flags, clock.ns(began));
+        if s.write_all(&r).is_err() {
+            error = Some(format!("request {i}: write failed"));
+            break;
+        }
+        if read_reply(&mut s, args.large_size as usize).is_none() {
+            error = Some(format!("request {i}: reply not read in full"));
+            break;
+        }
+        if counted {
+            us.push(began.elapsed().as_micros() as u64);
+        }
+    }
+    window.1 = clock.ns(Instant::now());
+    let mut sorted = us.clone();
+    sorted.sort_unstable();
+    json!({
+        "closed_loop": {
+            "requests": args.closed_loop,
+            "warmup": args.closed_warmup,
+            "completed": us.len(),
+            "size": args.large_size,
+            "rcvbuf_set": args.head_rcvbuf,
+            "rcvbuf_reported": reported,
+            "p50_us": percentile(&sorted, 0.50),
+            "p99_us": percentile(&sorted, 0.99),
+            "max_us": sorted.last().copied().unwrap_or(0),
+            "us": us,
+            "error": error,
+        },
+        "window_ns": [window.0, window.1],
     })
 }
 
@@ -1109,6 +1274,10 @@ fn millis(d: Option<Duration>) -> Option<u64> {
     d.map(|d| d.as_millis() as u64)
 }
 
+fn micros(d: Option<Duration>) -> Option<u64> {
+    d.map(|d| d.as_micros() as u64)
+}
+
 fn main() {
     let args = Args::parse();
     let _ = TLS.set(
@@ -1126,6 +1295,13 @@ fn main() {
         std::process::exit(2);
     }
     let clock = Clock::new();
+    if args.closed_loop > 0 {
+        let out = closed_loop(&args, clock);
+        let failed = out["closed_loop"]["error"].is_string();
+        println!("{out}");
+        std::process::exit(i32::from(failed));
+    }
+    let ports = Ports::open(args.ports_file.as_deref());
     let start = Instant::now() + Duration::from_millis(200);
     let window = {
         let start_at = start + Duration::from_secs(args.warmup);
@@ -1143,10 +1319,12 @@ fn main() {
         let episodes = Arc::clone(&episodes);
         thread::spawn(move || {
             let mut at = window.start;
+            let mut number = 0;
             while at + Duration::from_millis(args.episode_ms) <= window.stop {
-                let e = episode(&args, at, clock);
+                let e = episode(&args, at, clock, &ports, number);
                 episodes.lock().unwrap().push(e);
                 at += Duration::from_millis(args.episode_ms);
+                number += 1;
             }
         })
     };
@@ -1188,6 +1366,23 @@ fn main() {
         "large_ms".into(),
         json!(episodes.iter().map(|e| millis(e.large)).collect::<Vec<_>>()),
     );
+    // Per episode's head: the time from its request to its last byte, in
+    // microseconds, or null where it was not read in full.
+    out.insert(
+        "large_us".into(),
+        json!(episodes.iter().map(|e| micros(e.large)).collect::<Vec<_>>()),
+    );
+    out.insert(
+        "large_completed".into(),
+        json!(
+            episodes
+                .iter()
+                .map(|e| e.large.is_some())
+                .collect::<Vec<_>>()
+        ),
+    );
+    out.insert("large_size".into(), json!(args.large_size));
+    out.insert("head_rcvbuf".into(), json!(args.head_rcvbuf));
     let mut slow = summary(&slows, args.within_ms);
     slow.extend([
         ("conns".to_string(), json!(args.slow_conns)),
@@ -1211,6 +1406,14 @@ fn main() {
             "ms": episodes
                 .iter()
                 .map(|e| e.drainers.iter().map(|&d| millis(d)).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            "us": episodes
+                .iter()
+                .map(|e| e.drainers.iter().map(|&d| micros(d)).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            "completed": episodes
+                .iter()
+                .map(|e| e.drainers.iter().map(|d| d.is_some()).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
         }),
     );

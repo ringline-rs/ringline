@@ -1,0 +1,57 @@
+# Build the binaries for Experiment E (send-admission-e.toml). One artifact,
+# bench-bins.tgz, with io_uring builds of admission-server and admission-load
+# from {ref} of {repo}, built without target-cpu=native, so the binaries run
+# on hv01, hv02 and hv03.
+name = "send-admission E build ({ref})"
+
+[params]
+repo = "https://github.com/ringline-rs/ringline"
+ref  = "main"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "auto.c"
+image = "debian-13-6.12"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bench-bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+(
+  cat /etc/anvil-image.json 2>/dev/null || cat /etc/anvil-instance.json; echo
+  rustc -V; uname -r
+  mkdir -p out
+  git clone -q {repo} src && git -C src checkout -q {ref} || exit 1
+  ( cd src
+    echo "== $(git log --oneline -1)"
+    export CARGO_BUILD_JOBS=8
+    cargo build --locked --release -p ringline-bench --bin bench-server --bin admission-server --bin admission-load || exit 1
+    for b in bench-server admission-server admission-load; do cp target/release/$b ../out/; done
+  ) || exit 1
+  ( cd out && sha256sum * )
+  got=$(./out/bench-server --print-backend)
+  [ "$got" = io_uring ] || { echo "BACKEND MISMATCH: bench-server is $got"; exit 1; }
+  echo "backend ok: bench-server -> $got"
+  for f in --order --budget --tls-cert-out --stream-piece --stream-gate --summary-file; do
+    ./out/admission-server --help | grep -q -- "$f" || { echo "admission-server lacks $f"; exit 1; }
+  done
+  for f in --tls-ca --closed-loop --head-rcvbuf --ports-file --drain-rcvbuf --slow-rcvbuf; do
+    ./out/admission-load --help | grep -q -- "$f" || { echo "admission-load lacks $f"; exit 1; }
+  done
+  echo "admission flags ok"
+  tar czf bench-bins.tgz out
+) > /home/anvil/build.log 2>&1
+rc=$?
+tail -30 /home/anvil/build.log
+echo "RESULT build_status=$rc"
+exit $rc
+'''

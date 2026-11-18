@@ -784,16 +784,20 @@ and `--stream-gate` for the gate:
   `wmem_queued` is below `sk_sndbuf`, checking only before it starts a new
   segment. Both count truesize: payload plus per-segment overhead. A piece is
   sure to go in whole when its truesize fits in a third of `sk_sndbuf`. A
-  larger piece goes in whole when the gate opens with less queued, which is
-  always the case for a stalled peer's first pieces and never for a reader
-  that keeps its buffer near two thirds full. On loopback `sk_sndbuf` grows to
+  larger piece goes in whole when the gate opens with less queued, which was
+  the case for a stalled peer's first plaintext pieces in Experiment D, and
+  never for a reader that keeps its buffer near two thirds full. Over TLS
+  with a 256 KiB buffer, a stalled peer's second 128 KiB piece waited for
+  room (Experiment E). On loopback `sk_sndbuf` grows to
   the `tcp_wmem` maximum at the handshake, so a third is about 341 KiB at
   1 MiB and about 85 KiB at W2's 256 KiB. Small segments add overhead: a peer
   with a 4 KiB receive window gets about 2 KiB segments, about 61% payload
   (derived from the kernel source, not measured). A piece that does not go in
   whole holds its slots until the socket takes the rest, as an ungated piece
   does. To a reader that drains, that is until it has read enough for the
-  socket to take the rest; to a stalled peer, until `settle_limit`.
+  socket to take the rest; to a stalled peer, until the socket takes the
+  rest or `settle_limit` expires. In Experiment E, 2,480 of 2,520 such TLS
+  pieces were taken before `settle_limit`.
 - The wait for room is bounded by `settle_limit`, and a socket that stays
   unwritable that long is aborted. The gate opens again once the reader has
   taken about one piece, so a reader is aborted when it takes less than about
@@ -1103,13 +1107,42 @@ These are untested, and each is a limit of the specification as written:
   it is about two thirds full, about six 128 KiB pieces at 1 MiB, so about 85
   stalled peers would hold the default 512 entries (derived, not measured),
   and other connections' guarded batches would then be refused;
-- TLS replies in pieces;
 - a network between server and client, where `sk_sndbuf` starts near 85 KiB
   and grows with the congestion window, so a piece can be partly sent early
   in a connection;
 - mio under load: `writable` is tested on mio but did not run on the rack;
 - small replies to a peer that pipelines and stops reading, which still hold
   their slots until `settle_limit` (Non-goals).
+
+TLS replies in pieces ran in Experiment E
+(`docs/journal/2026-11-send-admission-e.md`), on loopback and kernel 6.12.
+With 512 slots of 16 KiB, under strict order, gated pieces of 64 KiB and
+128 KiB passed Experiment D's decision rule over TLS. Outside the rule's
+cells, in W4 with a 256 KiB send buffer and 128 stalled peers, 128 KiB
+pieces were partly sent to stalled peers and held the pool (fast small p99
+929 ms), while plaintext 128 KiB pieces were not; why is not known. A piece
+counts as partly sent when a send of it came back short
+(`SendCompletion::waited_for_room`). 85 KiB pieces, a third of that buffer,
+passed the three cells they ran in. A piece of a third of the send buffer, at
+most 128 KiB, passed in every cell E ran it in: at 85 KiB with 512 slots of
+16 KiB, and at 128 KiB with that pool and with 128 slots of 64 KiB. With 512
+slots, pieces of 16, 32 and 64 KiB passed every rule cell over both
+transports, at more CPU per byte the smaller they were (2.77 times whole
+replies over plaintext and 2.23 over TLS at 16 KiB).
+
+In W2, with six slow readers, a pool of 128 slots failed (fast small p99
+about 445 ms) with 16 KiB and with 64 KiB slots, and a pool of 512 slots
+passed with either. A small reply needs one free slot to be admitted over
+plaintext and two over TLS (records plus one), and once sent holds one slot
+on either transport, whatever the slot's size. A slow reader keeps up to
+the benchmark server's pipeline depth (16) of admitted, unsettled replies.
+The server's per-class held-slot samples count them at that depth with 512
+slots and gated pieces (96 over plaintext, 192 over TLS at two per reply),
+but they count a reply from admission until its task sees it settle, and
+over TLS count the two free slots admission requires where a sent reply
+holds one, so they over-count.
+With 128 slots the TLS samples (about 170) exceed the pool. Why 128 slots
+fail in W2 is not known over either transport.
 
 #### Decisions
 
