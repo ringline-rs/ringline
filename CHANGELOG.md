@@ -35,20 +35,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   many slab entries is refused. A zero-copy send holds its entry until the
   peer has acknowledged the bytes, so before this cap peers that stopped
   reading could take every entry, and every zero-copy send on the worker
-  failed. With the defaults, as few as 17 such peers can fill the 512
-  entries. `submit_batch_admitted` returns the parts with `WouldBlock`, so
+  failed. The cap does not prevent a full slab: with the defaults, 17
+  connections whose peers do not read can still fill the 512 entries.
+  `submit_batch_admitted` returns the parts with `WouldBlock`, so
   the caller can send their bytes as a copy; `submit_batch`, `build` and a
   send chain fail with `Other` and drop the guards. Entries of coalesced copy
   sends and of `forward_recv_buf` count toward the cap; `forward_recv_buf`
   itself is not refused at it, and `forward_to_conn` copies a chunk whose
   sink is at the cap. A connection that sends many guarded batches now has
-  the ones past the cap refused once the slab is over half used, including
-  by that connection alone. `SendHalf::zero_copy_capped` and
+  the ones past the cap refused once the slab is over half used, even when
+  that connection's own entries are what put it over half used.
+  `SendHalf::zero_copy_capped` and
   `Connection::zero_copy_capped` report whether a guarded send would be
   refused now, so a caller of `submit_batch` or `build` can copy instead.
   ringline-redis's and ringline-memcache's guarded sets and `Client::flush`
-  do: at the cap they send the bytes as one copy send. `usize::MAX` turns the
-  cap off.
+  do: at the cap they send the bytes as one copy send. The guarded sets wait
+  for send-pool capacity; `flush` fails with `Other` when the pool cannot take
+  the copy now, or `InvalidInput` when it is wider than the whole pool.
+  `usize::MAX` turns the cap off.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been
   handed to the kernel, without taking a send-pool slot. A server that sends

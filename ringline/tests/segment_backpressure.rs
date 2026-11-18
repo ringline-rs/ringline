@@ -15,13 +15,13 @@ use std::time::{Duration, Instant};
 
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
 
-/// The first byte picks the mode: `N` never reads again, `R` echoes each
-/// buffer with `forward_recv_buf`, `T` echoes with `forward_to_conn`, and
-/// anything else echoes through `with_data`.
 /// Forwards in mode `T` that failed because the sink was at
 /// `zero_copy_hold_cap`.
 static FORWARD_TO_CAP_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
+/// The first byte picks the mode: `N` never reads again, `R` echoes each
+/// buffer with `forward_recv_buf`, `T` echoes with `forward_to_conn`, and
+/// anything else echoes through `with_data`.
 struct Modes;
 
 impl AsyncEventHandler for Modes {

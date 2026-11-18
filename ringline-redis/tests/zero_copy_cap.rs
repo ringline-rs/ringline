@@ -115,15 +115,15 @@ fn stub(listener: TcpListener) {
 /// The client runtime's slab has four entries and `zero_copy_hold_cap` is 1.
 /// The stub's receive buffer is smaller than a value and it does not read
 /// until every SET is flushed, so the first zero-copy batches stay
-/// unacknowledged and hold their entries; with three held the slab is over half used and the
-/// connection is at the cap. The later flushes are copied, and every SET is
-/// answered.
+/// unacknowledged and hold their entries; with three held the slab is over
+/// half used and the connection is at the cap. The later flushes are copied,
+/// and every SET is answered.
 #[test]
 fn guarded_sets_at_the_zero_copy_cap_are_copied() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    // Above loopback's MSS (about 64 KiB): a smaller buffer cannot open its
-    // window by a whole segment, and the sender then waits on its probe
-    // timer once the stub reads.
+    // With a 4 KiB buffer the test hung once the stub read, with the cap on
+    // or off; 256 KiB, above loopback's MSS of about 64 KiB, does not. The
+    // cause is not measured.
     let rcvbuf: libc::c_int = 256 << 10;
     // SAFETY: setsockopt on a descriptor the listener owns.
     let set = unsafe {

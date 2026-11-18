@@ -204,13 +204,13 @@ async fn pass_and_panic(conn: &mut Connection) {
 /// A send's error kind and message, or `None` if it was accepted.
 type SendError = Option<(io::ErrorKind, String)>;
 
-/// The outcomes of the over-cap scenario's sends that are not a
-/// `submit_batch_admitted`.
 /// `zero_copy_capped` on the over-cap scenario's connection once it holds its
 /// three entries.
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 static OVER_CAP_CAPPED: Mutex<Option<bool>> = Mutex::new(None);
 
+/// The outcomes of the over-cap scenario's sends that are not a
+/// `submit_batch_admitted`.
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 static OVER_CAP_ERRORS: Mutex<Vec<(u8, SendError)>> = Mutex::new(Vec::new());
 
@@ -740,7 +740,8 @@ fn a_full_slab_refuses_a_batch_with_its_parts() {
 }
 
 /// Runs the over-cap scenario with a four-entry slab and `cap`, and returns
-/// the admitted batch's outcome and the plain batch's and the chain's errors.
+/// the admitted batch's outcome and the plain batch's, the chain's and the
+/// gathered batch's errors.
 #[cfg(has_io_uring)]
 fn run_over_cap(cap: usize) -> (Outcome, SendError, SendError, SendError) {
     OVER_CAP_ERRORS.lock().unwrap().clear();

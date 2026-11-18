@@ -2660,7 +2660,9 @@ impl RecvHalf {
     /// the sink holds
     /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap) send
     /// slab entries and the slab is over half used, the chunk is copied into
-    /// the send pool instead. One send is in flight at a time, and the source receives the next chunk
+    /// the send pool instead; without free slots for it the forward resolves
+    /// `Other` and the chunk stays buffered on the source. One send is in
+    /// flight at a time, and the source receives the next chunk
     /// while it is. Because the sends go through the sink's queue, they are
     /// ordered with other sends on the sink. A send the runtime cannot submit,
     /// for example with the worker's send slab
@@ -3423,14 +3425,15 @@ impl SendHalf {
         self.conn.send_parts()
     }
 
-    /// Whether a guarded send on this connection would be refused now at
+    /// Whether a guarded send at or above `send_zc_threshold` on this
+    /// connection would be refused now at
     /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap): the
     /// connection holds that many send slab entries and the worker's slab is
     /// over half used. A caller that cannot get its parts back from a refusal
-    /// (`submit_batch`, `build`) checks this first and sends the bytes as a
-    /// copy instead. False on a TLS connection, whose guarded sends are copied
-    /// and take no entry, on a closed connection, and on mio, which has no
-    /// send slab.
+    /// (`submit_batch`, `build`, `send_chain`) checks this first and sends the
+    /// bytes as a copy instead. False on a TLS connection, whose guarded sends
+    /// are copied and are not refused at the cap, on a closed connection, and
+    /// on mio, which has no send slab.
     pub fn zero_copy_capped(&self) -> bool {
         self.conn.zero_copy_capped()
     }

@@ -735,6 +735,13 @@ impl Client {
     /// Called automatically by [`recv()`](Self::recv). Call explicitly if you
     /// need commands to hit the wire before reading responses (e.g., when
     /// interleaving fire/recv across multiple clients).
+    ///
+    /// A batch with guarded values is sent zero-copy, unless the connection is
+    /// at ringline's `zero_copy_hold_cap` (`SendHalf::zero_copy_capped`): then
+    /// the whole batch, values included, is copied into one buffer and sent
+    /// with `send`. That copy fails with `Other` when the send pool cannot take
+    /// it now, or `InvalidInput` when it is wider than the whole pool, and the
+    /// batch's commands are discarded as for any failed flush.
     pub fn flush(&mut self) -> Result<(), Error> {
         if self.write_buf.is_empty() && self.write_guards.is_empty() {
             self.buffered_ops = 0;
@@ -926,6 +933,8 @@ impl Client {
     ///
     /// The guard value is kept alive and sent zero-copy at flush time via
     /// scatter-gather I/O. The command prefix/suffix are buffered as copy data.
+    /// If the connection is at ringline's `zero_copy_hold_cap` when the batch
+    /// is flushed, the value is copied instead (see [`flush`](Self::flush)).
     pub fn fire_set_with_guard<G: SendGuard>(
         &mut self,
         key: &[u8],
@@ -1584,7 +1593,9 @@ impl Client {
     // -- Zero-copy SET -------------------------------------------------------
 
     /// SET with zero-copy value via SendGuard. The guard pins value memory
-    /// until the kernel completes the send.
+    /// until the kernel completes the send. If the connection is at ringline's
+    /// `zero_copy_hold_cap`, the value is copied and the send waits for
+    /// send-pool capacity.
     pub async fn set_with_guard<G: SendGuard>(
         &mut self,
         key: &[u8],
@@ -1604,7 +1615,7 @@ impl Client {
             )?;
 
             let prefix: &[u8] = &self.encode_buf;
-            send_guarded(&mut self.tx, prefix, GuardBox::new(guard), b"\r\n")?;
+            send_guarded(&mut self.tx, prefix, GuardBox::new(guard), b"\r\n").await?;
 
             let response = self.read_response().await?;
             check_error_bytes(&response)?;
@@ -1628,7 +1639,7 @@ impl Client {
         let start = Instant::now();
 
         let prefix: &[u8] = &self.encode_buf;
-        let sent = send_guarded(&mut self.tx, prefix, GuardBox::new(guard), b"\r\n");
+        let sent = send_guarded(&mut self.tx, prefix, GuardBox::new(guard), b"\r\n").await;
 
         // A send error is recorded too, with nothing read.
         let (response, rx_bytes, arrival) = match sent.map(drop) {
@@ -2244,10 +2255,11 @@ fn arrival_ns(arrival: Option<&RecvArrival>, start: Option<Instant>) -> (Option<
 }
 
 /// Send `prefix`, the guard's bytes and `suffix` as one request: zero-copy,
-/// or as one copy send when the connection is at ringline's
-/// `zero_copy_hold_cap`, where `build` would refuse the guarded send and drop
-/// the guard.
-fn send_guarded(
+/// or, when the connection is at ringline's `zero_copy_hold_cap` (where
+/// `build` would refuse the guarded send and drop the guard), as one copy
+/// that waits for send-pool capacity (`send_admitted`). A copy wider than the
+/// whole pool is refused with `InvalidInput`.
+async fn send_guarded(
     tx: &mut SendHalf,
     prefix: &[u8],
     guard: GuardBox,
@@ -2262,7 +2274,7 @@ fn send_guarded(
         copy.extend_from_slice(value);
         copy.extend_from_slice(suffix);
         drop(guard);
-        return tx.send(&copy);
+        return tx.send_admitted(&copy).await;
     }
     tx.send_parts()
         .build(move |b| b.copy(prefix).guard(guard).copy(suffix).submit())
