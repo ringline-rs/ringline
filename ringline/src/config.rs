@@ -189,6 +189,10 @@ pub struct Config {
     /// How much a connection may have queued before a forward stops reading
     /// from it. See `ConfigBuilder::forward_hold_cap`.
     pub(crate) forward_hold_cap: usize,
+    /// How many send slab entries a connection may hold before its zero-copy
+    /// batches are refused, once the slab is over half used. See
+    /// `ConfigBuilder::zero_copy_hold_cap`.
+    pub(crate) zero_copy_hold_cap: usize,
     /// Fault the send copy pool's pages in at worker startup instead of on
     /// first use. See `ConfigBuilder::prefault_buffers`.
     pub(crate) prefault_buffers: bool,
@@ -242,7 +246,9 @@ pub struct Config {
     /// than one slot or a TLS send's ciphertext, is sent as one `sendmsg`
     /// and holds one until that CQE; with the slab full those slots go out
     /// one per CQE instead. Guard sends fail with `Other("send slab
-    /// exhausted")` while it is full. Default: 512.
+    /// exhausted")` while it is full, and a connection's zero-copy sends are
+    /// refused at `zero_copy_hold_cap` while it is over half used. Default:
+    /// 512.
     pub(crate) send_slab_slots: u16,
     /// The order in which each worker's admission FIFO admits bounded sends;
     /// see [`ConfigBuilder::send_admission_order`]. Default: `Budget` with
@@ -519,6 +525,7 @@ impl Default for Config {
             defer_recv_arm: false,
             recv_direct_pool_max: 16 << 20,
             forward_hold_cap: 64,
+            zero_copy_hold_cap: 16,
             // Off by default while the trade is being measured: prefaulting
             // converts a latent memory cost into an immediate one, which is
             // the intent but is also a behaviour change for anything that
@@ -698,6 +705,13 @@ impl Config {
         if self.forward_hold_cap == 0 {
             return Err(crate::error::Error::RingSetup(
                 "forward_hold_cap must be >= 1".into(),
+            ));
+        }
+        // A cap of 0 would refuse every zero-copy batch once the slab is over
+        // half used, including a connection's first.
+        if self.zero_copy_hold_cap == 0 {
+            return Err(crate::error::Error::RingSetup(
+                "zero_copy_hold_cap must be >= 1".into(),
             ));
         }
         // A close pushes its lead (a shutdown or a cancel) and the Close as
@@ -1293,6 +1307,44 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set how many send slab entries a connection may hold before its
+    /// zero-copy sends are refused, once the slab is over half used.
+    ///
+    /// On io_uring a zero-copy send ([`send_parts`](crate::SendHalf::send_parts)
+    /// with a guard, at or above `send_zc_threshold`) holds a slab entry until
+    /// the kernel's notification arrives, which is after the peer has
+    /// acknowledged the bytes; its [`SendCompletion`](crate::SendCompletion)
+    /// settles earlier. A guarded send on a Unix-domain connection holds an
+    /// entry until its send completes. A peer that stops reading keeps every
+    /// entry its connection holds. Once more than half the slab is in use, a
+    /// guarded send on a connection that holds `cap` entries is refused:
+    /// [`submit_batch_admitted`](crate::AsyncSendBuilder::submit_batch_admitted)
+    /// returns its parts with `WouldBlock`, as for a full slab, and the caller
+    /// can send their bytes with a copy send. `submit_batch`, `build` and a
+    /// send chain return `Other` and drop the guards. The check counts the
+    /// connection's own entries, so one connection alone is refused once it
+    /// holds more than half the slab. Entries of every kind count, including
+    /// those of coalesced copy sends and of
+    /// [`forward_recv_buf`](crate::SendHalf::forward_recv_buf), which is not
+    /// refused at this cap and is bounded by `forward_hold_cap` instead. A
+    /// [`forward_to_conn`](crate::RecvHalf::forward_to_conn) whose sink is at
+    /// the cap copies its chunk into the send pool. A batch below
+    /// `send_zc_threshold` that is copied into one pool slot takes no entry
+    /// and is not refused.
+    ///
+    /// The cap applies only over half used, so one connection can take half
+    /// the slab and each later one `cap` entries: as few as `1 +
+    /// (send_slab_slots / 2) / cap` connections whose peers do not read can
+    /// fill it (17 with the defaults). After that, a guarded send on any
+    /// connection is refused because the slab is full. `usize::MAX` turns the
+    /// cap off. On mio, which has no send slab, the cap has no effect.
+    ///
+    /// Default: 16.
+    pub fn zero_copy_hold_cap(mut self, cap: usize) -> Self {
+        self.config.zero_copy_hold_cap = cap;
+        self
+    }
+
     /// Set the number and size of copy-send pool slots.
     ///
     /// Default: 1024 slots of 16448 bytes. One slot is consumed per chunk of a
@@ -1765,6 +1817,15 @@ mod tests {
     #[test]
     fn validate_send_slab_slots_zero_rejected() {
         assert!(config_with(|c| c.send_slab_slots = 0).validate().is_err());
+    }
+
+    #[test]
+    fn validate_zero_copy_hold_cap_zero_rejected() {
+        assert!(
+            config_with(|c| c.zero_copy_hold_cap = 0)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

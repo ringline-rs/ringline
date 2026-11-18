@@ -413,6 +413,13 @@ impl InFlightSendSlab {
         self.free_list.len() * 2 < self.entries.len()
     }
 
+    /// Whether a zero-copy send on the connection is refused: more than half
+    /// the entries are in use and the connection holds at least `cap`
+    /// (`ConfigBuilder::zero_copy_hold_cap`).
+    pub fn zero_copy_over_cap(&self, conn_index: u32, generation: u32, cap: usize) -> bool {
+        self.over_half_used() && self.held_by(conn_index, generation) >= cap
+    }
+
     /// Get the total original send length for an entry.
     pub fn total_len(&self, idx: u16) -> u32 {
         self.entries[idx as usize].total_len

@@ -1106,7 +1106,13 @@ These are untested, and each is a limit of the specification as written:
   and a send-slab entry each: a stalled peer's socket takes gated pieces until
   it is about two thirds full, about six 128 KiB pieces at 1 MiB, so about 85
   stalled peers would hold the default 512 entries (derived, not measured),
-  and other connections' guarded batches would then be refused;
+  and other connections' guarded batches would then be refused.
+  `ConfigBuilder::zero_copy_hold_cap` (default 16) does not bind here, since
+  each such peer holds about six entries. It limits a connection that keeps
+  taking entries: once the slab is over half used, a connection that holds
+  16 has its guarded sends refused, and `submit_batch_admitted` returns the
+  parts so the caller can copy them. With the defaults, as few as 17 such
+  connections can fill the slab;
 - a network between server and client, where `sk_sndbuf` starts near 85 KiB
   and grows with the congestion window, so a piece can be partly sent early
   in a connection;

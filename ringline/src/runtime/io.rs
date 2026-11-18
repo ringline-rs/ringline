@@ -1258,6 +1258,7 @@ impl ConnCtx {
                     let result = driver
                         .make_ctx()
                         .send_parts(token)
+                        .without_zero_copy_cap()
                         .guard(crate::guard::GuardBox::new(AccumulatorGuard(frozen)))
                         .submit_awaited(id);
                     if let Err(e) = result {
@@ -1391,6 +1392,23 @@ impl ConnCtx {
             _borrow: PhantomData,
             _not_send: PhantomData,
         }
+    }
+
+    /// See [`SendHalf::zero_copy_capped`].
+    #[cfg(has_io_uring)]
+    pub(crate) fn zero_copy_capped(&self) -> bool {
+        with_state(|driver, _| {
+            driver.connections.generation(self.conn_index) == self.generation
+                && !driver
+                    .tls_table
+                    .as_ref()
+                    .is_some_and(|t| t.has(self.conn_index))
+                && driver.send_slab.zero_copy_over_cap(
+                    self.conn_index,
+                    self.generation,
+                    driver.zero_copy_hold_cap,
+                )
+        })
     }
 
     /// See [`SendHalf::send_parts`].
@@ -1801,6 +1819,10 @@ impl AsyncSendBuilder {
     /// call never consumes a prefix. Callers wanting larger batches should
     /// split them (ringline-redis flushes at 8 guards or 17 iovecs). A batch
     /// that is empty or carries no bytes is rejected with `InvalidInput`.
+    /// A batch that needs a send slab entry is rejected with `Other` when the
+    /// slab is full, or when the connection holds
+    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap)
+    /// entries while the slab is over half used.
     ///
     /// Awaiting the future parks the task until the kernel signals the send,
     /// which returns control to the event loop so completions are reaped and
@@ -1930,6 +1952,11 @@ pub struct AsyncSendBuilder {
 
 #[cfg(not(has_io_uring))]
 impl ConnCtx {
+    /// See [`SendHalf::zero_copy_capped`]: mio has no send slab.
+    pub(crate) fn zero_copy_capped(&self) -> bool {
+        false
+    }
+
     /// See [`SendHalf::send_parts`].
     pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
         AsyncSendBuilder {
@@ -2629,8 +2656,14 @@ impl RecvHalf {
     /// source's decrypted plaintext lands there too. The forward takes the
     /// bytes the accumulator holds, up to what is left of `len`, and sends
     /// them on the sink through the sink's send queue under a guard: zero-copy
-    /// at or above `send_zc_threshold`, copied into a pool slot below it. One
-    /// send is in flight at a time, and the source receives the next chunk
+    /// at or above `send_zc_threshold`, copied into a pool slot below it. While
+    /// the sink holds
+    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap) send
+    /// slab entries and the slab is over half used, the chunk is copied into
+    /// the send pool instead: the forward resolves `Other` when the pool has
+    /// no free slots for it now, or `InvalidInput` when the chunk is wider than
+    /// the whole pool, and the chunk stays buffered on the source. One send is in
+    /// flight at a time, and the source receives the next chunk
     /// while it is. Because the sends go through the sink's queue, they are
     /// ordered with other sends on the sink. A send the runtime cannot submit,
     /// for example with the worker's send slab
@@ -3046,6 +3079,11 @@ impl Connection {
         self.tx.send_parts()
     }
 
+    /// See [`SendHalf::zero_copy_capped`].
+    pub fn zero_copy_capped(&self) -> bool {
+        self.tx.zero_copy_capped()
+    }
+
     /// See [`SendHalf::send_backpressured`].
     pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSend<'a> {
         self.tx.send_backpressured(data)
@@ -3377,12 +3415,29 @@ impl SendHalf {
     /// included, into one pool slot and sent as a plain send when a slot is
     /// free and the gather fits it; otherwise, and at or above the
     /// threshold, it goes out zero-copy through the send slab. `Other` when
-    /// the pool, or for a zero-copy batch the send slab, has no free entry;
-    /// `NotConnected` as for [`send`](Self::send). A TLS batch is gathered,
+    /// the pool, or for a zero-copy batch the send slab, has no free entry, or
+    /// when the connection holds
+    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap)
+    /// entries while the slab is over half used; `NotConnected` as for
+    /// [`send`](Self::send). A TLS batch is gathered,
     /// encrypted into as many slots as its ciphertext needs, and queued in
     /// order, sent as one run when the send slab has a free entry.
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.conn.send_parts()
+    }
+
+    /// Whether a guarded send on this connection that would take a send slab
+    /// entry (at or above `send_zc_threshold`, or below it when no pool slot
+    /// can take the gather) would be refused now at
+    /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap): the
+    /// connection holds that many send slab entries and the worker's slab is
+    /// over half used. A caller that cannot get its parts back from a refusal
+    /// (`submit_batch`, `build`, `send_chain`) checks this first and sends the
+    /// bytes as a copy instead. False on a TLS connection, whose guarded sends
+    /// are copied and are not refused at the cap, on a closed connection, and
+    /// on mio, which has no send slab.
+    pub fn zero_copy_capped(&self) -> bool {
+        self.conn.zero_copy_capped()
     }
 
     /// Send `data`, waiting for send-pool capacity instead of failing when
@@ -4102,11 +4157,18 @@ impl DirectForward {
                 driver.accumulators.note_consumed(source, take);
                 let id = executor.register_send(self.sink_index);
                 let token = ConnId::new(self.sink_index, self.sink_generation);
-                let submitted = driver
-                    .make_ctx()
-                    .send_parts(token)
-                    .guard(crate::guard::GuardBox::new(AccumulatorGuard(chunk.clone())))
-                    .submit_awaited(id);
+                let submitted = {
+                    let mut ctx = driver.make_ctx();
+                    // At `zero_copy_hold_cap` a guarded send is refused, so the
+                    // chunk is copied into the send pool instead.
+                    if ctx.zero_copy_over_cap(token) {
+                        ctx.send_awaited(token, &chunk, id)
+                    } else {
+                        ctx.send_parts(token)
+                            .guard(crate::guard::GuardBox::new(AccumulatorGuard(chunk.clone())))
+                            .submit_awaited(id)
+                    }
+                };
                 match submitted {
                     Ok(()) => DirectStep::Sent(
                         SendCompletion::pending(self.sink_index, self.sink_generation, id),
@@ -4998,7 +5060,10 @@ pub type BatchAdmitted<'a> = Result<(usize, SendCompletion), BatchRefused<'a>>;
 ///   `send_admitted` does.
 ///
 /// The send-slab entry a zero-copy batch needs is not part of admission:
-/// the batch takes it once admitted, and a full slab refuses the batch.
+/// the batch takes it once admitted. A full slab refuses the batch, and so
+/// does a connection that holds
+/// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap) entries
+/// while the slab is over half used.
 /// Releasing a slab entry wakes nothing, and `writable` waits for socket
 /// room, not for a slab entry: after a slab refusal, a caller copies the
 /// parts' bytes or aborts.
@@ -5014,8 +5079,9 @@ pub type BatchAdmitted<'a> = Result<(usize, SendCompletion), BatchRefused<'a>>;
 /// - On a plaintext io_uring connection also, with `InvalidInput`: more than
 ///   32 parts or 8 guards, more than `u32::MAX` bytes, copy parts over one
 ///   slot, and a guard outside its registered region, checked whatever the
-///   batch's size. A full send slab is refused with `WouldBlock` ("send
-///   slab exhausted") once the batch is admitted.
+///   batch's size. Once the batch is admitted, a full send slab is refused
+///   with `WouldBlock` ("send slab exhausted"), and so is a connection at
+///   `zero_copy_hold_cap` while the slab is over half used.
 ///
 /// Pool exhaustion is not a refusal: the batch waits.
 ///
