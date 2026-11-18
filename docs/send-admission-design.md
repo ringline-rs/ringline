@@ -1116,20 +1116,27 @@ These are untested, and each is a limit of the specification as written:
 
 TLS replies in pieces ran in Experiment E
 (`docs/journal/2026-11-send-admission-e.md`), on loopback and kernel 6.12.
-Under strict order, gated pieces of 64 KiB and 128 KiB passed Experiment D's
-decision rule over TLS. Outside the rule's cells, in W4 with a 256 KiB send
-buffer and 128 stalled peers, 128 KiB pieces were partly sent to stalled
-peers and held the pool (fast small p99 929 ms), while plaintext 128 KiB
-pieces were not; why is not known. A piece counts as partly sent when a send
-of it came back short (`SendCompletion::waited_for_room`). 85 KiB pieces, a third of that buffer,
+With 512 slots of 16 KiB, under strict order, gated pieces of 64 KiB and
+128 KiB passed Experiment D's decision rule over TLS. Outside the rule's
+cells, in W4 with a 256 KiB send buffer and 128 stalled peers, 128 KiB
+pieces were partly sent to stalled peers and held the pool (fast small p99
+929 ms), while plaintext 128 KiB pieces were not; why is not known. A piece
+counts as partly sent when a send of it came back short
+(`SendCompletion::waited_for_room`). 85 KiB pieces, a third of that buffer,
 passed the three cells they ran in. A piece of a third of the send buffer, at
-most 128 KiB, passed in every cell E ran. With 512 slots, pieces of 16, 32
-and 64 KiB passed every rule cell over both transports, at more CPU per byte
-the smaller they were (2.77 times whole replies over plaintext and 2.23 over
-TLS at 16 KiB). In W2, with six slow readers, a pool of 128 slots failed
-(fast small p99 about 445 ms) with 16 KiB and with 64 KiB slots, and a pool
-of 512 slots passed with either: a reply smaller than a slot takes a whole
-slot, so the slot count bounds how many small replies can wait.
+most 128 KiB, passed in every cell E ran it in, all with 512 slots. With 512
+slots, pieces of 16, 32 and 64 KiB passed every rule cell over both
+transports, at more CPU per byte the smaller they were (2.77 times whole
+replies over plaintext and 2.23 over TLS at 16 KiB).
+
+In W2, with six slow readers, a pool of 128 slots failed (fast small p99
+about 445 ms) with 16 KiB and with 64 KiB slots, and a pool of 512 slots
+passed with either. A small reply occupies one slot whatever the slot's
+size, and a slow reader keeps up to the benchmark server's pipeline depth
+(16) of admitted, unsettled replies, so the slots those replies take depend
+on the slot count, not the pool's bytes. No run counted the slots each
+connection held, and the 512-slot runs' peak use (106 to 141 slots) does
+not by itself explain why 128 slots fail for TLS 32 KiB pieces.
 
 #### Decisions
 

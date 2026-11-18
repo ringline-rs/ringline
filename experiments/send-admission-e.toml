@@ -10,10 +10,10 @@
 # capped at {tcp_wmem_max} B. net.core.rmem_max and wmem_max are raised to
 # {core_mem_max} B, so that an SO_RCVBUF the load sets takes effect.
 #
-# An arm is tls, order, budget, stream_piece, stream_gate and slot_size. A
-# cell is the rest of the parameters; the cells and arms, with their values,
-# are in send-admission-e-matrix.json. The defaults are W1, plaintext, strict
-# order, whole replies.
+# An arm is tls, order, budget, stream_piece, stream_gate, slot_size and
+# pool_slots. A cell is the rest of the parameters; the cells and arms, with
+# their values, are in send-admission-e-matrix.json. The defaults are W1,
+# plaintext, strict order, whole replies.
 #
 # Parameters, beyond send-admission-c0.toml's (see there for the rest):
 #   tls             on: the server serves TLS with a certificate it generates
