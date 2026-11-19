@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::handoff::{Sender, TrySendError};
 
@@ -44,6 +44,83 @@ impl StopSignal {
     }
 }
 
+/// The runtime's record of accepting, for `Runtime::stop_accepting`: whether
+/// it has begun, and per worker, how many connections have been placed in the
+/// worker's accept channel and how many the worker has taken from it and
+/// installed or closed.
+///
+/// A connection is counted as placed by the thread that sends it: an acceptor,
+/// or in merged accept mode the worker that accepted it and hands it to
+/// another. The receiving worker counts it after `install_accepted` (io_uring)
+/// or after the item's turn in `drain_channels` (mio).
+pub(crate) struct AcceptState {
+    /// Set by `Runtime::stop_accepting` before it raises the stop signal.
+    /// An acceptor checks it before each `accept`.
+    stopping: AtomicBool,
+    placed: Box<[PaddedCount]>,
+    handled: Box<[PaddedCount]>,
+}
+
+/// One counter on its own cache line: `placed` is written by the senders and
+/// `handled` by the worker.
+#[repr(align(128))]
+struct PaddedCount(AtomicU64);
+
+impl AcceptState {
+    pub(crate) fn new(workers: usize) -> Self {
+        let counts = || {
+            (0..workers)
+                .map(|_| PaddedCount(AtomicU64::new(0)))
+                .collect()
+        };
+        AcceptState {
+            stopping: AtomicBool::new(false),
+            placed: counts(),
+            handled: counts(),
+        }
+    }
+
+    /// How many workers this counts for.
+    pub(crate) fn workers(&self) -> usize {
+        self.placed.len()
+    }
+
+    pub(crate) fn begin_stopping(&self) {
+        self.stopping.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Count a connection placed in `worker`'s accept channel.
+    pub(crate) fn placed(&self, worker: usize) {
+        if let Some(count) = self.placed.get(worker) {
+            count.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Count a connection `worker` took from its accept channel and installed
+    /// or closed.
+    pub(crate) fn handled(&self, worker: usize) {
+        if let Some(count) = self.handled.get(worker) {
+            count.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn placed_count(&self, worker: usize) -> u64 {
+        self.placed
+            .get(worker)
+            .map_or(0, |count| count.0.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn handled_count(&self, worker: usize) -> u64 {
+        self.handled
+            .get(worker)
+            .map_or(0, |count| count.0.load(Ordering::Acquire))
+    }
+}
+
 /// Configuration for one acceptor thread.
 pub struct AcceptorConfig {
     /// The listener's socket. The acceptor's hold keeps it open while the
@@ -60,9 +137,13 @@ pub struct AcceptorConfig {
     pub worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     /// Shared flag set by `Runtime::shutdown` to signal the acceptor to stop.
     pub shutdown_flag: Arc<AtomicBool>,
-    /// Raised by `Runtime::shutdown` after it sets `shutdown_flag`; wakes the
+    /// Raised by `Runtime::shutdown` after it sets `shutdown_flag`, and by
+    /// `Runtime::stop_accepting` after it sets `accept.stopping`; wakes the
     /// acceptor from `poll`.
     pub(crate) stop: StopSignal,
+    /// Whether `Runtime::stop_accepting` has begun, and where this acceptor
+    /// counts each connection it places.
+    pub(crate) accept: Arc<AcceptState>,
     /// The runtime's listen gates. This acceptor waits on its gate before
     /// accepting. `ListenGates::open` calls `listen(2)`; until it runs, the
     /// socket is bound and not listening.
@@ -99,8 +180,8 @@ pub(crate) fn apply_accepted_sockopts(fd: RawFd, nodelay: bool) {
     }
 }
 
-/// Run one listener's acceptor loop, until shutdown, a fatal accept error, or
-/// every worker has exited.
+/// Run one listener's acceptor loop, until shutdown, `Runtime::stop_accepting`,
+/// a fatal accept error, or every worker has exited.
 ///
 /// Accepts connections with `accept_nonblock` until the listener has none,
 /// then waits in `poll` on the listener and the stop signal. Distributes the
@@ -139,7 +220,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
     let mut alive = vec![true; num_workers];
 
     loop {
-        if config.shutdown_flag.load(Ordering::Acquire) {
+        if config.shutdown_flag.load(Ordering::Acquire) || config.accept.is_stopping() {
             return;
         }
         let mut addr_len: libc::socklen_t =
@@ -152,7 +233,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
             let errno = err.raw_os_error().unwrap_or(0);
             // A shutdown that began during the `accept` may have made it fail
             // (`EINVAL` after `SHUT_RD`), and a retry would only fail again.
-            if config.shutdown_flag.load(Ordering::Acquire) {
+            if config.shutdown_flag.load(Ordering::Acquire) || config.accept.is_stopping() {
                 return;
             }
             // No connection queued: wait for one, or for the stop signal.
@@ -222,6 +303,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
             let accepted = pending.take().expect("connection not yet sent");
             match config.worker_channels[worker_idx].try_send(accepted) {
                 Ok(()) => {
+                    config.accept.placed(worker_idx);
                     config.worker_wake_handles[worker_idx].wake();
                     conn_count = conn_count.wrapping_add(1);
                     break;
@@ -246,7 +328,9 @@ pub fn run_acceptor(config: AcceptorConfig) {
 
         // Every live worker is backlogged. Hold this connection until one has
         // room: not calling `accept4` leaves the rest in the kernel's listen
-        // queue, whose overflow the peer's TCP retries.
+        // queue, whose overflow the peer's TCP retries. `stop_accepting` does
+        // not end the wait; it waits for this acceptor to place the
+        // connection.
         if let Some(accepted) = pending {
             crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_QUEUE_FULL);
             if !send_when_room(&config, &mut alive, accepted) {
@@ -336,6 +420,7 @@ fn send_when_room(config: &AcceptorConfig, alive: &mut [bool], accepted: Accepte
             }
             match tx.try_send(accepted) {
                 Ok(()) => {
+                    config.accept.placed(worker_idx);
                     config.worker_wake_handles[worker_idx].wake();
                     return true;
                 }
@@ -454,6 +539,7 @@ mod tests {
             tcp_nodelay: false,
             conn_chunk_size: 1,
             stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
 
         let handle = std::thread::spawn(move || run_acceptor(config));
@@ -516,6 +602,7 @@ mod tests {
             tcp_nodelay: false,
             conn_chunk_size: 1,
             stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
         (addr, sockets, gates, rx, config)
     }
@@ -587,6 +674,7 @@ mod tests {
             tcp_nodelay: false,
             conn_chunk_size: 1,
             stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
         let handle = std::thread::spawn(move || run_acceptor(config));
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -791,6 +879,7 @@ mod tests {
             tcp_nodelay: false,
             conn_chunk_size: 1,
             stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
         let stop = config.stop.clone();
         let handle = std::thread::spawn(move || run_acceptor(config));
@@ -838,6 +927,7 @@ mod tests {
             tcp_nodelay: false,
             conn_chunk_size: 1,
             stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
         let handle = std::thread::spawn(move || run_acceptor(config));
         std::thread::sleep(std::time::Duration::from_millis(30));

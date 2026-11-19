@@ -325,6 +325,20 @@ shutdown, when the acceptor thread or, in merged accept mode
 observe shutdown after draining a CQE batch and run backend shutdown drainage;
 Mio workers finish the current event/task/send/close cycle before returning.
 
+`Runtime::stop_accepting(timeout)` stops accepting without setting the
+shutdown flag. It sets the `stopping` flag in the runtime's `AcceptState`,
+releases the listen gates, raises the stop signal, and calls `SHUT_RD` on the
+merged-mode listeners. Each acceptor exits at its next check of the flag,
+after placing a connection it holds, and calls `SHUT_RD` on its listener
+unless it came from `bind_fd`. `stop_accepting` waits for the acceptor threads
+to exit, then reads, for each worker, the number of connections placed in its
+accept channel, and waits until the worker's count of connections taken from
+the channel and installed or closed reaches it. The senders (an acceptor, or a
+merged-mode worker handing a connection to another) count a placement after a
+successful `try_send`; the worker counts after `install_accepted` on io_uring
+and after each item of `drain_channels` on mio. The workers keep running
+tasks and I/O; `Runtime::shutdown` afterwards closes what they hold.
+
 Startup failures are returned from `launch`: workers acknowledge backend
 preparation before the listener exists, and a failed worker, listener bind, or
 acceptor spawn rolls back already-started workers. At runtime, task panics

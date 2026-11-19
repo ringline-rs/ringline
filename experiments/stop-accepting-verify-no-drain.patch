@@ -1,0 +1,13 @@
+diff --git a/ringline/src/worker.rs b/ringline/src/worker.rs
+index 6d35f5f4..14ca2e46 100644
+--- a/ringline/src/worker.rs
++++ b/ringline/src/worker.rs
+@@ -793,7 +793,7 @@ impl RuntimeShutdown {
+                 .iter()
+                 .enumerate()
+                 .any(|(w, &n)| !exited.contains(&w) && self.accept.handled_count(w) < n);
+-            if !pending {
++            if true || !pending {
+                 return Ok(());
+             }
+             if self.flag.load(Ordering::Acquire) {

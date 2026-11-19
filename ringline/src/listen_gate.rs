@@ -309,6 +309,15 @@ pub(crate) fn install(gates: Arc<ListenGates>) {
     GATES.with(|g| *g.borrow_mut() = Some(gates));
 }
 
+/// Whether this thread is a worker of the runtime that owns `gates`.
+pub(crate) fn is_worker_of(gates: &Arc<ListenGates>) -> bool {
+    GATES.with(|g| {
+        g.borrow()
+            .as_ref()
+            .is_some_and(|installed| Arc::ptr_eq(installed, gates))
+    })
+}
+
 fn with_gates<R>(f: impl FnOnce(&ListenGates) -> R) -> Option<R> {
     GATES.with(|g| g.borrow().as_ref().map(|gates| f(gates)))
 }

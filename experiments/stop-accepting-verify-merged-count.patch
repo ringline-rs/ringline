@@ -1,0 +1,17 @@
+diff --git a/ringline/src/backend/uring/event_loop.rs b/ringline/src/backend/uring/event_loop.rs
+index ec3775cf..0ab6f443 100644
+--- a/ringline/src/backend/uring/event_loop.rs
++++ b/ringline/src/backend/uring/event_loop.rs
+@@ -2830,11 +2830,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
+                         .driver
+                         .shutdown_flag
+                         .load(std::sync::atomic::Ordering::Acquire)
+-                        || self
+-                            .driver
+-                            .accept_state
+-                            .as_ref()
+-                            .is_some_and(|accept| accept.is_stopping());
++;
+                     if !requested {
+                         metrics::CONNECTIONS.increment(metrics::conn::ACCEPTOR_STOPPED);
+                     }

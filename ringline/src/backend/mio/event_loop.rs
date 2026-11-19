@@ -554,6 +554,110 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Install one connection from the accept channel: register it and
+    /// spawn its accept task, start its TLS handshake, or close it if the
+    /// connection table is full or registration fails.
+    fn install_accepted(&mut self, conn: crate::acceptor::AcceptedConn) {
+        let crate::acceptor::AcceptedConn {
+            fd,
+            listener,
+            peer: peer_addr,
+        } = conn;
+        let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
+
+        let conn_index = match self.driver.connections.allocate() {
+            Some(idx) => idx,
+            None => {
+                metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_TABLE_FULL);
+                unsafe {
+                    libc::close(raw_fd);
+                }
+                return;
+            }
+        };
+
+        // Set peer address.
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.peer_addr = Some(peer_addr);
+            cs.listener = Some(listener);
+        }
+
+        // Convert raw fd to mio TcpStream.
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
+        std_stream.set_nonblocking(true).ok();
+        if self.driver.tcp_nodelay {
+            std_stream.set_nodelay(true).ok();
+        }
+        let mut mio_stream = mio::net::TcpStream::from_std(std_stream);
+
+        // READABLE *and* WRITABLE, registered once and never modified
+        // afterwards. mio's epoll is edge-triggered, so a socket that is
+        // already writable fires one edge and then stays quiet — it does
+        // not spin. The outbound path (`handler.rs`) has always registered
+        // both; matching it here is what lets the per-send `epoll_ctl`
+        // toggling go away (ringline-rs/ringline#395).
+        let mio_token = mio::Token(conn_index as usize + 1);
+        if self
+            .driver
+            .poll
+            .registry()
+            .register(
+                &mut mio_stream,
+                mio_token,
+                crate::backend::mio::driver::STREAM_INTEREST,
+            )
+            .is_err()
+        {
+            metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_REGISTER_FAILED);
+            self.driver.connections.release(conn_index);
+            return;
+        }
+
+        let idx = conn_index as usize;
+        self.driver.tcp_streams[idx] = Some(mio_stream);
+        self.driver.accumulators.reset(conn_index);
+        self.driver.arrival[idx].clear();
+        // Defensive: a freshly allocated slot should have an empty send
+        // queue, but if anything survived, its awaited sends must be
+        // failed and its permits returned rather than dropped.
+        self.driver.clear_pending_sends(idx, || {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection slot reused by a new accept",
+            )
+        });
+        self.driver.writable[idx] = false;
+
+        // TLS path: defer accept until handshake completes in handle_readable.
+        if let Some(ref mut tls_table) = self.driver.tls_table
+            && tls_table.has_server_config_for(Some(listener))
+        {
+            if tls_table.create(conn_index, Some(listener)).is_err() {
+                self.driver.close_connection(conn_index);
+            } else {
+                let generation = self.driver.connections.generation(conn_index);
+                let driver = &mut self.driver;
+                driver
+                    .handshake_deadlines
+                    .arm(conn_index, generation, |i, g| {
+                        crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+                    });
+            }
+            return;
+        }
+
+        // Plaintext path: mark connection as established and spawn accept task.
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.established = true;
+        }
+
+        metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
+        metrics::CONNECTIONS_ACTIVE.increment();
+
+        // Spawn async accept task.
+        self.spawn_accept_task(conn_index);
+    }
+
     /// Drain all cross-thread channels: accept, resolve, spawn, blocking.
     ///
     /// Called unconditionally on every event loop iteration (not just on wake
@@ -580,107 +684,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Some(ref rx) => rx.try_recv().ok(),
                 None => None,
             };
-            let Some(crate::acceptor::AcceptedConn {
-                fd,
-                listener,
-                peer: peer_addr,
-            }) = item
-            else {
+            let Some(conn) = item else {
                 break;
             };
-            let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
-
-            let conn_index = match self.driver.connections.allocate() {
-                Some(idx) => idx,
-                None => {
-                    metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_TABLE_FULL);
-                    unsafe {
-                        libc::close(raw_fd);
-                    }
-                    continue;
-                }
-            };
-
-            // Set peer address.
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.peer_addr = Some(peer_addr);
-                cs.listener = Some(listener);
+            self.install_accepted(conn);
+            // After the install, so `Runtime::stop_accepting` returns only
+            // once the connection has a task or is closed.
+            if let Some(ref accept) = self.driver.accept_state {
+                accept.handled(self.driver.worker_index);
             }
-
-            // Convert raw fd to mio TcpStream.
-            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
-            std_stream.set_nonblocking(true).ok();
-            if self.driver.tcp_nodelay {
-                std_stream.set_nodelay(true).ok();
-            }
-            let mut mio_stream = mio::net::TcpStream::from_std(std_stream);
-
-            // READABLE *and* WRITABLE, registered once and never modified
-            // afterwards. mio's epoll is edge-triggered, so a socket that is
-            // already writable fires one edge and then stays quiet — it does
-            // not spin. The outbound path (`handler.rs`) has always registered
-            // both; matching it here is what lets the per-send `epoll_ctl`
-            // toggling go away (ringline-rs/ringline#395).
-            let mio_token = mio::Token(conn_index as usize + 1);
-            if self
-                .driver
-                .poll
-                .registry()
-                .register(
-                    &mut mio_stream,
-                    mio_token,
-                    crate::backend::mio::driver::STREAM_INTEREST,
-                )
-                .is_err()
-            {
-                metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_REGISTER_FAILED);
-                self.driver.connections.release(conn_index);
-                continue;
-            }
-
-            let idx = conn_index as usize;
-            self.driver.tcp_streams[idx] = Some(mio_stream);
-            self.driver.accumulators.reset(conn_index);
-            self.driver.arrival[idx].clear();
-            // Defensive: a freshly allocated slot should have an empty send
-            // queue, but if anything survived, its awaited sends must be
-            // failed and its permits returned rather than dropped.
-            self.driver.clear_pending_sends(idx, || {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "connection slot reused by a new accept",
-                )
-            });
-            self.driver.writable[idx] = false;
-
-            // TLS path: defer accept until handshake completes in handle_readable.
-            if let Some(ref mut tls_table) = self.driver.tls_table
-                && tls_table.has_server_config_for(Some(listener))
-            {
-                if tls_table.create(conn_index, Some(listener)).is_err() {
-                    self.driver.close_connection(conn_index);
-                } else {
-                    let generation = self.driver.connections.generation(conn_index);
-                    let driver = &mut self.driver;
-                    driver
-                        .handshake_deadlines
-                        .arm(conn_index, generation, |i, g| {
-                            crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
-                        });
-                }
-                continue;
-            }
-
-            // Plaintext path: mark connection as established and spawn accept task.
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.established = true;
-            }
-
-            metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
-            metrics::CONNECTIONS_ACTIVE.increment();
-
-            // Spawn async accept task.
-            self.spawn_accept_task(conn_index);
         }
 
         // Drain DNS resolve responses.
