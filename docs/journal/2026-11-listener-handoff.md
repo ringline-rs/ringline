@@ -289,10 +289,14 @@ from `ACCEPTOR_STOPPED`, and the skip of ended workers. The last runs on mio:
 in 01a1f539-3338-7100-a0a4-ce5c82d456fb (at ae3e118e) it passed on io_uring
 with the patch applied, because an io_uring worker drains its accept channel
 (the acceptor's wake is a completion) in the iteration that sees its
-shutdown request, before it checks the flag. There the ended-worker case
+shutdown request, before it checks for that request. There the ended-worker case
 needs a connection placed between the worker's last drain and the drop of
 its channel, which the test cannot arrange. Every other step of that run
-passed. In SystemsLab experiment
+passed. In 01a1f540-cc39-711e-a2f1-15c26812667b (Linux 6.12.116, at 8e5f7f43,
+the reviewed code) every step passed: the tests three times on io_uring,
+with `unstable-accept` and on mio, each of the four patches failed its test,
+and the full ringline suite with and without `unstable-accept`, fmt, clippy
+and doc passed (measured). In SystemsLab experiment
 01a1f52f-bbe6-7100-8c6c-669ac5076993 (Linux 6.12.116, io_uring, at 124b7bf3,
 before the review fixes and the fourth patch) every test passed three times,
 the merged-mode test passed, each of the first three patches failed its test,

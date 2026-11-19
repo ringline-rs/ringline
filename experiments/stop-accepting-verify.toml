@@ -1,10 +1,11 @@
 name = "stop_accepting verify on {image} ({ref})"
-# Verifies `Runtime::stop_accepting` on the io_uring backend
+# Verifies `Runtime::stop_accepting` on Linux, on the io_uring backend and mio
 # (docs/journal/2026-11-listener-handoff.md, PR 3):
 #   systemslab submit experiments/stop-accepting-verify.toml -p ref=<branch or sha>
 #
-# - green: tests/stop_accepting.rs passes three times, and with
-#   `unstable-accept` the merged-mode test runs too.
+# - green: tests/stop_accepting.rs passes three times, with
+#   `unstable-accept` (where the merged-mode test runs too), and once on mio
+#   (`force-mio`), where the ended-worker mutation runs.
 # - Each patch removes one part of the change, and the named test must fail:
 #   - stop-accepting-verify-no-drain.patch returns without waiting for the
 #     workers' handled counts:
@@ -18,8 +19,8 @@ name = "stop_accepting verify on {image} ({ref})"
 #   - stop-accepting-verify-no-done.patch waits for a worker whose thread has
 #     ended: `stop_accepting_does_not_wait_for_a_worker_that_ended`, on the
 #     mio backend (`force-mio`). An io_uring worker drains its accept channel
-#     in the iteration that sees the shutdown flag, so there the test leaves
-#     nothing in the channel of the worker that ended.
+#     in the iteration that sees its shutdown request, so there the test
+#     leaves nothing in the channel of the worker that ended.
 # Then the whole ringline suite, with and without `unstable-accept`, and the
 # io_uring lint and doc gates run.
 
