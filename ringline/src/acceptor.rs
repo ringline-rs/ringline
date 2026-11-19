@@ -15,7 +15,8 @@ pub struct AcceptedConn {
     pub peer: crate::connection::PeerAddr,
 }
 
-/// The runtime's signal to its acceptors that shutdown has begun.
+/// The runtime's signal to its acceptors to stop: raised by shutdown and by
+/// `Runtime::stop_accepting`.
 ///
 /// An fd from [`create_wake_fd`](crate::wakeup::create_wake_fd) that is
 /// written and never read, so once raised it stays readable. Every acceptor
@@ -59,6 +60,9 @@ pub(crate) struct AcceptState {
     stopping: AtomicBool,
     placed: Box<[PaddedCount]>,
     handled: Box<[PaddedCount]>,
+    /// Set when a worker thread ends, however it ends. Its accept channel is
+    /// gone, and what was left in it is closed.
+    done: Box<[AtomicBool]>,
 }
 
 /// One counter on its own cache line: `placed` is written by the senders and
@@ -77,6 +81,7 @@ impl AcceptState {
             stopping: AtomicBool::new(false),
             placed: counts(),
             handled: counts(),
+            done: (0..workers).map(|_| AtomicBool::new(false)).collect(),
         }
     }
 
@@ -106,6 +111,19 @@ impl AcceptState {
         if let Some(count) = self.handled.get(worker) {
             count.0.fetch_add(1, Ordering::Release);
         }
+    }
+
+    /// Record that `worker`'s thread has ended.
+    pub(crate) fn worker_done(&self, worker: usize) {
+        if let Some(done) = self.done.get(worker) {
+            done.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn is_done(&self, worker: usize) -> bool {
+        self.done
+            .get(worker)
+            .is_some_and(|done| done.load(Ordering::Acquire))
     }
 
     pub(crate) fn placed_count(&self, worker: usize) -> u64 {

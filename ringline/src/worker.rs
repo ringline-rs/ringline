@@ -433,36 +433,38 @@ impl Runtime {
     ///
     /// This is the first phase of a restart that hands a listening socket to
     /// the next process: after it returns, the workers keep polling tasks and
-    /// I/O and serving the connections they hold, and no new connection
-    /// reaches the handler. Call [`shutdown`](Self::shutdown) afterwards to
-    /// close what is left.
+    /// I/O and serve the connections they hold. Call
+    /// [`shutdown`](Self::shutdown) afterwards to close what is left.
     ///
     /// It closes every listen gate (a [`ListenHandle`](crate::ListenHandle)'s
     /// calls return an error from then on), signals every acceptor thread to
     /// stop, and waits for each to exit. An acceptor holding a connection no
     /// worker has room for waits until a worker takes it. Then it waits until
-    /// each worker that has not exited has taken every connection placed in
-    /// its accept channel and either spawned its accept task (`on_accept` has
-    /// been called) or closed it, because its connection table was full or,
-    /// on io_uring, registering the fd failed. On a TLS listener, `on_accept`
-    /// is called after the handshake, so it may not have been called yet.
+    /// each worker that is still running has taken every connection placed
+    /// in its accept channel and either spawned its accept task (`on_accept`
+    /// has been called) or closed it (connection table full, registration
+    /// failed, or TLS state creation failed). On a TLS listener, `on_accept`
+    /// is called after the handshake, so it may be called after this returns.
     ///
     /// A listener from [`RinglineBuilder::bind`],
     /// [`bind_unix`](RinglineBuilder::bind_unix) or
     /// [`bind_tls`](RinglineBuilder::bind_tls) is shut down with `SHUT_RD`
-    /// when its acceptor exits: on Linux the kernel resets the connections in
-    /// its backlog, and a new connection is refused. A listener from
+    /// when its acceptor exits: on Linux, for a TCP listener, the kernel
+    /// resets the connections in its backlog and refuses new ones. A listener
+    /// from
     /// [`RinglineBuilder::bind_fd`] keeps listening, and new connections wait
     /// in its backlog for another process that holds the socket.
     ///
     /// With the `unstable-accept` feature in `AcceptMode::Merged`, the
     /// workers' listeners are shut down with `SHUT_RD`, and a connection a
-    /// worker accepted just before may reach another worker after this
-    /// returns.
+    /// worker accepted before the `SHUT_RD` may reach `on_accept`, on that
+    /// worker or another, after this returns.
     ///
     /// Returns `Ok(())` at once if the runtime has shut down, and also if it
     /// shuts down during the wait. A second call repeats the wait, which
-    /// returns at once when nothing has been placed since.
+    /// returns at once when nothing has been placed since. A `timeout` too
+    /// long to add to the current time, such as `Duration::MAX`, waits
+    /// without a deadline.
     ///
     /// # Errors
     ///
@@ -567,6 +569,16 @@ pub(crate) struct RuntimeShutdown {
     /// it, so two changes cannot attach out of order.
     #[cfg(target_os = "linux")]
     steering: std::sync::Mutex<()>,
+}
+
+/// Records in `AcceptState` that a worker thread has ended when dropped, so
+/// `stop_accepting` does not wait for a channel nobody drains.
+struct WorkerDone(Arc<crate::acceptor::AcceptState>, usize);
+
+impl Drop for WorkerDone {
+    fn drop(&mut self) {
+        self.0.worker_done(self.1);
+    }
 }
 
 /// How often `stop_accepting` checks whether the acceptors have exited and
@@ -724,14 +736,14 @@ impl RuntimeShutdown {
                  accept channel",
             ));
         }
-        let deadline = Instant::now() + timeout;
+        // `None` when `timeout` is too long to add to now: no deadline.
+        let deadline = Instant::now().checked_add(timeout);
+        let expired = || deadline.is_some_and(|d| Instant::now() >= d);
         self.accept.begin_stopping();
         // After this no gate starts a socket listening, and an acceptor
         // parked on a gate that was never opened returns.
         self.listen_gates.shutdown();
-        // Before any `SHUT_RD` below: on a Unix-domain socket `SHUT_RD` makes
-        // `poll` report the listener readable while `accept` returns `EAGAIN`,
-        // and an acceptor that did not see the stop signal first would spin.
+        // Wakes an acceptor waiting in `poll`; it then sees `stopping`.
         self.stop.raise();
         // Merged listeners have no acceptor; their workers' multishot accepts
         // end on `SHUT_RD`. A connection a worker is handing to another as
@@ -769,7 +781,7 @@ impl RuntimeShutdown {
             if self.flag.load(Ordering::Acquire) {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            if expired() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "stop_accepting(): an acceptor did not exit in time",
@@ -788,18 +800,18 @@ impl RuntimeShutdown {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            // A worker that has exited closed what was left in its channel.
-            let pending = placed
-                .iter()
-                .enumerate()
-                .any(|(w, &n)| !exited.contains(&w) && self.accept.handled_count(w) < n);
+            // A worker that has stopped, or whose thread has ended, closed
+            // what was left in its channel.
+            let pending = placed.iter().enumerate().any(|(w, &n)| {
+                !exited.contains(&w) && !self.accept.is_done(w) && self.accept.handled_count(w) < n
+            });
             if !pending {
                 return Ok(());
             }
             if self.flag.load(Ordering::Acquire) {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            if expired() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "stop_accepting(): a worker did not take the connections in its accept \
@@ -2078,6 +2090,7 @@ impl RinglineBuilder {
             let worker_listen_gates = listen_gates.clone();
             let worker_fn = worker_fn.clone();
             let startup_tx = startup_tx.clone();
+            let worker_done = WorkerDone(Arc::clone(&runtime_shutdown.accept), worker_id);
 
             let (worker_resolve_rx, worker_resolve_tx, worker_resolver) =
                 if let Some(ref rxs) = resolve_rxs {
@@ -2115,6 +2128,8 @@ impl RinglineBuilder {
             let spawn_result = thread::Builder::new()
                 .name(format!("rl-work-{worker_id}"))
                 .spawn(move || {
+                    // Dropped when this thread ends, however it ends.
+                    let _worker_done = worker_done;
                     if config.worker.pin_to_core {
                         let core = pin_cpu;
                         // Report the failure before bailing — otherwise

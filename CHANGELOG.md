@@ -11,13 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `Runtime::stop_accepting(timeout)`: stops every listener accepting without
   shutting the workers down, and returns once each acceptor thread has exited
-  and each worker has taken the connections already placed in its accept
-  channel (spawned their accept tasks, or closed them when its connection
-  table was full). The workers keep serving their connections until
-  `Runtime::shutdown`. A listener from `bind_fd` keeps listening, so new
-  connections wait in its backlog for the next process; a listener from
-  `bind`, `bind_unix` or `bind_tls` is shut down with `SHUT_RD`. It returns
-  `TimedOut` if a worker does not take its connections within `timeout`, and
+  and each running worker has taken the connections already placed in its
+  accept channel (spawned their accept tasks, or closed them). The workers
+  keep serving their connections until `Runtime::shutdown`. A listener from
+  `bind_fd` keeps listening, so new connections wait in its backlog for the
+  next process; a listener from `bind`, `bind_unix` or `bind_tls` is shut
+  down with `SHUT_RD`. It returns `TimedOut` if an acceptor has not exited,
+  or a worker has not taken its connections, within `timeout`, and
   `Deadlock` on a worker thread. After it, `ListenHandle` calls return an
   error.
 - `RinglineBuilder::bind_fd`: a listener on a socket the caller made or

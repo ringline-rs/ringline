@@ -400,6 +400,73 @@ fn a_second_stop_accepting_returns_at_once() {
     join(&runtime, handles);
 }
 
+/// `Duration::MAX` waits without a deadline instead of overflowing.
+#[test]
+fn stop_accepting_with_the_longest_timeout_returns() {
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<Echo>()
+        .expect("launch");
+    runtime
+        .stop_accepting(Duration::MAX)
+        .expect("stop accepting");
+    join(&runtime, handles);
+}
+
+static ENDS_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The first connection's task asks its worker to stop, then blocks the
+/// worker thread for [`STALL`], so a connection accepted meanwhile is left in
+/// the channel of a worker that ends without draining it.
+struct EndsWorker;
+
+impl AsyncEventHandler for EndsWorker {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        let n = ENDS_ACCEPTED.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if n == 0 {
+                ringline::request_shutdown().expect("request shutdown");
+                std::thread::sleep(STALL);
+            }
+            drop(conn);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        EndsWorker
+    }
+}
+
+/// A worker that ended on its own, with a connection left in its channel,
+/// does not hold `stop_accepting` until the timeout.
+#[test]
+fn stop_accepting_does_not_wait_for_a_worker_that_ended() {
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<EndsWorker>()
+        .expect("launch");
+    let addr = runtime.bound_addr().expect("address");
+    let _first = connect(addr);
+    wait_for(&ENDS_ACCEPTED, 1);
+    let _second = connect(addr);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !handles.iter().all(|h| h.is_finished()) {
+        assert!(Instant::now() < deadline, "the worker did not end");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let start = Instant::now();
+    runtime
+        .stop_accepting(Duration::from_secs(2))
+        .expect("stop accepting");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "waited {:?} for a worker that had ended",
+        start.elapsed()
+    );
+    join(&runtime, handles);
+}
+
 /// After `shutdown`, `stop_accepting` returns `Ok` at once.
 #[test]
 fn stop_accepting_after_shutdown_returns_at_once() {
@@ -429,11 +496,16 @@ impl AsyncEventHandler for CallsStop {
             let runtime = WORKER_RUNTIME.lock().unwrap().clone();
             if let Some(runtime) = runtime {
                 let start = Instant::now();
-                let kind = match runtime.stop_accepting(Duration::from_secs(5)) {
+                let result = runtime.stop_accepting(Duration::from_secs(5));
+                let elapsed = start.elapsed();
+                // Before the result is stored: the test takes the runtime
+                // back once it sees the result.
+                drop(runtime);
+                let kind = match result {
                     Ok(()) => std::io::ErrorKind::Other,
                     Err(e) => e.kind(),
                 };
-                *WORKER_RESULT.lock().unwrap() = Some((kind, start.elapsed()));
+                *WORKER_RESULT.lock().unwrap() = Some((kind, elapsed));
             }
             drop(conn);
         }
