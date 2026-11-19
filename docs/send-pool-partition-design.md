@@ -94,21 +94,32 @@ Success, measured with the cache server's cells (below):
 ### 1. Sends wait by default
 
 Every send that takes pool slots is bounded unless the caller asks for one
-that does not wait.
+that does not wait. A send resolves once its bytes are copied into the pool,
+when the caller's buffer is free again; waiting for the bytes to reach the
+kernel is a separate call. tokio's `AsyncWriteExt::write_all` and `flush`
+have the same split.
 
-- `send(data)` waits for slots and resolves, once the send is admitted and
-  queued, to a `SendCompletion` that resolves when it settles. This is what
-  `send_admitted` does today; `send_admitted` stays for one release as a
-  deprecated name for it.
+- `send(data)` waits for slots and resolves with `io::Result<()>` once the
+  send is admitted and queued. It replaces `send_admitted`, whose
+  `SendCompletion` result is gone.
+- `flush()` waits until every send made earlier on the connection has
+  settled, and returns the first error among them. A connection's sends
+  settle in order, so `flush` right after a send waits for that send. A
+  caller can no longer wait for one send's settlement while it keeps
+  sending; `flush` also waits for the later sends.
 - `try_send(data)` does not wait. It is served in the call or refused
-  (section 6), and returns the `SendCompletion` as `send` does today.
+  (section 6), and returns `io::Result<()>`.
 - `submit_batch` waits, as `submit_batch_admitted` does today, and
-  `try_submit_batch` does not. `send_parts(..).build(..)` calls `submit`
-  inside a synchronous closure (`runtime/io.rs`, `handler.rs`), so it cannot
-  wait; it stays non-waiting under the name `try_build`, and `submit_batch`
-  is the waiting form for parts.
+  `try_submit_batch` does not; both resolve at admission as `send` does.
+  `send_parts(..).build(..)` calls `submit` inside a synchronous closure
+  (`runtime/io.rs`, `handler.rs`), so it cannot wait; it stays non-waiting
+  under the name `try_build`, and `submit_batch` is the waiting form for
+  parts.
 - `forward_recv_buf` is synchronous and, on TLS, takes pool slots. It stays
   non-waiting and is refused like `try_send` (its name is open question 5).
+- `send_backpressured` is removed: `send(..).await?` followed by
+  `flush().await?` does what it does. Its one production caller is the redis
+  client's `AUTH`.
 - `send_chain` is removed. Its IO_LINK send path and `SendChainBuilder` go
   with it, along with `ConfigBuilder::max_chain_length` and the tests that
   exercise chains (`chain_short_send.rs`, `zc_chain_enomem.rs` and the chain
@@ -116,7 +127,9 @@ that does not wait.
   crate built on ringline calls it, and a waiting form would need the
   chain's slot count before its closure builds it. IO_LINK chains for other
   operations, such as `abort`'s linked operations and disk ordering, stay.
-- `send_backpressured`, which resolves when the send settles, is unchanged.
+
+Zero-copy sends still hold their guards until the kernel releases the
+pages; that release is internal and does not need a per-send result.
 
 A bounded send borrows its data until it is admitted, as `send_admitted`
 does. A caller that reuses its buffer before awaiting does not compile. The
@@ -127,22 +140,26 @@ nothing. There are about 165 such statements in the workspace, most in
 tests. `clippy::let_underscore_future` flags them, and CI runs clippy with
 `-D warnings`; rustdoc examples are not linted and are fixed by hand.
 
-A send made inside a `with_data` closure cannot await, because the closure
-is synchronous and its data borrows the receive buffer. The documented echo
-pattern does this (the `split` docs and `with_data` examples in
-`runtime/io.rs`, `examples/echo_async_server.rs`, `examples/echo_tls_server.rs`,
-ringline-bench's echo servers). Such a caller uses `with_bytes` instead,
-keeps the `Bytes` slice it wants to send (a reference-counted handle, not a
-copy), and sends it with `send(..).await` after the closure returns. A
-closure that would rather drop a reply than wait uses `try_send`.
+`with_data` stays the way to parse received bytes: its closure borrows them
+in place, as a tokio-util `Decoder` or `httparse` does. A send made inside
+the closure cannot await, because the closure is synchronous. The documented
+echo pattern does this (the `split` docs and `with_data` examples in
+`runtime/io.rs`, `examples/echo_async_server.rs`,
+`examples/echo_tls_server.rs`, ringline-bench's echo servers). Such a caller
+uses `with_bytes`, keeps the `Bytes` slice it wants to send (a
+reference-counted handle, not a copy), and sends it with `send(..).await`
+after the closure returns. `with_bytes` freezes the receive buffer, and a
+slice kept alive stops the next receive from reusing that allocation, so
+`with_data` stays the default for parsing. A closure that would rather drop
+a reply than wait uses `try_send`.
 
 A task that sends on several connections waits on the first one that cannot
 be served. It uses `try_send`, or one task per connection.
 
 A bounded send's wait has no limit. A peer that never reads makes the task
 wait until the connection fails or the task gives up, as `writable()` does
-today; the examples on `send` show a timeout around it, as `send_admitted`'s
-do. Whether ringline offers a configured default limit is open question 7.
+today; the examples on `send` show a timeout around it. Whether ringline
+offers a configured default limit is open question 7.
 
 Slab conditions are unchanged: a send that needs a send slab entry is still
 refused at `zero_copy_hold_cap` or when the slab is full, with `WouldBlock`
@@ -364,46 +381,54 @@ that case for replies that fit one slot.
 ## In-tree callers
 
 Each caller of a non-waiting send moves to the waiting form unless it has a
-reason not to wait. The redis and memcache clients show the change:
+reason not to wait.
 
-- `write_set_frame_and_read` (ringline-redis and ringline-memcache) sends
-  the header, each chunk and the trailer with `send(..).await?`. The number
-  of sends is unchanged. A piece that cannot be served waits, so a frame is
-  never cut short by the pool or the cap; it fails only if the connection
-  fails, which already poisons the client. The chunk loop already awaits each
-  chunk's settlement before the next.
-- `flush` (`ringline-redis/src/lib.rs`, `ringline-memcache/src/lib.rs`) becomes
-  async. The async paths that call it (`recv`, `recv_meta`) add `.await`. The
-  synchronous `fire_*` calls flush when their buffer reaches a limit or holds a
-  guard (`pre_flush_if_needed`, `post_flush_if_needed`); they only buffer
-  instead, and the next `recv` or explicit `flush().await` sends the batch.
-  `recv_ready`, which is synchronous and returns a future, moves its flush into
-  that future. The documentation that a failed flush discards the batch stays
-  true for connection failures.
-- Synchronous paths in those clients and in ringline-http send today:
-  `fire_*` with the default `max_batch_size` of 1, documented as sending
-  immediately; `recv_ready`, whose future is documented not to borrow the
-  client; `send_raw` (ringline-redis, called from its sharded and cluster
-  clients, and ringline-memcache's sharded client); and the HTTP/2
-  `fire_request` and `from_conn` preface flush. Each tries `try_send` and, if
-  it is refused, keeps the bytes in the client's write buffer for its next
-  async send. A command then reaches the wire at once when the pool can take
-  it, as documented, and otherwise at the next `recv` or `flush().await`,
-  which the clients' docs say. `recv_ready` keeps its contract because its
-  flush stays synchronous.
-- ringline-http's HTTP/2 `flush_pending_send` takes frames from h2 and sends
-  them with `send(..).await`, so no frames are lost. Its HTTP/1 connection
-  (`h1_conn.rs`) changes as redis's does.
+The redis and memcache clients split into halves, as tokio's `TcpStream`
+does with `split`:
+
+- The send half has async methods named for the commands (`get`, `set`,
+  `set_with_guard`, `del` and the others that `fire_*` covers today), which
+  take a `user_data` value, and `flush`. They replace `fire_*`. A command is
+  encoded into the client's write buffer, which is sent when it holds
+  `max_batch_size` commands or a guard that would pass the scatter-gather
+  limit, and by `flush`; a method that sends resolves when the send is
+  admitted, as ringline's `send` does. With the default `max_batch_size` of
+  1, each command is sent by its own call, as `fire_*` documents today.
+- The receive half has `recv` and `recv_meta`, which return each reply with
+  its `user_data`. The halves share the client's state on the worker's
+  thread, so `recv` sends any buffered commands first, as it does today.
+- `recv_ready` is removed. Its future does not borrow the client so that a
+  caller can fire while waiting for a reply; with halves, one half sends
+  while the other waits.
+- The unsplit client keeps its request-response methods (`get().await`
+  returns the value).
+- `write_set_frame_and_read` sends the header, each chunk and the trailer
+  with `send(..).await?`, and calls `flush().await?` after each chunk where
+  it awaits the chunk's `SendCompletion` today. The number of sends is
+  unchanged. A piece that cannot be served waits, so a frame is never cut
+  short by the pool or the cap; it fails only if the connection fails, which
+  already poisons the client.
+- `send_raw` is `pub(crate)`: the sharded and cluster routers send one
+  encoded command through a pooled `Client` with it. It becomes async, with
+  no public change.
+- A load generator built on these clients uses `fire_*` and `recv_ready` in
+  its open-loop path, and changes to the halves.
+
+ringline-http changes the same way: the HTTP/2 `fire_request` and the
+`from_conn` preface flush become async, and `flush_pending_send` takes
+frames from h2 and sends them with `send(..).await`, so no frames are lost.
+The HTTP/1 connection (`h1_conn.rs`) sends with `send(..).await`.
+
 - `forward_to_conn`'s copy fallback waits for slots; it runs inside
   `ForwardFuture::poll`, so the forward pauses instead of failing. Its
   rustdoc's "`Other` when the pool has no free slots" changes.
 - ringline-ping, ringline-bench, the examples and the test call sites change
-  mechanically. `admission-server`'s outside probe keeps `try_send`,
-  since it counts refusals.
+  mechanically. `admission-server`'s outside probe keeps `try_send`, since
+  it counts refusals.
 
 `docs/send-admission-design.md` lists `send` and `submit_batch` as
-unchanged; it changes to point here. The renames are batched into one
-breaking release (principle 9).
+unchanged; it changes to point here. The renames and removals are batched
+into one breaking release of ringline and its client crates (principle 9).
 
 ## mio
 
@@ -600,7 +625,9 @@ checked, the entry says so.
 4. How large the output rustls produces without an application write can be
    (handshake flights, session tickets), which bounds what a connection's
    exempt tickets hold and sets `D`.
-5. Names: the configuration for `M`, `k`, `D` and `L`; `try_send`,
+5. Names: the send half's command methods, which share names with the
+   unsplit client's request-response methods but return at admission; the
+   configuration for `M`, `k`, `D` and `L`; `try_send`,
    `try_submit_batch`, `try_build` and the name of `forward_recv_buf`; the
    method that reports a refusal in advance; `SendRefused` and its reasons. They
    are public and hard to change once released.
