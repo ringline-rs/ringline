@@ -439,6 +439,10 @@ impl AsyncEventHandler for EndsWorker {
 
 /// A worker that ended on its own, with a connection left in its channel,
 /// does not hold `stop_accepting` until the timeout.
+///
+/// On io_uring the worker takes the second connection in the iteration that
+/// sees its shutdown request, so the channel is empty when it ends and the
+/// test passes either way; on mio the connection is left in the channel.
 #[test]
 fn stop_accepting_does_not_wait_for_a_worker_that_ended() {
     let (runtime, handles) = RinglineBuilder::new(config())
