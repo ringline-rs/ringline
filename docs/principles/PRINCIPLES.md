@@ -141,10 +141,10 @@ regressions and were not.
 A policy setting (an admission order, a limit) is measured only if its effect
 can be seen. Identical results under two settings can mean the setting made no
 difference, or that the setting never changed an outcome in that run, and the
-results alone do not say which. So each setting exports a counter of the times it changed an outcome
-(sends admitted ahead of the head of a queue, sends that waited at a limit,
-sends refused at one), and an experiment that varies the setting reports that
-counter beside its results.
+results alone do not say which. So each setting must export a counter of the
+times it changed an outcome (sends admitted ahead of the head of a queue, sends
+that waited at a limit, sends refused at one), and an experiment that varies
+the setting reports that counter beside its results.
 
 ## 9. The public surface is a contract
 
@@ -188,13 +188,13 @@ such a resource keeps no account per connection, one client that pipelines
 requests and reads slowly can hold all of it, and every other client on that
 worker then waits for that client's reads.
 
-So every resource a worker shares between its connections keeps a count per
-connection and has a limit per connection. On io_uring, `forward_hold_cap` and
+So every resource a worker shares between its connections must keep a count per
+connection and have a limit per connection. On io_uring, `forward_hold_cap` and
 `zero_copy_hold_cap` limit send slab entries per connection once the slab is
-more than half used. A limit that applies only above an occupancy is
-acceptable when measurement shows that an unconditional one costs healthy
-connections too much, or can deadlock against a peer that writes a batch
-before it reads; the count is kept either way.
+more than half used. A limit that applies only above an occupancy is acceptable
+when measurement shows that an unconditional one costs healthy connections too
+much, or can deadlock against a peer that writes a batch before it reads; the
+count is kept either way.
 
 ## 12. Backpressure lands on the connection that caused it
 
@@ -216,8 +216,8 @@ slots after it has sealed records can only be ended by closing the connection.
 Any operation that fails after an irreversible step has the same problem: the
 step cannot be undone, so the failure has to be handled at a larger scope.
 
-So the runtime takes every resource an operation needs before it acts, and
-returns what the operation did not use. Where the exact need is not known in
+So the runtime must take every resource an operation needs before it acts,
+and return what the operation did not use. Where the exact need is not known in
 advance, the operation takes an upper bound, and a check confirms in testing
 that it stayed within it. Taking the resources themselves, rather than a count
 of them, means each one is accounted for once. Where there is nothing to take,
@@ -233,12 +233,12 @@ for them. A TLS 1.3 `key_update` response is required too, but rustls sends it
 with the next application write or TLS message, so it is subject to that
 operation's limits.
 
-So such output is exempt from per-connection limits. When there is no space for
-it, it is kept, ahead of any later operation whose records are not yet sealed,
-and retried when space returns. It is bounded by the protocol's own limits,
-such as the handshake timeout, rather than by refusal. `close_notify` is the
-exception: when it still finds no space once the connection's other sends have
-drained, it is dropped and the connection ends with a bare FIN, so that a
+So such output must be exempt from per-connection limits. When there is no space
+for it, it must be kept, ahead of any later operation whose records are not yet
+sealed, and retried when space returns. It is bounded by the protocol's own
+limits, such as the handshake timeout, rather than by refusal. `close_notify` is
+the exception: when it still finds no space once the connection's other sends
+have drained, it is dropped and the connection ends with a bare FIN, so that a
 closing connection does not wait without bound.
 
 ---

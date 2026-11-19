@@ -2,10 +2,12 @@
 
 Status: proposal. Nothing here is implemented.
 
-Terms from `docs/send-admission-design.md`: the admission FIFO is the
-worker's queue of sends waiting for send-pool slots; `Strict` and
-`Budget { slots }` are its admission orders; `F` is the plaintext of one TLS
-record (16,384 bytes by default). A bounded send waits for send-pool slots
+Terms: the worker queue is the worker's queue of sends waiting for
+send-pool slots, which `docs/send-admission-design.md` calls the FIFO
+(`SendCompletions::waiting`); `Strict` and `Budget { slots }` are its
+admission orders. `F` is the plaintext of one TLS record (16,384 bytes), as
+in `docs/tls-premutation-bound-design.md`; `docs/send-admission-design.md`
+uses `F` for free slots. A bounded send waits for send-pool slots
 when the pool cannot serve it. A non-waiting send is either served in the
 call or refused.
 
@@ -17,15 +19,16 @@ The pool keeps no account of which connection holds which slot (`release`
 takes only a slot index), so one connection can hold any number of slots.
 `docs/send-admission-design.md` lists one connection's share as a non-goal
 and leaves it to the caller, who can await each reply's `SendCompletion`
-before admitting the next, or wait for `writable()` before each send.
+before admitting the next. A caller can also wait for `writable()` before
+each send.
 
-The cache server this design is for gates its long replies that way (pieces
-of at most 128 KiB, each sent after `writable()`), but not its whole replies
-of up to 128 KiB or its pipelined small replies. While one of its replies
-waits for slots, the server sends its later replies through `send_admitted`.
-It measured what that leaves (plaintext, loopback, kernel 6.12, one worker,
-8,192 slots of 16,448 bytes, three runs per cell, closed-loop probes). The
-runs are recorded in that server's repository, not in this one:
+The cache server this design is for gates its long replies that way (pieces of
+at most 128 KiB, each sent after `writable()`), but not its whole replies of up
+to 128 KiB or its pipelined small replies. While one of its replies waits for
+slots, the server sends its later replies through `send_admitted`. Measurements
+on that server show what that leaves (plaintext, loopback, kernel 6.12, one
+worker, 8,192 slots of 16,448 bytes, three runs per cell, closed-loop probes).
+The runs are recorded in that server's repository, not in this one:
 
 - A client that pipelines 4,000 GETs of 64 KiB values and reads at 1 MB/s
   keeps the pool full. Every reply on the worker, including a 1 KiB reply on
@@ -67,17 +70,19 @@ Two related gaps are in the TLS paths:
 
 ## Goal and criterion
 
-A connection holds a bounded share of its worker's send pool, a slow
-receiver makes the task that sends on that connection wait, a connection's
-sends that take pool slots go out in the order their futures were first
-polled, and no TLS connection is failed because the pool was short.
+- A connection holds a bounded share of its worker's send pool.
+- A slow receiver makes the task that sends on that connection wait.
+- A connection's sends that take pool slots go out in the order their
+  futures were first polled.
+- No TLS connection is failed because the pool was short.
 
 Success, measured with the cache server's cells (below):
 
-- in every run of the `slow` and `mixed` cells at slow-reader counts below
-  `S / M` (the pool's slots over the cap), under each admission order, at
-  most 1% of an open-loop 1 KiB probe's requests are not answered within
-  10 ms, so a request that is lost or never answered counts against it;
+- in every run of the `slow` and `mixed` cells, under each admission order,
+  at most 1% of an open-loop 1 KiB probe's requests are not answered within
+  10 ms. This applies at slow-reader counts below `S / M` (the pool's slots
+  over the cap), and a request that is lost or never answered counts against
+  it;
 - the slow readers are still served: their throughput is within 10% of the
   same readers on the unchanged pool, and no connection is closed by the
   runtime;
@@ -120,11 +125,11 @@ have the same split.
 - `send_backpressured` is removed: `send(..).await?` followed by
   `flush().await?` does what it does. Its one production caller is the redis
   client's `AUTH`.
-- `send_chain` is removed. Its IO_LINK send path and `SendChainBuilder` go
-  with it, along with `ConfigBuilder::max_chain_length` and the tests that
-  exercise chains (`chain_short_send.rs`, `zc_chain_enomem.rs` and the chain
-  cases in seven other test files and in `backend/uring/event_loop.rs`). No
-  crate built on ringline calls it, and a waiting form would need the
+- `send_chain` is removed. Its IO_LINK send path and `SendChainBuilder` go with
+  it, along with `ConfigBuilder::max_chain_length` and the tests that exercise
+  chains (`chain_short_send.rs`, `zc_chain_enomem.rs` and the chain cases in
+  seven other test files and in `backend/uring/event_loop.rs`). No crate in this
+  workspace other than `ringline` calls it, and a waiting form would need the
   chain's slot count before its closure builds it. IO_LINK chains for other
   operations, such as `abort`'s linked operations and disk ordering, stay.
 
@@ -154,7 +159,7 @@ slice kept alive stops the next receive from reusing that allocation, so
 a reply than wait uses `try_send`.
 
 A task that sends on several connections waits on the first one that cannot
-be served. It uses `try_send`, or one task per connection.
+be served. Such a task should use `try_send` or one task per connection.
 
 A bounded send's wait has no limit. A peer that never reads makes the task
 wait until the connection fails or the task gives up, as `writable()` does
@@ -220,7 +225,7 @@ The held count is updated when slots are popped, pushed back and released.
 
 ### 3. The worker queue holds one entry per connection
 
-The worker's admission queue holds at most one entry per connection: the
+The worker queue holds at most one entry per connection: the
 front ticket of each connection that has a ticket waiting for slots. When a
 connection's front ticket is served, its next waiting ticket, if any, takes
 its place. `Strict` serves the worker queue's head only; `Budget { slots }`
@@ -386,28 +391,28 @@ reason not to wait.
 The redis and memcache clients split into halves, as tokio's `TcpStream`
 does with `split`:
 
-- The send half has two methods, `send(command, user_data)` and `flush`.
-  They replace `fire_*` (six methods in the redis client, four in the
-  memcache client). A command is a value: each client defines a
-  `Command<'a>` enum with borrowed fields (`Command::get(key)`,
-  `Command::set(key, value).ex(60)`, `Command::del(key)` and the others
-  `fire_*` covers today). Each variant encodes through the client's existing
-  `encode_*_into` functions, honouring its renamed commands, and gives the
-  reply kind the receive half needs to classify the reply. A guarded SET
-  holds its guard as a `GuardBox`, one allocation per guarded SET.
-  `resp_proto::Request` is not used for this: it allocates a `Vec` per
-  command and carries no reply kind. `send` encodes the command into the
-  client's write buffer, which is sent when it holds `max_batch_size`
-  commands or a guard that would pass the scatter-gather limit, and by
-  `flush`; a call that sends resolves when the send is admitted, as
-  ringline's `send` does. With the default `max_batch_size` of 1, each
+- The send half has two methods, `send(command, user_data)` and `flush`. They
+  replace `fire_*` (six methods in the redis client, four in each memcache
+  client, `Client` and `BinaryClient`). A command is a value: each client
+  defines a `Command<'a>` enum with borrowed fields (`Command::get(key)`,
+  `Command::set(key, value).ex(60)`, `Command::del(key)` and the others `fire_*`
+  covers today). Each variant encodes through the client's existing encoders
+  (the redis client's `encode_*_into`, which honour its renamed commands; the
+  memcache client's `encode_request_into`) and gives the reply kind the receive
+  half needs to classify the reply. A guarded SET holds its guard as a
+  `GuardBox`, one allocation per guarded SET. `resp_proto::Request` is not used
+  for this: it allocates a `Vec` per command and carries no reply kind. `send`
+  encodes the command into the client's write buffer. The buffer is sent when it
+  holds `max_batch_size` commands or a guard that would pass the scatter-gather
+  limit, and by `flush`. A call that sends resolves when the send is admitted,
+  as ringline's `send` does. With the default `max_batch_size` of 1, each
   command is sent by its own call, as `fire_*` documents today.
 - The receive half has `recv` and `recv_meta`, which return each reply with
   its `user_data`. The halves share the client's state on the worker's
   thread, so `recv` sends any buffered commands first, as it does today.
-- `recv_ready` is removed. Its future does not borrow the client so that a
-  caller can fire while waiting for a reply; with halves, one half sends
-  while the other waits.
+- `recv_ready` is removed from both memcache clients and the redis client. Its
+  future does not borrow the client so that a caller can fire while waiting for
+  a reply; with halves, one half sends while the other waits.
 - The unsplit client keeps its request-response methods (`get().await`
   returns the value). `Command::get` builds a command, `client.get` runs a
   request, and `tx.send` sends a command without waiting for its reply.
@@ -423,17 +428,17 @@ does with `split`:
 - A load generator built on these clients uses `fire_*` and `recv_ready` in
   its open-loop path, and changes to the halves.
 
-ringline-http changes the same way: the HTTP/2 `fire_request` and the
-`from_conn` preface flush become async, and `flush_pending_send` takes
+ringline-http changes the same way: the HTTP/2 `fire_request` becomes
+async, `from_conn` awaits its preface send, and `flush_pending_send` takes
 frames from h2 and sends them with `send(..).await`, so no frames are lost.
 The HTTP/1 connection (`h1_conn.rs`) sends with `send(..).await`.
 
 - `forward_to_conn`'s copy fallback waits for slots; it runs inside
   `ForwardFuture::poll`, so the forward pauses instead of failing. Its
   rustdoc's "`Other` when the pool has no free slots" changes.
-- ringline-ping, ringline-bench, the examples and the test call sites change
-  mechanically. `admission-server`'s outside probe keeps `try_send`, since
-  it counts refusals.
+- ringline-ping, ringline-bench, ringline-benchmarks, the examples and the test
+  call sites change mechanically. `admission-server`'s outside probe keeps
+  `try_send`, since it counts refusals.
 
 `docs/send-admission-design.md` lists `send` and `submit_batch` as
 unchanged; it changes to point here. The renames and removals are batched
@@ -549,9 +554,9 @@ an occupancy.
 NO-GO for round-robin: in stage 0, no connection in the cache server's cells
 ever has more than one bounded send waiting. Round-robin then reorders
 nothing and is not built. Stage 1 repeats the count with the cap on. If it
-is built, stage 1 runs it against arrival
-order in a cell where connections have several sends waiting, and it is kept
-only if the 1 KiB probe's not-within-10-ms count falls.
+is built, stage 1 runs it against arrival order in a cell where connections
+have several sends waiting, and it is kept only if the 1 KiB probe's
+not-within-10-ms count falls.
 
 ## Prior art
 
@@ -696,8 +701,7 @@ checked, the entry says so.
    receive-path TLS output waiting in order instead of failing the
    connection; bounded sends by default, the `try_` forms, `SendRefused` and
    the method that reports a refusal in advance; the removal of `send_chain`;
-   and the in-tree callers
-   (sections 1, 2 and 6, In-tree callers).
+   and the in-tree callers (sections 1, 2 and 6, In-tree callers).
 5. The cap (section 5) and its mio account (the mio section).
 6. Experiment stages 1 and 2.
 7. If stage 1's rule for section 7 is met, the dedicated pool (section 7)
