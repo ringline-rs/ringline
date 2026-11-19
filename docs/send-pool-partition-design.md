@@ -64,8 +64,8 @@ Two related gaps are in the TLS paths:
   already taken the bytes out of rustls when it runs short, and they are
   released (`tls/buffered.rs`).
 - Nothing orders TLS output produced on the receive path against the
-  connection's later sends except that both enter the same send queue at the
-  time they are made. Any change that holds such output back has to keep it
+  connection's later sends except that both are queued on the connection in the
+  order they are made. Any change that holds such output back has to keep it
   ahead of every record sealed after it.
 
 ## Goal and criterion
@@ -78,11 +78,10 @@ Two related gaps are in the TLS paths:
 
 Success, measured with the cache server's cells (below):
 
-- in every run of the `slow` and `mixed` cells, under each admission order,
-  at most 1% of an open-loop 1 KiB probe's requests are not answered within
-  10 ms. This applies at slow-reader counts below `S / M` (the pool's slots
-  over the cap), and a request that is lost or never answered counts against
-  it;
+- in every run of the `slow` and `mixed` cells, under each admission order, at
+  most 1% of an open-loop 1 KiB probe's requests are not answered within 10 ms,
+  counting a lost or unanswered request as not answered. This applies at
+  slow-reader counts below `S / M` (the pool's slots over the cap);
 - the slow readers are still served: their throughput is within 10% of the
   same readers on the unchanged pool, and no connection is closed by the
   runtime;
@@ -398,15 +397,17 @@ does with `split`:
   `Command::set(key, value).ex(60)`, `Command::del(key)` and the others `fire_*`
   covers today). Each variant encodes through the client's existing encoders
   (the redis client's `encode_*_into`, which honour its renamed commands; the
-  memcache client's `encode_request_into`) and gives the reply kind the receive
-  half needs to classify the reply. A guarded SET holds its guard as a
-  `GuardBox`, one allocation per guarded SET. `resp_proto::Request` is not used
-  for this: it allocates a `Vec` per command and carries no reply kind. `send`
-  encodes the command into the client's write buffer. The buffer is sent when it
-  holds `max_batch_size` commands or a guard that would pass the scatter-gather
-  limit, and by `flush`. A call that sends resolves when the send is admitted,
-  as ringline's `send` does. With the default `max_batch_size` of 1, each
-  command is sent by its own call, as `fire_*` documents today.
+  memcache clients' `append_get`, `append_set` and `append_delete`, which call
+  `encode_request_into` for the text protocol and `BinaryRequest::encode_*` for
+  the binary one) and gives the reply kind the receive half needs to classify
+  the reply. A guarded SET holds its guard as a `GuardBox`, one allocation per
+  guarded SET. `resp_proto::Request` is not used for this: it allocates a `Vec`
+  per command and carries no reply kind. `send` encodes the command into the
+  client's write buffer. The buffer is sent when it holds `max_batch_size`
+  commands or a guard that would pass the scatter-gather limit, and by `flush`.
+  A call that sends resolves when the send is admitted, as ringline's `send`
+  does. With the default `max_batch_size` of 1, each command is sent by its own
+  call, as `fire_*` documents today.
 - The receive half has `recv` and `recv_meta`, which return each reply with
   its `user_data`. The halves share the client's state on the worker's
   thread, so `recv` sends any buffered commands first, as it does today.
