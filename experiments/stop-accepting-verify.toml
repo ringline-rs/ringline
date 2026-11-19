@@ -14,7 +14,9 @@ name = "stop_accepting verify on {image} ({ref})"
 #     `an_acceptor_holding_a_connection_places_it_and_accepts_no_more`;
 #   - stop-accepting-verify-merged-count.patch counts a merged listener
 #     stopped by `stop_accepting` in `ACCEPTOR_STOPPED`:
-#     `stop_accepting_in_merged_mode_counts_no_stopped_acceptor`.
+#     `stop_accepting_in_merged_mode_counts_no_stopped_acceptor`;
+#   - stop-accepting-verify-no-done.patch waits for a worker whose thread has
+#     ended: `stop_accepting_does_not_wait_for_a_worker_that_ended`.
 # Then the whole ringline suite, with and without `unstable-accept`, and the
 # io_uring lint and doc gates run.
 
@@ -85,6 +87,7 @@ echo 1 > /tmp/job/status
   mutate no-drain "" stop_accepting_waits_for_the_connections_in_a_workers_channel
   mutate no-stopping "" an_acceptor_holding_a_connection_places_it_and_accepts_no_more
   mutate merged-count "--features unstable-accept" stop_accepting_in_merged_mode_counts_no_stopped_acceptor
+  mutate no-done "" stop_accepting_does_not_wait_for_a_worker_that_ended
   cargo test --locked -p ringline > /tmp/job/full.out 2>&1
   echo "full_rc=$?" | tee -a /tmp/job/rc.txt
   grep -E "^test result|FAILED|panicked" /tmp/job/full.out | sort | uniq -c | sort -rn | head -20
@@ -100,7 +103,7 @@ echo 1 > /tmp/job/status
   tail -20 /tmp/job/doc.out
   fail=0
   [ "$backend" = "io_uring" ] || { echo "FAIL backend $backend"; fail=1; }
-  for rc in green1_rc green2_rc green3_rc merged_rc merged_ran no-drain_red no-stopping_red merged-count_red full_rc full_ua_rc gate_fmt gate_clippy gate_clippy_ua gate_doc; do
+  for rc in green1_rc green2_rc green3_rc merged_rc merged_ran no-drain_red no-stopping_red merged-count_red no-done_red full_rc full_ua_rc gate_fmt gate_clippy gate_clippy_ua gate_doc; do
     grep -q "^$rc=0" /tmp/job/rc.txt && echo "ok   $rc" || { echo "FAIL $rc"; fail=1; }
   done
   echo "verdict_fail=$fail"

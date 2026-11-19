@@ -1,6 +1,6 @@
 # 2026-11 — Handing a listening socket to the next process
 
-- **Status:** open — PR 1 (the acceptor) merged (#971) and GO; PR 2 (`bind_fd`) built; PRs 3 and 4 not started
+- **Status:** open — PR 1 (the acceptor) merged (#971) and GO; PR 2 (`bind_fd`) merged (#972); PR 3 (`stop_accepting`) built; PR 4 not started
 - **Span:** Nov 2026 · tree 911e0497 (`main`) · intent #970 · PR 1 · SystemsLab experiments listed under "What happened"
 
 ## Goal
@@ -260,6 +260,51 @@ suite, fmt, clippy and doc gates passed (measured). An earlier run,
 01a1e6db-2a09-71ef-8138-d4b6993fb743 at 260797da, passed every step but the
 mutation, whose patch no longer applied after that commit's doc edits; the
 patch was regenerated in 4f6bd505.
+
+### PR 3: stop accepting without shutting down
+
+Built as planned, with these differences:
+
+- A second call repeats the wait instead of returning at once, so a call
+  that follows a `TimedOut` waits again. It returns at once when nothing has
+  been placed since.
+- Review found that a worker stopped by `request_shutdown()` returns
+  `Ok(())` and is not recorded in `RuntimeShutdown::exited`, so
+  `stop_accepting` waited for its channel until the timeout. `AcceptState`
+  now records every worker thread that has ended, through a guard dropped
+  when the thread ends, and the wait skips those workers.
+- Review also found that `Duration::MAX` overflowed the deadline; a timeout
+  too long to add to the current time now means no deadline.
+- The plan's reason for raising the stop signal before any `SHUT_RD` does
+  not apply in `stop_accepting`: the only `SHUT_RD` it calls is on merged
+  listeners, which are TCP and have no acceptor. An acceptor calls `SHUT_RD`
+  on its own listener after it exits.
+- In merged mode, nothing waits for multishot-accept completions already
+  queued when the listeners are shut down, so a connection accepted before
+  the `SHUT_RD` can reach `on_accept` after the call returns. The doc says
+  so.
+
+`experiments/stop-accepting-verify.toml` runs `tests/stop_accepting.rs` on
+Linux io_uring three times and with `unstable-accept`, then with each of four
+patches that remove one part of the change, each of which must fail a named
+test: the wait for the workers' handled counts, the acceptor's `stopping`
+check, the merged-mode exemption from `ACCEPTOR_STOPPED`, and the skip of
+ended workers. In SystemsLab experiment
+01a1f52f-bbe6-7100-8c6c-669ac5076993 (Linux 6.12.116, io_uring, at 124b7bf3,
+before the review fixes and the fourth patch) every test passed three times,
+the merged-mode test passed, each of the first three patches failed its test,
+and the full ringline suite with and without `unstable-accept`, fmt, clippy
+and doc passed (measured). The first two submissions failed outside the
+tests: 01a1f52c had Linux-only unit tests still calling
+`RuntimeShutdown::new` with three arguments, and 01a1f52e cloned before the
+fix was on the fork.
+
+The counts add one atomic increment per connection on the sender and one on
+the worker, each on its own cache line. The connect rate was not measured
+for this PR.
+
+No test can tell `handled` incremented before `install_accepted` from after
+it, since both happen on the worker thread before it polls a task.
 
 ## Tests planned
 
