@@ -1,0 +1,82 @@
+# Send pool stage 0 (docs/journal/2026-11-send-pool-stage0.md): runs a plan
+# of admission-server/admission-load pairs in one guest on {host}, one after
+# another, with the binaries from {bins_artifact} (send-admission-e-build.toml
+# built at this entry's branch).
+#
+# {plan} is a base64-encoded file of lines, one run per line:
+#   label|server arguments|load arguments
+# send-pool-stage0-plan.py writes it. Every run gets, beyond its own
+# arguments: the server on CPU 0 with --addr 127.0.0.1:7979 and
+# --summary-file, the load on CPUs 2 and up with --addr. The image's TCP
+# sysctls are left as they are and recorded (sysctl.txt). net.core.rmem_max
+# and wmem_max are raised to {core_mem_max} B so that an SO_RCVBUF the load
+# sets takes effect.
+#
+# For each run the job prints a RUN line with the label, the load's exit
+# code and the worker thread's CPU time over the load, then LOAD (the load's
+# JSON) and SERVER (the server's summary file). The payload exits 0 whatever
+# the loads' exit codes, so the job keeps its artifacts; results.tgz holds
+# every run's files under results/<n>-<label>/.
+name = "send-pool stage0 {tag}"
+
+[params]
+bins_artifact = "REPLACE-WITH-ARTIFACT-ID"
+plan          = ""
+tag           = "calibration"
+host          = "hv03"
+image         = "debian-13-6.12"
+core_mem_max  = "16777216"
+timeout       = "7200"
+
+[[jobs]]
+name = "vm"
+tags = ["host:{host}"]
+
+[[jobs.steps]]
+uses = "anvil-vm"
+[jobs.steps.with]
+shape = "auto.c"
+image = "{image}"
+memory_gib = 8
+gpu = false
+boot_timeout = 600
+payload_timeout = {timeout}
+upload = true
+inputs = [{ artifact = "{bins_artifact}", name = "bench-bins.tgz", dest = "/home/anvil" }]
+artifacts = ["/home/anvil/results.tgz"]
+payload = '''
+set -uo pipefail
+export PATH="$PATH:/usr/sbin:/sbin"
+cd /home/anvil && tar xzf bench-bins.tgz && chmod +x out/* || exit 1
+mkdir -p results
+cat /etc/anvil-image.json 2>/dev/null || cat /etc/anvil-instance.json; echo
+uname -r; nproc
+( cd out && sha256sum admission-server admission-load )
+ulimit -n 65536
+sudo sysctl -w net.core.rmem_max={core_mem_max} net.core.wmem_max={core_mem_max}
+sudo sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem net.core.rmem_max net.core.wmem_max | tee results/sysctl.txt
+echo '{plan}' | base64 -d > results/plan.txt
+last=$(($(nproc) - 1))
+n=0
+while IFS='|' read -r label sargs largs; do
+  [ -z "$label" ] && continue
+  n=$((n + 1)); d=results/$n-$label; mkdir -p $d
+  ./out/admission-server --addr 127.0.0.1:7979 $sargs --summary-file $d/server-summary.json --cpu 0 > $d/server.json 2> $d/server.log &
+  srv=$!
+  for i in $(seq 1 100); do (exec 3<>/dev/tcp/127.0.0.1/7979) 2>/dev/null && { exec 3>&-; break; }; sleep 0.1; done
+  tid=$(ps -L -o tid=,comm= -p "$srv" | grep -w rl-work-0 | head -n 1 | sed 's/^ *//; s/ .*//' || true)
+  sched=/proc/$srv/task/$tid/schedstat
+  cpu0=$(cut -d' ' -f1 "$sched" 2>/dev/null || echo 0); wall0=$(date +%s%N)
+  taskset -c 2-$last ./out/admission-load --addr 127.0.0.1:7979 $largs > $d/load.json 2> $d/load.log
+  rc=$?
+  cpu1=$(cut -d' ' -f1 "$sched" 2>/dev/null || echo 0); wall1=$(date +%s%N)
+  kill -INT $srv; wait $srv
+  echo "RUN n=$n label=$label load_rc=$rc cpu_ns=$((cpu1 - cpu0)) wall_ns=$((wall1 - wall0))"
+  echo "LOAD $n $(tr -d '\n' < $d/load.json)"
+  echo "SERVER $n $(tr -d '\n' < $d/server-summary.json 2>/dev/null)"
+  tail -2 $d/load.log $d/server.log
+done < results/plan.txt
+tar czf results.tgz results
+echo "STATUS done runs=$n"
+exit 0
+'''
