@@ -4,6 +4,7 @@
 Usage: send-pool-stage0-plan.py calibration
        send-pool-stage0-plan.py matrix REP
        send-pool-stage0-plan.py batchretest REP
+       send-pool-stage0-plan.py addendum REP
 
 The cells, arms and fixed arguments are those of
 docs/journal/2026-11-send-pool-stage0.md. A matrix plan holds one run of
@@ -64,6 +65,31 @@ def batchretest(rep):
     return out
 
 
+def addendum(rep):
+    """The addendum's cells, `budget` order: idle and two deeper healthy
+    cells across M = 32 to 256, and slow readers around the pool's S / M
+    at M = 64. The arms within each cell rotate with REP."""
+    extra = {
+        "deep1k": f"{NOPROBE} --fast-conns 4 --fast-size 1024 --fast-depth 256",
+        "deep16k": f"{NOPROBE} --fast-conns 4 --fast-size 16384 --fast-depth 64",
+        "slow96": f"{PROBE} --slow-conns 96 {SLOW}",
+        "slow128": f"{PROBE} --slow-conns 128 {SLOW}",
+        "slow160": f"{PROBE} --slow-conns 160 {SLOW}",
+    }
+    caps = {"cap0": "", "cap32": "--conn-slot-cap 32", "cap64": "--conn-slot-cap 64",
+            "cap128": "--conn-slot-cap 128", "cap256": "--conn-slot-cap 256"}
+    out = []
+    for i, cell in enumerate(["idle", "deep1k", "deep16k"]):
+        arms = list(caps)
+        k = (rep + i) % len(arms)
+        for arm in arms[k:] + arms[:k]:
+            largs = CELLS[cell] if cell in CELLS else extra[cell]
+            out.append(f"{cell}-{arm}-budget|{SERVER} --order budget {caps[arm]}|{LOAD} {largs}")
+    for cell in ["slow96", "slow128", "slow160"]:
+        out.append(f"{cell}-cap64-budget|{SERVER} --order budget {caps['cap64']}|{LOAD} {extra[cell]}")
+    return out
+
+
 def calibration():
     return [
         line("slow4", "cap0", "budget"),
@@ -96,6 +122,8 @@ def matrix(rep):
 def main():
     if sys.argv[1] == "calibration":
         lines = calibration()
+    elif sys.argv[1] == "addendum":
+        lines = addendum(int(sys.argv[2]))
     elif sys.argv[1] == "batchretest":
         lines = batchretest(int(sys.argv[2]))
     else:

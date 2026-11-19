@@ -124,6 +124,10 @@
 //!   their total time in microseconds. The wait comes before the admitting
 //!   call, so it counts in a reply's delay from its scheduled time and not in
 //!   its delay from the call.
+//! - `max_conn_slots` is the most slots one connection's unsettled replies
+//!   held, counted the same way, with or without `--conn-slot-cap`. A reply
+//!   stays counted until the connection sees it settle, so this can exceed
+//!   what the pool held for that connection at that moment.
 //!
 //! # Measurements
 //!
@@ -390,6 +394,12 @@ static HELD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// total time in microseconds, over every request.
 static CAP_WAITS: AtomicU64 = AtomicU64::new(0);
 static CAP_WAIT_US: AtomicU64 = AtomicU64::new(0);
+
+/// The most slots any one connection's unsettled replies held, over every
+/// request, counted as `--conn-slot-cap` counts them: a reply's slots stay
+/// counted until the connection sees it settle, so this can exceed what the
+/// pool held at that moment.
+static MAX_CONN_SLOTS: AtomicU64 = AtomicU64::new(0);
 
 /// Connections the server aborted, by cause, over every request, indexed by
 /// `Abort as usize`.
@@ -795,6 +805,7 @@ impl Unsettled {
     ) {
         HELD[class].fetch_add(slots, Relaxed);
         self.slots += slots;
+        MAX_CONN_SLOTS.fetch_max(self.slots, Relaxed);
         let passed = sent.passed_head();
         if passed && recorded {
             recorder().passed[class] += 1;
@@ -1680,6 +1691,7 @@ fn main() {
             "conn_slot_cap": args.conn_slot_cap,
             "cap_waits": CAP_WAITS.load(Relaxed),
             "cap_wait_us": CAP_WAIT_US.load(Relaxed),
+            "max_conn_slots": MAX_CONN_SLOTS.load(Relaxed),
             "aborts": ABORT_NAMES
                 .iter()
                 .zip(ABORTS.iter())
@@ -1689,7 +1701,9 @@ fn main() {
     });
     println!("{out}");
     if let Some(path) = &args.summary_file {
-        let mut summary = out.clone();
+        // `out` is not used again, so the summary takes it rather than a
+        // copy: with many large replies the output is hundreds of MB.
+        let mut summary = out;
         if let Some(st) = summary["statistics"].as_object_mut() {
             let larges = st.remove("large_replies");
             st.remove("main_free_samples");

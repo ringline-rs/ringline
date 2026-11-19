@@ -179,3 +179,37 @@ is below about 1,100.
 - K = 10,000: both arms stall, since about 9,900 unsent replies exceed the
   8,192-slot pool even unchanged. This shows the pool bounds a batch writer
   without any cap.
+
+### Addendum: where M binds, and the pool's S / M; predictions written before its runs
+
+Rep 1 of the matrix showed `M` = 16 costing `idle` about a third of its
+replies per second and `M` = 64 costing nothing measured. The addendum
+(`send-pool-stage0-plan.py addendum`, two runs, `budget` order, binaries
+with a new server counter, `max_conn_slots`: the most slots one
+connection's unsettled replies held) asks where between those the healthy
+connections stop being held, whether anything improves above 64, and how
+many slow readers the 8,192-slot pool holds at `M` = 64.
+
+Cells, at `M` = 0 (unchanged), 32, 64, 128 and 256: `idle` (4 connections,
+64 outstanding 1 KiB replies each), `deep1k` (4 connections, 256 outstanding
+1 KiB replies), `deep16k` (4 connections, 64 outstanding 16 KiB replies, one
+slot each). At `M` = 64 only: `slow96`, `slow128` and `slow160`, the
+`slow-N` cell with 96, 128 and 160 slow readers.
+
+Predictions:
+
+- `max_conn_slots` unchanged is at most the depth in slots: 64 for `idle`
+  and `deep16k`, 256 for `deep1k`. A cell loses replies per second under an
+  `M` below that peak and not under an `M` at or above it.
+- `idle`: `M` = 32 loses more than 10%; 64, 128 and 256 are within the A/A
+  spread of unchanged.
+- `deep1k`: `M` = 32, 64 and 128 lose more than 10%; 256 is within the
+  spread. If so, `M` = 64 costs a healthy connection that pipelines 256
+  small replies.
+- `deep16k`: as `idle`.
+- Slow readers at `M` = 64: each holds up to 67 slots (a 64 KiB reply is 4
+  slots, admitted while the connection holds fewer than 64), so the pool
+  fills at about 122 readers. `slow96`: at most 1% of probe requests miss
+  10 ms. `slow128` and `slow160`: more than 1% miss. Refuted in the useful
+  direction if `slow128` passes (readers hold less than the bound); refuted
+  in the other if `slow96` fails.
