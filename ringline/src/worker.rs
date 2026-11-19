@@ -428,6 +428,35 @@ impl Runtime {
         sig
     }
 
+    /// Block until `SIGINT` or `SIGTERM` is received, a task panic shuts the
+    /// runtime down under
+    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown), or a
+    /// worker stops, and return which, without shutting the runtime down.
+    ///
+    /// The first task panic under `Shutdown`, and each worker stop, is
+    /// returned once: a later call waits for the next event. Under
+    /// `TaskPanicPolicy::Contain` the other workers keep serving after a
+    /// worker stop; under `Shutdown` a worker stop also shuts the runtime
+    /// down, and that shutdown may not have started when
+    /// [`Signal::WorkerExited`](crate::signal::Signal::WorkerExited) is
+    /// returned. A task panic shuts the runtime down before
+    /// [`Signal::TaskPanic`](crate::signal::Signal::TaskPanic) is returned.
+    /// The process-wide signal handlers are installed on the first call, as by
+    /// [`signal::install`](crate::signal::install).
+    ///
+    /// With [`stop_accepting`](Self::stop_accepting), this splits
+    /// [`wait_on_signal`](Self::wait_on_signal) into steps: wait for
+    /// `SIGTERM`, stop accepting, finish the work that needs the workers, then
+    /// call [`shutdown`](Self::shutdown).
+    ///
+    /// An event returned here is not returned by a later `wait_on_signal`; a
+    /// `wait_on_signal` already waiting when it arrives returns it too. A task
+    /// panic or worker stop already returned by `wait_on_signal` is returned
+    /// here too.
+    pub fn next_signal(&self) -> crate::signal::Signal {
+        crate::signal::next_or_ready(self.shutdown.panic_fd(), self.shutdown.exit_fd())
+    }
+
     /// Stop accepting connections without shutting the workers down, and wait
     /// until every connection already accepted has reached its worker.
     ///
@@ -3565,6 +3594,66 @@ mod worker_exit_tests {
             );
             wait_for_exit(&handles, 2);
         }
+    }
+
+    /// `next_signal` returns `WorkerExited` once for each stopped worker and
+    /// leaves the others serving: of two callers waiting for one stop, one
+    /// returns and the other waits for the second stop, after which the exit
+    /// pipe is empty.
+    #[test]
+    fn next_signal_reports_each_worker_exit_once_and_keeps_serving() {
+        let (runtime, handles, fault) = launch(3, AcceptMode::Pool, TaskPanicPolicy::Contain);
+        let mut streams = connect_all(runtime.bound_addr().unwrap(), 12);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let waiter = runtime.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(waiter.next_signal());
+            });
+        }
+        // Both callers in `poll` before the stop, so both are likely to wake
+        // for its byte; the kernel re-checks readiness, so one may not.
+        std::thread::sleep(Duration::from_millis(50));
+        let exit_pipe_readable = || {
+            let mut fds = [libc::pollfd {
+                fd: runtime.shutdown.exit_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+            ready > 0
+        };
+
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, 3);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).ok(),
+            Some(Signal::WorkerExited)
+        );
+        wait_for_exit(&handles, 1);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(300)).ok(),
+            None,
+            "one worker exit was returned to both callers"
+        );
+        check_service_after_exit(&runtime, &mut streams, 3);
+
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, 3);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).ok(),
+            Some(Signal::WorkerExited)
+        );
+        wait_for_exit(&handles, 2);
+        assert!(
+            !exit_pipe_readable(),
+            "the worker exit would be returned again"
+        );
+
+        runtime.shutdown();
+        wait_for_exit(&handles, 3);
     }
 
     /// `shutdown` returns after the acceptor thread has exited, so the

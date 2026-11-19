@@ -1,6 +1,6 @@
 # 2026-11 — Handing a listening socket to the next process
 
-- **Status:** open — PR 1 (the acceptor) merged (#971) and GO; PR 2 (`bind_fd`) merged (#972); PR 3 (`stop_accepting`) built; PR 4 not started
+- **Status:** closed — all four PRs merged: the acceptor (#971, GO), `bind_fd` (#972), `stop_accepting` (#982), `next_signal` and `signal::install` (#983)
 - **Span:** Nov 2026 · tree 911e0497 (`main`) · intent #970 · PR 1 · SystemsLab experiments listed under "What happened"
 
 ## Goal
@@ -313,6 +313,33 @@ for this PR.
 No test here tells `handled` incremented before `install_accepted` from
 after it: the gap is a few instructions on the worker thread, so a test would
 depend on timing.
+
+### PR 4: a signal wait that does not shut down
+
+Built as planned. `next_signal` uses the poll `wait_on_signal` uses, and reads
+one byte from the panic or worker-exit pipe it returns for; another waiter
+that took the byte first makes it poll again. `wait_on_signal` still reads
+neither pipe, so an event `next_signal` returned is not returned by a later
+`wait_on_signal`; one already waiting returns it too.
+
+The planned test that "the next call waits" runs two `next_signal` callers
+for one worker stop: one returns, the other is still waiting 300 ms later and
+returns for a second stop, after which the exit pipe is not readable. While
+it waits, that caller shares the signal pipe with `signal::tests`, which
+writes a `SIGTERM` byte and waits for it; the existing
+`wait_on_signal_reports_a_worker_exit_and_shuts_down` has the same exposure.
+`tests/next_signal.rs`, its own binary with one test, sends real `SIGTERM`s:
+one after `install()` and before the runtime exists, which is returned
+without shutting the runtime down, and one after a task panic, which the next
+call returns in place of the panic. Three patches were seen to fail the tests
+on macOS: `next_signal` not reading the byte (both tests), `install()`
+doing nothing (the process ends on the first `SIGTERM`), and a caller that
+lost the byte to another returning anyway (the unit test, which waits 50 ms
+so both callers are in `poll` before the stop; caught in 97 of 100 runs on
+macOS, since the kernel re-checks readiness and the second caller may not
+wake).
+`experiments/next-signal-verify.toml` runs the tests and the first patch on
+Linux io_uring.
 
 ## Tests planned
 
