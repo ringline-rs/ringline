@@ -190,10 +190,14 @@ measured this: one client that pipelined 4,000 requests and read slowly made
 every reply on its worker wait one to two seconds.
 
 So every resource a worker shares between its connections keeps a count per
-connection and has a limit per connection. `forward_hold_cap` and
-`zero_copy_hold_cap` do this for the send slab. A limit that applies only above
-an occupancy is acceptable when measurement shows that an unconditional one
-costs healthy connections too much; the count is kept either way.
+connection and has a limit per connection. Not every resource meets this yet.
+`forward_hold_cap` and `zero_copy_hold_cap` count and limit send slab entries
+per connection, but only once the slab is more than half used, so one
+connection can take half the slab before either applies. The send pool keeps
+no count per connection (`docs/send-pool-partition-design.md`). A limit that
+applies only above an occupancy is acceptable when measurement shows that an
+unconditional one costs healthy connections too much, or can deadlock against
+a peer that writes a batch before it reads; the count is kept either way.
 
 ## 12. Backpressure lands on the connection that caused it
 
@@ -205,8 +209,9 @@ other sends are refused; the worker's other connections continue.
 The pressure is not moved into a resource with no bound. Sending a copy that a
 limit kept out of the pool from a heap buffer instead would remove the refusal,
 but it turns a slow client into memory growth that the application does not see
-until some larger limit is reached. A refusal or a wait the caller can observe
-is preferred to pressure the runtime absorbs where nobody can see it.
+until some larger limit is reached. The runtime makes the caller wait or
+refuses the operation, so the caller can see the pressure, rather than holding
+the bytes somewhere the caller cannot see.
 
 ## 13. Reserve what an operation needs before taking an irreversible step
 
@@ -216,23 +221,31 @@ number, so a send that runs out of pool slots after it has sealed records can
 only be ended by closing the connection.
 
 So the runtime takes every resource an operation needs before it acts, and
-returns what the operation did not use. A copy send takes all its slots before
-it copies the first byte. Where the exact need is not known in advance, the
-operation takes an upper bound, and a check confirms in testing that it stayed
-within it. Taking the resources themselves, rather than a count of them,
-means each one is accounted for once.
+returns what the operation did not use. Where the exact need is not known in
+advance, the operation takes an upper bound, and a check confirms in testing
+that it stayed within it. Taking the resources themselves, rather than a count
+of them, means each one is accounted for once. Today a copy send that waits
+for the send pool reserves a count of slots, and TLS encryption checks the
+free count and allocates with nothing in between; the send pool design
+(`docs/send-pool-partition-design.md`) replaces both with slots taken before
+the operation. Where no resource exists to take, as on mio, whose send pool is
+an admission budget with no slot memory, a count is the resource.
 
 ## 14. Output the protocol requires is kept until it can be sent
 
-Handshake records, `key_update` responses, alerts and `close_notify` are output
-the runtime owes the peer. Refusing or dropping them breaks the connection, and
-the application cannot apply backpressure to them, because it did not ask for
-them.
+Handshake records, alerts and `close_notify` are output the runtime owes the
+peer. Refusing or dropping them breaks the connection, and the application
+cannot apply backpressure to them, because it did not ask for them. A TLS 1.3
+`key_update` response is owed too, but rustls sends it with the next
+application write, so it travels under that write's limits.
 
 So such output is exempt from per-connection limits. When there is no space for
-it, it is kept, in order and ahead of the connection's later sends, and retried
-when space returns. It is bounded by the protocol's own limits, such as the
-handshake timeout, rather than by refusal.
+it, it is kept, ahead of any later operation whose records are not yet sealed,
+and retried when space returns. It is bounded by the protocol's own limits,
+such as the handshake timeout, rather than by refusal. Not all of it meets this
+yet: TLS output produced while receiving fails the connection when the send
+pool is short, and `close_notify` that still finds no space once the
+connection's sends have drained is dropped for a bare FIN.
 
 ---
 
