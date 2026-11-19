@@ -57,7 +57,7 @@ echo 1 > /tmp/job/status
   echo "backend=$backend"
   run_tests() {
     # Not `-q`: it makes the harness print dots, not one line per test.
-    { cargo test --locked -p ringline --lib next_signal; cargo test --locked -p ringline --test next_signal; } > /tmp/job/$1.out 2>&1
+    { cargo test --locked -p ringline --lib next_signal && cargo test --locked -p ringline --test next_signal; } > /tmp/job/$1.out 2>&1
     echo "$1_rc=$?" | tee -a /tmp/job/rc.txt
     grep -E "^test |test result|panicked" /tmp/job/$1.out
   }

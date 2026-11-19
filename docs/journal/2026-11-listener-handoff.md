@@ -319,12 +319,15 @@ depend on timing.
 Built as planned. `next_signal` uses the poll `wait_on_signal` uses, and reads
 one byte from the panic or worker-exit pipe it returns for; another waiter
 that took the byte first makes it poll again. `wait_on_signal` still reads
-neither pipe, so an event `next_signal` returned is not returned by it.
+neither pipe, so an event `next_signal` returned is not returned by a later
+`wait_on_signal`; one already waiting returns it too.
 
-The planned test that "the next call waits" is two checks: after the first
-worker stop the exit pipe is not readable, and a second stop is returned by
-the next call. A waiter left blocked in a unit test would share the signal
-pipe with `signal::tests`, which writes a `SIGTERM` byte and waits for it.
+The planned test that "the next call waits" runs two `next_signal` callers
+for one worker stop: one returns, the other is still waiting 300 ms later and
+returns for a second stop, after which the exit pipe is not readable. While
+it waits, that caller shares the signal pipe with `signal::tests`, which
+writes a `SIGTERM` byte and waits for it; the existing
+`wait_on_signal_reports_a_worker_exit_and_shuts_down` has the same exposure.
 `tests/next_signal.rs`, its own binary with one test, sends real `SIGTERM`s:
 one after `install()` and before the runtime exists, which is returned
 without shutting the runtime down, and one after a task panic, which the next

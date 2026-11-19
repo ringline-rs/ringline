@@ -8,15 +8,16 @@
 //! what to do with each signal.
 //!
 //! The handlers are installed by the first wait, or by [`install()`]. Until
-//! then `SIGINT` and `SIGTERM` have their default action, which ends the
-//! process. Call [`install()`] at start to catch a signal that arrives before
-//! the first wait.
+//! then ringline leaves the disposition of `SIGINT` and `SIGTERM` alone; with
+//! the default action either signal ends the process. Call [`install()`] at
+//! start to catch a signal that arrives before the first wait. Installing
+//! replaces any handler already set for either signal.
 //!
 //! # Implementation
 //!
 //! Uses the self-pipe trick: a `pipe2` fd pair is created once, and
 //! `sigaction` handlers write the signal number to the pipe. [`wait()`]
-//! does a blocking `read()` on the pipe read end.
+//! polls the pipe's read end and reads the byte.
 //!
 //! # Example
 //!
@@ -51,8 +52,9 @@ static PIPE: OnceLock<(i32, i32)> = OnceLock::new();
 /// (OnceLock is not async-signal-safe, but AtomicI32 load is).
 static PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// A caught signal, or the reason [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal)
-/// returned.
+/// A caught signal, or the reason
+/// [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal) or
+/// [`Runtime::next_signal`](crate::Runtime::next_signal) returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Signal {
@@ -71,7 +73,7 @@ pub enum Signal {
     /// only by [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal),
     /// which then shuts the runtime down, so a supervisor can restart the
     /// process, and by [`Runtime::next_signal`](crate::Runtime::next_signal),
-    /// which leaves the other workers running.
+    /// which does not shut the runtime down itself.
     WorkerExited,
 }
 
@@ -90,9 +92,10 @@ impl fmt::Display for Signal {
 ///
 /// [`wait()`], [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal) and
 /// [`Runtime::next_signal`](crate::Runtime::next_signal) install them on their
-/// first call. Before the handlers are installed, either signal ends the
-/// process; after, a signal that arrives while nothing waits is kept, and the
-/// next wait returns it.
+/// first call. Before then, with the default action, either signal ends the
+/// process. After, a signal that arrives while nothing waits is kept, and the
+/// next wait returns it. Installing replaces any handler already set for
+/// either signal.
 ///
 /// # Panics
 ///
