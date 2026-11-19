@@ -1,13 +1,12 @@
 # Send pool stage 0 (docs/journal/2026-11-send-pool-stage0.md): runs a plan
 # of admission-server/admission-load pairs in one guest on {host}, one after
-# another, with the binaries from {bins_artifact} (send-admission-e-build.toml
-# built at this entry's branch).
+# another, with the binaries from {bins_artifact}.
 #
-The guest fetches send-pool-stage0-plan.py from {plan_repo} at {plan_ref}
+# The guest fetches send-pool-stage0-plan.py from {plan_repo} at {plan_ref}
 # and runs it with {plan_args} ("calibration" or "matrix REP"). The plan is
 # a file of lines, one run per line:
-#   label|server arguments|load arguments Every run gets, beyond its own
-# arguments: the server on CPU 0 with --addr 127.0.0.1:7979 and
+#   label|server arguments|load arguments
+# Every run gets, beyond its own arguments: the server on CPU 0 with --addr 127.0.0.1:7979 and
 # --summary-file, the load on CPUs 2 and up with --addr. The image's TCP
 # sysctls are left as they are and recorded (sysctl.txt). net.core.rmem_max
 # and wmem_max are raised to {core_mem_max} B so that an SO_RCVBUF the load
