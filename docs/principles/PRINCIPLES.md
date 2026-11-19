@@ -215,11 +215,12 @@ undoing something larger than itself. Sealing a TLS record spends a sequence
 number, so a send that runs out of pool slots after it has sealed records can
 only be ended by closing the connection.
 
-So the runtime reserves every resource an operation needs, checks the
-reservation, and only then acts. A copy send reserves all its slots before it
-copies the first byte. Where the exact need is not known in advance, the
-reservation is made from an upper bound, and a check confirms in testing that
-the operation stayed within it.
+So the runtime takes every resource an operation needs before it acts, and
+returns what the operation did not use. A copy send takes all its slots before
+it copies the first byte. Where the exact need is not known in advance, the
+operation takes an upper bound, and a check confirms in testing that it stayed
+within it. Taking the resources themselves, rather than a count of them,
+means each one is accounted for once.
 
 ## 14. Output the protocol requires is kept until it can be sent
 
