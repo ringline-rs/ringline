@@ -116,4 +116,41 @@ A/A spread.
 
 ## What happened
 
-Not yet run.
+### Calibration
+
+SystemsLab experiment `01a1f52f-4f3e-71f3-f926-705f774e2310` on hv03
+(Linux 6.12, image TCP defaults: `tcp_rmem` 4096 131072 6291456,
+`tcp_wmem` 4096 16384 4194304), binaries artifact `01a1f52e-6226` built at
+0dc0a18e. One run per line, `budget` order.
+
+| Run | Probe not within 10 ms | Other | `cap_waits` |
+|---|---|---|---|
+| `slow4`, unchanged | 55,482 of 60,000 (48,131 lost) | p99 26 s | 0 |
+| `slow4`, `M` = 16 | 0 of 60,000 | p99 0.50 ms; slow readers 120.0 MB read in the window, as unchanged | 1,207 |
+| `batch10000`, unchanged | | 442 rounds, none stalled | 0 |
+| `batch10000`, `M` = 16 | | 454 rounds, none stalled | 643,434 |
+| `batch2000`, `M` = 16 | | 7,039 rounds, none stalled | 1,981,484 |
+| `bulk`, unchanged | | 4.73 GB/s | 0 |
+| `bulk`, `M` = 16 | | 4.77 GB/s | 154,400 |
+| `idle`, `M` = 16 | | 616,337 replies/s | 2,340,664 |
+
+The `slow4` positive control holds, and the bound acted in every run that
+had it.
+
+The `batch10000` positive control failed: under `M` = 16 every round
+finished, as fast as unchanged, though the bound made the connection wait
+643,434 times. The batch client's writes did not block. Inferred, not
+measured: ringline keeps receiving into a connection's receive accumulator
+while the handler does not read, up to `recv_accumulator_max` (1 GiB by
+default, `config.rs`), so the server's socket receive buffer never fills
+and the peer's writes complete. If so, the deadlock the design describes
+(section 5) does not form in a ringline server at default settings until a
+connection has buffered about 1 GiB of unread requests, and the cost of an
+always-on cap against a batch writer is receive-buffer memory, not a stall.
+The `batch-K` cells therefore cannot trip the always-on NO-GO as written;
+they still run in the matrix, as recorded above. What a server with a small
+`recv_accumulator_max` would see (the connection closed with
+`QuotaExceeded`) is not measured here.
+
+`bulk` under `M` = 16 was as fast as unchanged in this one run each, against
+the prediction of more than 10% loss; the matrix has three runs per arm.
