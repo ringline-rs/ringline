@@ -386,14 +386,22 @@ reason not to wait.
 The redis and memcache clients split into halves, as tokio's `TcpStream`
 does with `split`:
 
-- The send half has async methods named for the commands (`get`, `set`,
-  `set_with_guard`, `del` and the others that `fire_*` covers today), which
-  take a `user_data` value, and `flush`. They replace `fire_*`. A command is
-  encoded into the client's write buffer, which is sent when it holds
-  `max_batch_size` commands or a guard that would pass the scatter-gather
-  limit, and by `flush`; a method that sends resolves when the send is
-  admitted, as ringline's `send` does. With the default `max_batch_size` of
-  1, each command is sent by its own call, as `fire_*` documents today.
+- The send half has two methods, `send(command, user_data)` and `flush`.
+  They replace `fire_*` (six methods in the redis client, four in the
+  memcache client). A command is a value: each client defines a
+  `Command<'a>` enum with borrowed fields (`Command::get(key)`,
+  `Command::set(key, value).ex(60)`, `Command::del(key)` and the others
+  `fire_*` covers today). Each variant encodes through the client's existing
+  `encode_*_into` functions, honouring its renamed commands, and gives the
+  reply kind the receive half needs to classify the reply. A guarded SET
+  holds its guard as a `GuardBox`, one allocation per guarded SET.
+  `resp_proto::Request` is not used for this: it allocates a `Vec` per
+  command and carries no reply kind. `send` encodes the command into the
+  client's write buffer, which is sent when it holds `max_batch_size`
+  commands or a guard that would pass the scatter-gather limit, and by
+  `flush`; a call that sends resolves when the send is admitted, as
+  ringline's `send` does. With the default `max_batch_size` of 1, each
+  command is sent by its own call, as `fire_*` documents today.
 - The receive half has `recv` and `recv_meta`, which return each reply with
   its `user_data`. The halves share the client's state on the worker's
   thread, so `recv` sends any buffered commands first, as it does today.
@@ -401,7 +409,8 @@ does with `split`:
   caller can fire while waiting for a reply; with halves, one half sends
   while the other waits.
 - The unsplit client keeps its request-response methods (`get().await`
-  returns the value).
+  returns the value). `Command::get` builds a command, `client.get` runs a
+  request, and `tx.send` sends a command without waiting for its reply.
 - `write_set_frame_and_read` sends the header, each chunk and the trailer
   with `send(..).await?`, and calls `flush().await?` after each chunk where
   it awaits the chunk's `SendCompletion` today. The number of sends is
@@ -603,6 +612,9 @@ checked, the entry says so.
   grants, where the cap is a limit the sender sets, but both bound one
   stream's share; `poll_capacity` waits for capacity as a bounded send waits
   for slots.
+- Request values with one verb: hyper's and h2's `send_request(req)` and
+  tower's `Service::call(req)`. The clients' send halves take a `Command`
+  the same way.
 - Tokio's bounded channels (`tokio::sync::mpsc::Sender`). `send` waits for
   capacity and `try_send` returns an error at once when the channel is full.
   Section 1 gives sends the same pair of forms.
@@ -625,9 +637,7 @@ checked, the entry says so.
 4. How large the output rustls produces without an application write can be
    (handshake flights, session tickets), which bounds what a connection's
    exempt tickets hold and sets `D`.
-5. Names: the send half's command methods, which share names with the
-   unsplit client's request-response methods but return at admission; the
-   configuration for `M`, `k`, `D` and `L`; `try_send`,
+5. Names: the configuration for `M`, `k`, `D` and `L`; `try_send`,
    `try_submit_batch`, `try_build` and the name of `forward_recv_buf`; the
    method that reports a refusal in advance; `SendRefused` and its reasons. They
    are public and hard to change once released.
