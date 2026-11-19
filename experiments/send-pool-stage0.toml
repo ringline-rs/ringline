@@ -3,7 +3,8 @@
 # another, with the binaries from {bins_artifact}.
 #
 # The guest fetches send-pool-stage0-plan.py from {plan_repo} at {plan_ref}
-# and runs it with {plan_args} ("calibration" or "matrix REP"). The plan is
+# and runs it with {plan_args} ("calibration", "matrix REP", "batchretest
+# REP" or "addendum REP"). The plan is
 # a file of lines, one run per line:
 #   label|server arguments|load arguments|sysctls
 # where sysctls, optional, is a ';'-separated list of key=value settings

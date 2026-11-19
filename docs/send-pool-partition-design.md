@@ -297,7 +297,10 @@ A connection with `held >= M` is at the cap. `M` defaults to 64: in stage 0
 an application-level bound of 64 slots removed the slow-reader stalls (0 of
 60,000 probe requests over 10 ms in every run, against 32-100% unbounded)
 and cost no measured throughput to connections with up to 256 replies
-outstanding, where 16 slots cost idle connections a third of their replies.
+outstanding (at most 2% in a cell with 64 outstanding 16 KiB replies, which
+had no A/A runs), where 16 slots cost idle connections a third of their
+replies. At 96 slow readers, below `S / M` = 128, 64 did not meet the probe
+bar (open question 8).
 The rule is the one
 `zero_copy_hold_cap` uses (`zero_copy_over_cap`), so an operation of any
 size is served while its connection is under the cap; nothing is refused for
@@ -519,10 +522,12 @@ The cells:
    pipelining cells, 226 runs. `M` = 64 met the decision rules under both
    orders; `M` = 16 cost idle connections a third of their replies. NO-GO
    for an always-on cap (the `batch` cell with small server socket buffers)
-   and for round-robin (section 3). At `M` = 64 the 8,192-slot pool
-   protected small replies with fewer than 96 slow readers, with 1,500 to
-   2,200 slots in use that the application's count did not cover (open
-   question 8).
+   and for round-robin (section 3). At `M` = 64 the 8,192-slot pool held the
+   probe bar with 16 slow readers and missed it at 96, below `S / M` = 128,
+   with about 1,500 to 2,300 slots in use that the application's count did
+   not cover (open question 8). Under the criterion that is a miss below
+   `S / M`, the rule for section 7 below; whether it counts as one waits on
+   what holds those slots.
 1. After sections 1 to 6: every cell, `M` at 32 and 64, the cap above half
    occupancy and above three quarters, under `Strict` and `Budget`, against
    the unchanged pool; `slow-N` at 64, 96 and 128 readers, with the runtime's
@@ -546,8 +551,8 @@ more the pool is full by construction, so those counts measure section 7,
 not the cap.
 
 Stage 0 met the NO-GO for an always-on cap (the `batch` client deadlocked
-under the bound) and the NO-GO for round-robin (no connection has more than
-one bounded send waiting), so neither is built.
+under the bound) and the NO-GO for round-robin (by reading the code, at most
+one bounded send waits per connection; section 3), so neither is built.
 
 ## Prior art
 
@@ -592,10 +597,11 @@ checked, the entry says so.
   round so flows with large packets do not get more than their share. DRR is
   O(1) per packet when the quantum is at least the largest packet. Round-robin
   over connections (section 3, not built) would be Nagle's scheme, and turns
-  weighted by slots DRR. Linux's `fq` qdisc combines both with a per-flow limit: per-flow
-  queues served round-robin with a quantum of two MTUs, and a packet dropped
-  once its flow holds 100 (`flow_limit`, `net/sched/sch_fq.c`). The per-flow
-  limit there is the cap here, with a refusal or a wait in place of a drop.
+  weighted by slots DRR. Linux's `fq` qdisc combines both with a per-flow limit:
+  per-flow queues served round-robin with a quantum of two MTUs, and a packet
+  dropped once its flow holds 100 (`flow_limit`, `net/sched/sch_fq.c`). The
+  per-flow limit there is the cap here, with a refusal or a wait in place of a
+  drop.
 - EASY backfilling (Lifka, "The ANL/IBM SP Scheduling System", 1995;
   Mu'alem and Feitelson, IEEE TPDS 2001). A later job may start ahead of
   the queue's head if that does not delay the head. `Budget { slots }` is a
@@ -643,7 +649,7 @@ checked, the entry says so.
 6. Whether sends that take a slab entry and no slot join the ticket order.
 7. Whether ringline offers a configured default limit on a bounded send's
    wait, and what a send that reaches it returns.
-8. What holds the 1,500 to 2,200 pool slots that stage 0's application-level
+8. What holds the 1,500 to 2,300 pool slots that stage 0's application-level
    count did not cover with 96 to 160 slow readers. It decides how many slow
    readers a pool of a given size protects, and so the pool's size.
 
@@ -651,8 +657,8 @@ checked, the entry says so.
 
 - Do nothing, and require callers to gate every send on settlement or
   `writable()`. This is the current non-goal; the measured cells are what a
-  caller that gates only its long replies gets. Stage 0's `--pipeline` arm
-  measures it.
+  caller that gates only its long replies gets. Stage 0 did not measure
+  it.
 - Keep non-waiting sends as the default and add the cap, refusing a non-waiting
   send at the cap or behind a waiting ticket. The API stays as it is, but every
   caller meets the refusal: redis and memcache leave partial frames, and HTTP/2
