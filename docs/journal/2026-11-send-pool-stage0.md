@@ -252,8 +252,8 @@ run, so those cells tested the bound. `M` = 16 and 64 met the probe bar in every
 run, as predicted. `idle` under `M` = 16 lost about a third (593k-626k
 replies/s), against the prediction of no loss: four connections with 64
 outstanding replies each reach 16 unsettled slots between their reads. `bulk`
-lost nothing under either bound, against the prediction of more than 10% at `M`
-= 16.
+lost nothing under either bound, against the prediction of more than 10% at
+`M` = 16.
 
 ### Batch retest
 
@@ -306,13 +306,15 @@ outstanding replies held 256 slots unbounded but ran as fast held to 64.
 | 160 | 100% | 0; 94% | 5,960-6,359 (2.0 s) |
 
 The free-slot columns cover the whole run (about 3,550 samples); the held
-means cover the server's measurement window, which spans only admitted
-requests and so is 2-3 s long at 128 and 160 readers.
+means cover the server's measurement window, which spans the scheduled times
+of requests that reached an admission result and so is 2-3 s long at 128 and
+160 readers.
 
 `slow96` failed, against the prediction that it would pass; 128 and 160 failed
 as predicted. The pool ran out while the server counted about 6,000 slots held
-by unsettled replies at every reader count, so about 1,500 to 2,300 slots (8,192
-less the free and the held slots) were in use that the server's count does not
+by unsettled replies at every reader count, so about 1,500 to 2,300 slots
+(8,192 less the free slots, as the whole-run median, and the held slots, as the
+window mean) were in use that the server's count does not
 cover. What holds them is not established. The runtime's own held count, which
 stage 1 builds, is the measurement that would show it.
 
@@ -334,7 +336,8 @@ stage 1 builds, is the measurement that would show it.
 - At `M` = 64 the 8,192-slot pool held the probe bar with 16 slow readers
   and missed it at 96 (counts in between were not run), against 128
   (`S / M`) if each reader held only its 64 slots: `max_conn_slots` was 64
-  in every slow-reader run, since a reply is 4 slots. The prediction's 122
+  in all six addendum slow-reader runs (the matrix binaries predate the
+  counter), since 64 is a multiple of a reply's 4 slots. The prediction's 122
   assumed 67 per reader. The shortfall is the slots the server's count does
   not cover. Reopen the pool-size question once stage 1's held count shows
   what holds them.

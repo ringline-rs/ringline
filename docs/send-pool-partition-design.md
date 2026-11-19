@@ -296,9 +296,9 @@ occupant of its index.
 A connection with `held >= M` is at the cap. `M` defaults to 64: in stage 0
 an application-level bound of 64 slots removed the slow-reader stalls (0 of
 60,000 probe requests over 10 ms in every run, against 32-100% unbounded)
-and cost no measured throughput to connections with up to 256 replies
-outstanding (at most 2% in a cell with 64 outstanding 16 KiB replies, which
-had no A/A runs), where 16 slots cost idle connections a third of their
+and cost at most about 2% of throughput to connections with up to 256
+replies outstanding (the 2% in a cell with 64 outstanding 16 KiB replies,
+which had no A/A runs), where 16 slots cost idle connections a third of their
 replies. At 96 slow readers, below `S / M` = 128, 64 did not meet the probe
 bar (open question 8).
 The rule is the one
@@ -525,9 +525,10 @@ The cells:
    and for round-robin (section 3). At `M` = 64 the 8,192-slot pool held the
    probe bar with 16 slow readers and missed it at 96, below `S / M` = 128,
    with about 1,500 to 2,300 slots in use that the application's count did
-   not cover (open question 8). Under the criterion that is a miss below
-   `S / M`, the rule for section 7 below; whether it counts as one waits on
-   what holds those slots.
+   not cover (open question 8). 96 is below `S / M`, so under the criterion
+   (the rule for section 7 below) the stage 0 bound missed at `M` = 64.
+   Stage 1 reruns `slow-N` with the runtime's held count to show whether the
+   runtime cap misses too.
 1. After sections 1 to 6: every cell, `M` at 32 and 64, the cap above half
    occupancy and above three quarters, under `Strict` and `Budget`, against
    the unchanged pool; `slow-N` at 64, 96 and 128 readers, with the runtime's
