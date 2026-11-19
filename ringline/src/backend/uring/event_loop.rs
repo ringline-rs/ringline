@@ -2763,6 +2763,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
         match tx.try_send(conn) {
             Ok(()) => {
+                if let Some(ref accept) = self.driver.accept_state {
+                    accept.placed(target);
+                }
                 // Claim the slot on the target's behalf straight away. The
                 // target only republishes once it drains, and a burst of
                 // accepts all read the table before that happens — so without
@@ -2821,11 +2824,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             };
             match action {
                 AcceptErrorAction::Stop => {
-                    if !self
+                    // Shutdown and `Runtime::stop_accepting` stop the listener
+                    // on purpose; only an unrequested stop is counted.
+                    let requested = self
                         .driver
                         .shutdown_flag
                         .load(std::sync::atomic::Ordering::Acquire)
-                    {
+                        || self
+                            .driver
+                            .accept_state
+                            .as_ref()
+                            .is_some_and(|accept| accept.is_stopping());
+                    if !requested {
                         metrics::CONNECTIONS.increment(metrics::conn::ACCEPTOR_STOPPED);
                     }
                     if let Some(i) = arm {
@@ -2961,6 +2971,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 };
                 let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
                 self.install_accepted(raw_fd, listener, peer_addr);
+                // After the install, so `Runtime::stop_accepting` returns
+                // only once the connection has a task or is closed.
+                if let Some(ref accept) = self.driver.accept_state {
+                    accept.handled(self.driver.worker_index);
+                }
             }
         }
         self.publish_load();

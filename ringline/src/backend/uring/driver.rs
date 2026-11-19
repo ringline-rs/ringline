@@ -740,6 +740,9 @@ pub(crate) struct Driver {
     pub(crate) merged_accept_pushes: usize,
     /// This worker's index into `worker_loads` / `peer_accept`.
     pub(crate) worker_index: usize,
+    /// Where this worker counts the connections it takes from its accept
+    /// channel, and a merged worker counts those it hands to a peer.
+    pub(crate) accept_state: Option<std::sync::Arc<crate::acceptor::AcceptState>>,
     /// Live connection count per worker, for accept-time placement.
     pub(crate) worker_loads: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU32>>>,
     /// Which workers are in the accept rotation; placement skips the rest.
@@ -1363,6 +1366,7 @@ impl Driver {
             merged_accept_pushes: 0,
             worker_index: config.worker_index,
             worker_loads: config.worker_loads.clone(),
+            accept_state: config.accept_state.clone(),
             worker_accepting: config.worker_accepting.clone(),
             peer_accept: config.peer_accept.clone(),
             eventfd,
