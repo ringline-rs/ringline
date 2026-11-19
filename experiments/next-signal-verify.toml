@@ -1,0 +1,97 @@
+name = "next_signal verify on {image} ({ref})"
+# Verifies `Runtime::next_signal` and `signal::install` on Linux, on the
+# io_uring backend (docs/journal/2026-11-listener-handoff.md, PR 4):
+#   systemslab submit experiments/next-signal-verify.toml -p ref=<branch or sha>
+#
+# - green: the unit test
+#   `next_signal_reports_each_worker_exit_once_and_keeps_serving` and
+#   tests/next_signal.rs pass three times.
+# - next-signal-verify-no-take.patch makes `next_signal` leave the byte it
+#   was woken by in the panic or exit pipe, and both tests must fail.
+# Then the whole ringline suite and the io_uring lint and doc gates run.
+
+[params]
+image = "debian-13-6.12"
+ref = "next-signal"
+repo = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "vm"
+tags = ["hypervisor", "x86_64"]
+
+[[jobs.steps]]
+uses = "anvil-vm"
+
+[jobs.steps.with]
+shape = "auto.c"
+image = "{image}"
+memory_gib = 8
+gpu = false
+boot_timeout = 600
+payload_timeout = 7200
+artifacts = ["/tmp/job/run.log"]
+payload = '''
+set -o pipefail
+mkdir -p /tmp/job
+echo 1 > /tmp/job/status
+{
+  echo "== guest =="; uname -r; nproc; grep PRETTY /etc/os-release
+  if ! command -v cc >/dev/null || ! command -v git >/dev/null; then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential git curl >/dev/null
+  fi
+  if ! command -v cargo >/dev/null; then
+    curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal -c clippy -c rustfmt
+    . "$HOME/.cargo/env"
+  fi
+  cargo --version
+  ulimit -Sn 65536
+  # On disk, not in /tmp: /tmp is tmpfs on these images.
+  export CARGO_BUILD_JOBS=8
+  git clone -q {repo} "$HOME/src" || exit 1
+  cd "$HOME/src" && git checkout -q {ref} || exit 1
+  git log --oneline -1
+  # A mio build would run none of the code under test.
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  backend=$(./target/debug/bench-server --print-backend)
+  echo "backend=$backend"
+  run_tests() {
+    # Not `-q`: it makes the harness print dots, not one line per test.
+    { cargo test --locked -p ringline --lib next_signal; cargo test --locked -p ringline --test next_signal; } > /tmp/job/$1.out 2>&1
+    echo "$1_rc=$?" | tee -a /tmp/job/rc.txt
+    grep -E "^test |test result|panicked" /tmp/job/$1.out
+  }
+  for i in 1 2 3; do run_tests green$i; done
+  grep -q "next_signal_reports_each_worker_exit_once_and_keeps_serving ... ok" /tmp/job/green1.out
+  echo "unit_ran=$?" | tee -a /tmp/job/rc.txt
+  grep -q "next_signal_returns_signals_and_a_task_panic_once ... ok" /tmp/job/green1.out
+  echo "integration_ran=$?" | tee -a /tmp/job/rc.txt
+  # Red only if each test failed, not if the patched tree failed to build.
+  if git apply experiments/next-signal-verify-no-take.patch; then
+    cargo test --locked -p ringline --lib next_signal > /tmp/job/mut_unit.out 2>&1
+    grep -qE "^    worker::worker_exit_tests::next_signal_reports_each_worker_exit_once_and_keeps_serving$" /tmp/job/mut_unit.out
+    echo "no-take_unit_red=$?" | tee -a /tmp/job/rc.txt
+    cargo test --locked -p ringline --test next_signal > /tmp/job/mut_int.out 2>&1
+    grep -qE "^    next_signal_returns_signals_and_a_task_panic_once$" /tmp/job/mut_int.out
+    echo "no-take_int_red=$?" | tee -a /tmp/job/rc.txt
+    grep -E "^test |test result|panicked" /tmp/job/mut_unit.out /tmp/job/mut_int.out
+    git checkout -q -- ringline/src
+  fi
+  cargo test --locked -p ringline > /tmp/job/full.out 2>&1
+  echo "full_rc=$?" | tee -a /tmp/job/rc.txt
+  grep -E "FAILED|panicked" /tmp/job/full.out | sort | uniq -c | sort -rn | head -20
+  cargo fmt --all --check; echo "gate_fmt=$?" | tee -a /tmp/job/rc.txt
+  cargo clippy --locked -p ringline --all-targets -- -D warnings > /tmp/job/clippy.out 2>&1; echo "gate_clippy=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/clippy.out
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ringline > /tmp/job/doc.out 2>&1; echo "gate_doc=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/doc.out
+  fail=0
+  [ "$backend" = "io_uring" ] || { echo "FAIL backend $backend"; fail=1; }
+  for rc in green1_rc green2_rc green3_rc unit_ran integration_ran no-take_unit_red no-take_int_red full_rc gate_fmt gate_clippy gate_doc; do
+    grep -q "^$rc=0" /tmp/job/rc.txt && echo "ok   $rc" || { echo "FAIL $rc"; fail=1; }
+  done
+  echo "verdict_fail=$fail"
+  echo $fail > /tmp/job/status
+} 2>&1 | tee /tmp/job/run.log
+exit "$(cat /tmp/job/status)"
+'''

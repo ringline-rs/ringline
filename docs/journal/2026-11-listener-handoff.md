@@ -1,6 +1,6 @@
 # 2026-11 — Handing a listening socket to the next process
 
-- **Status:** open — PR 1 (the acceptor) merged (#971) and GO; PR 2 (`bind_fd`) merged (#972); PR 3 (`stop_accepting`) built; PR 4 not started
+- **Status:** closed — all four PRs merged: the acceptor (#971, GO), `bind_fd` (#972), `stop_accepting` (#982), `next_signal` and `signal::install` (PR_4)
 - **Span:** Nov 2026 · tree 911e0497 (`main`) · intent #970 · PR 1 · SystemsLab experiments listed under "What happened"
 
 ## Goal
@@ -313,6 +313,26 @@ for this PR.
 No test here tells `handled` incremented before `install_accepted` from
 after it: the gap is a few instructions on the worker thread, so a test would
 depend on timing.
+
+### PR 4: a signal wait that does not shut down
+
+Built as planned. `next_signal` uses the poll `wait_on_signal` uses, and reads
+one byte from the panic or worker-exit pipe it returns for; another waiter
+that took the byte first makes it poll again. `wait_on_signal` still reads
+neither pipe, so an event `next_signal` returned is not returned by it.
+
+The planned test that "the next call waits" is two checks: after the first
+worker stop the exit pipe is not readable, and a second stop is returned by
+the next call. A waiter left blocked in a unit test would share the signal
+pipe with `signal::tests`, which writes a `SIGTERM` byte and waits for it.
+`tests/next_signal.rs`, its own binary with one test, sends real `SIGTERM`s:
+one after `install()` and before the runtime exists, which is returned
+without shutting the runtime down, and one after a task panic, which the next
+call returns in place of the panic. Two patches were seen to fail the tests
+on macOS: `next_signal` not reading the byte (both tests), and `install()`
+doing nothing (the process ends on the first `SIGTERM`).
+`experiments/next-signal-verify.toml` runs the tests and the first patch on
+Linux io_uring.
 
 ## Tests planned
 
