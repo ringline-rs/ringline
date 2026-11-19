@@ -1,6 +1,6 @@
 # Send pool stage 0: a per-connection bound, measured with no runtime change
 
-- **Status:** open. Predictions and decision rules are written; no runs yet.
+- **Status:** closed. `M` = 64 met the decision rules; NO-GO for an always-on cap and for round-robin.
 - **Span:** Nov 2026 · follows #981 (`docs/send-pool-partition-design.md`)
 
 ## Goal
@@ -213,3 +213,115 @@ Predictions:
   10 ms. `slow128` and `slow160`: more than 1% miss. Refuted in the useful
   direction if `slow128` passes (readers hold less than the bound); refuted
   in the other if `slow96` fails.
+
+### Matrix
+
+SystemsLab experiments `01a1f535-c329-719a-14b8-ae76097e6f75`,
+`01a1f535-c4d1-7102-aabb-c729b4d15559` and
+`01a1f535-c56b-7166-cdd9-80e8b1eeff1d` (reps 1 to 3) on hv03, binaries
+`01a1f52e-6226`, plans from 8c9e12f6. 170 runs, all with load results.
+Summarised by `experiments/send-pool-stage0-report.py`. In the 12 `mixed`
+runs under a bound the server's summary file is missing; the full output is
+complete, and the report reads the counters from it. Inferred: the server
+ran out of memory copying its output, which holds one record per 120 KiB
+reply.
+
+| Cell | Unchanged | `M` = 16 | `M` = 64 |
+|---|---|---|---|
+| `slow1`, probe not within 10 ms | 32.00% | 0% | 0% |
+| `slow4` | 92.47% | 0% | 0% |
+| `slow16` | 100% | 0% | 0% |
+| `mixed` | 90.24-92.52% | 0% | 0% |
+| `mixed`, 120 KiB clients | 308-317 MB/s, p99 402 ms | 3.83-3.90 GB/s | 4.11-4.20 GB/s |
+| `idle`, replies/s (A/A 911k-946k) | 829k-925k | 593k-626k | 899k-935k |
+| `bulk` (A/A 4.68-4.71 GB/s) | 4.67-4.71 GB/s | 4.67-4.80 GB/s | 4.74-4.82 GB/s |
+
+Ranges are over three reps and both orders. Every one of the 48 runs of
+`slow-N` and `mixed` under a bound had 0 of 60,000 probe requests miss
+10 ms, with p99 at most 0.8 ms; the slow readers read the same bytes in the
+window under every arm (30, 120, 480 and 120 MB). The bound acted in every
+run that had it (`cap_waits` above zero) except `idle` at `M` = 64, where no
+connection reached it. `strict` and `budget` gave the same results in every
+cell. None of the 54 `batch-K` runs stalled, as calibration showed.
+
+Against the predictions: the unchanged arm failed `slow-N` and `mixed` in
+every run, so those cells tested the bound. `M` = 16 and 64 met the probe bar
+in every run, as predicted. `idle` under `M` = 16 lost about a third (593k-626k replies/s), against the
+prediction of no loss: four connections with 64 outstanding replies each
+reach 16 unsettled slots between their reads. `bulk` lost nothing under
+either bound, against the prediction of more than 10% at `M` = 16.
+
+### Batch retest
+
+SystemsLab experiments `01a1f552-9ae6-718e-781c-dbb605d80b66` and
+`01a1f552-9b8d-7159-330e-358d6b31897e`, plans from 94d3e326.
+
+| K | Unchanged | `M` = 16 |
+|---|---|---|
+| 500 | 23,261-23,317 rounds, none stalled | 25,879-25,899 rounds, none stalled |
+| 2,000 | 5,968-6,024 rounds, none stalled | stalled in the first round's writes, at 768 requests written |
+| 10,000 | stalled in the first round's writes, at 5,205 written | stalled at 768 written |
+
+The predictions held for K = 500 and 2,000: with the server's socket buffers
+small, a batch writer deadlocks under the bound at a batch that finishes
+unchanged. The positive control for the always-on NO-GO holds. At K = 10,000
+the unchanged arm stalled as predicted, but the predicted cause (replies
+beyond the pool) does not fit: it stalled after 5,205 requests were written,
+which fits the server's `--pipeline 4096` limit plus about 1,100 requests in
+the buffers. Inferred, not checked.
+
+### Addendum
+
+SystemsLab experiments `01a1f56f-0989-71ca-38ca-af3cbd8e5381` and
+`01a1f56f-09fc-71e1-775a-8b52aa2a748c`, binaries `01a1f56e-e190` built at
+3c0acaf1, plans from 3c0acaf1. Two runs per line.
+
+| Cell | Unchanged | `M` = 32 | `M` = 64 | `M` = 128 | `M` = 256 |
+|---|---|---|---|---|---|
+| `idle`, replies/s | 906k-907k | 756k-869k | 902k-912k | 898k-904k | 903k-904k |
+| `deep1k`, replies/s | 1.076M-1.080M | 0.997M-1.072M | 1.082M-1.092M | 1.105M-1.109M | 1.076M-1.087M |
+| `deep16k`, replies/s | 263k-265k | 240k-241k | 259k-262k | 263k-266k | 262k-265k |
+
+`max_conn_slots` unchanged was 64 in `idle` and 256 in `deep1k`, as
+predicted, and equal to `M` wherever `M` was below that. The `deep16k`
+server crashed before writing any output in every run, so that cell has no
+server counters; inferred to be the same memory exhaustion, with 263,000
+records a second.
+
+Against the predictions: `M` = 32 lost 4% and 17% in `idle` and 1% and 7% in
+`deep1k`, so 32 is at the edge of the 10% rule. `M` = 64 and 128 lost nothing
+in `deep1k`, against the prediction of more than 10%: a connection with 256
+outstanding replies held 256 slots unbounded but ran as fast held to 64.
+
+| Readers at `M` = 64 | Probe not within 10 ms | Pool free slots (median; share of samples under 64) | Slots the server counted held (mean) |
+|---|---|---|---|
+| 96 | 11.81%, 13.02% | 536-576; 14-26% | 6,117-6,119 |
+| 128 | 100% | 0; 94% | 5,882-6,002 |
+| 160 | 100% | 0; 94% | 5,960 |
+
+`slow96` failed, against the prediction that it would pass; 128 and 160
+failed as predicted. The pool ran out while the server counted about 6,000
+slots held by unsettled replies at every reader count, so 1,500 to 2,200
+slots were in use that the server's count does not cover. What holds them is
+not established. The runtime's own held count, which stage 1 builds, is the
+measurement that would show it.
+
+## Outcome
+
+- `M` = 64 meets stage 0's decision rules under both orders: every `slow-N`
+  and `mixed` run met the probe bar, slow readers read what they read
+  unchanged, and `idle` and `bulk` lost nothing. `M` = 16 fails the `idle`
+  rule. `M` = 32 is at the rule's edge. Nothing measured improves above 64.
+- NO-GO for an always-on cap: with small server socket buffers a batch
+  writer deadlocks under the bound at 2,000 requests, where it finishes
+  unchanged. Stage 1 builds the cap to apply only above an occupancy, as
+  the send slab's caps do. With the image's default buffers no batch run
+  stalled up to 10,000 requests.
+- NO-GO for round-robin, by reading the code (above).
+- At `M` = 64 the 8,192-slot pool protects small replies with fewer than 96
+  slow readers per worker, not the 122 the bound predicts, because of the
+  slots the server's count does not cover. Reopen the pool-size question
+  once stage 1's held count shows what holds them.
+- The harness records one entry per reply above `--small-max`, which runs
+  the server out of memory in cells with many such replies. It needs a
+  limit before stage 1's runs.

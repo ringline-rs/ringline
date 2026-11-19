@@ -45,7 +45,7 @@ def server_counters(path):
             text = f.read()
     except OSError:
         return srv
-    for key in ("cap_waits", "cap_wait_us"):
+    for key in ("cap_waits", "cap_wait_us", "max_conn_slots"):
         m = re.search(rb'"%s":([0-9]+)' % key.encode(), text)
         if m:
             srv[key] = int(m.group(1))
@@ -71,6 +71,8 @@ def fmt(label, load, srv):
         where = ",".join(f"{s['phase']}@{s['written']}/{s['read']}" for s in st)
         out.append(f"batch rounds {batch['rounds']} stalled {batch['stalled']} {where}")
     out.append(f"cap_waits {srv.get('cap_waits')}")
+    if "max_conn_slots" in srv:
+        out.append(f"max_conn_slots {srv['max_conn_slots']}")
     return "  ".join(out)
 
 
