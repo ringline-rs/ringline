@@ -275,10 +275,6 @@ Built as planned, with these differences:
   when the thread ends, and the wait skips those workers.
 - Review also found that `Duration::MAX` overflowed the deadline; a timeout
   too long to add to the current time now means no deadline.
-- The plan's reason for raising the stop signal before any `SHUT_RD` does
-  not apply in `stop_accepting`: the only `SHUT_RD` it calls is on merged
-  listeners, which are TCP and have no acceptor. An acceptor calls `SHUT_RD`
-  on its own listener after it exits.
 - In merged mode, nothing waits for multishot-accept completions already
   queued when the listeners are shut down, so a connection accepted before
   the `SHUT_RD` can reach `on_accept` after the call returns. The doc says
@@ -303,8 +299,9 @@ The counts add one atomic increment per connection on the sender and one on
 the worker, each on its own cache line. The connect rate was not measured
 for this PR.
 
-No test can tell `handled` incremented before `install_accepted` from after
-it, since both happen on the worker thread before it polls a task.
+No test here tells `handled` incremented before `install_accepted` from
+after it: the gap is a few instructions on the worker thread, so a test would
+depend on timing.
 
 ## Tests planned
 

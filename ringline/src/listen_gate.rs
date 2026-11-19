@@ -189,9 +189,9 @@ impl ListenGates {
     /// Release every waiter.
     ///
     /// Called by `Runtime::shutdown` and `Runtime::stop_accepting` before
-    /// they shut listener sockets down. The stop signal wakes an acceptor in `poll`; neither it nor
-    /// [`ListenerSockets::shut_down`] wakes one waiting in `wait_open`. After
-    /// this call no gate calls `listen(2)`.
+    /// they shut listener sockets down. The stop signal wakes an acceptor in
+    /// `poll`; neither it nor [`ListenerSockets::shut_down`] wakes one waiting
+    /// in `wait_open`. After this call no gate calls `listen(2)`.
     pub(crate) fn shutdown(&self) {
         let released = {
             let mut inner = self.lock();

@@ -451,9 +451,8 @@ impl Runtime {
     /// [`bind_tls`](RinglineBuilder::bind_tls) is shut down with `SHUT_RD`
     /// when its acceptor exits: on Linux, for a TCP listener, the kernel
     /// resets the connections in its backlog and refuses new ones. A listener
-    /// from
-    /// [`RinglineBuilder::bind_fd`] keeps listening, and new connections wait
-    /// in its backlog for another process that holds the socket.
+    /// from [`RinglineBuilder::bind_fd`] keeps listening, and new connections
+    /// wait in its backlog for another process that holds the socket.
     ///
     /// With the `unstable-accept` feature in `AcceptMode::Merged`, the
     /// workers' listeners are shut down with `SHUT_RD`, and a connection a
