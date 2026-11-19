@@ -3902,6 +3902,7 @@ mod worker_exit_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             crate::listen_gate::ListenGates::new(0, 128),
             Arc::from(Vec::new()),
+            2,
         )
         .unwrap();
         let accepting = (0..2)
@@ -3939,6 +3940,7 @@ mod worker_exit_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             crate::listen_gate::ListenGates::new(0, 128),
             Arc::from(Vec::new()),
+            2,
         )
         .unwrap();
         let accepting = (0..2)
