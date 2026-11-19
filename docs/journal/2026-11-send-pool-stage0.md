@@ -139,18 +139,19 @@ had it.
 
 The `batch10000` positive control failed: under `M` = 16 every round
 finished, as fast as unchanged, though the bound made the connection wait
-643,434 times. The batch client's writes did not block. Inferred, not
-measured: ringline keeps receiving into a connection's receive accumulator
-while the handler does not read, up to `recv_accumulator_max` (1 GiB by
-default, `config.rs`), so the server's socket receive buffer never fills
-and the peer's writes complete. If so, the deadlock the design describes
-(section 5) does not form in a ringline server at default settings until a
-connection has buffered about 1 GiB of unread requests, and the cost of an
-always-on cap against a batch writer is receive-buffer memory, not a stall.
-The `batch-K` cells therefore cannot trip the always-on NO-GO as written;
-they still run in the matrix, as recorded above. What a server with a small
-`recv_accumulator_max` would see (the connection closed with
-`QuotaExceeded`) is not measured here.
+643,434 times. The batch client's writes did not block. (Corrected after
+reading the receive path: an earlier version of this paragraph inferred that
+ringline keeps receiving into the connection's accumulator while the handler
+does not read. On a plaintext io_uring connection a receive is armed only
+when a reader parks (`park_recv`, `runtime/io.rs`), so the accumulator does
+not grow while the handler waits.) The likelier cause is the cell's size:
+10,000 requests of 24 bytes are 240 KB, and the server's kernel receive
+buffer (`tcp_rmem` up to 6 MB, autotuned while the server reads quickly) and
+the client's send buffer hold the requests left unread when the bound stops
+the server, so the client's writes complete. Not measured. The `batch-K`
+cells as planned therefore cannot trip the always-on NO-GO; they still run in
+the matrix, as recorded above. Testing the NO-GO needs the server's socket
+buffers held small, so that the unread requests fill them.
 
 `bulk` under `M` = 16 was as fast as unchanged in this one run each, against
 the prediction of more than 10% loss; the matrix has three runs per arm.
