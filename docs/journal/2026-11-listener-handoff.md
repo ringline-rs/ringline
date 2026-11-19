@@ -331,9 +331,10 @@ writes a `SIGTERM` byte and waits for it; the existing
 `tests/next_signal.rs`, its own binary with one test, sends real `SIGTERM`s:
 one after `install()` and before the runtime exists, which is returned
 without shutting the runtime down, and one after a task panic, which the next
-call returns in place of the panic. Two patches were seen to fail the tests
-on macOS: `next_signal` not reading the byte (both tests), and `install()`
-doing nothing (the process ends on the first `SIGTERM`).
+call returns in place of the panic. Three patches were seen to fail the tests
+on macOS: `next_signal` not reading the byte (both tests), `install()`
+doing nothing (the process ends on the first `SIGTERM`), and a caller that
+lost the byte to another returning anyway (the unit test).
 `experiments/next-signal-verify.toml` runs the tests and the first patch on
 Linux io_uring.
 
