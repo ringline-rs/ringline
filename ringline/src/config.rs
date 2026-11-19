@@ -311,6 +311,9 @@ pub struct Config {
     /// This worker's index, so it can find its own slot in `worker_loads` and
     /// avoid handing a connection back to itself.
     pub(crate) worker_index: usize,
+    /// The runtime's accept counts and `stop_accepting` flag. Set by
+    /// `launch()`; `None` in event loops built by unit tests.
+    pub(crate) accept_state: Option<std::sync::Arc<crate::acceptor::AcceptState>>,
     /// Live connection count per worker, published by each worker and read by
     /// all of them when placing a newly accepted connection. Merged accept
     /// mode only — pool mode places explicitly in the acceptor thread.
@@ -554,6 +557,7 @@ impl Default for Config {
             #[cfg(test)]
             test_fault: None,
             worker_index: 0,
+            accept_state: None,
             worker_loads: None,
             worker_accepting: None,
             peer_accept: Vec::new(),

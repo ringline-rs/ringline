@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Runtime::next_signal()`: waits for `SIGINT`, `SIGTERM`, a task panic or a
+  worker stop, as `Runtime::wait_on_signal` does, and returns it without
+  shutting the runtime down itself. The first task panic under
+  `TaskPanicPolicy::Shutdown`, and each worker stop, is returned once. With
+  `stop_accepting`, it lets a server wait for `SIGTERM`, stop accepting,
+  finish its work and then call `shutdown`.
+- `signal::install()`: installs the `SIGINT` and `SIGTERM` handlers now.
+  Before they are installed, by this or by the first wait, either signal ends
+  the process if its action is the default.
+- `Runtime::stop_accepting(timeout)`: stops every listener accepting without
+  shutting the workers down, and returns once each acceptor thread has exited
+  and each running worker has taken the connections already placed in its
+  accept channel (spawned their accept tasks, or closed them). The workers
+  keep serving their connections until `Runtime::shutdown`. A listener from
+  `bind_fd` keeps listening, so new connections wait in its backlog for the
+  next process; a listener from `bind`, `bind_unix` or `bind_tls` is shut
+  down with `SHUT_RD`. It returns `TimedOut` if an acceptor has not exited,
+  or a worker has not taken its connections, within `timeout`, and
+  `Deadlock` on a worker thread. After it, `ListenHandle` calls return an
+  error.
 - `RinglineBuilder::bind_fd`: a listener on a socket the caller made or
   received, such as one systemd passes in `LISTEN_FDS` or keeps in its fd
   store. It must be a bound, unconnected `SOCK_STREAM` socket in `AF_INET`,

@@ -1,0 +1,22 @@
+diff --git a/ringline/src/acceptor.rs b/ringline/src/acceptor.rs
+index 0a7fa4c8..b1dc3576 100644
+--- a/ringline/src/acceptor.rs
++++ b/ringline/src/acceptor.rs
+@@ -220,7 +220,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
+     let mut alive = vec![true; num_workers];
+ 
+     loop {
+-        if config.shutdown_flag.load(Ordering::Acquire) || config.accept.is_stopping() {
++        if config.shutdown_flag.load(Ordering::Acquire) {
+             return;
+         }
+         let mut addr_len: libc::socklen_t =
+@@ -233,7 +233,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
+             let errno = err.raw_os_error().unwrap_or(0);
+             // A shutdown that began during the `accept` may have made it fail
+             // (`EINVAL` after `SHUT_RD`), and a retry would only fail again.
+-            if config.shutdown_flag.load(Ordering::Acquire) || config.accept.is_stopping() {
++            if config.shutdown_flag.load(Ordering::Acquire) {
+                 return;
+             }
+             // No connection queued: wait for one, or for the stop signal.

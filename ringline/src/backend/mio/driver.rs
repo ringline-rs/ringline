@@ -162,6 +162,10 @@ pub(crate) struct Driver {
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_queues: Vec<ConnSendState>,
     pub(crate) accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
+    /// Where this worker counts the connections it takes from `accept_rx`.
+    pub(crate) accept_state: Option<Arc<crate::acceptor::AcceptState>>,
+    /// This worker's index into `accept_state`.
+    pub(crate) worker_index: usize,
     pub(crate) wake_handle: crate::wakeup::WakeFd,
     /// Set by a disk-I/O pool thread that wrote the wake pipe, cleared by
     /// `drain_channels` before it reads the responses, so a burst of
@@ -549,6 +553,8 @@ impl Driver {
             },
             send_queues: (0..max_conn).map(|_| ConnSendState::new()).collect(),
             accept_rx,
+            accept_state: config.accept_state.clone(),
+            worker_index: config.worker_index,
             // The pipe's WRITE end: handed to worker-pool threads (disk I/O,
             // resolver, spawner) so their completion wakes actually reach
             // this worker. `eventfd` is the READ end (polled by the loop) —

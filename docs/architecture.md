@@ -325,6 +325,20 @@ shutdown, when the acceptor thread or, in merged accept mode
 observe shutdown after draining a CQE batch and run backend shutdown drainage;
 Mio workers finish the current event/task/send/close cycle before returning.
 
+`Runtime::stop_accepting(timeout)` stops accepting without setting the
+shutdown flag. It sets the `stopping` flag in the runtime's `AcceptState`,
+releases the listen gates, raises the stop signal, and calls `SHUT_RD` on the
+merged-mode listeners. Each acceptor exits at its next check of the flag,
+after placing a connection it holds, and calls `SHUT_RD` on its listener
+unless it came from `bind_fd`. `stop_accepting` waits for the acceptor threads
+to exit, then reads, for each worker, the number of connections placed in its
+accept channel, and waits until the worker's count of connections taken from
+the channel and installed or closed reaches it. The senders (an acceptor, or a
+merged-mode worker handing a connection to another) count a placement after a
+successful `try_send`; the worker counts after `install_accepted` on io_uring
+and after each item of `drain_channels` on mio. The workers keep running
+tasks and I/O; `Runtime::shutdown` afterwards closes what they hold.
+
 Startup failures are returned from `launch`: workers acknowledge backend
 preparation before the listener exists, and a failed worker, listener bind, or
 acceptor spawn rolls back already-started workers. At runtime, task panics
@@ -342,8 +356,11 @@ it too. It leaves
 the accept rotation, closes its connections (on io_uring through
 `run_shutdown`), and wakes `Runtime::wait_on_signal` with
 `Signal::WorkerExited`, which shuts the runtime down so a supervisor can restart
-the process. Until then, and in a process that does not call `wait_on_signal`,
-the other workers keep serving. A worker is not replaced. Under
+the process. `Runtime::next_signal` returns the same events without shutting
+down; it reads the byte it was woken by from the panic or worker-exit pipe, so
+each event is returned once. Until `wait_on_signal` shuts the runtime down,
+and in a process that does not call it, the other workers keep serving. A
+worker is not replaced. Under
 `TaskPanicPolicy::Shutdown` a stopped worker shuts the runtime down. If
 `run_shutdown` panics, the worker drops its ring and leaks the heap memory its
 event loop owns, which the kernel can still be using.

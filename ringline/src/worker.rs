@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::acceptor::{AcceptorConfig, run_acceptor};
 use crate::backend::AsyncEventLoop;
@@ -427,6 +428,85 @@ impl Runtime {
         sig
     }
 
+    /// Block until `SIGINT` or `SIGTERM` is received, a task panic shuts the
+    /// runtime down under
+    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown), or a
+    /// worker stops, and return which, without shutting the runtime down.
+    ///
+    /// The first task panic under `Shutdown`, and each worker stop, is
+    /// returned once: a later call waits for the next event. Under
+    /// `TaskPanicPolicy::Contain` the other workers keep serving after a
+    /// worker stop; under `Shutdown` a worker stop also shuts the runtime
+    /// down, and that shutdown may not have started when
+    /// [`Signal::WorkerExited`](crate::signal::Signal::WorkerExited) is
+    /// returned. A task panic shuts the runtime down before
+    /// [`Signal::TaskPanic`](crate::signal::Signal::TaskPanic) is returned.
+    /// The process-wide signal handlers are installed on the first call, as by
+    /// [`signal::install`](crate::signal::install).
+    ///
+    /// With [`stop_accepting`](Self::stop_accepting), this splits
+    /// [`wait_on_signal`](Self::wait_on_signal) into steps: wait for
+    /// `SIGTERM`, stop accepting, finish the work that needs the workers, then
+    /// call [`shutdown`](Self::shutdown).
+    ///
+    /// An event returned here is not returned by a later `wait_on_signal`; a
+    /// `wait_on_signal` already waiting when it arrives returns it too. A task
+    /// panic or worker stop already returned by `wait_on_signal` is returned
+    /// here too.
+    pub fn next_signal(&self) -> crate::signal::Signal {
+        crate::signal::next_or_ready(self.shutdown.panic_fd(), self.shutdown.exit_fd())
+    }
+
+    /// Stop accepting connections without shutting the workers down, and wait
+    /// until every connection already accepted has reached its worker.
+    ///
+    /// This is the first phase of a restart that hands a listening socket to
+    /// the next process: after it returns, the workers keep polling tasks and
+    /// I/O and serve the connections they hold. Call
+    /// [`shutdown`](Self::shutdown) afterwards to close what is left.
+    ///
+    /// It closes every listen gate (a [`ListenHandle`](crate::ListenHandle)'s
+    /// calls return an error from then on), signals every acceptor thread to
+    /// stop, and waits for each to exit. An acceptor holding a connection no
+    /// worker has room for waits until a worker takes it. Then it waits until
+    /// each worker that is still running has taken every connection placed
+    /// in its accept channel and either spawned its accept task (`on_accept`
+    /// has been called) or closed it (connection table full, registration
+    /// failed, or TLS state creation failed). On a TLS listener, `on_accept`
+    /// is called after the handshake, so it may be called after this returns.
+    ///
+    /// A listener from [`RinglineBuilder::bind`],
+    /// [`bind_unix`](RinglineBuilder::bind_unix) or
+    /// [`bind_tls`](RinglineBuilder::bind_tls) is shut down with `SHUT_RD`
+    /// when its acceptor exits: on Linux, for a TCP listener, the kernel
+    /// resets the connections in its backlog and refuses new ones. A listener
+    /// from [`RinglineBuilder::bind_fd`] keeps listening, and new connections
+    /// wait in its backlog for another process that holds the socket.
+    ///
+    /// With the `unstable-accept` feature in `AcceptMode::Merged`, the
+    /// workers' listeners are shut down with `SHUT_RD`, and a connection a
+    /// worker accepted before the `SHUT_RD` may reach `on_accept`, on that
+    /// worker or another, after this returns.
+    ///
+    /// Returns `Ok(())` at once if the runtime has shut down, and also if it
+    /// shuts down during the wait. A second call repeats the wait, which
+    /// returns at once when nothing has been placed since. A `timeout` too
+    /// long to add to the current time, such as `Duration::MAX`, waits
+    /// without a deadline.
+    ///
+    /// # Errors
+    ///
+    /// - [`io::ErrorKind::TimedOut`] if an acceptor has not exited, or a worker
+    ///   has not taken the connections in its channel, within `timeout`: for
+    ///   example a worker blocked in synchronous code. Accepting stays stopped,
+    ///   and an acceptor still holding a connection keeps trying to place it
+    ///   until a worker takes it or [`shutdown`](Self::shutdown) closes it.
+    /// - [`io::ErrorKind::Deadlock`] at once if called on one of this runtime's
+    ///   worker threads, which would wait for its own channel.
+    pub fn stop_accepting(&self, timeout: Duration) -> io::Result<()> {
+        self.shutdown.stop_accepting(timeout)
+    }
+
     /// Signal all workers to shut down gracefully.
     ///
     /// Workers stop accepting new connections, close all active connections (on
@@ -490,9 +570,14 @@ pub(crate) struct RuntimeShutdown {
     /// Each listener's sockets and whether it is merged, added as `launch()`
     /// creates the listeners and released by `shutdown()`.
     listeners: std::sync::Mutex<Vec<(Arc<ListenerSockets>, bool)>>,
-    /// Raised by `shutdown()`; wakes every acceptor from `poll`.
+    /// Raised by `shutdown()` and `stop_accepting()`; wakes every acceptor
+    /// from `poll`.
     stop: crate::acceptor::StopSignal,
-    /// The acceptor threads `launch()` started, joined by `shutdown()`.
+    /// The `stop_accepting()` flag and the per-worker accept counts, shared
+    /// with the acceptors and the workers.
+    accept: Arc<crate::acceptor::AcceptState>,
+    /// The acceptor threads `launch()` started, joined by `shutdown()`, or by
+    /// `stop_accepting()` once they have exited.
     acceptors: std::sync::Mutex<Vec<thread::JoinHandle<()>>>,
     wake: crate::wakeup::WakeKeepAlive,
     /// Readable once a task panic has shut the runtime down;
@@ -513,6 +598,20 @@ pub(crate) struct RuntimeShutdown {
     #[cfg(target_os = "linux")]
     steering: std::sync::Mutex<()>,
 }
+
+/// Records in `AcceptState` that a worker thread has ended when dropped, so
+/// `stop_accepting` does not wait for a channel nobody drains.
+struct WorkerDone(Arc<crate::acceptor::AcceptState>, usize);
+
+impl Drop for WorkerDone {
+    fn drop(&mut self) {
+        self.0.worker_done(self.1);
+    }
+}
+
+/// How often `stop_accepting` checks whether the acceptors have exited and
+/// the workers have taken what was placed in their channels.
+const STOP_ACCEPTING_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Accept and close every connection queued on a listening socket.
 #[cfg(target_os = "linux")]
@@ -567,6 +666,7 @@ impl RuntimeShutdown {
         flag: Arc<AtomicBool>,
         listen_gates: Arc<crate::listen_gate::ListenGates>,
         wake: crate::wakeup::WakeKeepAlive,
+        workers: usize,
     ) -> io::Result<Self> {
         let (panic_read, panic_write) = nonblocking_pipe()?;
         let (exit_read, exit_write) = nonblocking_pipe()?;
@@ -575,6 +675,7 @@ impl RuntimeShutdown {
             listen_gates,
             listeners: std::sync::Mutex::new(Vec::new()),
             stop: crate::acceptor::StopSignal::new()?,
+            accept: Arc::new(crate::acceptor::AcceptState::new(workers)),
             acceptors: std::sync::Mutex::new(Vec::new()),
             wake,
             panic_read,
@@ -651,6 +752,104 @@ impl RuntimeShutdown {
         self.stop.clone()
     }
 
+    /// See [`Runtime::stop_accepting`].
+    fn stop_accepting(&self, timeout: Duration) -> io::Result<()> {
+        if self.flag.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if crate::listen_gate::is_worker_of(&self.listen_gates) {
+            return Err(io::Error::new(
+                io::ErrorKind::Deadlock,
+                "stop_accepting() called on a worker thread, which would wait for its own \
+                 accept channel",
+            ));
+        }
+        // `None` when `timeout` is too long to add to now: no deadline.
+        let deadline = Instant::now().checked_add(timeout);
+        let expired = || deadline.is_some_and(|d| Instant::now() >= d);
+        self.accept.begin_stopping();
+        // After this no gate starts a socket listening, and an acceptor
+        // parked on a gate that was never opened returns.
+        self.listen_gates.shutdown();
+        // Wakes an acceptor waiting in `poll`; it then sees `stopping`.
+        self.stop.raise();
+        // Merged listeners have no acceptor; their workers' multishot accepts
+        // end on `SHUT_RD`. A connection a worker is handing to another as
+        // this runs may be placed after the counts below are read.
+        for (sockets, merged) in self
+            .listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if *merged {
+                sockets.shut_down();
+            }
+        }
+
+        // Each acceptor exits at its next stop check. One holding a
+        // connection no worker has room for places it first.
+        loop {
+            {
+                let mut acceptors = self.acceptors.lock().unwrap_or_else(|e| e.into_inner());
+                let mut i = 0;
+                while i < acceptors.len() {
+                    if acceptors[i].is_finished() {
+                        // A panic in an acceptor has already been reported
+                        // by the panic hook.
+                        let _ = acceptors.swap_remove(i).join();
+                    } else {
+                        i += 1;
+                    }
+                }
+                if acceptors.is_empty() {
+                    break;
+                }
+            }
+            if self.flag.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if expired() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stop_accepting(): an acceptor did not exit in time",
+                ));
+            }
+            thread::sleep(STOP_ACCEPTING_POLL_INTERVAL);
+        }
+
+        // Every acceptor has exited, so these counts are final for the
+        // connections they placed.
+        let workers = self.accept.workers();
+        let placed: Vec<u64> = (0..workers).map(|w| self.accept.placed_count(w)).collect();
+        loop {
+            let exited = self
+                .exited
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            // A worker that has stopped, or whose thread has ended, closed
+            // what was left in its channel.
+            let pending = placed.iter().enumerate().any(|(w, &n)| {
+                !exited.contains(&w) && !self.accept.is_done(w) && self.accept.handled_count(w) < n
+            });
+            if !pending {
+                return Ok(());
+            }
+            if self.flag.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if expired() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stop_accepting(): a worker did not take the connections in its accept \
+                     channel in time",
+                ));
+            }
+            thread::sleep(STOP_ACCEPTING_POLL_INTERVAL);
+        }
+    }
+
     /// Hold an acceptor thread for `shutdown()` to join. One started after a
     /// shutdown exits on its own and is joined by the next `shutdown()`
     /// (`Drop for Runtime` runs one).
@@ -690,7 +889,7 @@ impl RuntimeShutdown {
             .unwrap_or_else(|e| e.into_inner())
             .push(worker);
         #[cfg(target_os = "linux")]
-        self.stop_accepting(worker);
+        self.steer_away_from(worker);
         let byte = 1u8;
         unsafe {
             libc::write(self.exit_write.as_raw_fd(), (&byte as *const u8).cast(), 1);
@@ -715,7 +914,7 @@ impl RuntimeShutdown {
     /// shut down. If only workers taken out of the rotation are left, they go
     /// back in.
     #[cfg(target_os = "linux")]
-    fn stop_accepting(&self, worker: usize) {
+    fn steer_away_from(&self, worker: usize) {
         let Some(accepting) = self.accepting.get() else {
             return;
         };
@@ -792,7 +991,7 @@ impl RuntimeShutdown {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             for worker in exited {
-                self.stop_accepting(worker);
+                self.steer_away_from(worker);
             }
         }
     }
@@ -1753,6 +1952,7 @@ impl RinglineBuilder {
                 shutdown_flag.clone(),
                 listen_gates.clone(),
                 wake_keep_alive.clone(),
+                num_threads,
             )
             .map_err(crate::error::Error::Io)?,
         );
@@ -1880,6 +2080,7 @@ impl RinglineBuilder {
             // in merged accept mode (io_uring) it wakes peers.
             config.wake_keep_alive = Some(wake_keep_alive.clone());
             config.runtime_shutdown = Some(runtime_shutdown.clone());
+            config.accept_state = Some(Arc::clone(&runtime_shutdown.accept));
             config.worker_index = worker_id;
             config.sq_thread_cpu = sq_thread_cpus[worker_id];
             config.worker_loads = worker_loads.clone();
@@ -1917,6 +2118,7 @@ impl RinglineBuilder {
             let worker_listen_gates = listen_gates.clone();
             let worker_fn = worker_fn.clone();
             let startup_tx = startup_tx.clone();
+            let worker_done = WorkerDone(Arc::clone(&runtime_shutdown.accept), worker_id);
 
             let (worker_resolve_rx, worker_resolve_tx, worker_resolver) =
                 if let Some(ref rxs) = resolve_rxs {
@@ -1954,6 +2156,8 @@ impl RinglineBuilder {
             let spawn_result = thread::Builder::new()
                 .name(format!("rl-work-{worker_id}"))
                 .spawn(move || {
+                    // Dropped when this thread ends, however it ends.
+                    let _worker_done = worker_done;
                     if config.worker.pin_to_core {
                         let core = pin_cpu;
                         // Report the failure before bailing — otherwise
@@ -2190,6 +2394,7 @@ impl RinglineBuilder {
                         tcp_nodelay: !is_unix && self.config.tcp_nodelay,
                         conn_chunk_size: self.config.conn_chunk_size,
                         stop: runtime_shutdown.stop_signal(),
+                        accept: Arc::clone(&runtime_shutdown.accept),
                     };
                     thread::Builder::new()
                         .name(format!("rl-acpt-{idx}"))
@@ -3391,6 +3596,66 @@ mod worker_exit_tests {
         }
     }
 
+    /// `next_signal` returns `WorkerExited` once for each stopped worker and
+    /// leaves the others serving: of two callers waiting for one stop, one
+    /// returns and the other waits for the second stop, after which the exit
+    /// pipe is empty.
+    #[test]
+    fn next_signal_reports_each_worker_exit_once_and_keeps_serving() {
+        let (runtime, handles, fault) = launch(3, AcceptMode::Pool, TaskPanicPolicy::Contain);
+        let mut streams = connect_all(runtime.bound_addr().unwrap(), 12);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let waiter = runtime.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(waiter.next_signal());
+            });
+        }
+        // Both callers in `poll` before the stop, so both are likely to wake
+        // for its byte; the kernel re-checks readiness, so one may not.
+        std::thread::sleep(Duration::from_millis(50));
+        let exit_pipe_readable = || {
+            let mut fds = [libc::pollfd {
+                fd: runtime.shutdown.exit_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+            ready > 0
+        };
+
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, 3);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).ok(),
+            Some(Signal::WorkerExited)
+        );
+        wait_for_exit(&handles, 1);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(300)).ok(),
+            None,
+            "one worker exit was returned to both callers"
+        );
+        check_service_after_exit(&runtime, &mut streams, 3);
+
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, 3);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).ok(),
+            Some(Signal::WorkerExited)
+        );
+        wait_for_exit(&handles, 2);
+        assert!(
+            !exit_pipe_readable(),
+            "the worker exit would be returned again"
+        );
+
+        runtime.shutdown();
+        wait_for_exit(&handles, 3);
+    }
+
     /// `shutdown` returns after the acceptor thread has exited, so the
     /// listener's socket is closed when it returns. Nothing connects, so the
     /// acceptor is in `poll`; on macOS only the stop signal wakes it, and on
@@ -3413,6 +3678,7 @@ mod worker_exit_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             crate::listen_gate::ListenGates::new(0, 128),
             Arc::from(Vec::new()),
+            0,
         )
         .expect("runtime shutdown")
     }
@@ -3739,6 +4005,7 @@ mod worker_exit_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             crate::listen_gate::ListenGates::new(0, 128),
             Arc::from(Vec::new()),
+            2,
         )
         .unwrap();
         let accepting = (0..2)
@@ -3776,6 +4043,7 @@ mod worker_exit_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             crate::listen_gate::ListenGates::new(0, 128),
             Arc::from(Vec::new()),
+            2,
         )
         .unwrap();
         let accepting = (0..2)
