@@ -138,6 +138,14 @@ Beware the environment before blaming the code. Link capacity, interrupt
 placement, and processor topology have all produced results that looked like
 regressions and were not.
 
+A policy setting (an admission order, a limit) is measured only if its effect
+can be seen. Identical results under two settings can mean the setting made no
+difference, or that the setting never changed an outcome in that run, and the
+results alone do not say which. So each setting must export a counter of the
+times it changed an outcome (sends admitted ahead of the head of a queue, sends
+that waited at a limit, sends refused at one), and an experiment that varies the
+setting must report that counter beside its results.
+
 ## 9. The public surface is a contract
 
 What is exposed is chosen, not defaulted. Fields are private and reached through
@@ -171,6 +179,67 @@ keyword at the call site is the mechanism working.
 The same reasoning applies to panics. An operation that will abort on some
 inputs says so, and a caller who cannot guarantee those inputs is given a
 fallible variant instead of being left to discover the panic in production.
+
+## 11. No connection may hold an unbounded share of a worker's resources
+
+Principle 3 partitions state between threads, but within a worker the
+connections still share: the send pool, the send slab, receive buffers. When
+such a resource keeps no account per connection, one client that pipelines
+requests and reads slowly can hold all of it, and every other client on that
+worker then waits for that client's reads.
+
+So every resource a worker shares between its connections must keep a count per
+connection and have a limit per connection. On io_uring, `forward_hold_cap` and
+`zero_copy_hold_cap` limit send slab entries per connection once the slab is
+more than half used. A limit that applies only above an occupancy is acceptable
+when measurement shows that an unconditional one costs healthy connections too
+much, or can deadlock against a peer that writes a batch before it reads; the
+count is kept either way.
+
+## 12. Backpressure lands on the connection that caused it
+
+When a resource is short because of one connection, the wait or the refusal
+applies to that connection's operations. A slow receiver's bounded sends wait
+on its own connection, and its other sends are refused; the worker's other
+connections continue.
+
+The pressure is not moved into a resource with no bound. Sending a copy that a
+limit kept out of the pool from a heap buffer instead would remove the refusal,
+but a slow client would then grow the heap without the application seeing it
+until some larger limit is reached. The runtime makes the caller wait or
+refuses the operation, so the caller can see the pressure.
+
+## 13. Reserve what an operation needs before taking an irreversible step
+
+Sealing a TLS record spends a sequence number, so a send that runs out of pool
+slots after it has sealed records can only be ended by closing the connection.
+Any operation that fails after an irreversible step has the same problem: the
+step cannot be undone, so the failure has to be handled at a larger scope.
+
+So the runtime must take every resource an operation needs before it acts, and
+return what the operation did not use. Where the exact need is not known in
+advance, the operation must take an upper bound, and a test must confirm that it
+stayed within it. Taking the resources themselves, rather than a count of them,
+means each one is accounted for once. Where there is nothing to take, as on mio,
+whose send pool is an admission budget with no slot memory, the count is the
+resource.
+
+## 14. Output the protocol requires must be kept until it can be sent
+
+Handshake records, alerts and `close_notify` are output the TLS protocol
+requires the runtime to send. Refusing or dropping them breaks the connection,
+and the application cannot apply backpressure to them, because it did not ask
+for them. A TLS 1.3 `key_update` response is required too, but rustls sends it
+with the next application write or TLS message, so it is subject to that
+operation's limits.
+
+So such output must be exempt from per-connection limits. When there is no space
+for it, it must be kept, ahead of any later operation whose records are not yet
+sealed, and retried when space returns. It must be bounded by the protocol's own
+limits, such as the handshake timeout, rather than by refusal. `close_notify` is
+the exception: when it still finds no space once the connection's other sends
+have drained, it is dropped and the connection ends with a bare FIN, so that a
+closing connection does not wait without bound.
 
 ---
 
