@@ -1,6 +1,8 @@
 # Send pool: bounded sends, per-connection tickets, and a cap
 
-Status: proposal. Nothing here is implemented.
+Status: proposal. Experiment stage 0 has run
+(`docs/journal/2026-11-send-pool-stage0.md`); nothing in the runtime is
+implemented.
 
 Terms: the worker queue is the worker's queue of sends waiting for
 send-pool slots, which `docs/send-admission-design.md` calls the FIFO
@@ -231,20 +233,14 @@ its place. `Strict` serves the worker queue's head only; `Budget { slots }`
 also serves a later entry that fits ahead of a head that does not, within
 its limit, as today.
 
-Round-robin is built only if stage 0 shows connections with more than one
-ticket waiting at once (NO-GO below). It differs in one rule: a connection's
-next waiting ticket joins the back of the worker queue instead of taking its
-predecessor's place, so a connection with many waiting tickets takes one
-turn and then waits behind every other connection that has a ticket waiting.
-That replaces arrival order across connections with turn order, which
-changes the documentation of `SendAdmissionOrder`
-(`runtime/send_completion.rs`).
-
-Turns are per ticket, not per slot: a connection whose tickets need eight
-slots takes more of the pool per turn than one whose tickets need one. The
-cap (section 5) bounds what any connection holds. Turns weighted by slots
-(deficit round-robin) are the next step if the experiment shows per-ticket
-turns are too coarse under the cap.
+The worker queue keeps arrival order across connections. Round-robin, in
+which a connection's next waiting ticket joins the back of the worker queue
+instead of taking its predecessor's place, is not built: stage 0 found, by
+reading the code, that the cache server and `admission-server` send each
+reply on a connection only after the one before it is admitted, so at most
+one bounded send waits per connection and turn order would reorder nothing.
+Reopen if a server sends on one connection from more than one task, or joins
+or selects over several sends on one connection.
 
 Slots that a ticket admitted ahead of the head pops are marked passing as
 today (`mark_if_passing`, `buffer/send_copy.rs`). Slots it pushes back are
@@ -297,7 +293,12 @@ earlier generation of the index does not decrement the current one, so slots
 a closed connection's sends still hold do not count against the next
 occupant of its index.
 
-A connection with `held >= M` is at the cap. The rule is the one
+A connection with `held >= M` is at the cap. `M` defaults to 64: in stage 0
+an application-level bound of 64 slots removed the slow-reader stalls (0 of
+60,000 probe requests over 10 ms in every run, against 32-100% unbounded)
+and cost no measured throughput to connections with up to 256 replies
+outstanding, where 16 slots cost idle connections a third of their replies.
+The rule is the one
 `zero_copy_hold_cap` uses (`zero_copy_over_cap`), so an operation of any
 size is served while its connection is under the cap; nothing is refused for
 its size.
@@ -324,10 +325,13 @@ The cap can deadlock against a peer that writes a batch of requests before
 it reads any reply. If the batch's replies need more than `M` slots plus
 what the socket buffers take, the server's send waits at the cap; a handler
 that awaits it stops reading, the peer's writes block, and the peer never
-reads the replies that would release the slots. The send slab's caps apply
-only above half occupancy for this reason. The choice between an always-on
-cap and one above an occupancy is made from stage 1's results, including
-the `batch` cell.
+reads the replies that would release the slots. Stage 0 measured it with the
+server's socket buffers held small: a client writing 2,000 requests before
+reading deadlocked under a 16-slot bound and finished unbounded. With the
+image's default buffers no batch of up to 10,000 requests stalled. So the
+cap applies only while the pool is more than half used, as the send slab's
+caps do; below that a connection may hold any number of slots. Stage 1
+measures the threshold.
 
 ### 6. Refusals
 
@@ -487,9 +491,8 @@ Per worker, as `SendAdmissionCounters` fields: tickets that waited, the
 largest number of tickets waiting on one connection at once, waits at the
 cap, non-waiting sends refused for each reason, the largest held count, TLS
 receive-path output that waited for slots, connections closed with a bare
-FIN because sealed output was waiting, and, if built, tickets served ahead
-of an earlier ticket from another connection (round-robin), dedicated-slot
-sends and retired dedicated slots (section 7).
+FIN because sealed output was waiting, and, if built, dedicated-slot sends
+and retired dedicated slots (section 7).
 
 ## Experiment
 
@@ -510,27 +513,22 @@ The cells:
 `send` on the uncontended path is measured with a criterion benchmark of
 `send(..).await` against `try_send` (`ringline/benches/echo.rs`).
 
-0. No runtime change. ringline-bench's `admission-server` and
-   `admission-load` have an open-loop small-request probe and slow readers.
-   - The cap-only arm is `admission-server --pipeline P --small-send
-     admitted`, so small replies wait as they will by default. `--pipeline`
-     bounds each connection's unsettled replies, swept at the `P` that gives
-     about 16 and 64 slots per connection. It is also a test of the do-nothing
-     alternative, since `--pipeline` is the caller-side gating that
-     alternative asks for.
-   - `admission-load` gains a batch writer, a client pipelining small
-     replies, a full-speed 1 MiB reader that reports throughput, and the
-     count of probe requests not answered within 10 ms.
-   - The cache server and `admission-server` count, per connection, the
-     largest number of bounded sends waiting at once.
-
-   Cells `slow`, `mixed`, `batch`, `idle`, `bulk`. This stage measures
-   whether a per-connection bound meets the criterion before tickets, the
-   TLS ordering, the API change or mio are built, and whether round-robin
-   can act at all in these workloads.
-1. After sections 1 to 6: every cell, `M` at the values stage 0 chose, an
-   always-on cap and one above half occupancy, under `Strict` and `Budget`,
-   against the unchanged pool.
+0. Done, with no runtime change (`docs/journal/2026-11-send-pool-stage0.md`):
+   `admission-server --conn-slot-cap M`, an application-level bound on the
+   slots a connection's unsettled replies hold, in these cells and deeper
+   pipelining cells, 226 runs. `M` = 64 met the decision rules under both
+   orders; `M` = 16 cost idle connections a third of their replies. NO-GO
+   for an always-on cap (the `batch` cell with small server socket buffers)
+   and for round-robin (section 3). At `M` = 64 the 8,192-slot pool
+   protected small replies with fewer than 96 slow readers, with 1,500 to
+   2,200 slots in use that the application's count did not cover (open
+   question 8).
+1. After sections 1 to 6: every cell, `M` at 32 and 64, the cap above half
+   occupancy and above three quarters, under `Strict` and `Budget`, against
+   the unchanged pool; `slow-N` at 64, 96 and 128 readers, with the runtime's
+   held count, to find what holds the slots stage 0 could not account for;
+   and the `batch` cell with small server socket buffers, which the
+   occupancy threshold must let finish.
 2. A TLS cell with slow readers and the pool held near full, counting
    connections failed, receive-path output that waited, and bare-FIN closes.
 3. Only if stage 1's rule for section 7 is met (below): section 7, with the
@@ -547,17 +545,9 @@ pool's slots over the cap) that a deployment expects. At `S / M` readers or
 more the pool is full by construction, so those counts measure section 7,
 not the cap.
 
-NO-GO for an always-on cap: no `M` meets the criterion in the `slow` cells
-at reader counts below `S / M` and in both throughput cells, or the `batch`
-client is not served to completion under it. The cap then applies only above
-an occupancy.
-
-NO-GO for round-robin: in stage 0, no connection in the cache server's cells
-ever has more than one bounded send waiting. Round-robin then reorders
-nothing and is not built. Stage 1 repeats the count with the cap on. If it
-is built, stage 1 runs it against arrival order in a cell where connections
-have several sends waiting, and it is kept only if the 1 KiB probe's
-not-within-10-ms count falls.
+Stage 0 met the NO-GO for an always-on cap (the `batch` client deadlocked
+under the bound) and the NO-GO for round-robin (no connection has more than
+one bounded send waiting), so neither is built.
 
 ## Prior art
 
@@ -600,9 +590,9 @@ checked, the entry says so.
   host and one packet per non-empty queue per cycle), and deficit round-robin
   (Shreedhar and Varghese, SIGCOMM 1995), which gives each flow a quantum per
   round so flows with large packets do not get more than their share. DRR is
-  O(1) per packet when the quantum is at least the largest packet. Round-robin's
-  per-ticket turns (section 3) are Nagle's scheme; turns weighted by slots would
-  be DRR. Linux's `fq` qdisc combines both with a per-flow limit: per-flow
+  O(1) per packet when the quantum is at least the largest packet. Round-robin
+  over connections (section 3, not built) would be Nagle's scheme, and turns
+  weighted by slots DRR. Linux's `fq` qdisc combines both with a per-flow limit: per-flow
   queues served round-robin with a quantum of two MTUs, and a packet dropped
   once its flow holds 100 (`flow_limit`, `net/sched/sch_fq.c`). The per-flow
   limit there is the cap here, with a refusal or a wait in place of a drop.
@@ -635,8 +625,11 @@ checked, the entry says so.
 
 ## Open questions
 
-1. Defaults for `M` and, if section 7 is built, `k` and `D`.
-2. Whether the cap applies always or above an occupancy.
+1. Defaults for `k` and `D`, if section 7 is built. `M` defaults to 64 from
+   stage 0; stage 1 confirms it against the runtime's own count.
+2. The occupancy above which the cap applies: half, as the send slab's caps,
+   unless stage 1 shows another threshold serves the `batch` cell and the
+   slow readers better.
 3. Whether a capped connection rejoins at `held < M` or only below a lower
    mark `L`, as Netty's and Envoy's watermarks do (Prior art). A lower mark
    gives a capped connection fewer, larger turns.
@@ -650,8 +643,9 @@ checked, the entry says so.
 6. Whether sends that take a slab entry and no slot join the ticket order.
 7. Whether ringline offers a configured default limit on a bounded send's
    wait, and what a send that reaches it returns.
-8. Whether per-ticket turns are fair enough, or turns weighted by slots are
-   needed, if round-robin is built.
+8. What holds the 1,500 to 2,200 pool slots that stage 0's application-level
+   count did not cover with 96 to 160 slow readers. It decides how many slow
+   readers a pool of a given size protects, and so the pool's size.
 
 ## Alternatives
 
@@ -692,18 +686,19 @@ checked, the entry says so.
 
 ## Order of work
 
-1. Experiment stage 0, in ringline-bench and the cache server.
+1. Experiment stage 0 (done).
 2. The held count per connection, keyed by generation, with tests and no
    behaviour change.
 3. Taking slots for an operation and returning the excess, for copy sends,
    TLS application data and receive-path TLS output (section 4).
 4. In one breaking release: the per-connection ticket queue and the worker
-   queue (sections 2 and 3, round-robin only if stage 0 keeps it), with
+   queue (sections 2 and 3), with
    receive-path TLS output waiting in order instead of failing the
    connection; bounded sends by default, the `try_` forms, `SendRefused` and
    the method that reports a refusal in advance; the removal of `send_chain`;
    and the in-tree callers (sections 1, 2 and 6, In-tree callers).
-5. The cap (section 5) and its mio account (the mio section).
+5. The cap above half occupancy, `M` = 64 by default (section 5), and its
+   mio account (the mio section).
 6. Experiment stages 1 and 2.
 7. If stage 1's rule for section 7 is met, the dedicated pool (section 7)
    and stage 3.
