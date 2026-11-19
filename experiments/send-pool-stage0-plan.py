@@ -3,6 +3,7 @@
 
 Usage: send-pool-stage0-plan.py calibration
        send-pool-stage0-plan.py matrix REP
+       send-pool-stage0-plan.py batchretest REP
 
 The cells, arms and fixed arguments are those of
 docs/journal/2026-11-send-pool-stage0.md. A matrix plan holds one run of
@@ -47,6 +48,22 @@ def line(cell, arm, order):
             f"|{LOAD} {CELLS[cell]}")
 
 
+SMALLBUF = "net.ipv4.tcp_rmem=4096 8192 16384;net.ipv4.tcp_wmem=4096 8192 65536"
+
+
+def batchretest(rep):
+    """batch-K at K = 500, 2,000 and 10,000, unchanged and M = 16, budget
+    order, with the server's socket buffers held small by the sysctls."""
+    out = []
+    arms = ["cap0", "cap16"]
+    for i, k in enumerate([500, 2000, 10000]):
+        a = arms if (rep + i) % 2 == 0 else arms[::-1]
+        for arm in a:
+            out.append(f"sbatch{k}-{arm}-budget|{SERVER} --order budget {ARMS[arm]}"
+                       f"|{LOAD} {batch(k)}|{SMALLBUF}")
+    return out
+
+
 def calibration():
     return [
         line("slow4", "cap0", "budget"),
@@ -79,6 +96,8 @@ def matrix(rep):
 def main():
     if sys.argv[1] == "calibration":
         lines = calibration()
+    elif sys.argv[1] == "batchretest":
+        lines = batchretest(int(sys.argv[2]))
     else:
         lines = matrix(int(sys.argv[2]))
     text = "\n".join(" ".join(l.split()) for l in lines) + "\n"

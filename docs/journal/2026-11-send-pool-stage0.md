@@ -155,3 +155,27 @@ buffers held small, so that the unread requests fill them.
 
 `bulk` under `M` = 16 was as fast as unchanged in this one run each, against
 the prediction of more than 10% loss; the matrix has three runs per arm.
+
+### Batch retest: predictions, written before its runs
+
+The retest (`send-pool-stage0-plan.py batchretest`) runs `batch-K` at
+K = 500, 2,000 and 10,000, unchanged and `M` = 16, `budget` order, two runs
+each, with `net.ipv4.tcp_rmem` set to 4096 8192 16384 and `tcp_wmem` to
+4096 8192 65536 for its runs only. The client sets its own buffers (4096,
+which Linux doubles), so the sysctls cap the server's sockets: about 16 KB
+to receive and 64 KB to send.
+
+Under `M` = 16 the server stops reading once 16 replies are unsettled and its
+socket's send buffer is full, about 60 replies of 1 KiB later: after about
+80 requests. The requests still unread then fit in the server's receive
+buffer and the client's send buffer (about 24 KB, 1,000 requests) only if K
+is below about 1,100.
+
+- K = 500: every round finishes under both arms.
+- K = 2,000: unchanged finishes every round (the pool holds all 2,000
+  replies); `M` = 16 stalls in the write phase of its first round. This is
+  the positive control for the always-on NO-GO. Refuted if `M` = 16
+  finishes its rounds.
+- K = 10,000: both arms stall, since about 9,900 unsent replies exceed the
+  8,192-slot pool even unchanged. This shows the pool bounds a batch writer
+  without any cap.
