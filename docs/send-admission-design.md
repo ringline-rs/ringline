@@ -784,16 +784,20 @@ and `--stream-gate` for the gate:
   `wmem_queued` is below `sk_sndbuf`, checking only before it starts a new
   segment. Both count truesize: payload plus per-segment overhead. A piece is
   sure to go in whole when its truesize fits in a third of `sk_sndbuf`. A
-  larger piece goes in whole when the gate opens with less queued, which is
-  always the case for a stalled peer's first pieces and never for a reader
-  that keeps its buffer near two thirds full. On loopback `sk_sndbuf` grows to
+  larger piece goes in whole when the gate opens with less queued, which was
+  the case for a stalled peer's first plaintext pieces in Experiment D, and
+  never for a reader that keeps its buffer near two thirds full. Over TLS
+  with a 256 KiB buffer, a stalled peer's second 128 KiB piece waited for
+  room (Experiment E). On loopback `sk_sndbuf` grows to
   the `tcp_wmem` maximum at the handshake, so a third is about 341 KiB at
   1 MiB and about 85 KiB at W2's 256 KiB. Small segments add overhead: a peer
   with a 4 KiB receive window gets about 2 KiB segments, about 61% payload
   (derived from the kernel source, not measured). A piece that does not go in
   whole holds its slots until the socket takes the rest, as an ungated piece
   does. To a reader that drains, that is until it has read enough for the
-  socket to take the rest; to a stalled peer, until `settle_limit`.
+  socket to take the rest; to a stalled peer, until the socket takes the
+  rest or `settle_limit` expires. In Experiment E, 2,480 of 2,520 such TLS
+  pieces were taken before `settle_limit`.
 - The wait for room is bounded by `settle_limit`, and a socket that stays
   unwritable that long is aborted. The gate opens again once the reader has
   taken about one piece, so a reader is aborted when it takes less than about
@@ -1039,11 +1043,10 @@ pieces passed.
   backends count different sends as having waited when replies are pipelined.
 - On the branches `SendCompletion::passed_head`, `waited_for_room` and the
   admission counters are `#[doc(hidden)] pub`, and stay so (Decisions).
-- O7w has not run on TLS. Neither Experiment C nor D sent TLS replies, and
-  under O7w a TLS reply is a whole reply: in D, O7w with whole replies
-  completed no 7 MiB reply in W4 or W5, and its fast small p99 was 25.4 ms in
-  W4 at 256 KiB. A TLS reply needs at least two slots, so R admits fewer TLS
-  passers than plaintext ones.
+- Neither Experiment C nor D sent TLS replies. Under O7w a TLS reply is a
+  whole reply: in D, O7w with whole replies completed no 7 MiB reply in W4 or
+  W5, and its fast small p99 was 25.4 ms in W4 at 256 KiB. A TLS reply needs
+  at least two slots, so R admits fewer TLS passers than plaintext ones.
 - The part is done when C2's seven cells and the W1 cell with sends outside
   the FIFO, rerun on the ported code, give, under O7w, each cell's largest
   head delay within the larger of 10% of C2's O7w figure and the spread
@@ -1052,13 +1055,15 @@ pieces passed.
   C2's range over the passing orders, 810.2 to 811.2 ms and 0.5 to 0.6 ms);
   under strict order, the same against C2's O0 figures; and the echo check
   puts the default build within the floor of main.
-- Because O7w is the default and has not run on TLS, `admission-server` and
-  `admission-load` gain TLS, with a pool slot of at least one whole record
-  (16,413 bytes; `validate_tls_slot_size` refuses C's 16 KiB), and the W1 and
-  W2 cells run once with TLS under both orders. By two of C's conditions, O7w
-  must time out no more heads than strict order and keep W1's fast small p99 at
-  or below 10 ms. Otherwise the default goes back to the owner before the pull
-  request merges.
+- Because O7w is the default and C and D sent no TLS replies,
+  `admission-server` and `admission-load` gain TLS, with a pool slot of at
+  least one whole record (16,413 bytes; `validate_tls_slot_size` refuses C's
+  16 KiB), and the W1 and W2 cells run once with TLS under both orders. By two
+  of C's conditions, O7w must time out no more heads than strict order and
+  keep W1's fast small p99 at or below 10 ms. Otherwise the default goes back
+  to the owner before the pull request merges.
+- Part 2's runs, against these criteria, are in
+  `docs/journal/2026-11-send-admission-o7w.md`.
 
 #### Part 3: guarded batches that wait
 
@@ -1077,7 +1082,7 @@ that does not want them back.
   total length.
 - The send-slab entry is not part of the FIFO's admission (Alternatives). It
   is taken when the batch is admitted, and a full slab then refuses the
-  batch.
+  batch with `WouldBlock`.
 - On mio, where `submit_batch` copies the whole batch and takes no slots,
   the method waits as `send_admitted` does for the batch's total length.
 - A refusal returns every part to the caller, guards included, and every
@@ -1101,14 +1106,49 @@ These are untested, and each is a limit of the specification as written:
   and a send-slab entry each: a stalled peer's socket takes gated pieces until
   it is about two thirds full, about six 128 KiB pieces at 1 MiB, so about 85
   stalled peers would hold the default 512 entries (derived, not measured),
-  and other connections' guarded batches would then be refused;
-- TLS replies in pieces;
+  and other connections' guarded batches would then be refused.
+  `ConfigBuilder::zero_copy_hold_cap` (default 16) does not bind here, since
+  each such peer holds about six entries. It limits a connection that keeps
+  taking entries: once the slab is over half used, a connection that holds
+  16 has its guarded sends refused, and `submit_batch_admitted` returns the
+  parts so the caller can copy them. With the defaults, as few as 17 such
+  connections can fill the slab;
 - a network between server and client, where `sk_sndbuf` starts near 85 KiB
   and grows with the congestion window, so a piece can be partly sent early
   in a connection;
 - mio under load: `writable` is tested on mio but did not run on the rack;
 - small replies to a peer that pipelines and stops reading, which still hold
   their slots until `settle_limit` (Non-goals).
+
+TLS replies in pieces ran in Experiment E
+(`docs/journal/2026-11-send-admission-e.md`), on loopback and kernel 6.12.
+With 512 slots of 16 KiB, under strict order, gated pieces of 64 KiB and
+128 KiB passed Experiment D's decision rule over TLS. Outside the rule's
+cells, in W4 with a 256 KiB send buffer and 128 stalled peers, 128 KiB
+pieces were partly sent to stalled peers and held the pool (fast small p99
+929 ms), while plaintext 128 KiB pieces were not; why is not known. A piece
+counts as partly sent when a send of it came back short
+(`SendCompletion::waited_for_room`). 85 KiB pieces, a third of that buffer,
+passed the three cells they ran in. A piece of a third of the send buffer, at
+most 128 KiB, passed in every cell E ran it in: at 85 KiB with 512 slots of
+16 KiB, and at 128 KiB with that pool and with 128 slots of 64 KiB. With 512
+slots, pieces of 16, 32 and 64 KiB passed every rule cell over both
+transports, at more CPU per byte the smaller they were (2.77 times whole
+replies over plaintext and 2.23 over TLS at 16 KiB).
+
+In W2, with six slow readers, a pool of 128 slots failed (fast small p99
+about 445 ms) with 16 KiB and with 64 KiB slots, and a pool of 512 slots
+passed with either. A small reply needs one free slot to be admitted over
+plaintext and two over TLS (records plus one), and once sent holds one slot
+on either transport, whatever the slot's size. A slow reader keeps up to
+the benchmark server's pipeline depth (16) of admitted, unsettled replies.
+The server's per-class held-slot samples count them at that depth with 512
+slots and gated pieces (96 over plaintext, 192 over TLS at two per reply),
+but they count a reply from admission until its task sees it settle, and
+over TLS count the two free slots admission requires where a sent reply
+holds one, so they over-count.
+With 128 slots the TLS samples (about 170) exceed the pool. Why 128 slots
+fail in W2 is not known over either transport.
 
 #### Decisions
 
@@ -1224,5 +1264,6 @@ The fast-path specification changes one default and adds API:
   connections sets the order to strict. Sends on one connection keep their
   order either way.
 - A configuration with an O7w budget of 0 fails validation.
-- `writable`, `send_buffer_size` and the waiting batch method are new; no
-  existing signature changes.
+- `writable`, `send_buffer_size` and the waiting batch method
+  (`AsyncSendBuilder::submit_batch_admitted`) are new; no existing signature
+  changes.

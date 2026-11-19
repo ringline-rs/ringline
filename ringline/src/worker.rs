@@ -337,8 +337,9 @@ impl Runtime {
     /// table. Blocks until every worker has acknowledged the kernel-side
     /// update.
     ///
-    /// The returned [`RegionId`](crate::RegionId) is valid for use in
-    /// `SendGuard` on any worker.
+    /// The returned [`RegionId`](crate::RegionId) is valid for
+    /// [`SendGuard::region`](crate::SendGuard::region) and
+    /// [`IoBuf::region`](crate::buf::IoBuf::region) on any worker.
     ///
     /// # Errors
     ///

@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.7.0-alpha.148"
+version = "0.7.0-alpha.154"
 dependencies = [
  "bytes",
  "criterion",
@@ -1845,6 +1845,7 @@ dependencies = [
  "histogram 0.11.5",
  "itoa",
  "ketama",
+ "libc",
  "resp-proto",
  "ringline",
  "thiserror",

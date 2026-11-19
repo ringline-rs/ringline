@@ -1,4 +1,4 @@
-//! Load for the contended cases of Experiments B and C
+//! Load for the contended cases of Experiments B to E
 //! (`docs/send-admission-design.md`, section 4), against `admission-server`.
 //!
 //! Every request is 24 bytes, in the format `admission-server` documents. It
@@ -38,7 +38,24 @@
 //!   them.
 //! - `--large-delay-ms` later, one connection asks for a `--large-size` reply,
 //!   which needs more slots than are free and waits at the head of the
-//!   server's FIFO, then reads it.
+//!   server's FIFO, then reads it as fast as it can, with `SO_RCVBUF` set to
+//!   `--head-rcvbuf` before the connect (0 leaves it to the kernel). With
+//!   `--large-size 0` the episode has no head.
+//!
+//! With `--ports-file`, each stalled peer, drainer and head appends its local
+//! port to the file as it connects, so that a sampler can pick its socket out
+//! of `ss`.
+//!
+//! # Closed loop
+//!
+//! With `--closed-loop N` the load runs only workload U of Experiment D: one
+//! connection, with `SO_RCVBUF` set to `--head-rcvbuf` before the connect,
+//! writes a request for `--large-size` bytes, reads the reply in full, and
+//! writes the next, `--closed-warmup` times uncounted and then N times. It
+//! prints the `SO_RCVBUF` the kernel reports, each counted reply's time from
+//! its request to its last byte in microseconds, their median, p99 and
+//! maximum, and the window over which they ran. It exits 1 if a reply was not
+//! read in full.
 //!
 //! The head's tag is `u32::MAX`, each drainer's `0x8000_0000` plus its index,
 //! and each stalled peer's its index; `admission-server` records the tag of
@@ -94,22 +111,53 @@
 //! 4096 bytes or 10 ms of the rate, whichever is less. The thread sleeps at
 //! most 1 ms between checks.
 //!
+//! # TLS
+//!
+//! With `--tls`, every connection runs a rustls client session over its TCP
+//! socket, trusting only the certificate in `--tls-ca` (which
+//! `admission-server --tls-cert-out` writes) for the name `localhost`. The
+//! handshake completes before the connection's first request; a request
+//! scheduled while its connection is reconnecting keeps its scheduled time,
+//! so the handshake counts in the latencies. The session reads and writes
+//! the socket itself, not through `rustls::Stream`, so the socket sees the
+//! same calls as without TLS:
+//!
+//! - `SO_RCVBUF` is set on the TCP socket as above, before the connect where
+//!   it is set before the connect without TLS.
+//! - A paced reader's token bucket counts the bytes read from the socket,
+//!   which are ciphertext, and each read takes at most 4096 bytes of them as
+//!   before. The plaintext rustls has decrypted is taken without waiting for
+//!   tokens. Other reads take at most 16384 bytes of ciphertext at a time, so
+//!   rustls' buffer of decrypted plaintext never overflows.
+//! - The fast connections wait for the socket to be readable only when rustls
+//!   holds no decrypted plaintext.
+//! - A slow connection's requests are encrypted as they are written; the
+//!   ciphertext the socket did not take is written before more requests are
+//!   encrypted.
+//!
+//! The reply bytes, latencies and `bytes_read` count plaintext.
+//!
 //! # Output
 //!
 //! One JSON object: for the fast small connections, the replies offered after
 //! `--warmup` (sent before the drain), delivered within `--within-ms`,
 //! delivered late and lost, their latency percentiles, and each episode's
-//! large-reply outcome, as in Experiment B; the same for the slow connections
+//! head: its time from request to last byte in milliseconds (`large_ms`) and
+//! microseconds (`large_us`), `null` where it was not read in full, and
+//! whether it was (`large_completed`); the same for the slow connections
 //! under `slow`; each drainer's time from request to last byte per episode,
-//! or `null`, under `drainers`; counts for the outside connections under
+//! in milliseconds and microseconds, or `null`, and whether its reply was
+//! read in full, under `drainers`; counts for the outside connections under
 //! `outside`; and the window's start and end in nanoseconds of
-//! `CLOCK_MONOTONIC` under `window_ns`.
+//! `CLOCK_MONOTONIC` under `window_ns`. The closed loop prints its own
+//! object (above).
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -119,7 +167,7 @@ use serde_json::{Value, json};
 #[derive(Parser, Clone)]
 #[command(
     name = "admission-load",
-    about = "The contended-case load of Experiments B and C"
+    about = "The contended-case load of Experiments B to E"
 )]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7979")]
@@ -190,6 +238,32 @@ struct Args {
     outside_rate: u64,
     #[arg(long, default_value_t = 256)]
     outside_size: u32,
+    /// Speak TLS to the server, which must run with `--tls`.
+    #[arg(long, requires = "tls_ca")]
+    tls: bool,
+    /// The certificate (PEM) to trust for `--tls`, as `admission-server
+    /// --tls-cert-out` writes it.
+    #[arg(long, requires = "tls")]
+    tls_ca: Option<PathBuf>,
+    /// `SO_RCVBUF` on the head's socket, and on the closed loop's, set
+    /// before the connect; 0 leaves it to the kernel.
+    #[arg(long, default_value_t = 0)]
+    head_rcvbuf: i32,
+    /// Run only a closed loop of this many `--large-size` requests on one
+    /// connection, each written once the reply before it has been read in
+    /// full, and nothing else (Experiment D's workload U).
+    #[arg(long, default_value_t = 0)]
+    closed_loop: u32,
+    /// Replies the closed loop reads before the ones it counts, outside the
+    /// measurement window.
+    #[arg(long, default_value_t = 10)]
+    closed_warmup: u32,
+    /// Append a line for each stalled peer, drainer and head connection to
+    /// this file as it connects: the `CLOCK_MONOTONIC` time in ns, the
+    /// episode, the kind (`stall`, `drain` or `head`), its index, and its
+    /// local port.
+    #[arg(long)]
+    ports_file: Option<std::path::PathBuf>,
 }
 
 const REQUEST_LEN: usize = 24;
@@ -202,6 +276,197 @@ const DRAIN_TAG: u32 = 0x8000_0000;
 const READ_CHUNK: usize = 4096;
 /// The longest a paced reader sleeps between checks.
 const PACE_SLEEP: Duration = Duration::from_millis(1);
+/// The most ciphertext one TLS read takes from the socket: rustls' default
+/// limit on the decrypted plaintext it holds unread.
+const TLS_READ: usize = 16384;
+/// Handshake attempts before the load gives up.
+const HANDSHAKE_TRIES: u32 = 100;
+
+/// The client config for `--tls`, set once in `main` before any connection.
+static TLS: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+
+fn tls_config() -> Option<&'static Arc<rustls::ClientConfig>> {
+    TLS.get().and_then(Option::as_ref)
+}
+
+/// A client config that trusts only the certificates in `ca`.
+fn client_config(ca: &std::path::Path) -> Arc<rustls::ClientConfig> {
+    use rustls_pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    let certs = CertificateDer::pem_file_iter(ca).unwrap_or_else(|e| {
+        eprintln!("admission-load: read {}: {e}", ca.display());
+        std::process::exit(2);
+    });
+    for cert in certs {
+        let cert = cert.unwrap_or_else(|e| {
+            eprintln!("admission-load: parse {}: {e}", ca.display());
+            std::process::exit(2);
+        });
+        roots.add(cert).expect("a valid CA certificate");
+    }
+    if roots.is_empty() {
+        eprintln!("admission-load: no certificate in {}", ca.display());
+        std::process::exit(2);
+    }
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// A client TLS session and what it holds decrypted and unread.
+struct Session {
+    conn: rustls::ClientConnection,
+    /// Decrypted plaintext not yet read.
+    plain: usize,
+    /// The server sent `close_notify`.
+    closed: bool,
+}
+
+/// One connection to the server: a TCP socket, with a TLS session over it
+/// under `--tls`. See the module docs, TLS.
+struct Wire {
+    sock: TcpStream,
+    tls: Option<Box<Session>>,
+}
+
+impl Wire {
+    /// Wrap `sock`, a blocking socket just connected, and complete the TLS
+    /// handshake on it if `--tls` is set.
+    fn new(mut sock: TcpStream) -> std::io::Result<Wire> {
+        let Some(cfg) = tls_config() else {
+            return Ok(Wire { sock, tls: None });
+        };
+        let name = rustls_pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut conn =
+            rustls::ClientConnection::new(Arc::clone(cfg), name).map_err(std::io::Error::other)?;
+        while conn.is_handshaking() {
+            conn.complete_io(&mut sock)?;
+        }
+        Ok(Wire {
+            sock,
+            tls: Some(Box::new(Session {
+                conn,
+                plain: 0,
+                closed: false,
+            })),
+        })
+    }
+
+    fn sock(&self) -> &TcpStream {
+        &self.sock
+    }
+
+    /// Whether rustls holds decrypted plaintext, or the server's
+    /// `close_notify`, that a read returns without touching the socket.
+    fn buffered(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.plain > 0 || t.closed)
+    }
+
+    /// Whether ciphertext waits to be written.
+    fn wants_write(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.conn.wants_write())
+    }
+
+    /// Write all of `data`, on a blocking socket.
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        let Some(t) = self.tls.as_mut() else {
+            return self.sock.write_all(data);
+        };
+        t.conn.writer().write_all(data)?;
+        while t.conn.wants_write() {
+            t.conn.write_tls(&mut self.sock)?;
+        }
+        Ok(())
+    }
+
+    /// Write ciphertext waiting to be written, on a non-blocking socket.
+    /// True if none is left.
+    fn flush(&mut self) -> std::io::Result<bool> {
+        let Some(t) = self.tls.as_mut() else {
+            return Ok(true);
+        };
+        while t.conn.wants_write() {
+            match t.conn.write_tls(&mut self.sock) {
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Write some of `data` on a non-blocking socket, as `TcpStream::write`
+    /// does. Under TLS, `WouldBlock` while earlier ciphertext waits; otherwise
+    /// the plaintext rustls takes, encrypted and written as far as the
+    /// socket takes it.
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.tls.is_none() {
+            return self.sock.write(data);
+        }
+        if !self.flush()? {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let t = self.tls.as_mut().expect("a TLS session");
+        let n = t.conn.writer().write(data)?;
+        self.flush()?;
+        Ok(n)
+    }
+
+    /// Read into `buf`, taking at most `cap` bytes from the socket. Returns
+    /// the bytes taken from the socket and the reply bytes put in `buf`;
+    /// `(0, 0)` is the end of the connection. Under TLS the first is
+    /// ciphertext, and either can be 0 alone: a read of part of a record
+    /// yields no plaintext, and plaintext rustls holds is returned without
+    /// reading the socket. Errors as the socket's read, `WouldBlock` among
+    /// them.
+    fn read(&mut self, buf: &mut [u8], cap: usize) -> std::io::Result<(usize, usize)> {
+        let Some(t) = self.tls.as_mut() else {
+            let len = cap.min(buf.len());
+            let n = self.sock.read(&mut buf[..len])?;
+            return Ok((n, n));
+        };
+        if t.plain == 0 && !t.closed {
+            let mut cipher = [0u8; TLS_READ];
+            let n = self.sock.read(&mut cipher[..cap.min(TLS_READ)])?;
+            if n == 0 {
+                return Ok((0, 0));
+            }
+            let mut rest = &cipher[..n];
+            while !rest.is_empty() {
+                t.conn.read_tls(&mut rest)?;
+                let state = t
+                    .conn
+                    .process_new_packets()
+                    .map_err(std::io::Error::other)?;
+                t.plain = state.plaintext_bytes_to_read();
+                t.closed = state.peer_has_closed();
+            }
+            if t.plain == 0 && !t.closed {
+                return Ok((n, 0));
+            }
+            let got = Self::take_plain(t, buf)?;
+            return Ok((n, got));
+        }
+        Ok((0, Self::take_plain(t, buf)?))
+    }
+
+    /// Read decrypted plaintext into `buf`. 0 once the server has closed
+    /// and nothing is left.
+    fn take_plain(t: &mut Session, buf: &mut [u8]) -> std::io::Result<usize> {
+        match t.conn.reader().read(buf) {
+            Ok(n) => {
+                t.plain -= n.min(t.plain);
+                Ok(n)
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
 
 /// Converts an `Instant` to nanoseconds of `CLOCK_MONOTONIC`, the clock the
 /// server reads.
@@ -244,15 +509,83 @@ fn request(len: u32, tag: u32, flags: u32, scheduled_ns: u64) -> [u8; REQUEST_LE
     r
 }
 
-fn connect(addr: SocketAddr) -> TcpStream {
+/// Connect to `addr`, retrying until it accepts, and complete the TLS
+/// handshake under `--tls`. An `rcvbuf` above 0 is set as `SO_RCVBUF` before
+/// the connect (`connect_with_rcvbuf`). A handshake that fails `HANDSHAKE_TRIES` times in a row ends the
+/// process, since it would otherwise retry forever on a bad `--tls-ca`.
+fn connect_wire(addr: SocketAddr, rcvbuf: i32) -> Wire {
+    let mut failures = 0;
     loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => {
-                s.set_nodelay(true).ok();
-                return s;
+        let sock = if rcvbuf > 0 {
+            try_connect_with_rcvbuf(addr, rcvbuf)
+        } else {
+            TcpStream::connect(addr)
+        };
+        let Ok(sock) = sock else {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        };
+        sock.set_nodelay(true).ok();
+        match Wire::new(sock) {
+            Ok(w) => return w,
+            Err(e) => {
+                failures += 1;
+                if failures >= HANDSHAKE_TRIES {
+                    eprintln!("admission-load: TLS handshake failed {failures} times: {e}");
+                    std::process::exit(1);
+                }
+                thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => thread::sleep(Duration::from_millis(5)),
         }
+    }
+}
+
+fn connect(addr: SocketAddr) -> Wire {
+    connect_wire(addr, 0)
+}
+
+/// The `SO_RCVBUF` the kernel reports for `s`: on Linux twice the size set,
+/// capped at `net.core.rmem_max` doubled.
+fn rcvbuf(s: &TcpStream) -> i32 {
+    let mut size: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: `s` is a live socket, and `size` and `len` outlive the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&mut size as *mut i32).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 { size } else { -1 }
+}
+
+/// Where the stalled peers', drainers' and heads' local ports are written
+/// (`--ports-file`).
+#[derive(Clone)]
+struct Ports(Option<Arc<Mutex<std::fs::File>>>);
+
+impl Ports {
+    fn open(path: Option<&std::path::Path>) -> Ports {
+        Ports(path.map(|p| {
+            Arc::new(Mutex::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .expect("open --ports-file"),
+            ))
+        }))
+    }
+
+    fn note(&self, episode: usize, kind: &str, index: usize, s: &TcpStream) {
+        let (Some(f), Ok(local)) = (&self.0, s.local_addr()) else {
+            return;
+        };
+        let line = format!("{} {episode} {kind} {index} {}\n", mono_ns(), local.port());
+        let _ = f.lock().unwrap().write_all(line.as_bytes());
     }
 }
 
@@ -276,19 +609,8 @@ fn set_rcvbuf(s: &TcpStream, size: i32) {
 /// connection's receive buffer to a few hundred KiB within about 50 ms of the
 /// connect, whether the size was set before or just after it, so on macOS
 /// this does not limit the buffer.
-fn connect_with_rcvbuf(addr: SocketAddr, rcvbuf: i32) -> TcpStream {
-    if rcvbuf <= 0 {
-        return connect(addr);
-    }
-    loop {
-        match try_connect_with_rcvbuf(addr, rcvbuf) {
-            Ok(s) => {
-                s.set_nodelay(true).ok();
-                return s;
-            }
-            Err(_) => thread::sleep(Duration::from_millis(5)),
-        }
-    }
+fn connect_with_rcvbuf(addr: SocketAddr, rcvbuf: i32) -> Wire {
+    connect_wire(addr, rcvbuf)
 }
 
 fn try_connect_with_rcvbuf(addr: SocketAddr, rcvbuf: i32) -> std::io::Result<TcpStream> {
@@ -538,12 +860,12 @@ fn fast_conn(
             } else {
                 window.drain.saturating_duration_since(Instant::now())
             };
-            if !wait_readable(&conn, wait) {
+            if !conn.buffered() && !wait_readable(conn.sock(), wait) {
                 continue;
             }
-            match conn.read(&mut buf[filled..]) {
-                Ok(0) => broken = true,
-                Ok(n) => {
+            match conn.read(&mut buf[filled..], usize::MAX) {
+                Ok((0, 0)) => broken = true,
+                Ok((_, n)) => {
                     out.bytes_read += n as u64;
                     filled += n;
                     let at = Instant::now();
@@ -572,9 +894,9 @@ fn fast_conn(
     out
 }
 
-fn slow_connect(args: &Args) -> TcpStream {
+fn slow_connect(args: &Args) -> Wire {
     let s = connect_with_rcvbuf(args.addr, args.slow_rcvbuf);
-    s.set_nonblocking(true).expect("non-blocking socket");
+    s.sock().set_nonblocking(true).expect("non-blocking socket");
     s
 }
 
@@ -613,8 +935,9 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
             tag = tag.wrapping_add(1);
             next += stream.interval;
         }
-        let mut broken = false;
-        while !unsent.is_empty() {
+        // Under TLS, ciphertext the socket did not take last time goes first.
+        let mut broken = conn.flush().is_err();
+        while !broken && !unsent.is_empty() {
             let (head, _) = unsent.as_slices();
             match conn.write(head) {
                 Ok(0) => {
@@ -633,13 +956,13 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
         let mut starved = false;
         while !broken {
             let allow = pacer.allowance(Instant::now()).min(buf.len() - filled);
-            if allow == 0 {
+            if allow == 0 && !conn.buffered() {
                 break;
             }
-            match conn.read(&mut buf[filled..filled + allow]) {
-                Ok(0) => broken = true,
-                Ok(n) => {
-                    pacer.take(n);
+            match conn.read(&mut buf[filled..], allow) {
+                Ok((0, 0)) => broken = true,
+                Ok((wire, n)) => {
+                    pacer.take(wire);
                     out.bytes_read += n as u64;
                     filled += n;
                     let at = Instant::now();
@@ -669,7 +992,7 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
             continue;
         }
         let now = Instant::now();
-        let mut sleep = if starved || !unsent.is_empty() {
+        let mut sleep = if starved || !unsent.is_empty() || conn.wants_write() {
             PACE_SLEEP
         } else {
             pacer.wait()
@@ -686,8 +1009,16 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
 /// One drainer: ask for a `--drain-size` reply and read it at most at
 /// `--drain-read-bps`. Returns the time from the request to the last byte, or
 /// `None` if the connection ended or `until` came first.
-fn drainer(args: &Args, index: usize, until: Instant, clock: Clock) -> Option<Duration> {
+fn drainer(
+    args: &Args,
+    index: usize,
+    until: Instant,
+    clock: Clock,
+    ports: &Ports,
+    episode: usize,
+) -> Option<Duration> {
     let mut s = connect_with_rcvbuf(args.addr, args.drain_rcvbuf);
+    ports.note(episode, "drain", index, s.sock());
     let began = Instant::now();
     let r = request(
         args.drain_size,
@@ -705,16 +1036,16 @@ fn drainer(args: &Args, index: usize, until: Instant, clock: Clock) -> Option<Du
             return None;
         }
         let allow = pacer.allowance(now).min(left);
-        if allow == 0 {
+        if allow == 0 && !s.buffered() {
             thread::sleep(pacer.wait().min(until - now));
             continue;
         }
-        s.set_read_timeout(Some(PACE_SLEEP)).ok();
-        match s.read(&mut buf[..allow]) {
-            Ok(0) => return None,
-            Ok(n) => {
-                pacer.take(n);
-                left -= n;
+        s.sock().set_read_timeout(Some(PACE_SLEEP)).ok();
+        match s.read(&mut buf[..left.min(READ_CHUNK)], allow) {
+            Ok((0, 0)) => return None,
+            Ok((wire, n)) => {
+                pacer.take(wire);
+                left = left.saturating_sub(n);
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(_) => return None,
@@ -724,7 +1055,9 @@ fn drainer(args: &Args, index: usize, until: Instant, clock: Clock) -> Option<Du
 }
 
 /// One episode's outcome: the large reply's time from request to its last
-/// byte, and each drainer's, or `None` where the connection ended first.
+/// byte, and each drainer's, or `None` where the connection ended first or
+/// the reply was not read in full. `large` is `None` too in an episode with
+/// no head (`--large-size 0`).
 struct Episode {
     large: Option<Duration>,
     drainers: Vec<Option<Duration>>,
@@ -732,18 +1065,20 @@ struct Episode {
 
 /// One episode's drainers, stalled peers and large reply. The stalled peers
 /// stay open until 100 ms before the episode ends, so the server, not this
-/// client, ends them; the drainers stop reading then.
-fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
+/// client, ends them; the drainers stop reading then. With `--large-size 0`
+/// the episode has no head.
+fn episode(args: &Args, at: Instant, clock: Clock, ports: &Ports, number: usize) -> Episode {
     thread::sleep(at.saturating_duration_since(Instant::now()));
     let hold_until = at + Duration::from_millis(args.episode_ms.saturating_sub(100));
     thread::scope(|scope| {
         let drainers: Vec<_> = (0..args.drainers)
-            .map(|i| scope.spawn(move || drainer(args, i, hold_until, clock)))
+            .map(|i| scope.spawn(move || drainer(args, i, hold_until, clock, ports, number)))
             .collect();
         let mut stalled = Vec::new();
         for i in 0..args.stall_peers {
             let mut s = connect(args.addr);
-            set_rcvbuf(&s, args.stall_rcvbuf);
+            set_rcvbuf(s.sock(), args.stall_rcvbuf);
+            ports.note(number, "stall", i, s.sock());
             let r = request(
                 args.stall_size,
                 i as u32,
@@ -754,23 +1089,21 @@ fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
             stalled.push(s);
         }
         thread::sleep(Duration::from_millis(args.large_delay_ms));
-        let mut large = connect(args.addr);
-        large
-            .set_read_timeout(Some(Duration::from_millis(args.episode_ms)))
-            .ok();
-        let began = Instant::now();
-        let r = request(args.large_size, HEAD_TAG, FLAG_WINDOW, clock.ns(began));
-        let took = large.write_all(&r).ok().and_then(|()| {
-            let mut left = args.large_size as usize;
-            let mut buf = vec![0u8; 1 << 20];
-            while left > 0 {
-                match large.read(&mut buf) {
-                    Ok(0) | Err(_) => return None,
-                    Ok(n) => left = left.saturating_sub(n),
-                }
-            }
-            Some(began.elapsed())
-        });
+        let took = (args.large_size > 0)
+            .then(|| {
+                let mut large = connect_with_rcvbuf(args.addr, args.head_rcvbuf);
+                ports.note(number, "head", 0, large.sock());
+                large
+                    .sock()
+                    .set_read_timeout(Some(Duration::from_millis(args.episode_ms)))
+                    .ok();
+                let began = Instant::now();
+                let r = request(args.large_size, HEAD_TAG, FLAG_WINDOW, clock.ns(began));
+                large.write_all(&r).ok()?;
+                read_reply(&mut large, args.large_size as usize)?;
+                Some(began.elapsed())
+            })
+            .flatten();
         thread::sleep(hold_until.saturating_duration_since(Instant::now()));
         drop(stalled);
         Episode {
@@ -780,6 +1113,77 @@ fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
                 .map(|h| h.join().expect("drainer thread"))
                 .collect(),
         }
+    })
+}
+
+/// Read one reply of `len` bytes from `s`. `None` if the connection ended,
+/// failed or timed out first.
+fn read_reply(s: &mut Wire, len: usize) -> Option<()> {
+    let mut left = len.max(8);
+    let mut buf = vec![0u8; 1 << 20];
+    while left > 0 {
+        match s.read(&mut buf[..left.min(1 << 20)], usize::MAX) {
+            Ok((0, 0)) | Err(_) => return None,
+            Ok((_, n)) => left = left.saturating_sub(n),
+        }
+    }
+    Some(())
+}
+
+/// Experiment D's workload U: `--closed-loop` requests for `--large-size`
+/// bytes on one connection, each written once the reply before it has been
+/// read in full, after `--closed-warmup` replies that are not counted. The
+/// socket's `SO_RCVBUF` is `--head-rcvbuf`, set before the connect, and the
+/// size the kernel reports is printed. Only the counted requests carry flag
+/// bit 2, so the server records only them.
+fn closed_loop(args: &Args, clock: Clock) -> Value {
+    let mut s = connect_with_rcvbuf(args.addr, args.head_rcvbuf);
+    let reported = rcvbuf(s.sock());
+    s.sock()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok();
+    let mut us: Vec<u64> = Vec::with_capacity(args.closed_loop as usize);
+    let mut error = None;
+    let mut window = (0u64, 0u64);
+    let total = args.closed_warmup + args.closed_loop;
+    for i in 0..total {
+        let counted = i >= args.closed_warmup;
+        let began = Instant::now();
+        if i == args.closed_warmup {
+            window.0 = clock.ns(began);
+        }
+        let flags = if counted { FLAG_WINDOW } else { 0 };
+        let r = request(args.large_size, HEAD_TAG, flags, clock.ns(began));
+        if s.write_all(&r).is_err() {
+            error = Some(format!("request {i}: write failed"));
+            break;
+        }
+        if read_reply(&mut s, args.large_size as usize).is_none() {
+            error = Some(format!("request {i}: reply not read in full"));
+            break;
+        }
+        if counted {
+            us.push(began.elapsed().as_micros() as u64);
+        }
+    }
+    window.1 = clock.ns(Instant::now());
+    let mut sorted = us.clone();
+    sorted.sort_unstable();
+    json!({
+        "closed_loop": {
+            "requests": args.closed_loop,
+            "warmup": args.closed_warmup,
+            "completed": us.len(),
+            "size": args.large_size,
+            "rcvbuf_set": args.head_rcvbuf,
+            "rcvbuf_reported": reported,
+            "p50_us": percentile(&sorted, 0.50),
+            "p99_us": percentile(&sorted, 0.99),
+            "max_us": sorted.last().copied().unwrap_or(0),
+            "us": us,
+            "error": error,
+        },
+        "window_ns": [window.0, window.1],
     })
 }
 
@@ -870,8 +1274,18 @@ fn millis(d: Option<Duration>) -> Option<u64> {
     d.map(|d| d.as_millis() as u64)
 }
 
+fn micros(d: Option<Duration>) -> Option<u64> {
+    d.map(|d| d.as_micros() as u64)
+}
+
 fn main() {
     let args = Args::parse();
+    let _ = TLS.set(
+        args.tls_ca
+            .as_deref()
+            .filter(|_| args.tls)
+            .map(client_config),
+    );
     if args.slow_conns > 0 && args.slow_rate == 0 {
         eprintln!("admission-load: --slow-conns needs --slow-rate");
         std::process::exit(2);
@@ -881,6 +1295,13 @@ fn main() {
         std::process::exit(2);
     }
     let clock = Clock::new();
+    if args.closed_loop > 0 {
+        let out = closed_loop(&args, clock);
+        let failed = out["closed_loop"]["error"].is_string();
+        println!("{out}");
+        std::process::exit(i32::from(failed));
+    }
+    let ports = Ports::open(args.ports_file.as_deref());
     let start = Instant::now() + Duration::from_millis(200);
     let window = {
         let start_at = start + Duration::from_secs(args.warmup);
@@ -898,10 +1319,12 @@ fn main() {
         let episodes = Arc::clone(&episodes);
         thread::spawn(move || {
             let mut at = window.start;
+            let mut number = 0;
             while at + Duration::from_millis(args.episode_ms) <= window.stop {
-                let e = episode(&args, at, clock);
+                let e = episode(&args, at, clock, &ports, number);
                 episodes.lock().unwrap().push(e);
                 at += Duration::from_millis(args.episode_ms);
+                number += 1;
             }
         })
     };
@@ -943,6 +1366,23 @@ fn main() {
         "large_ms".into(),
         json!(episodes.iter().map(|e| millis(e.large)).collect::<Vec<_>>()),
     );
+    // Per episode's head: the time from its request to its last byte, in
+    // microseconds, or null where it was not read in full.
+    out.insert(
+        "large_us".into(),
+        json!(episodes.iter().map(|e| micros(e.large)).collect::<Vec<_>>()),
+    );
+    out.insert(
+        "large_completed".into(),
+        json!(
+            episodes
+                .iter()
+                .map(|e| e.large.is_some())
+                .collect::<Vec<_>>()
+        ),
+    );
+    out.insert("large_size".into(), json!(args.large_size));
+    out.insert("head_rcvbuf".into(), json!(args.head_rcvbuf));
     let mut slow = summary(&slows, args.within_ms);
     slow.extend([
         ("conns".to_string(), json!(args.slow_conns)),
@@ -966,6 +1406,14 @@ fn main() {
             "ms": episodes
                 .iter()
                 .map(|e| e.drainers.iter().map(|&d| millis(d)).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            "us": episodes
+                .iter()
+                .map(|e| e.drainers.iter().map(|&d| micros(d)).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            "completed": episodes
+                .iter()
+                .map(|e| e.drainers.iter().map(|d| d.is_some()).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
         }),
     );

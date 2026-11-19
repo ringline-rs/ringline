@@ -154,6 +154,38 @@ pub(crate) struct ConnSendState {
     /// failed it, for the future's next poll.
     #[cfg(has_io_uring)]
     pub send_buf_result: Option<Result<u32, i32>>,
+    /// The connection's most recent send waited for room in the socket, so
+    /// `SendAdmissionOrder::Budget` lets no send on it pass a waiting head.
+    /// Kept only while the driver's `track_room_waits` is set.
+    ///
+    /// Both backends keep it by one rule. It is set as soon as a send waits
+    /// for room, and at each completion that settles awaited sends it becomes
+    /// whether any send since the previous such completion waited
+    /// (`send_waited`). When every send on the connection is awaited, as a
+    /// server's replies with `send_admitted` are, that is whether its most
+    /// recent send waited. A send without an id ends nothing: its wait
+    /// carries to the next awaited send, and the flag stays set meanwhile.
+    ///
+    /// What counts as having waited follows how each backend writes. On
+    /// io_uring a send waited if an SQE of it came back short or with
+    /// `EAGAIN` (`wait_for_room`); the sends queued behind it had not been
+    /// submitted. On mio a send waited if it was queued when a `writev`
+    /// returned `WouldBlock` (`waited_entries`): that write carried the
+    /// queued sends, up to the 1024 iovecs one `writev` takes, and mio counts
+    /// every queued send, those past the first 1024 too.
+    pub room_waited: bool,
+    /// A send since the last completion that settled an awaited send waited
+    /// for room. On io_uring `wait_for_room` sets it and
+    /// `Driver::end_logical_send` moves it into `room_waited`; on mio a send
+    /// that completes after waiting sets it, and an awaited one moves it.
+    /// Kept only while the driver's `track_room_waits` is set.
+    pub send_waited: bool,
+    /// mio: how many sends at the front of the queue were queued when a
+    /// `writev` last returned `WouldBlock`, and so waited for room; each
+    /// that completes counts one off. Kept only while the driver's
+    /// `track_room_waits` is set.
+    #[cfg(not(has_io_uring))]
+    pub waited_entries: usize,
 }
 
 /// What ended a `writable` future's wait on io_uring.
@@ -253,6 +285,10 @@ impl ConnSendState {
             send_buf_task: None,
             #[cfg(has_io_uring)]
             send_buf_result: None,
+            room_waited: false,
+            send_waited: false,
+            #[cfg(not(has_io_uring))]
+            waited_entries: 0,
         }
     }
 
@@ -304,6 +340,12 @@ impl ConnId {
         self.index as usize
     }
 }
+
+/// The message of a guarded send refused because its connection holds
+/// `zero_copy_hold_cap` send slab entries while the slab is over half used.
+#[cfg(has_io_uring)]
+pub(crate) const ZERO_COPY_CAP_REFUSAL: &str =
+    "send slab entries held by the connection at zero_copy_hold_cap";
 
 /// How long a close waits for its queued sends to drain before the
 /// connection is closed without them: a close after a fatal encrypt error
@@ -455,6 +497,10 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) tcp_nodelay: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
+    /// Send slab entries a connection may hold before its zero-copy sends are
+    /// refused, once the slab is over half used
+    /// (`ConfigBuilder::zero_copy_hold_cap`).
+    pub(crate) zero_copy_hold_cap: usize,
     /// The worker's connect deadlines (io_uring only).
     #[cfg(has_io_uring)]
     pub(crate) connect_deadlines:
@@ -654,7 +700,13 @@ impl<'a> DriverCtx<'a> {
             Err(e) => {
                 // `encrypt_to_sends` released every slot it took, but any
                 // record it sealed first spent a sequence number.
+                //
+                // The close queues a close_notify into pool slots. Those
+                // belong to no passing send, so a send that was passing a
+                // head stops marking around it.
+                let marking = self.send_copy_pool.pause_passing();
                 self.close(conn);
+                self.send_copy_pool.resume_passing(marking);
                 Err(e)
             }
         }
@@ -1069,6 +1121,131 @@ impl<'a> DriverCtx<'a> {
         builder
     }
 
+    /// The send-pool slots a waiting batch of `parts` on a plaintext
+    /// connection waits for, or the refusal [`SendBuilder::submit`] would give it
+    /// for its shape: one slot if it has copy parts, none if it has only
+    /// guards. Reads the parts and consumes nothing, so a refusal can return
+    /// every part.
+    #[cfg(has_io_uring)]
+    pub(crate) fn batch_plain_slots(&self, parts: &[SendPart<'_>]) -> io::Result<usize> {
+        if parts.len() > MAX_IOVECS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many send parts (max 32)",
+            ));
+        }
+        let mut copy_len = 0usize;
+        let mut guards = 0usize;
+        let mut total = 0u64;
+        for part in parts {
+            match part {
+                SendPart::Copy(data) => {
+                    copy_len += data.len();
+                    total += data.len() as u64;
+                }
+                SendPart::Guard(guard) => {
+                    guards += 1;
+                    let (ptr, len) = guard.as_ptr_len();
+                    total += u64::from(len);
+                    let region = guard.region();
+                    if region != crate::buffer::fixed::RegionId::UNREGISTERED {
+                        self.fixed_buffers
+                            .validate_region_ptr(region, ptr, len)
+                            .map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+                            })?;
+                    }
+                }
+            }
+        }
+        if guards > MAX_GUARDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many guards (max 8)",
+            ));
+        }
+        if total > u64::from(u32::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send batch longer than u32::MAX bytes",
+            ));
+        }
+        if copy_len > self.send_copy_pool.slot_size() as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "total copy data exceeds send pool slot size",
+            ));
+        }
+        Ok(usize::from(copy_len > 0))
+    }
+
+    /// Whether [`SendBuilder::submit`] can queue a waiting batch of `parts`
+    /// on plaintext connection `conn` now, checked without consuming a part:
+    /// the connection checks, [`batch_plain_slots`](Self::batch_plain_slots),
+    /// a free pool slot for copy parts, and, for a batch with guards that
+    /// does not fit the small-send gather, a free send-slab entry the
+    /// connection may take (`zero_copy_over_cap`). On `Ok`, `submit` does not
+    /// refuse the batch.
+    #[cfg(has_io_uring)]
+    pub(crate) fn batch_plain_ready(&self, conn: ConnId, parts: &[SendPart<'_>]) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
+        }
+        let needed = self.batch_plain_slots(parts)?;
+        let free = self.send_copy_pool.free_count();
+        if free < needed {
+            return Err(io::Error::other("send copy pool exhausted"));
+        }
+        let has_guards = parts.iter().any(|p| matches!(p, SendPart::Guard(_)));
+        if has_guards {
+            let total: usize = parts
+                .iter()
+                .map(|p| match p {
+                    SendPart::Copy(d) => d.len(),
+                    SendPart::Guard(g) => g.as_ptr_len().1 as usize,
+                })
+                .sum();
+            // `submit_small_gather` takes one slot when one is free and the
+            // whole batch fits it; otherwise the batch needs a slab entry.
+            let threshold = self.send_zc_threshold as usize;
+            let gathers = threshold > 0
+                && total < threshold
+                && total <= self.send_copy_pool.slot_size() as usize
+                && free >= 1;
+            if !gathers && !self.send_slab.has_free() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "send slab exhausted",
+                ));
+            }
+            if !gathers && self.zero_copy_over_cap(conn) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    ZERO_COPY_CAP_REFUSAL,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a zero-copy send on `conn` is refused: the connection holds
+    /// `zero_copy_hold_cap` send slab entries and the slab is over half used.
+    #[cfg(has_io_uring)]
+    pub(crate) fn zero_copy_over_cap(&self, conn: ConnId) -> bool {
+        self.send_slab
+            .zero_copy_over_cap(conn.index, conn.generation, self.zero_copy_hold_cap)
+    }
+
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
     pub fn send_parts(&mut self, conn: ConnId) -> SendBuilder<'_, 'a> {
         SendBuilder {
@@ -1084,6 +1261,7 @@ impl<'a> DriverCtx<'a> {
             total_len: 0,
             error: None,
             send_id: None,
+            zero_copy_capped: true,
         }
     }
 
@@ -1538,6 +1716,7 @@ impl<'a> DriverCtx<'a> {
     /// `buf_addr` must point to a valid, aligned buffer of at least `buf_len`
     /// bytes that remains valid and exclusively accessible until the
     /// corresponding CQE completes.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn nvme_read(
         &mut self,
         device: crate::nvme::NvmeDevice,
@@ -1545,12 +1724,14 @@ impl<'a> DriverCtx<'a> {
         num_blocks: u16,
         buf_addr: u64,
         buf_len: u32,
+        region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         if num_blocks == 0 {
             return Err(io::Error::other("num_blocks must be >= 1"));
         }
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
+        let buf_index = self.fixed_buf_index(region, buf_addr as *const u8, buf_len)?;
 
         let slab = self
             .nvme_cmd_slab
@@ -1571,7 +1752,7 @@ impl<'a> DriverCtx<'a> {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
-        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, buf_index, ud) } {
             Ok(()) => {
                 if let Some(devices) = self.nvme_devices.as_mut()
                     && let Some(dev) = devices.get_mut(device.index)
@@ -1602,6 +1783,7 @@ impl<'a> DriverCtx<'a> {
     /// `buf_addr` must point to a valid, aligned buffer of at least `buf_len`
     /// bytes that remains valid and exclusively accessible until the
     /// corresponding CQE completes.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn nvme_write(
         &mut self,
         device: crate::nvme::NvmeDevice,
@@ -1609,12 +1791,14 @@ impl<'a> DriverCtx<'a> {
         num_blocks: u16,
         buf_addr: u64,
         buf_len: u32,
+        region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         if num_blocks == 0 {
             return Err(io::Error::other("num_blocks must be >= 1"));
         }
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
+        let buf_index = self.fixed_buf_index(region, buf_addr as *const u8, buf_len)?;
 
         let slab = self
             .nvme_cmd_slab
@@ -1635,7 +1819,7 @@ impl<'a> DriverCtx<'a> {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
-        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, buf_index, ud) } {
             Ok(()) => {
                 if let Some(devices) = self.nvme_devices.as_mut()
                     && let Some(dev) = devices.get_mut(device.index)
@@ -1683,7 +1867,7 @@ impl<'a> DriverCtx<'a> {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
-        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
+        match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, None, ud) } {
             Ok(()) => {
                 if let Some(devices) = self.nvme_devices.as_mut()
                     && let Some(dev) = devices.get_mut(device.index)
@@ -1905,6 +2089,26 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
+    /// The registered buffer a disk operation's memory is in: `None` for
+    /// [`RegionId::UNREGISTERED`](crate::buffer::fixed::RegionId::UNREGISTERED),
+    /// otherwise the region's index once `ptr..ptr + len` is checked to lie
+    /// inside it. A range outside the region it names is refused with
+    /// `InvalidInput`, before a command slot is taken.
+    fn fixed_buf_index(
+        &self,
+        region: crate::buffer::fixed::RegionId,
+        ptr: *const u8,
+        len: u32,
+    ) -> io::Result<Option<u16>> {
+        if region == crate::buffer::fixed::RegionId::UNREGISTERED {
+            return Ok(None);
+        }
+        self.fixed_buffers
+            .validate_region_ptr(region, ptr, len)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        Ok(Some(region.0))
+    }
+
     /// Submit a read that completes to `key`. Returns its user_data, which a
     /// dropped future cancels.
     ///
@@ -1920,11 +2124,16 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *mut u8,
         len: u32,
+        region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let fd_index = self.validate_file(kind, index, generation)?;
+        let buf_index = self.fixed_buf_index(region, buf, len)?;
         let (slab_idx, ud) = self.file_command(kind, index, crate::fs::FsOp::Read, key)?;
-        let pushed = unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) };
+        let pushed = unsafe {
+            self.ring
+                .submit_direct_read(fd_index, buf, len, offset, buf_index, ud)
+        };
         self.file_pushed(kind, index, slab_idx, pushed)?;
         Ok(ud.raw())
     }
@@ -1944,13 +2153,15 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *const u8,
         len: u32,
+        region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let fd_index = self.validate_file(kind, index, generation)?;
+        let buf_index = self.fixed_buf_index(region, buf, len)?;
         let (slab_idx, ud) = self.file_command(kind, index, crate::fs::FsOp::Write, key)?;
         let pushed = unsafe {
             self.ring
-                .submit_direct_write(fd_index, buf, len, offset, ud)
+                .submit_direct_write(fd_index, buf, len, offset, buf_index, ud)
         };
         self.file_pushed(kind, index, slab_idx, pushed)?;
         self.write_orders.begin_write(
@@ -2078,7 +2289,18 @@ impl<'a> DriverCtx<'a> {
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let (index, generation) = (file.index, file.generation);
-        unsafe { self.file_read(FileKind::Fs, index, generation, offset, buf, len, key) }
+        unsafe {
+            self.file_read(
+                FileKind::Fs,
+                index,
+                generation,
+                offset,
+                buf,
+                len,
+                crate::buffer::fixed::RegionId::UNREGISTERED,
+                key,
+            )
+        }
     }
 
     /// Submit a filesystem write; see [`file_write`](Self::file_write).
@@ -2095,7 +2317,18 @@ impl<'a> DriverCtx<'a> {
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let (index, generation) = (file.index, file.generation);
-        unsafe { self.file_write(FileKind::Fs, index, generation, offset, buf, len, key) }
+        unsafe {
+            self.file_write(
+                FileKind::Fs,
+                index,
+                generation,
+                offset,
+                buf,
+                len,
+                crate::buffer::fixed::RegionId::UNREGISTERED,
+                key,
+            )
+        }
     }
 
     /// Submit an fsync for a filesystem file.
@@ -2930,6 +3163,7 @@ impl<'a> DriverCtx<'a> {
     ///
     /// Mirrors the io_uring backend's contract (caller-supplied DMA address
     /// must be valid and outlive the operation); this stub always errors.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn nvme_read(
         &mut self,
         _device: crate::nvme::NvmeDevice,
@@ -2937,6 +3171,7 @@ impl<'a> DriverCtx<'a> {
         _num_blocks: u16,
         _buf_addr: u64,
         _buf_len: u32,
+        _region: crate::buffer::fixed::RegionId,
         _key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         Err(io::Error::new(
@@ -2950,6 +3185,7 @@ impl<'a> DriverCtx<'a> {
     /// # Safety
     ///
     /// Mirrors the io_uring backend's contract; this stub always errors.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn nvme_write(
         &mut self,
         _device: crate::nvme::NvmeDevice,
@@ -2957,6 +3193,7 @@ impl<'a> DriverCtx<'a> {
         _num_blocks: u16,
         _buf_addr: u64,
         _buf_len: u32,
+        _region: crate::buffer::fixed::RegionId,
         _key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         Err(io::Error::new(
@@ -3179,6 +3416,7 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *mut u8,
         len: u32,
+        _region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let fd = self.validate_file(kind, index, generation)?;
@@ -3220,6 +3458,7 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *const u8,
         len: u32,
+        _region: crate::buffer::fixed::RegionId,
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let fd = self.validate_file(kind, index, generation)?;
@@ -3373,7 +3612,18 @@ impl<'a> DriverCtx<'a> {
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let (index, generation) = (file.index, file.generation);
-        unsafe { self.file_read(FileKind::Fs, index, generation, offset, buf, len, key) }
+        unsafe {
+            self.file_read(
+                FileKind::Fs,
+                index,
+                generation,
+                offset,
+                buf,
+                len,
+                crate::buffer::fixed::RegionId::UNREGISTERED,
+                key,
+            )
+        }
     }
 
     /// Submit a filesystem write via the disk I/O pool.
@@ -3387,7 +3637,18 @@ impl<'a> DriverCtx<'a> {
         key: crate::runtime::DiskIoKey,
     ) -> io::Result<u64> {
         let (index, generation) = (file.index, file.generation);
-        unsafe { self.file_write(FileKind::Fs, index, generation, offset, buf, len, key) }
+        unsafe {
+            self.file_write(
+                FileKind::Fs,
+                index,
+                generation,
+                offset,
+                buf,
+                len,
+                crate::buffer::fixed::RegionId::UNREGISTERED,
+                key,
+            )
+        }
     }
 
     /// Submit an fsync for a filesystem file via the disk I/O pool.
@@ -3568,10 +3829,22 @@ pub struct SendBuilder<'b, 'a> {
     error: Option<io::Error>,
     /// Settled by the send's completion; see `submit_awaited`.
     send_id: Option<crate::runtime::send_completion::SendId>,
+    /// Whether `zero_copy_hold_cap` refuses the send. Cleared by
+    /// `forward_recv_buf` (`without_zero_copy_cap`), which `forward_hold_cap`
+    /// bounds instead.
+    zero_copy_capped: bool,
 }
 
 #[cfg(has_io_uring)]
 impl<'b, 'a> SendBuilder<'b, 'a> {
+    /// Exempt the send from `zero_copy_hold_cap`. A connection that forwards
+    /// its receive buffers stops receiving at `forward_hold_cap` entries; a
+    /// refusal below that would leave it receiving into its accumulator.
+    pub(crate) fn without_zero_copy_cap(mut self) -> Self {
+        self.zero_copy_capped = false;
+        self
+    }
+
     /// Add a copy part. The data will be copied into the send pool on `submit()`.
     /// The data reference must outlive the builder (guaranteed by the `'b` lifetime).
     pub fn copy(mut self, data: &'b [u8]) -> Self {
@@ -3712,7 +3985,11 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             return Ok(());
         }
 
-        // With guards: build iovecs mixing copy pool subranges and guard pointers.
+        // With guards: build iovecs mixing copy pool subranges and guard
+        // pointers, in a slab entry the connection may take.
+        if self.zero_copy_capped && self.ctx.zero_copy_over_cap(self.conn) {
+            return Err(io::Error::other(ZERO_COPY_CAP_REFUSAL));
+        }
         self.submit_with_guards()
     }
 
@@ -4480,6 +4757,15 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
             } else {
                 None
             };
+
+        // A zero-copy link takes a slab entry the connection may not take.
+        if folded.is_none()
+            && self.guard_count > 0
+            && self.chain.ctx.zero_copy_over_cap(self.chain.conn)
+        {
+            self.chain.error = Some(io::Error::other(ZERO_COPY_CAP_REFUSAL));
+            return self.chain;
+        }
 
         let built = if let Some(built) = folded {
             built

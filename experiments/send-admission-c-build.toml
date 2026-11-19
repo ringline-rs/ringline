@@ -52,8 +52,10 @@ cd /home/anvil
     ./out/bench-server --help | grep -q -- "$m" || { echo "bench-server lacks --echo-mode $m"; exit 1; }
   done
   echo "echo modes ok"
-  ./out/admission-server --help | grep -q -- --pipeline || { echo "admission-server lacks --pipeline"; exit 1; }
-  for f in --slow-read-bps --slow-rcvbuf --drain-read-bps --drain-rcvbuf --outside-rate; do
+  for f in --pipeline --order --budget --tls-cert-out; do
+    ./out/admission-server --help | grep -q -- "$f" || { echo "admission-server lacks $f"; exit 1; }
+  done
+  for f in --slow-read-bps --slow-rcvbuf --drain-read-bps --drain-rcvbuf --outside-rate --tls-ca; do
     ./out/admission-load --help | grep -q -- "$f" || { echo "admission-load lacks $f"; exit 1; }
   done
   echo "admission flags ok"

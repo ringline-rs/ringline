@@ -19,6 +19,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   on the socket and calls `listen(2)` with `ConfigBuilder::backlog`. It works
   with `defer_listen()`. `launch()` refuses it under the `unstable-accept`
   feature's `AcceptMode::Merged` on io_uring.
+- `SendAdmissionOrder` and `ConfigBuilder::send_admission_order`: the order in
+  which each worker admits `send_admitted` and `send_backpressured` sends that
+  wait for send-pool capacity. `Strict` admits only the oldest waiter.
+  `Budget { slots }` (default 32) also admits a waiter that fits ahead of an
+  older waiter on another connection that does not. A waiter passes only while
+  the slots held by passed sends, with its own, are at most min(`slots`, pool
+  slots - the head's need), and only when its connection has no send queued or
+  in flight and its last send did not wait for room in the socket. Sends on
+  one connection are admitted in order under either. `build()` refuses
+  `Budget { slots: 0 }`.
+- `AsyncSendBuilder::submit_batch_admitted`: a batch of `SendPart`s that
+  waits in the worker's admission FIFO for its own send-pool cost, as
+  `send_admitted` waits for a copied send's, and is submitted once admitted.
+  On io_uring a plaintext batch with copy parts waits for one slot, a batch of
+  guards alone joins no FIFO, and a TLS batch waits for the ciphertext bound
+  of its length; on mio a batch waits for its length. A refusal is a
+  `BatchRefused`, which returns every part, guards included, and converts to
+  an `io::Error`; `BatchAdmission::into_parts` takes the parts back from a
+  waiting batch, after a timeout for example. On a plaintext io_uring
+  connection a full send slab, checked once the batch is admitted, is refused
+  with `WouldBlock`. `submit_batch` is unchanged.
+- `ConfigBuilder::zero_copy_hold_cap` (default 16): once a worker's send
+  slab is over half used, a guarded send on a connection that holds that
+  many slab entries is refused. A zero-copy send holds its entry until the
+  peer has acknowledged the bytes, so before this cap peers that stopped
+  reading could take every entry, and every zero-copy send on the worker
+  failed. The cap does not prevent a full slab: with the defaults, 17
+  connections whose peers do not read can still fill the 512 entries.
+  `submit_batch_admitted` returns the parts with `WouldBlock`, so
+  the caller can send their bytes as a copy; `submit_batch`, `build` and a
+  send chain fail with `Other` and drop the guards. Entries of coalesced copy
+  sends and of `forward_recv_buf` count toward the cap; `forward_recv_buf`
+  itself is not refused at it, and `forward_to_conn` copies a chunk whose
+  sink is at the cap. A connection that sends many guarded batches now has
+  the ones past the cap refused once the slab is over half used, even when
+  that connection's own entries are what put it over half used.
+  `SendHalf::zero_copy_capped` and
+  `Connection::zero_copy_capped` report whether a guarded send would be
+  refused now, so a caller of `submit_batch` or `build` can copy instead.
+  ringline-redis's and ringline-memcache's guarded sets and `Client::flush`
+  do: at the cap they send the bytes as one copy send. The guarded sets wait
+  for send-pool capacity; `flush` fails with `Other` when the pool cannot take
+  the copy now, or `InvalidInput` when it is wider than the whole pool.
+  `usize::MAX` turns the cap off.
 - `SendHalf::writable` and `Connection::writable`: wait until the socket
   reports room (`POLLOUT`), after the connection's queued sends have been
   handed to the kernel, without taking a send-pool slot. A server that sends
@@ -49,6 +93,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `IoBufAligned` marks a buffer whose start is a multiple of 4096 bytes;
   direct I/O reads and writes take only such buffers, such as `AlignedBuf`
   and `AlignedBytes`.
+- `IoBuf::region`: a disk buffer whose memory is in a region registered
+  with `Runtime::register_region` returns its `RegionId` (#841). On
+  io_uring, fs and direct I/O reads and writes from it are then
+  `IORING_OP_READ_FIXED` / `IORING_OP_WRITE_FIXED`, and NVMe commands set
+  `IORING_URING_CMD_FIXED`, so a direct I/O or NVMe operation does not pin
+  and unpin the buffer's pages. A buffered fs read or write pins nothing
+  either way. A buffer whose range is not inside the region it names is
+  refused with `InvalidInput`. The method defaults to
+  `RegionId::UNREGISTERED`. The mio backend ignores it.
 - `nvme_lba_size(device)` returns the namespace's logical block size, which
   `open_nvme_device` now reads with Identify Namespace.
 - `SendHalf::send_admitted` and `Connection::send_admitted`, returning an
@@ -372,17 +425,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once. `with_data` is unchanged and still reports `0` for both. First PR of
   the series that lands #318 (design:
   `docs/backpressured-sends-series-design.md`).
-- `SendHalf::send_backpressured` and `BackpressuredSend`: a send that
-  waits for send-pool capacity instead of failing when the pool is full.
-  Admission is first-come-first-served per worker, so a large message cannot
-  be starved by a stream of small ones, and a message that could never fit
-  the pool is rejected with `InvalidInput` before it joins the queue rather
-  than waiting forever. Nothing is submitted until the future is polled, so
-  dropping one you never awaited does nothing; dropping a parked one hands
-  the queue to the next waiter. `send` is unchanged and still fails fast —
-  use it when a full pool means you would rather shed the message than wait.
-  On a TLS connection admission is sized by the *ciphertext* bound. Final PR
-  of the series that lands #318.
+- `SendHalf::send_backpressured` and `BackpressuredSend`: a send that waits
+  for send-pool capacity instead of failing when the pool is full. Under
+  `SendAdmissionOrder::Strict` admission is first come first served per
+  worker, so a large message cannot be starved by a stream of small ones; a
+  message that could never fit the pool is rejected with `InvalidInput` before
+  it joins the queue rather than waiting forever. Nothing is submitted until
+  the future is polled, so dropping one you never awaited does nothing;
+  dropping a parked one hands the queue to the next waiter. `send` is
+  unchanged and still fails fast — use it when a full pool means you would
+  rather shed the message than wait. On a TLS connection admission is sized by
+  the *ciphertext* bound. Final PR of the series that lands #318.
 
 ### Performance
 
@@ -396,6 +449,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Bounded sends (`send_admitted`, `send_backpressured`) are admitted under
+  `SendAdmissionOrder::Budget { slots: 32 }` by default, so one can be
+  admitted ahead of an older waiter on another connection when the older one
+  does not fit the send pool; before, admission was strictly first come first
+  served per worker. Sends on one connection keep their order. Set
+  `ConfigBuilder::send_admission_order(SendAdmissionOrder::Strict)` to keep
+  strict order across connections.
 - `Runtime::shutdown` (and dropping the `Runtime`) returns once every
   pool-mode acceptor thread has exited, so a pool-mode listener's port is
   free when it returns. It may block for up to 10 ms while an acceptor
