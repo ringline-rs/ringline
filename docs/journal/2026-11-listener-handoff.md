@@ -1,6 +1,6 @@
 # 2026-11 — Handing a listening socket to the next process
 
-- **Status:** closed — all four PRs merged: the acceptor (#971, GO), `bind_fd` (#972), `stop_accepting` (#982), `next_signal` and `signal::install` (PR_4)
+- **Status:** closed — all four PRs merged: the acceptor (#971, GO), `bind_fd` (#972), `stop_accepting` (#982), `next_signal` and `signal::install` (#983)
 - **Span:** Nov 2026 · tree 911e0497 (`main`) · intent #970 · PR 1 · SystemsLab experiments listed under "What happened"
 
 ## Goal
@@ -335,7 +335,9 @@ call returns in place of the panic. Three patches were seen to fail the tests
 on macOS: `next_signal` not reading the byte (both tests), `install()`
 doing nothing (the process ends on the first `SIGTERM`), and a caller that
 lost the byte to another returning anyway (the unit test, which waits 50 ms
-so both callers are in `poll` before the stop).
+so both callers are in `poll` before the stop; caught in 97 of 100 runs on
+macOS, since the kernel re-checks readiness and the second caller may not
+wake).
 `experiments/next-signal-verify.toml` runs the tests and the first patch on
 Linux io_uring.
 

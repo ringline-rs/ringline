@@ -3613,7 +3613,8 @@ mod worker_exit_tests {
                 let _ = tx.send(waiter.next_signal());
             });
         }
-        // Both callers in `poll` before the stop, so both wake for its byte.
+        // Both callers in `poll` before the stop, so both are likely to wake
+        // for its byte; the kernel re-checks readiness, so one may not.
         std::thread::sleep(Duration::from_millis(50));
         let exit_pipe_readable = || {
             let mut fds = [libc::pollfd {
