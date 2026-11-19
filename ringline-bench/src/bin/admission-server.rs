@@ -160,7 +160,8 @@
 //!   samples from its scheduled time to its end, and the smallest read just
 //!   after each admission of the reply or of its pieces (a reply in gated
 //!   pieces can take less time than a sample's 10 ms), and its pieces
-//!   admitted past a waiting head.
+//!   admitted past a waiting head. Only the first 100,000 large replies in
+//!   the window get a record; `large_replies_unrecorded` counts the rest.
 //! - Per class, admitted sends the runtime admitted past a waiting head
 //!   (`SendCompletion::passed_head`), and for those that settled, the time
 //!   from admission to settlement. Each piece of a reply counts as a send.
@@ -613,6 +614,8 @@ struct Recorder {
     /// `Ended as usize`.
     ended: [[u64; 4]; 3],
     large: Vec<LargeRecord>,
+    /// In-window large replies past `LARGE_RECORDS_MAX`, which get no record.
+    large_unrecorded: u64,
     samples: Vec<Sample>,
     /// The earliest and latest scheduled time of a recorded request.
     window_ns: Option<(u64, u64)>,
@@ -633,6 +636,7 @@ static RECORDER: Mutex<Recorder> = Mutex::new(Recorder {
     unadmitted: [[0; 5]; 3],
     ended: [[0; 4]; 3],
     large: Vec::new(),
+    large_unrecorded: 0,
     samples: Vec::new(),
     window_ns: None,
     passed: [0; 3],
@@ -1305,13 +1309,23 @@ fn piece_failed(
     false
 }
 
+/// The most in-window large replies that get a record. A cell with many
+/// large replies (hundreds of thousands a second) would otherwise hold more
+/// records than the server's memory.
+const LARGE_RECORDS_MAX: usize = 100_000;
+
 /// Start the record of an in-window large reply sent in `pieces` pieces, and
-/// return its index; `None` for a small reply or one outside the window.
+/// return its index; `None` for a small reply, one outside the window, or one
+/// past `LARGE_RECORDS_MAX`.
 fn begin_large(req: &Request, class: usize, pieces: u32) -> Option<usize> {
     if class != LARGE || !req.recorded() {
         return None;
     }
     let mut r = recorder();
+    if r.large.len() >= LARGE_RECORDS_MAX {
+        r.large_unrecorded += 1;
+        return None;
+    }
     r.large.push(LargeRecord {
         tag: req.tag,
         len: req.len,
@@ -1542,6 +1556,7 @@ fn statistics(r: &mut Recorder, admit_limit_ms: u64) -> Value {
     json!({
         "classes": classes,
         "large_replies": large,
+        "large_replies_unrecorded": r.large_unrecorded,
         "held_run": held_mean(&r.samples, 0, u64::MAX),
         "admission_counters": r.counters.map(|c| json!({
             "passing_admissions": c.passing_admissions,

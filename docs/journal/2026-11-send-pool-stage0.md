@@ -323,5 +323,6 @@ measurement that would show it.
   slots the server's count does not cover. Reopen the pool-size question
   once stage 1's held count shows what holds them.
 - The harness records one entry per reply above `--small-max`, which runs
-  the server out of memory in cells with many such replies. It needs a
-  limit before stage 1's runs.
+  the server out of memory in cells with many such replies. This entry's
+  pull request keeps records for the first 100,000 and counts the rest
+  (`LARGE_RECORDS_MAX`, `large_replies_unrecorded`).
