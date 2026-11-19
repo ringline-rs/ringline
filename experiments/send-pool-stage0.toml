@@ -3,9 +3,10 @@
 # another, with the binaries from {bins_artifact} (send-admission-e-build.toml
 # built at this entry's branch).
 #
-# {plan} is a base64-encoded file of lines, one run per line:
-#   label|server arguments|load arguments
-# send-pool-stage0-plan.py writes it. Every run gets, beyond its own
+The guest fetches send-pool-stage0-plan.py from {plan_repo} at {plan_ref}
+# and runs it with {plan_args} ("calibration" or "matrix REP"). The plan is
+# a file of lines, one run per line:
+#   label|server arguments|load arguments Every run gets, beyond its own
 # arguments: the server on CPU 0 with --addr 127.0.0.1:7979 and
 # --summary-file, the load on CPUs 2 and up with --addr. The image's TCP
 # sysctls are left as they are and recorded (sysctl.txt). net.core.rmem_max
@@ -21,12 +22,13 @@ name = "send-pool stage0 {tag}"
 
 [params]
 bins_artifact = "REPLACE-WITH-ARTIFACT-ID"
-plan          = ""
+plan_repo     = "https://raw.githubusercontent.com/brayniac/ringline"
+plan_ref      = "REPLACE-WITH-COMMIT"
+plan_args     = "calibration"
 tag           = "calibration"
 host          = "hv03"
 image         = "debian-13-6.12"
 core_mem_max  = "16777216"
-timeout       = "7200"
 
 [[jobs]]
 name = "vm"
@@ -40,7 +42,7 @@ image = "{image}"
 memory_gib = 8
 gpu = false
 boot_timeout = 600
-payload_timeout = {timeout}
+payload_timeout = 7200
 upload = true
 inputs = [{ artifact = "{bins_artifact}", name = "bench-bins.tgz", dest = "/home/anvil" }]
 artifacts = ["/home/anvil/results.tgz"]
@@ -55,7 +57,9 @@ uname -r; nproc
 ulimit -n 65536
 sudo sysctl -w net.core.rmem_max={core_mem_max} net.core.wmem_max={core_mem_max}
 sudo sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem net.core.rmem_max net.core.wmem_max | tee results/sysctl.txt
-echo '{plan}' | base64 -d > results/plan.txt
+curl -fsSL {plan_repo}/{plan_ref}/experiments/send-pool-stage0-plan.py -o plan.py || exit 1
+python3 plan.py {plan_args} | base64 -d > results/plan.txt || exit 1
+wc -l results/plan.txt
 last=$(($(nproc) - 1))
 n=0
 while IFS='|' read -r label sargs largs; do
