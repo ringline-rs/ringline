@@ -159,8 +159,9 @@ impl Runtime {
     }
 
     /// The actual TCP address of the **first** TCP listener, if any. Returns
-    /// `Some` for a TCP `bind()` (the port may have been zero-resolved) and
-    /// `None` for client-only mode or when every listener is a Unix socket.
+    /// `Some` for a TCP `bind()` (the port may have been zero-resolved) or an
+    /// inet `bind_fd()`, and `None` for client-only mode or when every
+    /// listener is a Unix socket.
     ///
     /// With more than one listener, prefer [`bound_addr_of`] or
     /// [`bound_addrs`]: this returns the first TCP bind and cannot express
@@ -461,7 +462,8 @@ impl Runtime {
     /// Work that must finish before exit has to complete before shutdown is
     /// requested.
     ///
-    /// The listeners stop accepting at once. A listener's sockets close, and
+    /// The listeners stop accepting at once. Apart from a listener from
+    /// [`RinglineBuilder::bind_fd`] (below), a listener's sockets close, and
     /// its port is free, once the threads accepting on it have exited: its
     /// acceptor thread, or with the `unstable-accept` feature in merged accept
     /// mode the workers. An acceptor exits at once, within about 1 ms if it
@@ -469,6 +471,11 @@ impl Runtime {
     /// backing off after `EMFILE` or a similar error. This method, and any
     /// call made while it runs, returns after every acceptor thread has
     /// exited. This `Runtime` does not hold the sockets open.
+    ///
+    /// A listener from [`RinglineBuilder::bind_fd`] is not shut down with
+    /// `SHUT_RD`: its socket keeps listening, and stays open in any other
+    /// process that holds it; its port is held for as long as any process
+    /// holds the socket.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
     }
@@ -621,7 +628,7 @@ impl RuntimeShutdown {
         for (sockets, _) in listeners {
             // In merged mode, ends the multishot accept a worker has armed on
             // each socket; on Linux, takes a pool socket out of the listening
-            // state.
+            // state unless it came from `bind_fd`.
             sockets.shut_down();
         }
         // Wake all workers so they see the flag even if blocked on I/O.
@@ -813,11 +820,109 @@ impl Drop for Runtime {
 enum BindAddr {
     Tcp(SocketAddr),
     Unix(PathBuf),
+    /// A socket from `RinglineBuilder::bind_fd`.
+    Fd(OwnedFd),
 }
 
 impl BindAddr {
     fn is_unix(&self) -> bool {
-        matches!(self, BindAddr::Unix(_))
+        match self {
+            BindAddr::Tcp(_) => false,
+            BindAddr::Unix(_) => true,
+            BindAddr::Fd(fd) => socket_family(fd.as_raw_fd()) == Some(libc::AF_UNIX),
+        }
+    }
+}
+
+/// The address family a socket is bound in, from `getsockname(2)`.
+fn socket_family(fd: RawFd) -> Option<libc::c_int> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(storage.ss_family as libc::c_int)
+}
+
+/// Whether a Unix-domain socket is bound to a path or, on Linux, an abstract
+/// name. An unbound one reports no bytes after the family from `getsockname`
+/// on Linux, and an empty path (16 bytes, the first NUL) on macOS.
+fn unix_socket_is_bound(fd: RawFd) -> bool {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    let path_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    if (len as usize) <= path_offset {
+        return false;
+    }
+    // SAFETY: `storage` is large enough for a `sockaddr_un`.
+    let un = unsafe { &*(&storage as *const libc::sockaddr_storage as *const libc::sockaddr_un) };
+    // A leading NUL is an abstract name on Linux, and no path elsewhere.
+    cfg!(target_os = "linux") || un.sun_path[0] != 0
+}
+
+/// Why `fd` cannot be a listener from `RinglineBuilder::bind_fd`, if it
+/// cannot: it must be a `SOCK_STREAM` socket bound in `AF_INET`, `AF_INET6`
+/// or `AF_UNIX` and not connected, and an inet socket must not be on port 0,
+/// which is what `getsockname` reports for one that was never bound.
+fn check_listener_fd(fd: RawFd) -> Result<(), String> {
+    let mut kind: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut kind as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "bind_fd(): fd {fd} is not a socket: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if kind != libc::SOCK_STREAM {
+        return Err(format!("bind_fd(): fd {fd} is not a SOCK_STREAM socket"));
+    }
+    // A connected stream socket cannot listen. `getpeername` fails with
+    // `ENOTCONN` on one that is not connected.
+    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    if unsafe {
+        libc::getpeername(
+            fd,
+            &mut peer as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut peer_len,
+        )
+    } == 0
+    {
+        return Err(format!("bind_fd(): fd {fd} is a connected socket"));
+    }
+    match socket_family(fd) {
+        Some(libc::AF_UNIX) if unix_socket_is_bound(fd) => Ok(()),
+        Some(libc::AF_UNIX) => Err(format!("bind_fd(): fd {fd} is not bound to a path")),
+        Some(libc::AF_INET) | Some(libc::AF_INET6) => match getsockname_v4_v6(fd) {
+            Some(addr) if addr.port() != 0 => Ok(()),
+            _ => Err(format!("bind_fd(): fd {fd} is not bound to a port")),
+        },
+        _ => Err(format!(
+            "bind_fd(): fd {fd} is not an AF_INET, AF_INET6 or AF_UNIX socket"
+        )),
     }
 }
 
@@ -1059,6 +1164,60 @@ impl RinglineBuilder {
         self
     }
 
+    /// Add a listener on a socket the caller made or received, such as one
+    /// systemd passes in `LISTEN_FDS` or keeps in its fd store.
+    ///
+    /// The socket must be a `SOCK_STREAM` socket in `AF_INET`, `AF_INET6` or
+    /// `AF_UNIX`, bound (an inet socket to a port other than 0) and not
+    /// connected; `launch()` refuses anything else. It may already be
+    /// listening. A Unix-domain socket's path is neither created nor removed.
+    /// Accumulates like [`bind`](Self::bind).
+    ///
+    /// The runtime owns `fd`: it closes it when the listener closes, or when
+    /// `launch()` fails. To keep using the socket, pass a duplicate
+    /// ([`OwnedFd::try_clone`]). Systemd keeps its own copy of a socket it
+    /// passes or stores.
+    ///
+    /// The runtime changes the socket, and every process holding it sees the
+    /// changes, since they are on the socket or its open file description: it
+    /// sets close-on-exec, `O_NONBLOCK` and `SO_REUSEADDR`, and calls
+    /// `listen(2)` with [`ConfigBuilder::backlog`](crate::ConfigBuilder::backlog),
+    /// at launch or, with [`defer_listen()`](Self::defer_listen), when the
+    /// gate opens. On a socket already listening, that sets its backlog,
+    /// replacing systemd's `Backlog=`.
+    ///
+    /// The runtime never calls `shutdown(SHUT_RD)` on this socket, which
+    /// would take it out of the listening state for every process holding it
+    /// and reset the connections in its backlog. When its acceptor exits for
+    /// any reason, such as [`Runtime::shutdown`](crate::Runtime::shutdown),
+    /// every worker exiting, or a fatal accept error, it keeps listening, and
+    /// connections wait in its backlog until another holder accepts them or
+    /// the last holder closes it. Connections already taken from the backlog
+    /// are closed at shutdown, including any not yet handed to a handler, and
+    /// the acceptor can take one more if it is in `accept` when the shutdown
+    /// begins.
+    ///
+    /// With `defer_listen()`, a socket that is already listening defers only
+    /// `accept`: the kernel completes handshakes and queues them, so a TCP
+    /// check passes before the gate opens.
+    ///
+    /// TLS falls back to the process-wide
+    /// [`ConfigBuilder::tls`](crate::ConfigBuilder::tls), as for `bind`. There
+    /// is no per-listener TLS variant, so a TLS listener from an fd cannot sit
+    /// beside plaintext listeners.
+    ///
+    /// With the `unstable-accept` feature, not supported with
+    /// `AcceptMode::Merged` on the io_uring backend, where `launch()` refuses
+    /// it.
+    pub fn bind_fd(mut self, fd: OwnedFd) -> Self {
+        self.listeners.push(ListenerSpec {
+            addr: BindAddr::Fd(fd),
+            tls: None,
+            defer_listen: false,
+        });
+        self
+    }
+
     /// Bind a TCP listener that terminates TLS with its own configuration.
     ///
     /// The config applies to this listener alone, so one process can serve
@@ -1108,10 +1267,11 @@ impl RinglineBuilder {
     /// not.
     ///
     /// Applies to the listener added by the most recent
-    /// [`bind`](Self::bind), [`bind_unix`](Self::bind_unix) or
-    /// [`bind_tls`](Self::bind_tls) call, so it is written immediately after
-    /// one. UDP binds are not listeners and are unaffected. Calling it before
-    /// any of those three is a configuration error that `launch()` reports.
+    /// [`bind`](Self::bind), [`bind_unix`](Self::bind_unix),
+    /// [`bind_tls`](Self::bind_tls) or [`bind_fd`](Self::bind_fd) call, so it
+    /// is written immediately after one. UDP binds are not listeners and are
+    /// unaffected. Calling it before any of those is a configuration error
+    /// that `launch()` reports.
     ///
     /// With the `unstable-accept` feature, not supported with
     /// `AcceptMode::Merged` on the io_uring backend, where `launch()` refuses
@@ -1200,6 +1360,18 @@ impl RinglineBuilder {
                  AcceptMode::Pool, or bind that listener without deferring"
                     .into(),
             ));
+        }
+        for spec in &self.listeners {
+            if let BindAddr::Fd(fd) = &spec.addr {
+                if merged {
+                    return Err(crate::error::Error::RingSetup(
+                        "bind_fd() is not supported with AcceptMode::Merged; use the default \
+                         AcceptMode::Pool"
+                            .into(),
+                    ));
+                }
+                check_listener_fd(fd.as_raw_fd()).map_err(crate::error::Error::RingSetup)?;
+            }
         }
         Ok(())
     }
@@ -1917,7 +2089,9 @@ impl RinglineBuilder {
             let worker_txs = pending_worker_txs.expect("worker senders must exist");
             let mut listeners: Vec<ListenerHandle> = Vec::with_capacity(pending_listeners.len());
 
-            for (idx, spec) in pending_listeners.iter().enumerate() {
+            for (idx, spec) in pending_listeners.into_iter().enumerate() {
+                let is_unix = spec.addr.is_unix();
+                let defer_listen = spec.defer_listen;
                 // Merged listeners were bound before the workers started; all
                 // that is left is to listen, which is the moment the runtime
                 // becomes reachable.
@@ -1935,16 +2109,26 @@ impl RinglineBuilder {
                 let created: Result<
                     (Arc<ListenerSockets>, Option<SocketAddr>),
                     crate::error::Error,
-                > = match (&spec.addr, merged_entry) {
+                > = match (spec.addr, merged_entry) {
                     (BindAddr::Tcp(_), Some((_, sockets, resolved))) => {
                         Ok((Arc::clone(sockets), *resolved))
                     }
-                    (BindAddr::Tcp(addr), None) => create_listener(*addr).map(|fd| {
+                    (BindAddr::Tcp(addr), None) => create_listener(addr).map(|fd| {
                         let bound = getsockname_v4_v6(fd.as_raw_fd());
                         (ListenerSockets::new(vec![fd]), bound)
                     }),
                     (BindAddr::Unix(path), _) => {
-                        create_unix_listener(path).map(|fd| (ListenerSockets::new(vec![fd]), None))
+                        create_unix_listener(&path).map(|fd| (ListenerSockets::new(vec![fd]), None))
+                    }
+                    // Checked by `validate_listeners`. A socket received from
+                    // systemd may not be close-on-exec.
+                    (BindAddr::Fd(fd), _) => {
+                        unsafe {
+                            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+                            libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                        }
+                        let bound = getsockname_v4_v6(fd.as_raw_fd());
+                        Ok((ListenerSockets::from_fd(fd), bound))
                     }
                 };
                 let (sockets, bound_addr) = match created {
@@ -1966,7 +2150,7 @@ impl RinglineBuilder {
                 // recorded the request, and `register` honours it.
                 let registered = listen_gates.register(idx as u32, Arc::clone(&sockets));
                 if let Err(error) = registered.and_then(|()| {
-                    if spec.defer_listen {
+                    if defer_listen {
                         Ok(())
                     } else {
                         listen_gates.open(idx as u32)
@@ -2003,7 +2187,7 @@ impl RinglineBuilder {
                         shutdown_flag: shutdown_flag.clone(),
                         listen_gates: listen_gates.clone(),
                         // A Unix listener has no TCP_NODELAY to set.
-                        tcp_nodelay: !spec.addr.is_unix() && self.config.tcp_nodelay,
+                        tcp_nodelay: !is_unix && self.config.tcp_nodelay,
                         conn_chunk_size: self.config.conn_chunk_size,
                         stop: runtime_shutdown.stop_signal(),
                     };
@@ -2013,7 +2197,10 @@ impl RinglineBuilder {
                             run_acceptor(acceptor_config);
                             // An acceptor that stops on its own, because every
                             // worker has exited, must not leave the socket
-                            // listening with nothing accepting.
+                            // listening with nothing accepting. A socket from
+                            // `bind_fd` is left listening whatever ended the
+                            // acceptor: other processes may hold it, and its
+                            // clients queue in the backlog.
                             acceptor_sockets.shut_down();
                         })
                 };

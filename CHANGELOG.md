@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `RinglineBuilder::bind_fd`: a listener on a socket the caller made or
+  received, such as one systemd passes in `LISTEN_FDS` or keeps in its fd
+  store. It must be a bound, unconnected `SOCK_STREAM` socket in `AF_INET`,
+  `AF_INET6` or `AF_UNIX`, and may already be listening. The runtime never
+  calls `shutdown(SHUT_RD)` on it, so it keeps listening after
+  `Runtime::shutdown` and connections wait in its backlog for the next
+  process. The runtime sets close-on-exec, `O_NONBLOCK` and `SO_REUSEADDR`
+  on the socket and calls `listen(2)` with `ConfigBuilder::backlog`. It works
+  with `defer_listen()`. `launch()` refuses it under the `unstable-accept`
+  feature's `AcceptMode::Merged` on io_uring.
 - `SendAdmissionOrder` and `ConfigBuilder::send_admission_order`: the order in
   which each worker admits `send_admitted` and `send_backpressured` sends that
   wait for send-pool capacity. `Strict` admits only the oldest waiter.
