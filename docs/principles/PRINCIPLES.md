@@ -138,6 +138,14 @@ Beware the environment before blaming the code. Link capacity, interrupt
 placement, and processor topology have all produced results that looked like
 regressions and were not.
 
+A policy setting (an admission order, a limit) is measured only if its effect
+can be seen. Identical results under two settings can mean the setting made no
+difference, or that it never came into play, and the results alone do not say
+which. So each setting exports a counter of the times it changed an outcome
+(sends admitted ahead of the head of a queue, sends that waited at a limit,
+sends refused at one), and an experiment that varies the setting reports that
+counter beside its results.
+
 ## 9. The public surface is a contract
 
 What is exposed is chosen, not defaulted. Fields are private and reached through
@@ -171,6 +179,59 @@ keyword at the call site is the mechanism working.
 The same reasoning applies to panics. An operation that will abort on some
 inputs says so, and a caller who cannot guarantee those inputs is given a
 fallible variant instead of being left to discover the panic in production.
+
+## 11. No connection holds an unbounded share of a worker's resources
+
+Principle 3 partitions state between threads, but within a worker the
+connections still share: the send pool, the send slab, receive buffers. A
+resource that keeps no account per connection lets one client set how long
+every other client on that worker waits. A cache server built on ringline
+measured this: one client that pipelined 4,000 requests and read slowly made
+every reply on its worker wait one to two seconds.
+
+So every resource a worker shares between its connections keeps a count per
+connection and has a limit per connection. `forward_hold_cap` and
+`zero_copy_hold_cap` do this for the send slab. A limit that applies only above
+an occupancy is acceptable when measurement shows that an unconditional one
+costs healthy connections too much; the count is kept either way.
+
+## 12. Backpressure lands on the connection that caused it
+
+When a resource is short because of one connection, the wait or the refusal
+applies to that connection's operations, not to a queue that every connection
+shares. A slow receiver's bounded sends wait on its own connection, and its
+other sends are refused; the worker's other connections continue.
+
+The pressure is not moved into a resource with no bound. Sending a copy that a
+limit kept out of the pool from a heap buffer instead would remove the refusal,
+but it turns a slow client into memory growth that the application does not see
+until some larger limit is reached. A refusal or a wait the caller can observe
+is preferred to pressure the runtime absorbs where nobody can see it.
+
+## 13. Reserve what an operation needs before taking an irreversible step
+
+An operation that can fail after an irreversible step can only be cleaned up by
+undoing something larger than itself. Sealing a TLS record spends a sequence
+number, so a send that runs out of pool slots after it has sealed records can
+only be ended by closing the connection.
+
+So the runtime reserves every resource an operation needs, checks the
+reservation, and only then acts. A copy send reserves all its slots before it
+copies the first byte. Where the exact need is not known in advance, the
+reservation is made from an upper bound, and a check confirms in testing that
+the operation stayed within it.
+
+## 14. Output the protocol requires is kept until it can be sent
+
+Handshake records, `key_update` responses, alerts and `close_notify` are output
+the runtime owes the peer. Refusing or dropping them breaks the connection, and
+the application cannot apply backpressure to them, because it did not ask for
+them.
+
+So such output is exempt from per-connection limits. When there is no space for
+it, it is kept, in order and ahead of the connection's later sends, and retried
+when space returns. It is bounded by the protocol's own limits, such as the
+handshake timeout, rather than by refusal.
 
 ---
 
