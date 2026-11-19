@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `Runtime::next_signal()`: waits for `SIGINT`, `SIGTERM`, a task panic or a
   worker stop, as `Runtime::wait_on_signal` does, and returns it without
   shutting the runtime down itself. The first task panic under
-  `TaskPanicPolicy::Shutdown`, and each worker stop, is returned once. With `stop_accepting`, it lets a server wait for `SIGTERM`, stop
-  accepting, finish its work and then call `shutdown`.
+  `TaskPanicPolicy::Shutdown`, and each worker stop, is returned once. With
+  `stop_accepting`, it lets a server wait for `SIGTERM`, stop accepting,
+  finish its work and then call `shutdown`.
 - `signal::install()`: installs the `SIGINT` and `SIGTERM` handlers now.
   Before they are installed, by this or by the first wait, either signal ends
   the process if its action is the default.

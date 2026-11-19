@@ -436,10 +436,11 @@ impl Runtime {
     /// The first task panic under `Shutdown`, and each worker stop, is
     /// returned once: a later call waits for the next event. Under
     /// `TaskPanicPolicy::Contain` the other workers keep serving after a
-    /// worker stop; under `Shutdown` a worker stop shuts the runtime down
-    /// before [`Signal::WorkerExited`](crate::signal::Signal::WorkerExited) is
-    /// returned, as a task panic does before
-    /// [`Signal::TaskPanic`](crate::signal::Signal::TaskPanic) is.
+    /// worker stop; under `Shutdown` a worker stop also shuts the runtime
+    /// down, and that shutdown may not have started when
+    /// [`Signal::WorkerExited`](crate::signal::Signal::WorkerExited) is
+    /// returned. A task panic shuts the runtime down before
+    /// [`Signal::TaskPanic`](crate::signal::Signal::TaskPanic) is returned.
     /// The process-wide signal handlers are installed on the first call, as by
     /// [`signal::install`](crate::signal::install).
     ///
@@ -3612,6 +3613,8 @@ mod worker_exit_tests {
                 let _ = tx.send(waiter.next_signal());
             });
         }
+        // Both callers in `poll` before the stop, so both wake for its byte.
+        std::thread::sleep(Duration::from_millis(50));
         let exit_pipe_readable = || {
             let mut fds = [libc::pollfd {
                 fd: runtime.shutdown.exit_fd(),

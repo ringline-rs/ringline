@@ -334,7 +334,8 @@ without shutting the runtime down, and one after a task panic, which the next
 call returns in place of the panic. Three patches were seen to fail the tests
 on macOS: `next_signal` not reading the byte (both tests), `install()`
 doing nothing (the process ends on the first `SIGTERM`), and a caller that
-lost the byte to another returning anyway (the unit test).
+lost the byte to another returning anyway (the unit test, which waits 50 ms
+so both callers are in `poll` before the stop).
 `experiments/next-signal-verify.toml` runs the tests and the first patch on
 Linux io_uring.
 

@@ -359,7 +359,8 @@ the accept rotation, closes its connections (on io_uring through
 the process. `Runtime::next_signal` returns the same events without shutting
 down; it reads the byte it was woken by from the panic or worker-exit pipe, so
 each event is returned once. Until `wait_on_signal` shuts the runtime down,
-and in a process that does not call it, the other workers keep serving. A worker is not replaced. Under
+and in a process that does not call it, the other workers keep serving. A
+worker is not replaced. Under
 `TaskPanicPolicy::Shutdown` a stopped worker shuts the runtime down. If
 `run_shutdown` panics, the worker drops its ring and leaks the heap memory its
 event loop owns, which the kernel can still be using.
