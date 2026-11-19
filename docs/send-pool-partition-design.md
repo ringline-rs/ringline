@@ -109,9 +109,13 @@ that does not wait.
   is the waiting form for parts.
 - `forward_recv_buf` is synchronous and, on TLS, takes pool slots. It stays
   non-waiting and is refused like `try_send` (its name is open question 5).
-- `send_chain` builds its parts in a closure, so its slot count is known only
-  after the closure runs. It stays non-waiting under the name
-  `try_send_chain` until a waiting form is designed (open question 8).
+- `send_chain` is removed. Its IO_LINK send path and `SendChainBuilder` go
+  with it, along with `ConfigBuilder::max_chain_length` and the tests that
+  exercise chains (`chain_short_send.rs`, `zc_chain_enomem.rs` and the chain
+  cases in seven other test files and in `backend/uring/event_loop.rs`). No
+  crate built on ringline calls it, and a waiting form would need the
+  chain's slot count before its closure builds it. IO_LINK chains for other
+  operations, such as `abort`'s linked operations and disk ordering, stay.
 - `send_backpressured`, which resolves when the send settles, is unchanged.
 
 A bounded send borrows its data until it is admitted, as `send_admitted`
@@ -313,8 +317,9 @@ kind `Other`, the kind pool exhaustion returns today, carrying a
 `ringline::SendRefused` as its inner error. `SendRefused::reason()` returns a
 `#[non_exhaustive]` enum with one variant per case, so a caller tells them
 apart with `get_ref()` and `downcast_ref` instead of matching the message.
-Kind `WouldBlock` is not used: in send chains it already means a send in
-progress.
+Kind `WouldBlock` is not used: pool exhaustion returns `Other` today, and
+the three reasons share one kind so that a caller that handles pool
+exhaustion handles the other two.
 
 Pool exhaustion and the cap clear as in-flight sends complete; a waiting
 ticket clears when the connection's own ticket is served. The documentation
@@ -596,16 +601,13 @@ checked, the entry says so.
    (handshake flights, session tickets), which bounds what a connection's
    exempt tickets hold and sets `D`.
 5. Names: the configuration for `M`, `k`, `D` and `L`; `try_send`,
-   `try_submit_batch`, `try_build`, `try_send_chain` and the name of
-   `forward_recv_buf`; the method that
-   reports a refusal in advance; `SendRefused` and its reasons. They are
-   public and hard to change once released.
+   `try_submit_batch`, `try_build` and the name of `forward_recv_buf`; the
+   method that reports a refusal in advance; `SendRefused` and its reasons. They
+   are public and hard to change once released.
 6. Whether sends that take a slab entry and no slot join the ticket order.
 7. Whether ringline offers a configured default limit on a bounded send's
    wait, and what a send that reaches it returns.
-8. A waiting form of `send_chain`, which needs the chain's slot count before
-   the closure builds it.
-9. Whether per-ticket turns are fair enough, or turns weighted by slots are
+8. Whether per-ticket turns are fair enough, or turns weighted by slots are
    needed, if round-robin is built.
 
 ## Alternatives
@@ -656,7 +658,8 @@ checked, the entry says so.
    queue (sections 2 and 3, round-robin only if stage 0 keeps it), with
    receive-path TLS output waiting in order instead of failing the
    connection; bounded sends by default, the `try_` forms, `SendRefused` and
-   the method that reports a refusal in advance; and the in-tree callers
+   the method that reports a refusal in advance; the removal of `send_chain`;
+   and the in-tree callers
    (sections 1, 2 and 6, In-tree callers).
 5. The cap (section 5) and its mio account (the mio section).
 6. Experiment stages 1 and 2.
