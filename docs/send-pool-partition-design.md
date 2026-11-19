@@ -24,7 +24,8 @@ of at most 128 KiB, each sent after `writable()`), but not its whole replies
 of up to 128 KiB or its pipelined small replies. While one of its replies
 waits for slots, the server sends its later replies through `send_admitted`.
 It measured what that leaves (plaintext, loopback, kernel 6.12, one worker,
-8,192 slots of 16,448 bytes, three runs per cell, closed-loop probes):
+8,192 slots of 16,448 bytes, three runs per cell, closed-loop probes). The
+runs are recorded in that server's repository, not in this one:
 
 - A client that pipelines 4,000 GETs of 64 KiB values and reads at 1 MB/s
   keeps the pool full. Every reply on the worker, including a 1 KiB reply on
@@ -36,7 +37,7 @@ It measured what that leaves (plaintext, loopback, kernel 6.12, one worker,
 
 The default send does not wait. `SendHalf::send` (`runtime/io.rs`) copies
 into the pool in the call and fails with `Other` when the pool is short, and
-`submit_batch`, `send_parts(..).submit()` and `send_chain` do the same.
+`submit_batch`, `send_parts(..).build(..)` and `send_chain` do the same.
 Waiting is opt-in (`send_admitted`, `send_backpressured`,
 `submit_batch_admitted`). A limit on one connection's share would therefore
 reach most callers as a refusal, which they handle as an error:
@@ -67,9 +68,9 @@ Two related gaps are in the TLS paths:
 ## Goal and criterion
 
 A connection holds a bounded share of its worker's send pool, a slow
-receiver's backpressure reaches the task that sends on that connection as a
-wait, a connection's sends that take pool slots go out in the order they
-were made, and no TLS connection is failed because the pool was short.
+receiver makes the task that sends on that connection wait, a connection's
+sends that take pool slots go out in the order their futures were first
+polled, and no TLS connection is failed because the pool was short.
 
 Success, measured with the cache server's cells (below):
 
@@ -102,8 +103,12 @@ that does not wait.
 - `try_send(data)` does not wait. It is served in the call or refused
   (section 6), and returns the `SendCompletion` as `send` does today.
 - `submit_batch` waits, as `submit_batch_admitted` does today, and
-  `try_submit_batch` does not. A builder from `send_parts` has `submit`,
-  which waits, and `try_submit`, which does not.
+  `try_submit_batch` does not. `send_parts(..).build(..)` calls `submit`
+  inside a synchronous closure (`runtime/io.rs`, `handler.rs`), so it cannot
+  wait; it stays non-waiting under the name `try_build`, and `submit_batch`
+  is the waiting form for parts.
+- `forward_recv_buf` is synchronous and, on TLS, takes pool slots. It stays
+  non-waiting and is refused like `try_send` (its name is open question 5).
 - `send_chain` builds its parts in a closure, so its slot count is known only
   after the closure runs. It stays non-waiting under the name
   `try_send_chain` until a waiting form is designed (open question 8).
@@ -114,8 +119,21 @@ does. A caller that reuses its buffer before awaiting does not compile. The
 send futures are `#[must_use]`, so a caller that drops one without awaiting
 it gets a warning and sends nothing. Today's `tx.send(x)?` does not compile
 against the new signature, but `let _ = tx.send(x);` does, and then sends
-nothing; the change finds those sites by grep (`ringline-bench`'s
-`close-latency`, `ringline/examples/echo_bench.rs` and three benches today).
+nothing. There are about 165 such statements in the workspace, most in
+tests. `clippy::let_underscore_future` flags them, and CI runs clippy with
+`-D warnings`; rustdoc examples are not linted and are fixed by hand.
+
+A send made inside a `with_data` closure cannot await, because the closure
+is synchronous and its data borrows the receive buffer. The documented echo
+pattern does this (the `split` docs and `with_data` examples in
+`runtime/io.rs`, `examples/echo_async_server.rs`, `examples/echo_tls_server.rs`,
+ringline-bench's echo servers). Such a caller uses `with_bytes` instead,
+keeps the `Bytes` slice it wants to send (a reference-counted handle, not a
+copy), and sends it with `send(..).await` after the closure returns. A
+closure that would rather drop a reply than wait uses `try_send`.
+
+A task that sends on several connections waits on the first one that cannot
+be served. It uses `try_send`, or one task per connection.
 
 A bounded send's wait has no limit. A peer that never reads makes the task
 wait until the connection fails or the task gives up, as `writable()` does
@@ -123,7 +141,9 @@ today; the examples on `send` show a timeout around it, as `send_admitted`'s
 do. Whether ringline offers a configured default limit is open question 7.
 
 Slab conditions are unchanged: a send that needs a send slab entry is still
-refused with `WouldBlock` at `zero_copy_hold_cap` or when the slab is full.
+refused at `zero_copy_hold_cap` or when the slab is full, with `WouldBlock`
+from a waiting batch and with `Other` from a non-waiting send, as today.
+`SendRefused` is carried only by pool, cap and ticket refusals.
 
 ### 2. A ticket queue per connection
 
@@ -161,7 +181,8 @@ admission order puts another connection's ticket first (section 3).
 
 A guarded send below `send_zc_threshold` that fits one slot is copied into
 it (`submit_small_gather`, `handler.rs`), and it takes a ticket like a copy
-send; `forward_to_conn` sends this way. A send of zero-copy or guard parts
+send; `forward_to_conn` sends this way. Behind a waiting ticket it waits; it
+does not fall through to the slab. A send of zero-copy or guard parts
 that takes a slab entry and no slot takes no ticket, and is ordered against
 the connection's tickets only as it is today (open question 6).
 
@@ -173,7 +194,7 @@ tickets and `close_notify` are not cancelled; they are dropped at teardown.
 
 The uncontended path adds one check per send: whether the connection has a
 ticket waiting or is at the cap. A bounded send that can be served at once
-is served on its first poll, so it costs one poll more than today's `send`.
+is served on its first poll, which adds one `with_state` call per send.
 The held count is updated when slots are popped, pushed back and released.
 
 ### 3. The worker queue holds one entry per connection
@@ -292,8 +313,8 @@ kind `Other`, the kind pool exhaustion returns today, carrying a
 `ringline::SendRefused` as its inner error. `SendRefused::reason()` returns a
 `#[non_exhaustive]` enum with one variant per case, so a caller tells them
 apart with `get_ref()` and `downcast_ref` instead of matching the message.
-Kind `WouldBlock` is not used: it already means a slab refusal (section 1)
-and, in send chains, a send in progress.
+Kind `WouldBlock` is not used: in send chains it already means a send in
+progress.
 
 Pool exhaustion and the cap clear as in-flight sends complete; a waiting
 ticket clears when the connection's own ticket is served. The documentation
@@ -354,13 +375,25 @@ reason not to wait. The redis and memcache clients show the change:
   `recv_ready`, which is synchronous and returns a future, moves its flush into
   that future. The documentation that a failed flush discards the batch stays
   true for connection failures.
+- Synchronous paths in those clients and in ringline-http send today:
+  `fire_*` with the default `max_batch_size` of 1, documented as sending
+  immediately; `recv_ready`, whose future is documented not to borrow the
+  client; `send_raw` (ringline-redis, called from its sharded and cluster
+  clients, and ringline-memcache's sharded client); and the HTTP/2
+  `fire_request` and `from_conn` preface flush. Each tries `try_send` and, if
+  it is refused, keeps the bytes in the client's write buffer for its next
+  async send. A command then reaches the wire at once when the pool can take
+  it, as documented, and otherwise at the next `recv` or `flush().await`,
+  which the clients' docs say. `recv_ready` keeps its contract because its
+  flush stays synchronous.
 - ringline-http's HTTP/2 `flush_pending_send` takes frames from h2 and sends
   them with `send(..).await`, so no frames are lost. Its HTTP/1 connection
   (`h1_conn.rs`) changes as redis's does.
-- `forward_to_conn`'s copy fallback waits for slots; the forwarding loop is
-  async, so the forward pauses instead of failing.
-- ringline-ping, ringline-bench, the examples and about 250 test call sites
-  change mechanically. `admission-server`'s outside probe keeps `try_send`,
+- `forward_to_conn`'s copy fallback waits for slots; it runs inside
+  `ForwardFuture::poll`, so the forward pauses instead of failing. Its
+  rustdoc's "`Other` when the pool has no free slots" changes.
+- ringline-ping, ringline-bench, the examples and the test call sites change
+  mechanically. `admission-server`'s outside probe keeps `try_send`,
   since it counts refusals.
 
 `docs/send-admission-design.md` lists `send` and `submit_batch` as
@@ -378,7 +411,8 @@ the worker queue and the cap apply on mio as on io_uring. A connection's
 held count on mio is its permits plus, in slot-sized units, the bytes of its
 queued entries that carry no permit (receive-path TLS output and
 `close_notify`), so a slow receiver waits on mio as it does on io_uring
-(principle 5).
+(principle 5). On mio, `try_send` is refused when permits are short, which
+today's `send` never is.
 
 ## Teardown and parking
 
@@ -427,14 +461,16 @@ The cells:
 - `idle`: a client that pipelines small replies;
 - `bulk`: a client reading 1 MiB replies at full speed.
 
-`idle` and `bulk` get their own A/A runs first. `idle` also measures the
-extra poll per send (section 2).
+`idle` and `bulk` get their own A/A runs first. The cost of the waiting
+`send` on the uncontended path is measured with a criterion benchmark of
+`send(..).await` against `try_send` (`ringline/benches/echo.rs`).
 
 0. No runtime change. ringline-bench's `admission-server` and
    `admission-load` have an open-loop small-request probe and slow readers.
-   - The cap-only arm is `admission-server --pipeline P`, which bounds each
-     connection's unsettled replies, swept at the `P` that gives about 16
-     and 64 slots per connection. It is also a test of the do-nothing
+   - The cap-only arm is `admission-server --pipeline P --small-send
+     admitted`, so small replies wait as they will by default. `--pipeline`
+     bounds each connection's unsettled replies, swept at the `P` that gives
+     about 16 and 64 slots per connection. It is also a test of the do-nothing
      alternative, since `--pipeline` is the caller-side gating that
      alternative asks for.
    - `admission-load` gains a batch writer, a client pipelining small
@@ -473,7 +509,8 @@ an occupancy.
 
 NO-GO for round-robin: in stage 0, no connection in the cache server's cells
 ever has more than one bounded send waiting. Round-robin then reorders
-nothing and is not built. If it is built, stage 1 runs it against arrival
+nothing and is not built. Stage 1 repeats the count with the cap on. If it
+is built, stage 1 runs it against arrival
 order in a cell where connections have several sends waiting, and it is kept
 only if the 1 KiB probe's not-within-10-ms count falls.
 
@@ -534,7 +571,8 @@ checked, the entry says so.
   `SendStream::reserve_capacity` and `poll_capacity` let it ask for capacity
   and wait until some is assigned. The windows are credit the receiver
   grants, where the cap is a limit the sender sets, but both bound one
-  stream's share; `poll_capacity` has the shape of a bounded send.
+  stream's share; `poll_capacity` waits for capacity as a bounded send waits
+  for slots.
 - Tokio's bounded channels (`tokio::sync::mpsc::Sender`). `send` waits for
   capacity and `try_send` returns an error at once when the channel is full.
   Section 1 gives sends the same pair of forms.
@@ -558,7 +596,8 @@ checked, the entry says so.
    (handshake flights, session tickets), which bounds what a connection's
    exempt tickets hold and sets `D`.
 5. Names: the configuration for `M`, `k`, `D` and `L`; `try_send`,
-   `try_submit_batch`, `try_submit` and `try_send_chain`; the method that
+   `try_submit_batch`, `try_build`, `try_send_chain` and the name of
+   `forward_recv_buf`; the method that
    reports a refusal in advance; `SendRefused` and its reasons. They are
    public and hard to change once released.
 6. Whether sends that take a slab entry and no slot join the ticket order.
@@ -575,10 +614,10 @@ checked, the entry says so.
   `writable()`. This is the current non-goal; the measured cells are what a
   caller that gates only its long replies gets. Stage 0's `--pipeline` arm
   measures it.
-- Keep non-waiting sends as the default and add the cap, refusing a direct
-  send at the cap or behind a waiting ticket. The API stays as it is, but
-  every caller meets the refusal: redis and memcache leave partial frames,
-  and HTTP/2 loses frames, unless each caller adds its own handling.
+- Keep non-waiting sends as the default and add the cap, refusing a non-waiting
+  send at the cap or behind a waiting ticket. The API stays as it is, but every
+  caller meets the refusal: redis and memcache leave partial frames, and HTTP/2
+  loses frames, unless each caller adds its own handling.
 - Non-waiting sends that overtake waiting tickets, with a rule that keeps
   sealed TLS output ahead of unsealed operations. A connection's bytes then
   follow two orders, and a caller that mixes the two kinds of send can see
@@ -613,13 +652,13 @@ checked, the entry says so.
    behaviour change.
 3. Taking slots for an operation and returning the excess, for copy sends,
    TLS application data and receive-path TLS output (section 4).
-4. The per-connection ticket queue and the worker queue (sections 2 and 3,
-   round-robin only if stage 0 keeps it), with receive-path TLS output
-   waiting in order instead of failing the connection.
-5. Bounded sends by default, the `try_` forms, `SendRefused` and the method
-   that reports a refusal in advance, with the in-tree callers (sections 1
-   and 6, In-tree callers), in one breaking release.
-6. The cap and mio (section 5).
-7. Experiment stages 1 and 2.
-8. If stage 1's rule for section 7 is met, the dedicated pool (section 7)
+4. In one breaking release: the per-connection ticket queue and the worker
+   queue (sections 2 and 3, round-robin only if stage 0 keeps it), with
+   receive-path TLS output waiting in order instead of failing the
+   connection; bounded sends by default, the `try_` forms, `SendRefused` and
+   the method that reports a refusal in advance; and the in-tree callers
+   (sections 1, 2 and 6, In-tree callers).
+5. The cap (section 5) and its mio account (the mio section).
+6. Experiment stages 1 and 2.
+7. If stage 1's rule for section 7 is met, the dedicated pool (section 7)
    and stage 3.
