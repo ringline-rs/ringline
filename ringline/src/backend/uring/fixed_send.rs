@@ -139,18 +139,56 @@ pub(crate) fn probed() -> bool {
 }
 
 /// The probe's result, running it on the first call. The calling thread
-/// blocks while the probe runs.
+/// blocks while the probe runs. The result is written to stderr once and set
+/// in the `ringline/ring/fixed_buffer_sends` gauge, so a kernel upgrade that turns
+/// fixed-buffer sends on or off shows in the log and the metrics.
 pub(crate) fn probe_once() -> FixedBufferSends {
     RESULT
         .get_or_init(|| {
             let result = probe();
+            let mut level = 0;
             if let FixedBufferSends::Enabled { multi_guard } = result {
                 MULTI.store(multi_guard, Ordering::Relaxed);
                 ENABLED.store(true, Ordering::Relaxed);
+                level = if multi_guard { 2 } else { 1 };
             }
+            crate::metrics::FIXED_BUFFER_SENDS.set(level);
+            // Not `eprintln!`, which panics if stderr fails.
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!("ringline: {}\n", describe(&result)),
+            );
             result
         })
         .clone()
+}
+
+/// The probe's result in words, for the line `probe_once` writes.
+fn describe(result: &FixedBufferSends) -> String {
+    const DOC: &str =
+        "https://github.com/ringline-rs/ringline/blob/main/docs/fixed-buffer-sends.md";
+    match result {
+        FixedBufferSends::Enabled { multi_guard: true } => {
+            "fixed-buffer sends on, for sends of one guard and of several".into()
+        }
+        FixedBufferSends::Enabled { multi_guard: false } => {
+            "fixed-buffer sends on for sends of one guard; the kernel refuses them \
+             for several (before Linux 6.15)"
+                .into()
+        }
+        FixedBufferSends::Overcharged => format!(
+            "fixed-buffer sends off: this kernel does not have the fix to how they \
+             are charged to the socket (Overcharged); sends use plain iovecs as \
+             before. See {DOC}"
+        ),
+        FixedBufferSends::Unsupported => {
+            "fixed-buffer sends off: the kernel refuses them (Unsupported)".into()
+        }
+        FixedBufferSends::Inconclusive(why) => {
+            format!("fixed-buffer sends off: the probe could not decide: {why}")
+        }
+        other => format!("fixed-buffer sends: {other:?}"),
+    }
 }
 
 fn probe() -> FixedBufferSends {
@@ -756,6 +794,22 @@ impl Drop for HugeBuffer {
 mod tests {
     use super::*;
 
+    /// The line names the outcome in words and ends with the result's name
+    /// where fixed sends are off.
+    #[test]
+    fn the_probe_line_says_on_or_off() {
+        assert!(describe(&FixedBufferSends::Enabled { multi_guard: true }).contains("sends on"));
+        assert!(describe(&FixedBufferSends::Enabled { multi_guard: false }).contains("one guard"));
+        let over = describe(&FixedBufferSends::Overcharged);
+        assert!(
+            over.contains("sends off") && over.contains("(Overcharged)"),
+            "{over}"
+        );
+        assert!(over.contains("https://"), "{over}");
+        let why = describe(&FixedBufferSends::Inconclusive("no huge page".into()));
+        assert!(why.ends_with("could not decide: no huge page"), "{why}");
+    }
+
     #[test]
     fn verdict_passes_equal_charges_and_names_the_fault() {
         assert_eq!(verdict(4352, 4352), Verdict::Pass);
@@ -767,12 +821,11 @@ mod tests {
     /// The probe's result agrees with the running kernel's version where the
     /// version decides it: before 6.15 the kernel refuses the flag on
     /// `SENDMSG_ZC`, so several guards never name a buffer. Whether a kernel
-    /// carries the charge fix its version does not say; the test prints the
-    /// result. `modes` reports what the result says.
+    /// carries the charge fix its version does not say; `probe_once` prints
+    /// the result. `modes` reports what the result says.
     #[test]
     fn the_probe_agrees_with_the_kernel_version() {
         let result = probe_once();
-        eprintln!("fixed-buffer send probe: {result:?}");
         let kernel = crate::memlock::KernelVersion::current().expect("kernel version");
         if (kernel.major, kernel.minor) < (6, 15) {
             assert!(
@@ -788,5 +841,7 @@ mod tests {
             _ => Modes::default(),
         };
         assert_eq!(modes(), want);
+        let level = i64::from(want.single) + i64::from(want.multi);
+        assert_eq!(crate::metrics::FIXED_BUFFER_SENDS.value(), level);
     }
 }

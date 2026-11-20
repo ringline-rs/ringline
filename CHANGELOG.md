@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     from Linux 6.3, kernels without the fix to `io_sg_from_iter` charge a send
     from a huge page by its offset in the page, which stalls the connection.
     On those kernels the sends keep using plain iovecs.
+  - The probe writes one line to stderr saying whether fixed sends are on,
+    for which sends, and if not why (`ringline: fixed-buffer sends on, …` or
+    `ringline: fixed-buffer sends off: …`), and sets the gauge
+    `ringline/ring/fixed_buffer_sends` (0 no fixed sends, 1 one guard, 2 one
+    or several guards).
   - `Runtime::fixed_buffer_sends` returns the result as a `FixedBufferSends`;
     `Enabled { multi_guard }` says whether sends of several guards use the
     buffer too.
