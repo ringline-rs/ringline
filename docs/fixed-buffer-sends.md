@@ -164,10 +164,12 @@ duration has not been measured. Until it
 has run, each launch raises the soft `RLIMIT_MEMLOCK` to cover it when the
 hard limit allows, and otherwise keeps it from running.
 
-When the probe runs it writes one line to stderr saying whether fixed sends
-are on, for which sends, and if not why, ending with the result's name (for
-example `ringline: fixed-buffer sends off: this kernel does not have the fix
-to how they are charged to the socket (Overcharged); …`), and sets the gauge
+When the probe runs it logs one line through the `log` crate saying whether
+fixed sends are on, for which sends, and if not why, with the result's name
+(for example `fixed-buffer sends off: this kernel does not have the fix to how
+they are charged to the socket (Overcharged); …`): at `debug` when fixed sends
+are on, at `warn` when they are off. Nothing is printed unless the application
+installs a logger. It also sets the gauge
 `ringline/ring/fixed_buffer_sends`: 0 when no fixed send is used (the probe has
 not run, or did not pass), 1 for sends of one guard, 2 for sends of one or
 several guards. A kernel upgrade that carries the charge fix changes the

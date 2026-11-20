@@ -139,9 +139,10 @@ pub(crate) fn probed() -> bool {
 }
 
 /// The probe's result, running it on the first call. The calling thread
-/// blocks while the probe runs. The result is written to stderr once and set
-/// in the `ringline/ring/fixed_buffer_sends` gauge, so a kernel upgrade that turns
-/// fixed-buffer sends on or off shows in the log and the metrics.
+/// blocks while the probe runs. The result is logged once, at `debug` when
+/// fixed sends are on and at `warn` when they are off, and set in the
+/// `ringline/ring/fixed_buffer_sends` gauge, so a kernel upgrade that turns
+/// fixed-buffer sends on or off shows in the application's log and metrics.
 pub(crate) fn probe_once() -> FixedBufferSends {
     RESULT
         .get_or_init(|| {
@@ -153,17 +154,17 @@ pub(crate) fn probe_once() -> FixedBufferSends {
                 level = if multi_guard { 2 } else { 1 };
             }
             crate::metrics::FIXED_BUFFER_SENDS.set(level);
-            // Not `eprintln!`, which panics if stderr fails.
-            let _ = std::io::Write::write_fmt(
-                &mut std::io::stderr(),
-                format_args!("ringline: {}\n", describe(&result)),
-            );
+            if level > 0 {
+                log::debug!("{}", describe(&result));
+            } else {
+                log::warn!("{}", describe(&result));
+            }
             result
         })
         .clone()
 }
 
-/// The probe's result in words, for the line `probe_once` writes.
+/// The probe's result in words, for the line `probe_once` logs.
 fn describe(result: &FixedBufferSends) -> String {
     const DOC: &str =
         "https://github.com/ringline-rs/ringline/blob/main/docs/fixed-buffer-sends.md";
@@ -827,8 +828,8 @@ mod tests {
     /// The probe's result agrees with the running kernel's version where the
     /// version decides it: before 6.15 the kernel refuses the flag on
     /// `SENDMSG_ZC`, so several guards never name a buffer. Whether a kernel
-    /// carries the charge fix its version does not say; `probe_once` prints
-    /// the result. `modes` reports what the result says.
+    /// carries the charge fix its version does not say; `probe_once` logs
+    /// the result, which shows only under a logger. `modes` reports what the result says.
     #[test]
     fn the_probe_agrees_with_the_kernel_version() {
         let result = probe_once();
