@@ -40,6 +40,14 @@ pub(crate) enum RegionControlMsg {
     },
 }
 
+/// The bytes of base pages `region` touches, which is what the kernel charges
+/// for it unless it is on huge pages.
+pub(crate) fn page_rounded(region: &MemoryRegion) -> u64 {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let start = region.ptr() as u64;
+    ((start + region.len() as u64).div_ceil(page) - start / page) * page
+}
+
 /// Per-worker receiver. The event loop owns this and drains it each tick.
 pub(crate) type RegionControlRx = Receiver<RegionControlMsg>;
 
@@ -54,23 +62,31 @@ pub(crate) struct RegionRegistrar {
 struct RegistrarInner {
     /// Stack of free slot indices, popped on `register`, pushed on `unregister`.
     free_slots: Vec<u16>,
+    /// The length of the region in each slot, rounded out to base pages, 0
+    /// for a free slot. A failed register with `ENOMEM` reports their sum,
+    /// which io_uring has charged once for each worker's ring. A region whose
+    /// registration is still in progress on another thread is not in it.
+    bytes: Vec<u64>,
 }
 
 impl RegionRegistrar {
-    /// Build a registrar with `max_slots` total capacity, where slots
-    /// `0..reserved` are pre-occupied by the initial `Config::registered_regions`.
+    /// Build a registrar with `max_slots` total capacity, where the first
+    /// `reserved.len()` slots are pre-occupied by the initial
+    /// `Config::registered_regions`, whose lengths `reserved` holds.
     pub(crate) fn new(
         max_slots: u16,
-        reserved: u16,
+        reserved: &[u64],
         workers: Vec<Sender<RegionControlMsg>>,
         wake_handles: Vec<WakeHandle>,
     ) -> Self {
-        debug_assert!(reserved <= max_slots);
+        debug_assert!(reserved.len() <= max_slots as usize);
         debug_assert_eq!(workers.len(), wake_handles.len());
         // Free list ordered so smaller slots come out first.
-        let free_slots: Vec<u16> = (reserved..max_slots).rev().collect();
+        let free_slots: Vec<u16> = (reserved.len() as u16..max_slots).rev().collect();
+        let mut bytes = vec![0; max_slots as usize];
+        bytes[..reserved.len()].copy_from_slice(reserved);
         RegionRegistrar {
-            inner: Mutex::new(RegistrarInner { free_slots }),
+            inner: Mutex::new(RegistrarInner { free_slots, bytes }),
             workers,
             wake_handles,
         }
@@ -96,8 +112,13 @@ impl RegionRegistrar {
             region: region.clone(),
             ack,
         }) {
-            Ok(()) => Ok(RegionId(slot)),
+            Ok(()) => {
+                let mut inner = self.inner.lock().expect("registrar mutex poisoned");
+                inner.bytes[slot as usize] = page_rounded(&region);
+                Ok(RegionId(slot))
+            }
             Err(e) => {
+                let e = self.with_charge(e, page_rounded(&region));
                 if self
                     .broadcast(|ack| RegionControlMsg::Release { slot, ack })
                     .is_ok()
@@ -109,6 +130,46 @@ impl RegionRegistrar {
         }
     }
 
+    /// Add the regions already registered to an `ENOMEM` from a register of
+    /// `adding` bytes, when `RLIMIT_MEMLOCK` is finite. The workers' error
+    /// names only the one buffer, which alone is usually within the limit.
+    fn with_charge(&self, e: io::Error, adding: u64) -> io::Error {
+        #[cfg(has_io_uring)]
+        {
+            let limit = crate::error::MemlockLimit::read().ok();
+            self.with_charge_under(e, adding, limit.as_ref())
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            let _ = adding;
+            e
+        }
+    }
+
+    #[cfg(any(has_io_uring, test))]
+    fn with_charge_under(
+        &self,
+        e: io::Error,
+        adding: u64,
+        limit: Option<&crate::error::MemlockLimit>,
+    ) -> io::Error {
+        let Some(limit) = limit.filter(|_| e.kind() == io::ErrorKind::OutOfMemory) else {
+            return e;
+        };
+        let (held, regions) = {
+            let inner = self.inner.lock().expect("registrar mutex poisoned");
+            (
+                inner.bytes.iter().sum::<u64>(),
+                inner.bytes.iter().filter(|&&b| b > 0).count(),
+            )
+        };
+        match crate::error::describe_region_charge(held, regions, self.workers.len(), adding, limit)
+        {
+            Some(context) => io::Error::new(e.kind(), format!("{e} {context}")),
+            None => e,
+        }
+    }
+
     /// Broadcast an `Unregister` message and block until every worker acks.
     /// On success the slot returns to the free list.
     pub(crate) fn unregister(&self, id: RegionId) -> io::Result<()> {
@@ -117,6 +178,7 @@ impl RegionRegistrar {
         }
         let slot = id.0;
         self.broadcast(|ack| RegionControlMsg::Unregister { slot, ack })?;
+        self.inner.lock().expect("registrar mutex poisoned").bytes[slot as usize] = 0;
         self.return_slot(slot);
         Ok(())
     }
@@ -231,6 +293,70 @@ mod tests {
         })
     }
 
+    /// An `ENOMEM` from a register names the regions already registered and
+    /// the total the rings need, counting each region once per worker.
+    #[test]
+    fn enomem_register_reports_the_regions_already_charged() {
+        let (txs, rxs) = build_worker_channels(2);
+        let wakes = (0..2)
+            .map(|_| crate::wakeup::create_wake_fd().unwrap().1)
+            .collect();
+        let registrar = RegionRegistrar::new(4, &[4096], txs, wakes);
+        let workers: Vec<_> = rxs.into_iter().map(|rx| fake_worker(rx, 0)).collect();
+
+        let mut backing = [0u8; 8192];
+        let region = unsafe { MemoryRegion::new(backing.as_mut_ptr(), backing.len()) };
+        let rounded = page_rounded(&region);
+        assert!(rounded >= 8192 && rounded.is_multiple_of(4096), "{rounded}");
+        let id = registrar.register(region).unwrap();
+
+        let limit = crate::error::MemlockLimit {
+            soft: 16384,
+            hard: 16384,
+        };
+        let oom = io::Error::new(io::ErrorKind::OutOfMemory, "ENOMEM from a worker");
+        let text = registrar
+            .with_charge_under(oom, 1024, Some(&limit))
+            .to_string();
+        assert!(text.starts_with("ENOMEM from a worker "), "{text}");
+        // The reserved 4096 bytes plus the region in whole pages, on each of
+        // 2 rings, then with 1024 bytes more.
+        let held = 4096 + rounded;
+        let want = format!("2 registered region(s) of {} KiB", held / 1024);
+        assert!(text.contains(&want), "{text}");
+        let want = format!("charged {} KiB", 2 * held / 1024);
+        assert!(text.contains(&want), "{text}");
+        let want = format!("the rings need {} KiB", (2 * (held + 1024)) / 1024);
+        assert!(text.contains(&want), "{text}");
+
+        // Unregistering removes the region from the count.
+        registrar.unregister(id).unwrap();
+        let oom = io::Error::new(io::ErrorKind::OutOfMemory, "ENOMEM from a worker");
+        let text = registrar
+            .with_charge_under(oom, 1024, Some(&limit))
+            .to_string();
+        assert!(text.contains("1 registered region(s) of 4 KiB"), "{text}");
+
+        // Other errors, and an unlimited soft limit, pass through unchanged.
+        let efault = io::Error::from_raw_os_error(libc::EFAULT);
+        let e = registrar.with_charge_under(efault, 1024, Some(&limit));
+        assert_eq!(e.raw_os_error(), Some(libc::EFAULT));
+        let unlimited = crate::error::MemlockLimit {
+            soft: libc::RLIM_INFINITY,
+            hard: libc::RLIM_INFINITY,
+        };
+        let oom = io::Error::new(io::ErrorKind::OutOfMemory, "ENOMEM from a worker");
+        let text = registrar
+            .with_charge_under(oom, 1024, Some(&unlimited))
+            .to_string();
+        assert_eq!(text, "ENOMEM from a worker");
+
+        drop(registrar);
+        for w in workers {
+            w.join().unwrap();
+        }
+    }
+
     /// A register that fails on one worker and succeeds on another leaves
     /// the slot usable: the retry gets the same slot and succeeds on both.
     #[test]
@@ -239,7 +365,7 @@ mod tests {
         let wakes = (0..2)
             .map(|_| crate::wakeup::create_wake_fd().unwrap().1)
             .collect();
-        let registrar = RegionRegistrar::new(4, 0, txs, wakes);
+        let registrar = RegionRegistrar::new(4, &[], txs, wakes);
         let mut rxs = rxs.into_iter();
         let ok = fake_worker(rxs.next().unwrap(), 0);
         let failing = fake_worker(rxs.next().unwrap(), 1);

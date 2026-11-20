@@ -358,7 +358,10 @@ impl Runtime {
     /// - The first kernel error reported by any worker if the underlying
     ///   `register_buffers_update` call fails. The slot is then released on
     ///   every worker, and reused by a later registration if every release
-    ///   succeeds.
+    ///   succeeds. io_uring charges `RLIMIT_MEMLOCK` once for each worker's
+    ///   ring, so under a finite limit an `ENOMEM` error (kind
+    ///   `OutOfMemory`) also gives the regions already registered and the
+    ///   total the rings need with this one.
     /// - `io::ErrorKind::Other` if a worker has exited. The slot is not
     ///   reused, so each such failure leaves one fewer free slot.
     /// - On the mio backend (no io_uring): always returns
@@ -2501,7 +2504,12 @@ impl RinglineBuilder {
 
         let region_registrar = Arc::new(crate::region_registry::RegionRegistrar::new(
             self.config.max_registered_regions,
-            self.config.registered_regions.len() as u16,
+            &self
+                .config
+                .registered_regions
+                .iter()
+                .map(crate::region_registry::page_rounded)
+                .collect::<Vec<_>>(),
             region_txs,
             worker_wake_handles.clone(),
         ));
@@ -2634,7 +2642,8 @@ fn check_kernel_floor(
 /// any process, which this cannot see, so passing here does not rule out an
 /// `ENOMEM` at setup; the setup error names the limit in that case. A region
 /// added later through `Runtime::register_region` is not counted here; if that
-/// call fails with `ENOMEM`, its error names the limit.
+/// call fails with `ENOMEM`, its error names the limit and the regions already
+/// registered.
 #[cfg(has_io_uring)]
 fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate::error::Error> {
     use crate::error::{MemlockLimit, MemlockPlan, describe_memlock_shortfall, memlock_plan};
