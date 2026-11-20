@@ -2,8 +2,9 @@
 
 Status: proposal. Experiment stage 0 has run
 (`docs/journal/2026-11-send-pool-stage0.md`). Of the runtime changes, only
-the held count per connection (order of work step 2) and the removal of
-`send_chain` (ahead of the rest of step 4) are implemented. The held count
+the held count per connection (order of work step 2), taking slots before
+the work and returning the excess (step 3), and the removal of `send_chain`
+(ahead of the rest of step 4) are implemented. The held count
 covers slots in use and reserved on io_uring, permits on mio; the mio count
 does not yet include queued entries that carry no permit (see mio).
 
@@ -61,13 +62,12 @@ reach most callers as a refusal, which they handle as an error:
 Two related gaps are in the TLS paths:
 
 - TLS output produced while receiving (handshake flights, session tickets,
-  alerts) is written into a heap buffer by `unbuffered::drive` and then
-  copied into slots by `ciphertext_to_sends` (`tls/backend_uring.rs`). If the
-  pool is short the connection is failed ("send pool exhausted during TLS
-  output flush"; on the connect path "send pool exhausted during TLS flush",
-  `backend/uring/event_loop.rs`). With the buffered engine, `PoolWriter` has
-  already taken the bytes out of rustls when it runs short, and they are
-  released (`tls/buffered.rs`).
+  alerts) is written into a heap buffer (by `unbuffered::drive`, or by
+  `write_tls` on the buffered engine) and then copied into slots by
+  `ciphertext_to_sends` (`tls/backend_uring.rs`), which reserves them first.
+  If the pool is short the connection is failed ("send pool exhausted during
+  TLS output flush"; on the connect path "send pool exhausted during TLS
+  flush", `backend/uring/event_loop.rs`).
 - Nothing orders TLS output produced on the receive path against the
   connection's later sends except that both are queued on the connection in the
   order they are made. Any change that holds such output back has to keep it
@@ -218,14 +218,14 @@ the connection's tickets only as it is today (open question 6).
 
 Cancelling a bounded send whose ticket is waiting removes the ticket. If it
 was the connection's front ticket, the connection's next ticket takes its
-place in the worker queue. A ticket is served in one call that pops, fills
+place in the worker queue. A ticket is served in one call that takes, fills
 and submits, so a ticket is never cancelled partway through. Receive-path
 tickets and `close_notify` are not cancelled; they are dropped at teardown.
 
 The uncontended path adds one check per send: whether the connection has a
 ticket waiting or is at the cap. A bounded send that can be served at once
 is served on its first poll, which adds one `with_state` call per send.
-The held count is updated when slots are popped, pushed back and released.
+The held count is updated when slots are taken, returned and released.
 
 ### 3. The worker queue holds one entry per connection
 
@@ -245,36 +245,40 @@ one bounded send waits per connection and turn order would reorder nothing.
 Reopen if a server sends on one connection from more than one task, or joins
 or selects over several sends on one connection.
 
-Slots that a ticket admitted ahead of the head pops are marked passing as
-today (`mark_if_passing`, `buffer/send_copy.rs`). Slots it pushes back are
-unmarked, so `passing_held` counts only slots in use.
+Slots that a ticket admitted ahead of the head takes count towards
+`passing_held` as today (`SlotReservation::passing`, `buffer/send_copy.rs`):
+the slots it fills are marked passing, and the ones it returns unfilled stop
+counting when they are returned.
 
 ### 4. Slots are taken, used, and the excess returned
 
-A ticket being served pops the slots its operation can need off the free
-list, owns them while it fills them, and pushes back the ones it did not use.
-The connection's held count rises when slots are popped and falls when they
-are pushed back or released after their send completes, so each slot is
-counted once and no slot is hidden from the free list by a count. Today
-every copy send on io_uring reserves its slots and fills them in one call
-(`handler.rs`, `buffer/send_copy.rs`), and a mio bounded send holds its
-reservation until its entry is written. Taking slots ahead of the work is
-new only for TLS application data on io_uring.
+A ticket being served takes the slots its operation can need, fills them,
+and returns the ones it did not use. Taking is a reservation
+(`SendCopyPool::reserve_slots`): the slots stay on the free list but leave
+the free count, and the operation pops them as it fills them. The
+connection's held count rises when slots are reserved and falls when unused
+ones are returned (`release_reservation`) or filled ones are released after
+their send completes, so each slot is counted once. Every operation on
+io_uring takes its slots this way within one call (`handler.rs`,
+`tls/backend_uring.rs`, `buffer/send_copy.rs`), and a mio bounded send holds
+its reservation until its entry is written.
 
-- A copy send pops `ceil(len / slot_size)` slots and uses all of them.
-- TLS application data pops its ciphertext bound (`ciphertext_capacity`,
+- A copy send takes `ceil(len / slot_size)` slots and uses all of them.
+- TLS application data takes its ciphertext bound (`ciphertext_capacity`,
   `tls/mod.rs`): `ceil(len / F) + 1` slots for the unbuffered engine, which
   writes whole records into each slot, and the byte bound in slots for the
-  buffered engine. Encryption writes into the popped slots (a new
-  `encrypt_to_sends` variant that takes them instead of calling `alloc_raw`)
-  and the unused slots are pushed back, usually the one slack record's. The
-  operation then cannot run out of slots after rustls has sealed a record
-  because its slots are already held. Today the check before encryption
-  (`encrypt_tls_send`, `handler.rs`) gives the same result because nothing
-  runs between the check and the allocation.
-- TLS output produced on the receive path pops the slots its bytes need:
-  the length of the unbuffered engine's scratch bytes, or the buffered
-  engine's pending bytes read from rustls when the ticket is served.
+  buffered engine. Encryption writes into the taken slots
+  (`SendCopyPool::alloc_raw_reserved`, from `encrypt_tls_send` in
+  `handler.rs`) and the unused ones are returned, usually the one slack
+  record's. The operation cannot run out of slots after rustls has sealed a
+  record because its slots are already held.
+- TLS output produced on the receive path, and a close_notify, take the
+  slots their bytes need (`ciphertext_to_sends`). The bytes are collected
+  first: the unbuffered engine's scratch bytes, or on the buffered engine
+  rustls' pending output drained with `write_tls`
+  (`buffered::drain_tls_output`), because the buffered API gives no byte
+  count for that output beforehand. A close_notify the pool cannot take
+  keeps its bytes for the retry on both engines.
 
 The extra record in the TLS bound covers records rustls has queued (a TLS 1.3
 `key_update` response, an alert), which it writes into the front of the same
@@ -289,7 +293,7 @@ thread touches its pool (principle 3).
 
 ### 5. A cap on the slots one connection holds
 
-The pool records the connection index and generation that popped each slot
+The pool records the connection index and generation that took each slot
 and keeps a held count per connection, as the send slab does for its entries
 (`InFlightSendSlab::held_by`, `buffer/send_slab.rs`). A release from an
 earlier generation of the index does not decrement the current one, so slots
@@ -313,9 +317,9 @@ its size.
   the worker queue. When the held count drops below `M`, the ticket goes
   back at the back of the worker queue. The drop is detected where held
   falls: in `SendCopyPool::release`, which every completion and disposal
-  path goes through; in the push-back of a ticket's unused slots, after the
-  push-back and not between pop and push-back; and on mio in
-  `release_reservation`, which returns permits. A capped connection is in
+  path goes through; and in `release_reservation`, which returns a
+  ticket's unused slots (on mio, its permits), after the return and not
+  between taking and returning. A capped connection is in
   the worker queue only when its front ticket is exempt (below).
 - A non-waiting send on a capped connection is refused (section 6).
 - TLS output produced on the receive path and `close_notify` are exempt:
@@ -702,7 +706,7 @@ checked, the entry says so.
    `SendHalf::send_pool_held` and the `conn_held_max` and `unowned_held`
    admission counters).
 3. Taking slots for an operation and returning the excess, for copy sends,
-   TLS application data and receive-path TLS output (section 4).
+   TLS application data and receive-path TLS output (section 4) (done).
 4. In one breaking release: the per-connection ticket queue and the worker
    queue (sections 2 and 3), with
    receive-path TLS output waiting in order instead of failing the

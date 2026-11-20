@@ -28,9 +28,10 @@ impl SlotOwner {
 }
 
 /// A promise of `remaining` free slots made by [`SendCopyPool::reserve_slots`].
-/// Filled with [`SendCopyPool::copy_in_reserved`]; the unfilled remainder must
-/// go back through [`SendCopyPool::release_reservation`]. On io_uring a
-/// reservation lives inside one synchronous `DriverCtx::send`; on mio a
+/// Filled with [`SendCopyPool::copy_in_reserved`], or on io_uring with
+/// `SendCopyPool::alloc_raw_reserved`; the unfilled remainder must go back
+/// through [`SendCopyPool::release_reservation`]. On io_uring a reservation
+/// lives inside one synchronous call that copies or encrypts a send; on mio a
 /// `send_backpressured` permit is held, unfilled, until its entry flushes or
 /// is discarded. The pool honours a reservation held across other
 /// allocations either way.
@@ -434,26 +435,9 @@ impl SendCopyPool {
         Some((idx, out_ptr, total_len as u32))
     }
 
-    /// Allocate an empty slot for incremental filling (e.g. TLS ciphertext
-    /// written directly by `write_tls` via `PoolWriter`). Returns
-    /// `(slot, base_ptr, capacity)`. The caller fills bytes front-to-back
-    /// and must call [`set_filled`](Self::set_filled) with the final length
-    /// before the slot is used in an SQE (until then remaining == 0).
-    /// Returns `None` if no unreserved slots are free.
-    pub fn alloc_raw(&mut self, owner: SlotOwner) -> Option<(u16, *mut u8, u32)> {
-        let idx = self.pop_unreserved()?;
-        self.mark_if_passing(idx);
-        self.take_for(idx, owner);
-        let offset = idx as usize * self.slot_size as usize;
-        self.slot_offset[idx as usize] = 0;
-        self.slot_remaining[idx as usize] = 0;
-        self.in_use[idx as usize] = true;
-        self.slot_send_id[idx as usize] = None;
-        let ptr = self.backing.as_mut_ptr().wrapping_add(offset);
-        Some((idx, ptr, self.slot_size))
-    }
-
-    /// Record how many bytes were filled into a slot from [`alloc_raw`](Self::alloc_raw).
+    /// Record how many bytes were filled into a slot from
+    /// [`alloc_raw_reserved`](Self::alloc_raw_reserved), which leaves it
+    /// empty. The slot must not be used in an SQE before this is called.
     pub fn set_filled(&mut self, slot: u16, len: u32) {
         let i = slot as usize;
         debug_assert!(self.in_use[i]);
@@ -465,8 +449,8 @@ impl SendCopyPool {
     /// Promise `n` slots to the caller without popping them. Fails without
     /// side effects (other than the `SEND_EXHAUSTED` metric on
     /// [`ReserveError::Exhausted`]). `n == 0` succeeds with an empty
-    /// reservation. While the reservation is outstanding, `copy_in`,
-    /// `copy_in_gather` and `alloc_raw` see `n` fewer free slots. A
+    /// reservation. While the reservation is outstanding, `copy_in` and
+    /// `copy_in_gather` see `n` fewer free slots. A
     /// reservation taken while marking ([`begin_passing`](Self::begin_passing))
     /// is a passing one: its `n` slots count towards
     /// [`passing_held`](Self::passing_held) until they are filled and
@@ -517,6 +501,13 @@ impl SendCopyPool {
             "copy_in_reserved past the end of the reservation"
         );
         debug_assert!(data.len() <= self.slot_size as usize);
+        let idx = self.pop_reserved(r);
+        self.fill_slot(idx, data)
+    }
+
+    /// Pop one of `r`'s promised slots and record it as the reservation's
+    /// owner's. The caller has checked `r.remaining > 0`.
+    fn pop_reserved(&mut self, r: &mut SlotReservation) -> u16 {
         let idx = self
             .free_list
             .pop()
@@ -528,19 +519,40 @@ impl SendCopyPool {
         }
         // The slot was charged to the owner when it was reserved.
         self.owner[idx as usize] = r.owner;
-        self.fill_slot(idx, data)
+        idx
+    }
+
+    /// Pop one promised slot empty, for incremental filling, and return
+    /// `(slot, base_ptr, capacity)`, or `None` when the reservation has no
+    /// slots left. The caller fills bytes front-to-back and calls
+    /// [`set_filled`](Self::set_filled) with the final length before the
+    /// slot is used in an SQE. TLS encryption on io_uring writes ciphertext
+    /// into slots taken this way, so it cannot run out of slots after rustls
+    /// has sealed a record. A slot taken from a passing reservation is
+    /// marked as passing, as in [`copy_in_reserved`](Self::copy_in_reserved).
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub fn alloc_raw_reserved(&mut self, r: &mut SlotReservation) -> Option<(u16, *mut u8, u32)> {
+        if r.remaining == 0 {
+            return None;
+        }
+        let idx = self.pop_reserved(r);
+        let offset = idx as usize * self.slot_size as usize;
+        self.slot_offset[idx as usize] = 0;
+        self.slot_remaining[idx as usize] = 0;
+        self.in_use[idx as usize] = true;
+        self.slot_send_id[idx as usize] = None;
+        let ptr = self.backing.as_mut_ptr().wrapping_add(offset);
+        Some((idx, ptr, self.slot_size))
     }
 
     /// Give back all but `keep` of a reservation's unfilled slots.
     ///
-    /// mio-only, and gated rather than `allow(dead_code)`d, because io_uring
-    /// has no way to reach it: its bounded TLS path cannot hold a reservation
-    /// across encryption at all (encryption allocates from this same pool and
-    /// the reservation would hide those slots from it), so it admits with a
-    /// plain capacity check and never over-reserves. Its plain path reserves
-    /// exactly what it needs. mio queues an owned buffer instead, so its
-    /// permit is pure admission accounting and *can* be narrowed after the
-    /// fact.
+    /// mio-only. io_uring encrypts into the reservation's slots
+    /// ([`alloc_raw_reserved`](Self::alloc_raw_reserved)) and returns the
+    /// unused ones with [`release_reservation`](Self::release_reservation)
+    /// once the send is built. mio queues an owned buffer instead, so its
+    /// permit is admission accounting held until the entry is written, and
+    /// is narrowed to the ciphertext's slots once the records exist.
     ///
     /// A bounded TLS send has to reserve against a conservative *ciphertext*
     /// bound before rustls mutates, and only learns the true cost once the
@@ -955,7 +967,13 @@ mod tests {
         let a = SlotOwner::conn(3, 1);
         let b = SlotOwner::conn(5, 1);
         let (s1, _, _) = pool.copy_in(a, b"x").unwrap();
-        let (s2, _, _) = pool.alloc_raw(a).unwrap();
+        let mut r = pool.reserve_slots(a, 1).unwrap();
+        let (s2, _, _) = pool.alloc_raw_reserved(&mut r).unwrap();
+        assert!(
+            pool.alloc_raw_reserved(&mut r).is_none(),
+            "the reservation is used up"
+        );
+        pool.release_reservation(r);
         let part = b"yz";
         // SAFETY: `part` is live for the call.
         let (s3, _, _) = unsafe { pool.copy_in_gather(b, &[(part.as_ptr(), 2)], 2) }.unwrap();
@@ -1147,7 +1165,6 @@ mod tests {
         // accounting every one of these would succeed.
         assert_eq!(pool.free_list.len(), 2);
         assert!(pool.copy_in(SlotOwner::NONE, b"a").is_none());
-        assert!(pool.alloc_raw(SlotOwner::NONE).is_none());
         let data = b"g";
         let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
         assert!(unsafe { pool.copy_in_gather(SlotOwner::NONE, parts, data.len()) }.is_none());
@@ -1158,7 +1175,7 @@ mod tests {
         pool.release_reservation(r);
         assert_eq!(pool.free_count(), 2);
         assert!(pool.copy_in(SlotOwner::NONE, b"a").is_some());
-        assert!(pool.alloc_raw(SlotOwner::NONE).is_some());
+        assert!(pool.copy_in(SlotOwner::NONE, b"b").is_some());
         assert_eq!(pool.free_count(), 0);
     }
 
@@ -1248,8 +1265,10 @@ mod tests {
             unsafe { pool.copy_in_gather(SlotOwner::NONE, parts, data.len()) }.unwrap();
         assert_eq!(pool.take_send_id(b), None);
 
-        let (c, _p, _cap) = pool.alloc_raw(SlotOwner::NONE).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 1).unwrap();
+        let (c, _p, _cap) = pool.alloc_raw_reserved(&mut r).unwrap();
         assert_eq!(pool.take_send_id(c), None);
+        pool.release_reservation(r);
 
         let mut r = pool.reserve_slots(SlotOwner::NONE, 1).unwrap();
         let (d, _p, _l) = pool.copy_in_reserved(&mut r, b"reserved");
@@ -1328,7 +1347,9 @@ mod tests {
         let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
         let (b, _p, _l) =
             unsafe { pool.copy_in_gather(SlotOwner::NONE, parts, data.len()) }.unwrap();
-        let (c, _p, _cap) = pool.alloc_raw(SlotOwner::NONE).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 1).unwrap();
+        let (c, _p, _cap) = pool.alloc_raw_reserved(&mut r).unwrap();
+        pool.release_reservation(r);
         pool.end_passing();
         let (plain, _p, _l) = pool.copy_in(SlotOwner::NONE, b"p").unwrap();
         assert_eq!(

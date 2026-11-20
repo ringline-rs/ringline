@@ -41,36 +41,34 @@
 use std::io;
 
 use crate::accumulator::AccumulatorTable;
-use crate::buffer::send_copy::SendCopyPool;
+use crate::buffer::send_copy::{SendCopyPool, SlotOwner, SlotReservation};
+use crate::completion::OpTag;
 use crate::handler::BuiltSend;
 
-use super::{TlsRecvResult, TlsTable};
+use super::{TlsRecvResult, TlsTable, build_pool_send};
 
 #[cfg(feature = "tls-buffered")]
 use super::buffered;
 
 #[cfg(not(feature = "tls-buffered"))]
-use super::{build_pool_send, unbuffered};
-#[cfg(not(feature = "tls-buffered"))]
-use crate::completion::OpTag;
+use super::unbuffered;
 
 /// Copy `ciphertext` into pool slots and append the resulting sends to `out`,
-/// all tagged [`OpTag::TlsSend`] — this only ever carries handshake records and
-/// alerts, which never complete a logical application send.
+/// all tagged [`OpTag::TlsSend`] — this only ever carries handshake records,
+/// session tickets and alerts, which never complete a logical application
+/// send.
 ///
-/// **All-or-nothing.** Slots are staged locally and appended to `out` only once
-/// the whole blob has one; running out of pool partway releases everything this
-/// call took and appends nothing, returning `false`. Appending a prefix would
-/// put a truncated TLS record on the wire — half a Certificate message is
-/// strictly worse for the peer than none of it — and the callers tear the
-/// connection down on `false` either way. Sends appended to `out` by *earlier*
-/// calls are untouched, which is where this matches
-/// [`buffered::take_tls_output_sends`][super::buffered::take_tls_output_sends]:
-/// it stages into a `PoolWriter` and drains into the caller's vector only on
-/// success, for the same reason.
+/// **All-or-nothing.** The slots the whole blob needs are reserved before
+/// the first byte is copied; if the pool cannot cover them, nothing is taken
+/// or appended and this returns `false`. Appending a prefix would put a
+/// truncated TLS record on the wire — half a Certificate message is strictly
+/// worse for the peer than none of it — and the callers tear the connection
+/// down on `false`, except a close_notify, which keeps the bytes and tries
+/// again (`TlsTable::send_close_notify_queued`). Sends appended to `out` by
+/// *earlier* calls are untouched. Both engines' handshake and alert output
+/// comes through here.
 ///
 /// An empty `ciphertext` appends nothing and succeeds.
-#[cfg(not(feature = "tls-buffered"))]
 pub(super) fn ciphertext_to_sends(
     pool: &mut SendCopyPool,
     conn_index: u32,
@@ -79,28 +77,17 @@ pub(super) fn ciphertext_to_sends(
     out: &mut Vec<BuiltSend>,
 ) -> bool {
     let slot_size = pool.slot_size() as usize;
-    // (slot, ciphertext length) in transmission order, same staging shape as
-    // `encrypt_to_sends` below.
-    let mut staged: Vec<(u16, u32)> = Vec::new();
+    let owner = SlotOwner::conn(conn_index, generation);
+    let Ok(mut permit) = pool.reserve_slots(owner, ciphertext.len().div_ceil(slot_size)) else {
+        return false;
+    };
     for chunk in ciphertext.chunks(slot_size) {
         // `submit_next_queued` may coalesce these chunks, with other queued
         // copy sends, into one `SendMsgCoalesced` (#628); queue order is
         // transmission order, so records stay in sequence. Only a slot that
         // carries a send id settles anything, so a coalesced run still wakes
         // each logical send once.
-        match pool.copy_in(
-            crate::buffer::send_copy::SlotOwner::conn(conn_index, generation),
-            chunk,
-        ) {
-            Some((slot, _, len)) => staged.push((slot, len)),
-            None => {
-                release_all(pool, &staged);
-                return false;
-            }
-        }
-    }
-    for &(slot, len) in &staged {
-        let (ptr, _) = pool.current_ptr_remaining(slot);
+        let (slot, ptr, len) = pool.copy_in_reserved(&mut permit, chunk);
         out.push(build_pool_send(
             conn_index,
             generation,
@@ -110,6 +97,7 @@ pub(super) fn ciphertext_to_sends(
             OpTag::TlsSend,
         ));
     }
+    pool.release_reservation(permit);
     true
 }
 
@@ -363,19 +351,26 @@ pub fn flush_tls_output(
 /// mode it is sealed from the plaintext into the slot, with no copy. A TLS 1.2
 /// record is sealed in a per-record buffer and then copied into the slot.
 ///
-/// On any failure every slot allocated by this call is released before
+/// Every slot comes from `permit`, which the caller reserved against the
+/// ciphertext bound (`TlsTable::ciphertext_capacity`) before calling. The
+/// caller returns the slots left in `permit` afterwards. Running out of
+/// `permit` means the bound was beaten: a debug build panics, and a release
+/// build fails the send as below.
+///
+/// On any failure every slot taken by this call is released before
 /// returning, so a rejected send leaks nothing and nothing reaches the send
 /// queue. It is *not* retryable, though: records encrypted before the failure
 /// consumed TLS sequence numbers that no longer have ciphertext on the wire, so
 /// the connection is finished. Treat an error here as fatal for the connection
-/// and close it, as `encrypt_tls_send` and `send_bounded` do; the buffered
-/// engine behaves the same.
+/// and close it, as `encrypt_tls_send` does; the buffered engine behaves the
+/// same.
 pub fn encrypt_to_sends(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
     generation: u32,
     plaintext: &[u8],
+    permit: &mut SlotReservation,
 ) -> io::Result<Vec<BuiltSend>> {
     #[cfg(not(feature = "tls-buffered"))]
     {
@@ -390,14 +385,13 @@ pub fn encrypt_to_sends(
             // `submit_next_queued` may coalesce these chunks with other queued
             // copy sends into one `SendMsgCoalesced` (#628); the send id rides
             // on the final chunk only, so the logical send settles once.
-            let Some((slot, ptr, cap)) = send_copy_pool.alloc_raw(
-                crate::buffer::send_copy::SlotOwner::conn(conn_index, generation),
-            ) else {
+            let Some((slot, ptr, cap)) = send_copy_pool.alloc_raw_reserved(permit) else {
+                debug_assert!(false, "TLS ciphertext bound beaten");
                 release_all(send_copy_pool, &filled);
-                return Err(io::Error::other("send copy pool exhausted for TLS"));
+                return Err(io::Error::other("TLS ciphertext bound beaten"));
             };
-            // SAFETY: `ptr`/`cap` are the base and size of the slot `alloc_raw`
-            // just handed out; this call holds it exclusively until the
+            // SAFETY: `ptr`/`cap` are the base and size of the slot
+            // `alloc_raw_reserved` just handed out; this call holds it exclusively until the
             // `set_filled`/`release` below, and the borrow ends before either.
             let dst = unsafe { std::slice::from_raw_parts_mut(ptr, cap as usize) };
             match unbuffered::encrypt_chunk(tls_conn, &plaintext[offset..], dst) {
@@ -443,6 +437,7 @@ pub fn encrypt_to_sends(
         conn_index,
         generation,
         plaintext,
+        permit,
     )
 }
 
@@ -459,15 +454,14 @@ fn release_all(pool: &mut SendCopyPool, filled: &[(u16, u32)]) {
 mod tests {
     use super::*;
 
-    // Pool exhaustion partway through a blob must append nothing and leak
-    // nothing. A prefix reaching the wire is a truncated TLS record at the
-    // peer, and staged slots have no CQE coming to release them.
+    // A blob the pool cannot cover must append nothing and leak nothing. A
+    // prefix reaching the wire is a truncated TLS record at the peer, and
+    // staged slots have no CQE coming to release them.
     #[test]
     fn ciphertext_to_sends_is_all_or_nothing_on_exhaustion() {
         let mut pool = SendCopyPool::new(2, 64);
         let mut out = Vec::new();
-        // Three slots' worth of output into a two-slot pool: the third
-        // `copy_in` is the one that fails.
+        // Three slots' worth of output into a two-slot pool.
         let ciphertext = vec![0xA5u8; 3 * 64];
 
         assert!(
