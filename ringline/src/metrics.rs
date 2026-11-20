@@ -302,10 +302,7 @@ pub mod park_abandon {
     pub const CLOSING: usize = 6;
     /// Queued or in-flight sends hold this worker's pool slots.
     pub const SENDS: usize = 7;
-    // Slot 8 has no blocker.
-    /// A send chain has SQEs in the kernel.
-    pub const CHAIN: usize = 9;
-    // Slots 10 and 11 have no blocker.
+    // Slots 8 to 11 have no blocker.
     /// The slot was recycled while the install was in flight.
     pub const SLOT_RECYCLED: usize = 12;
     /// The `FixedFdInstall` failed.
@@ -597,7 +594,6 @@ pub fn init_metadata() {
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OFFERED, "op".into(), "not_offered".into());
     PARK_ABANDONED.insert_metadata(park_abandon::CLOSING, "op".into(), "closing".into());
     PARK_ABANDONED.insert_metadata(park_abandon::SENDS, "op".into(), "sends".into());
-    PARK_ABANDONED.insert_metadata(park_abandon::CHAIN, "op".into(), "chain".into());
     PARK_ABANDONED.insert_metadata(
         park_abandon::SLOT_RECYCLED,
         "op".into(),

@@ -64,8 +64,7 @@ ordinary fd.
 
 ## Design
 
-Stream sends carry `MSG_DONTWAIT`, and `send_chain` keeps `MSG_WAITALL`. A send that
-cannot finish waits in ringline:
+Stream sends carry `MSG_DONTWAIT`. A send that cannot finish waits in ringline:
 
 1. A short send arms `PollAdd(POLLOUT)` for the rest. It does not resubmit first,
    because the resubmit would return `-EAGAIN`.
@@ -105,8 +104,7 @@ worker exit `run_shutdown` releases it directly, and the `Close` CQE fails one t
 forced close left waiting.
 
 The peer's FIN needs no tracking, because step 4 detects it from the poll's result.
-Nothing installs an fd. `send_chain` still takes a thread in this state, because its
-parts are linked and a short part would break their order (#734).
+Nothing installs an fd.
 
 ### Poll results
 
@@ -225,10 +223,8 @@ The threads count against `RLIMIT_NPROC`, and a client controls how many.
 
 A close with a send waiting behaves as it did, and waits for the peer. Completion
 semantics do not change: a short result stays inside its handler, and the send settles
-once with its full length. `SEND_EAGAIN` is now a normal backpressure count. A chain
-part is built with `Sqe::chain_send`, `Sqe::chain_send_msg` or `Sqe::chain_send_msg_zc`,
-and `push_sqe_chain` debug-asserts it, because a chain part with `MSG_DONTWAIT` restores
-#734.
+once with its full length. `SEND_EAGAIN` is now a normal backpressure count. Stream sends take their flags from
+`STREAM_SEND_FLAGS` (`completion.rs`), which is `MSG_DONTWAIT`.
 
 ## Tests
 
@@ -253,7 +249,8 @@ and `push_sqe_chain` debug-asserts it, because a chain part with `MSG_DONTWAIT` 
   1 ms tick and with none.
 - A close with a multishot poll armed: the peer sees EOF, and the socket leaves
   `/proc/net/tcp`. Unit tests check the cancel, including with no close lead.
-- A control: a chain with a part waiting on a half-closed peer holds a thread.
+- A control: a `MSG_WAITALL` send on the test's own ring holds no thread while it
+  waits on a full socket, and holds one after the peer half-closes.
 
 `a_paced_send_arrives_intact_without_a_fin` passes with `MSG_WAITALL` too. On a 64 KiB
 send buffer, a 64 MiB send with `MSG_WAITALL` takes a thread after io_uring's 127 poll

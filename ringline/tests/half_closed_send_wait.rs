@@ -5,8 +5,9 @@
 //!
 //! Most tests send more than loopback's socket buffers hold for a peer that does
 //! not read, check that the send has stalled, and count the process's `iou-wrk`
-//! threads. A send chain's parts keep `MSG_WAITALL`, so its test is the control
-//! and expects a thread.
+//! threads. The control pushes a `MSG_WAITALL` send through its own ring, which
+//! io_uring hands to an io-wq worker once the peer half-closes, and expects a
+//! thread.
 //!
 //! The tests share counters, so they take a lock.
 
@@ -43,7 +44,6 @@ const CHUNK: usize = 16 * 1024;
 /// Holds one TLS record.
 const SLOT: u32 = 32 * 1024;
 const CONNS: usize = 16;
-const CHAIN_PARTS: usize = 128;
 
 const SINGLE_SLOT: u8 = 0;
 const SPANS_SLOTS: u8 = 1;
@@ -561,62 +561,40 @@ fn unix_peers_shut_rd_fails_the_send(tick_us: u64) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Once a byte arrives, sends chains of copied parts until one fails. Each
-/// chain is long enough to fill a socket with no room left.
-struct ChainOnByte;
-
-impl AsyncEventHandler for ChainOnByte {
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            conn.with_data(|data| ParseResult::Consumed(data.len()))
-                .await;
-            let data = payload(0, CHUNK);
-            for _ in 0..4096 {
-                let Ok(fut) = conn.send_chain(|mut c| {
-                    for _ in 0..CHAIN_PARTS {
-                        c = c.copy(&data);
-                    }
-                    c.finish()
-                }) else {
-                    break;
-                };
-                if fut.await.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-    fn create_for_worker(_id: usize) -> Self {
-        ChainOnByte
-    }
-}
-
-/// The control: a chain's parts keep `MSG_WAITALL`, because a short part would
-/// break their order (#734). One on a full socket holds a thread, which is the
-/// cost the sends above no longer pay, and shows `iou_threads` counts them.
+/// The control: a `MSG_WAITALL` send, pushed through a ring of the test's own
+/// with no runtime, on a full socket whose peer has half-closed holds an
+/// `iou-wrk` thread. It shows `iou_threads` counts them.
 #[test]
-fn a_chain_on_a_half_closed_peer_holds_a_thread() {
+fn a_waitall_send_on_a_half_closed_peer_holds_a_thread() {
+    use io_uring::{IoUring, opcode, types};
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    reset(0);
-    let config = ConfigBuilder::new()
-        .workers(1)
-        .pin_to_core(false)
-        .sq_entries(1024)
-        .max_connections(64)
-        .send_pool(1024, SLOT)
-        .max_chain_length(CHAIN_PARTS as u16)
-        .build()
-        .expect("valid config");
-    let (runtime, handles) = RinglineBuilder::new(config)
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<ChainOnByte>()
-        .expect("launch");
-    let mut peer = connect(runtime.bound_addr().expect("bound address"));
-    peer.write_all(b"go").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (ours, _) = listener.accept().unwrap();
+    let data = vec![7u8; 64 << 20];
+    let mut ring = IoUring::new(8).expect("ring");
+    let send = opcode::Send::new(
+        types::Fd(ours.as_raw_fd()),
+        data.as_ptr(),
+        data.len() as u32,
+    )
+    .flags(libc::MSG_WAITALL)
+    .build()
+    .user_data(1);
+    // SAFETY: `data` and `ours` outlive the request: the test waits for its
+    // CQE before dropping either.
+    unsafe { ring.submission().push(&send) }.expect("push");
+    ring.submit().expect("submit");
     std::thread::sleep(Duration::from_millis(500));
+    let before = iou_threads();
     peer.shutdown(Shutdown::Write).unwrap();
     std::thread::sleep(Duration::from_millis(500));
-    assert!(iou_threads() >= 1, "the chain should hold a worker thread");
+    let after = iou_threads();
+    // Closing the peer with unread bytes resets the connection, so the send
+    // fails. Wait for its completion before `data` and the ring go.
     drop(peer);
-    stop(&runtime, handles);
+    ring.submit_and_wait(1).expect("wait");
+    drop(ours);
+    assert_eq!(before, 0, "the send held a thread before the half-close");
+    assert!(after >= 1, "the send should hold a worker thread");
 }

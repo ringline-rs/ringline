@@ -2,7 +2,7 @@
 //! for bounded sends.
 //!
 //! Every send through `SendHalf` (`send`, `forward_recv_buf`, `send_parts`'
-//! `build` and `submit_batch`, `send_chain`, `send_admitted`,
+//! `build` and `submit_batch`, `send_admitted`,
 //! `send_backpressured`) holds an entry here, named by the
 //! [`SendId`] its future keeps. The driver settles the entry when that send
 //! completes, and the future resolves with the result of that one send. A
@@ -668,7 +668,7 @@ impl SendCompletions {
     /// and return its id.
     ///
     /// Called by the awaiting send APIs (`SendHalf::send`,
-    /// `forward_recv_buf`, `build`, `submit_batch`, `send_chain`) before they
+    /// `forward_recv_buf`, `build`, `submit_batch`) before they
     /// submit. A submission that fails must [`withdraw`](Self::withdraw) the id
     /// it registered.
     pub(crate) fn register(&mut self, conn_index: u32, task_id: u32) -> SendId {

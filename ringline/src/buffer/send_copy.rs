@@ -296,11 +296,10 @@ impl SendCopyPool {
         }
         let (counted, held) = &mut self.held[index];
         if *counted != owner.generation {
-            // A handle from an earlier occupant of the index can still
-            // allocate (a stale `send_chain` builds before `finish` checks
-            // the generation). Its slot is not counted, and `discharge`
-            // ignores its release for the same reason. Generations wrap, so
-            // "earlier" is a wrapping comparison.
+            // A slot charged to an earlier occupant of the index is not
+            // counted against the current one, and `discharge` ignores its
+            // release for the same reason. Generations wrap, so "earlier" is
+            // a wrapping comparison.
             if (owner.generation.wrapping_sub(*counted) as i32) < 0 {
                 return;
             }

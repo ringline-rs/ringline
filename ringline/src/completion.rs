@@ -7,15 +7,6 @@
 #[cfg(has_io_uring)]
 pub(crate) const STREAM_SEND_FLAGS: i32 = libc::MSG_DONTWAIT;
 
-/// Msg flags for the sends of a linked chain.
-///
-/// `MSG_WAITALL`: the kernel retries a short send, and fails the link if it
-/// cannot finish, because the next SQE of the chain would otherwise follow a
-/// gap (#734). A chain part on a full socket whose peer has half-closed waits
-/// on an io-wq worker.
-#[cfg(has_io_uring)]
-pub(crate) const CHAIN_SEND_FLAGS: i32 = libc::MSG_WAITALL;
-
 /// Operation tags encoded in the upper 8 bits of user_data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

@@ -2,9 +2,10 @@
 
 Status: proposal. Experiment stage 0 has run
 (`docs/journal/2026-11-send-pool-stage0.md`). Of the runtime changes, only
-the held count per connection (order of work step 2) is implemented: slots in
-use and reserved on io_uring, permits on mio. The mio count does not yet
-include queued entries that carry no permit (see mio).
+the held count per connection (order of work step 2) and the removal of
+`send_chain` (ahead of the rest of step 4) are implemented. The held count
+covers slots in use and reserved on io_uring, permits on mio; the mio count
+does not yet include queued entries that carry no permit (see mio).
 
 Terms: the worker queue is the worker's queue of sends waiting for
 send-pool slots, which `docs/send-admission-design.md` calls the FIFO
@@ -44,7 +45,7 @@ The runs are recorded in that server's repository, not in this one:
 
 The default send does not wait. `SendHalf::send` (`runtime/io.rs`) copies
 into the pool in the call and fails with `Other` when the pool is short, and
-`submit_batch`, `send_parts(..).build(..)` and `send_chain` do the same.
+`submit_batch` and `send_parts(..).build(..)` do the same.
 Waiting is opt-in (`send_admitted`, `send_backpressured`,
 `submit_batch_admitted`). A limit on one connection's share would therefore
 reach most callers as a refusal, which they handle as an error:
@@ -133,8 +134,8 @@ have the same split.
   chains (`chain_short_send.rs`, `zc_chain_enomem.rs` and the chain cases in
   seven other test files and in `backend/uring/event_loop.rs`). No crate in this
   workspace other than `ringline` calls it, and a waiting form would need the
-  chain's slot count before its closure builds it. IO_LINK chains for other
-  operations, such as `abort`'s linked operations and disk ordering, stay.
+  chain's slot count before its closure builds it. The hardlinked chains of a
+  close's lead and `Close`, and of `abort`, stay.
 
 Zero-copy sends still hold their guards until the kernel releases the
 pages; that release is internal and does not need a per-send result.
@@ -706,7 +707,8 @@ checked, the entry says so.
    queue (sections 2 and 3), with
    receive-path TLS output waiting in order instead of failing the
    connection; bounded sends by default, the `try_` forms, `SendRefused` and
-   the method that reports a refusal in advance; the removal of `send_chain`;
+   the method that reports a refusal in advance; the removal of `send_chain`
+   (done ahead of the rest);
    and the in-tree callers (sections 1, 2 and 6, In-tree callers).
 5. The cap above half occupancy, `M` = 64 by default (section 5), and its
    mio account (the mio section).
