@@ -640,9 +640,10 @@ pub(crate) fn describe_region_charge(
         "RLIMIT_MEMLOCK accounting for this register_region: before it, {regions} \
          registered region(s) of {} KiB in all were on each of {rings} worker ring(s), \
          so they were charged {} KiB; with this region of {} KiB the rings need {} KiB \
-         (soft limit {}). These count each region in base pages; a region on huge pages \
-         is charged in whole huge pages, and the rings' own memory, on kernels that \
-         charge it, and memory the same user has pinned in other processes come on top.",
+         (soft limit {}). These figures count each region in base pages. The kernel \
+         charges a region on huge pages in whole huge pages, and also charges the rings' \
+         own memory (on kernels that charge rings) and memory the same user has pinned \
+         in other processes.",
         kib_ceil(held),
         kib_ceil(held.saturating_mul(rings_u64)),
         kib_ceil(adding),
