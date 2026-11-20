@@ -10976,6 +10976,10 @@ mod tests {
         assert_eq!(reused, conn_index, "test premise: index reused");
         let new_gen = el.driver.connections.generation(conn_index);
         assert_ne!(new_gen, old_gen);
+        // The new occupant holds a slot, which the stale chain's allocation
+        // and release must not touch.
+        let owner = crate::buffer::send_copy::SlotOwner::conn(conn_index, new_gen);
+        el.driver.send_copy_pool.copy_in(owner, b"held").unwrap();
 
         let pool_free = el.driver.send_copy_pool.free_count();
         let slab_free = el.driver.send_slab.free_count();
@@ -11002,6 +11006,11 @@ mod tests {
         );
         assert_eq!(el.driver.send_copy_pool.free_count(), pool_free);
         assert_eq!(el.driver.send_slab.free_count(), slab_free);
+        assert_eq!(
+            el.driver.send_copy_pool.held_by(conn_index, new_gen),
+            1,
+            "the stale chain changed the new occupant's held count"
+        );
 
         // The control: the new occupant's own handle still chains.
         let current = ConnCtx::new(conn_index, new_gen);

@@ -2,7 +2,9 @@
 
 Status: proposal. Experiment stage 0 has run
 (`docs/journal/2026-11-send-pool-stage0.md`). Of the runtime changes, only
-the held count per connection (order of work step 2) is implemented.
+the held count per connection (order of work step 2) is implemented: slots in
+use and reserved on io_uring, permits on mio. The mio count does not yet
+include queued entries that carry no permit (see mio).
 
 Terms: the worker queue is the worker's queue of sends waiting for
 send-pool slots, which `docs/send-admission-design.md` calls the FIFO

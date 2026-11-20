@@ -131,7 +131,7 @@ pub struct SendCopyPool {
     held: Vec<(u32, u32)>,
     // Slots held by `SlotOwner::NONE`, counted the same way.
     unowned_held: usize,
-    // The largest count in `held` has been.
+    // The largest count any entry of `held` has reached.
     held_peak: usize,
 }
 
@@ -260,7 +260,9 @@ impl SendCopyPool {
     /// The slots the connection at `conn_index` with `generation` holds:
     /// slots in use that it allocated, and the unfilled remainder of its
     /// reservations. Zero for a connection that holds none, and for an
-    /// earlier generation of the index once a later one has allocated.
+    /// earlier generation of the index once a later one has allocated. A
+    /// slot allocated for an earlier generation after a later one has
+    /// allocated is not counted for either.
     pub fn held_by(&self, conn_index: u32, generation: u32) -> usize {
         match self.held.get(conn_index as usize) {
             Some(&(counted, held)) if counted == generation => held as usize,
@@ -294,6 +296,14 @@ impl SendCopyPool {
         }
         let (counted, held) = &mut self.held[index];
         if *counted != owner.generation {
+            // A handle from an earlier occupant of the index can still
+            // allocate (a stale `send_chain` builds before `finish` checks
+            // the generation). Its slot is not counted, and `discharge`
+            // ignores its release for the same reason. Generations wrap, so
+            // "earlier" is a wrapping comparison.
+            if (owner.generation.wrapping_sub(*counted) as i32) < 0 {
+                return;
+            }
             *counted = owner.generation;
             *held = 0;
         }
@@ -1007,6 +1017,29 @@ mod tests {
         assert_eq!(pool.held_by(1, 2), 1);
         pool.release(new);
         assert_eq!(pool.held_by(1, 2), 0);
+    }
+
+    #[test]
+    fn a_stale_generation_s_slot_does_not_touch_the_current_count() {
+        let mut pool = SendCopyPool::new(8, 8);
+        let current = SlotOwner::conn(1, 2);
+        let (c1, _, _) = pool.copy_in(current, b"a").unwrap();
+        let (c2, _, _) = pool.copy_in(current, b"b").unwrap();
+        // A handle from the index's previous occupant allocates and releases.
+        let (stale, _, _) = pool.copy_in(SlotOwner::conn(1, 1), b"old").unwrap();
+        assert_eq!(pool.held_by(1, 2), 2);
+        assert_eq!(pool.held_by(1, 1), 0);
+        pool.release(stale);
+        assert_eq!(pool.held_by(1, 2), 2);
+        pool.release(c1);
+        pool.release(c2);
+        assert_eq!(pool.held_by(1, 2), 0);
+        // Across the wrap, u32::MAX is earlier than 0.
+        let (w, _, _) = pool.copy_in(SlotOwner::conn(4, 0), b"w").unwrap();
+        pool.copy_in(SlotOwner::conn(4, u32::MAX), b"x").unwrap();
+        assert_eq!(pool.held_by(4, 0), 1);
+        pool.release(w);
+        assert_eq!(pool.held_by(4, 0), 0);
     }
 
     #[test]

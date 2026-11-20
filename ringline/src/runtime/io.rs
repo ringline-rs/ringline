@@ -3455,12 +3455,13 @@ impl SendHalf {
         self.conn.zero_copy_capped()
     }
 
-    /// The send-pool slots this connection holds now: slots its sends have
-    /// filled that are not yet released, and slots reserved for its sends
-    /// and not yet filled. On mio the pool holds no data, so this counts the
-    /// slots its bounded sends reserved. After the connection closes, the
-    /// count covers its sends still in flight until the next connection on
-    /// its index takes a slot, and is zero from then on. A diagnostic for measuring the pool, not a stable interface.
+    /// The send-pool slots this connection holds now: slots holding its
+    /// data or TLS records that are not yet released, and slots reserved for
+    /// its sends and not yet filled. On mio the pool holds no data: a bounded
+    /// send's reserved slots count, and plain sends take no slot. After the
+    /// connection closes, the count covers its sends still in flight until
+    /// the next connection on its index takes a slot, and is zero from then
+    /// on. A diagnostic for measuring the pool, not a stable interface.
     #[doc(hidden)]
     pub fn send_pool_held(&self) -> usize {
         self.conn.send_pool_held()
