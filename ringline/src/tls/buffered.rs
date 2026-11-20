@@ -249,7 +249,9 @@ pub(super) fn feed_tls_recv_buffered(
         return TlsRecvResult::Error(crate::accumulator::recv_cap_exceeded());
     }
 
-    // Collect any TLS output (handshake messages, alerts, etc.).
+    // Collect any TLS output (handshake messages, alerts, etc.). The count
+    // from the last `process_new_packets` is exact here because nothing
+    // since has queued TLS output: draining plaintext only reads.
     if tls_conn.conn.wants_write()
         && !take_counted_tls_output_sends(
             tls_conn,
@@ -310,7 +312,7 @@ pub(super) fn flush_tls_output_buffered(
 /// Slots come from a reservation the caller took against the output's size
 /// or bound, and are filled front-to-back and sealed when full; the partially
 /// filled tail slot is sealed by [`into_filled`](Self::into_filled). When the
-/// reservation runs out (the bound was beaten) `write` reports whatever it
+/// reservation runs out (the bound or the reported count was short) `write` reports whatever it
 /// copied (rustls keeps the rest buffered) and errors on the next call; the
 /// caller treats that as a broken connection, and
 /// [`release_all`](Self::release_all) returns every slot on the error path.

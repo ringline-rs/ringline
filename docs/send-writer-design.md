@@ -340,9 +340,8 @@ admission against the ciphertext bound on io_uring, and none on mio.
 The writer holds no pool reservation on TLS. `encrypt_tls_send` takes its
 own reservation of the ciphertext bound and encrypts into it
 (`alloc_raw_reserved`), so a reservation held by the writer as well would
-count the same slots twice. Passing the writer's reservation to
-`encrypt_tls_send` instead is possible now that encryption fills a
-reservation. On TLS:
+count the same slots twice. `encrypt_tls_send` could take the writer's
+reservation instead, since encryption fills a reservation. On TLS:
 
 - `reserve` and `reserve_slots` succeed without reserving, and guarantee
   nothing. Pool exhaustion and `InvalidInput` are reported after the

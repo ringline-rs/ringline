@@ -157,6 +157,12 @@ sufficient here and was verified: the worker is single-threaded, no
 reservation is outstanding on this path, and nothing allocates from the pool
 between the check and the first allocation inside the call.
 
+At HEAD the check is a reservation: `encrypt_tls_send` reserves
+`capacity_slots` (`reserve_slots`), encryption writes into the reserved
+slots (`SendCopyPool::alloc_raw_reserved`), and the unused ones are
+returned (`release_reservation`). The refusal before anything mutates is
+the same.
+
 **mio** (`DriverCtx::send_bounded`, TLS branch): the reservation is already
 taken before the TLS branch; only its *size* is wrong. Size it by
 `capacity_slots` instead of the plaintext, then shrink the permit to what

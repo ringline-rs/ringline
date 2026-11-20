@@ -65,8 +65,11 @@ use super::unbuffered;
 /// worse for the peer than none of it — and the callers tear the connection
 /// down on `false`, except a close_notify, which keeps the bytes and tries
 /// again (`TlsTable::send_close_notify_queued`). Sends appended to `out` by
-/// *earlier* calls are untouched. Both engines' handshake and alert output
-/// comes through here.
+/// *earlier* calls are untouched. The unbuffered engine's handshake and alert
+/// output comes through here, as does the buffered engine's output that has
+/// no `IoState` to size it (close_notify, `process_new_packets` errors, the
+/// client's first flight); the buffered receive path writes through
+/// `PoolWriter` (`buffered::take_counted_tls_output_sends`).
 ///
 /// An empty `ciphertext` appends nothing and succeeds.
 pub(super) fn ciphertext_to_sends(

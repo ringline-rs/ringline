@@ -270,8 +270,10 @@ written.
   writes whole records into each slot, and the byte bound in slots for the
   buffered engine. Encryption writes into the taken slots
   (`SendCopyPool::alloc_raw_reserved`, from `encrypt_tls_send` in
-  `handler.rs`) and the unused ones are returned, usually the one slack
-  record's. The operation cannot run out of slots after rustls has sealed a
+  `handler.rs`) and the unused ones are returned: usually one slot on the
+  unbuffered engine (the slack record), and on the buffered engine the
+  slack record plus the 7 bytes per record the bound assumes beyond TLS
+  1.3's 22 bytes of overhead. The operation cannot run out of slots after rustls has sealed a
   record because its slots are already held.
 - TLS output produced on the receive path, and a close_notify, take the
   slots their bytes need. On the unbuffered engine that is the length of
