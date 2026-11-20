@@ -1,10 +1,12 @@
-//! Whether guard-only sends from a registered region go out as `SENDMSG_ZC`
-//! with `IORING_RECVSEND_FIXED_BUF`, decided once per process by a probe of
-//! the running kernel.
+//! Whether guard-only sends from a registered region name the region's
+//! buffer (`IORING_RECVSEND_FIXED_BUF`), decided once per process by a probe
+//! of the running kernel. A send of one guard goes out as `SEND_ZC` (the flag
+//! is Linux 6.0), and a send of several as `SENDMSG_ZC` (the flag is Linux
+//! 6.15).
 //!
-//! The kernel must accept the flag on `SENDMSG_ZC` (Linux 6.15), and must
-//! charge a send from a registered buffer to the socket's send buffer the
-//! same as a send of the same bytes from plain iovecs. From Linux 6.3, a
+//! The kernel must accept the flag, and must charge a send from a registered
+//! buffer to the socket's send buffer the same as a send of the same bytes
+//! from plain iovecs. From Linux 6.3, a
 //! registered buffer that lies in a large folio is coalesced into one bvec per
 //! folio, and `io_sg_from_iter` charges a send from it by its offset in the
 //! folio: a 4 KiB send near the end of a 2 MiB page is charged about 2 MiB.
@@ -18,14 +20,15 @@
 //! the probe measures the charge instead of reading the version.
 //!
 //! The probe sends 4 KiB from the last page of a registered 2 MiB transparent
-//! huge page, once with the flag and once from plain iovecs, each on a fresh
-//! loopback connection whose receiver does not read, and compares the change
-//! in `SK_MEMINFO_WMEM_QUEUED` across the send. The kernel's fault in the
-//! charge raises the fixed send's charge by about 2 MiB.
+//! huge page up to three times: from plain iovecs, as a fixed `SEND_ZC`, and,
+//! when that passes, as a fixed `SENDMSG_ZC`. Each send is on a fresh loopback connection whose
+//! receiver does not read, and the probe compares the change in
+//! `SK_MEMINFO_WMEM_QUEUED` across each fixed send with the plain one's. The
+//! kernel's fault in the charge raises a fixed send's charge by about 2 MiB.
 //!
 //! The probe usually takes a few milliseconds. Its waits on the sockets and
 //! the ring are bounded: 1 s for each connection's setup and prefill, and 5 s
-//! for each completion, about 22 s for one measurement and 66 s for the three
+//! for each completion, about 33 s for one measurement and 99 s for the three
 //! it makes at most. Two steps are not bounded: the huge
 //! page is allocated with `MADV_HUGEPAGE` and `MADV_COLLAPSE`, which can wait
 //! for memory compaction, and the check that it is one huge page reads
@@ -70,19 +73,33 @@ const SIOCOUTQNSD: libc::c_ulong = 0x894B;
 
 static RESULT: OnceLock<FixedBufferSends> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static MULTI: AtomicBool = AtomicBool::new(false);
+
+/// Which guard-only sends name their region's buffer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Modes {
+    /// A send of one guard, as `SEND_ZC`.
+    pub(crate) single: bool,
+    /// A send of several guards, as `SENDMSG_ZC`.
+    pub(crate) multi: bool,
+}
 /// Why the probe must not run, set at launch when `RLIMIT_MEMLOCK` has no room
 /// for its charge ([`refuse`]) and cleared by a later launch that made room
 /// ([`allow`]).
 static REFUSED: Mutex<Option<String>> = Mutex::new(None);
 
-/// Whether the probe has run and passed. Workers read it on the send path.
+/// Which sends the probe passed; none until it has run. Workers read it on
+/// the send path.
 ///
-/// [`probe_once`] stores `ENABLED` before its caller spawns the workers or
+/// [`probe_once`] stores the flags before its caller spawns the workers or
 /// sends a worker the message that registers a region. A worker checks a
 /// guard's region against its own table, which it updates on that message,
-/// so a worker that can find the region loads after the store.
-pub(crate) fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+/// so a worker that can find the region loads after the stores.
+pub(crate) fn modes() -> Modes {
+    Modes {
+        single: ENABLED.load(Ordering::Relaxed),
+        multi: MULTI.load(Ordering::Relaxed),
+    }
 }
 
 /// The `RLIMIT_MEMLOCK` charge the probe makes while it runs: its buffer, and
@@ -120,7 +137,8 @@ pub(crate) fn probe_once() -> FixedBufferSends {
     RESULT
         .get_or_init(|| {
             let result = probe();
-            if result == FixedBufferSends::Enabled {
+            if let FixedBufferSends::Enabled { multi_guard } = result {
+                MULTI.store(multi_guard, Ordering::Relaxed);
                 ENABLED.store(true, Ordering::Relaxed);
             }
             result
@@ -153,12 +171,23 @@ fn probe() -> FixedBufferSends {
     if let Err(e) = engine.register_buffers(&FixedBufferRegistry::new(&[region], 1)) {
         return FixedBufferSends::Inconclusive(format!("registering the probe buffer: {e}"));
     }
-    // A measurement can fail for a passing reason (a connection slow to set
-    // up, an ACK inside the measurement), so it is tried up to `ATTEMPTS`
-    // times. A `Leak` ends the probe at once.
-    let mut result = measure(&mut engine, &buf);
+    // Checked after registering: the registration pins the folio, so it is
+    // still one huge page when the sends run. A folio split before the pin
+    // reads as 0 here and makes the probe inconclusive, not wrong.
+    let mut result = if buf.anon_huge_kib() < HUGE / 1024 {
+        Err(Failure::Fixed(
+            "no transparent huge page for the probe buffer \
+             (/sys/kernel/mm/transparent_hugepage/enabled)"
+                .into(),
+        ))
+    } else {
+        measure(&mut engine, &buf)
+    };
+    // A measurement can fail for a transient reason (a connection slow to
+    // set up, an ACK inside the measurement), so a `Transient` failure is
+    // retried, up to `ATTEMPTS` measurements in all.
     for _ in 1..ATTEMPTS {
-        if !matches!(result, Err(Failure::Other(_))) {
+        if !matches!(result, Err(Failure::Transient(_))) {
             break;
         }
         result = measure(&mut engine, &buf);
@@ -181,58 +210,82 @@ fn probe() -> FixedBufferSends {
     }
     match result {
         Ok(result) => result,
-        Err(Failure::Leak(why) | Failure::Other(why)) => FixedBufferSends::Inconclusive(why),
+        Err(Failure::Leak(why) | Failure::Fixed(why) | Failure::Transient(why)) => {
+            FixedBufferSends::Inconclusive(why)
+        }
     }
 }
 
-/// Check that the registered buffer is one huge page, then compare the fixed
-/// and plain sends' charges.
+/// Compare the charges of a fixed `SEND_ZC` and a fixed `SENDMSG_ZC` with a
+/// plain send's.
 fn measure(engine: &mut ActiveEngine, buf: &HugeBuffer) -> Result<FixedBufferSends, Failure> {
-    // Checked after registering: the registration pins the folio, so it is
-    // still one huge page when the sends run. A folio split before the pin
-    // reads as 0 here and makes the probe inconclusive, not wrong.
-    if buf.anon_huge_kib() < HUGE / 1024 {
-        return Err(Failure::Other(
-            "no transparent huge page for the probe buffer \
-             (/sys/kernel/mm/transparent_hugepage/enabled)"
-                .into(),
-        ));
-    }
     // The last page of the huge page: the fault charges it about `HUGE`.
     let at = buf.ptr.wrapping_add(HUGE - LEN);
     let mut ready = Vec::new();
-    let fixed = match charge(engine, &mut ready, at, Some(0))? {
+    let plain = match charge(engine, &mut ready, at, Kind::Plain)? {
+        Charge::Sent(bytes) => bytes,
+        Charge::Refused => return Err(Failure::Fixed("a plain SENDMSG_ZC was refused".into())),
+    };
+    let single = match charge(engine, &mut ready, at, Kind::Single)? {
         Charge::Sent(bytes) => bytes,
         Charge::Refused => return Ok(FixedBufferSends::Unsupported),
     };
-    let plain = match charge(engine, &mut ready, at, None)? {
-        Charge::Sent(bytes) => bytes,
-        Charge::Refused => {
-            return Err(Failure::Other("a plain SENDMSG_ZC was refused".into()));
-        }
+    match verdict(single, plain) {
+        Verdict::Pass => {}
+        Verdict::Overcharged => return Ok(FixedBufferSends::Overcharged),
+        Verdict::Unclear(why) => return Err(Failure::Transient(why)),
+    }
+    // The single send passed. A multi-guard send that does not pass, or that
+    // cannot be measured, leaves sends of several guards on plain iovecs;
+    // only a `Leak` discards the single send's result.
+    let multi_guard = match charge(engine, &mut ready, at, Kind::Multi) {
+        Ok(Charge::Sent(bytes)) => verdict(bytes, plain) == Verdict::Pass,
+        Ok(Charge::Refused) | Err(Failure::Transient(_) | Failure::Fixed(_)) => false,
+        Err(leak @ Failure::Leak(_)) => return Err(leak),
     };
-    Ok(verdict(fixed, plain))
+    Ok(FixedBufferSends::Enabled { multi_guard })
 }
 
-/// The result from the fixed and plain sends' charges, in bytes.
-fn verdict(fixed: i64, plain: i64) -> FixedBufferSends {
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// The fixed send was charged the same as the plain one.
+    Pass,
+    /// The fixed send was charged the kernel's fault.
+    Overcharged,
+    /// Neither, for the reason given.
+    Unclear(String),
+}
+
+/// The verdict from a fixed and a plain send's charges, in bytes.
+fn verdict(fixed: i64, plain: i64) -> Verdict {
     if fixed - plain <= TOLERANCE {
-        FixedBufferSends::Enabled
+        Verdict::Pass
     } else if fixed - plain >= OVERCHARGE {
-        FixedBufferSends::Overcharged
+        Verdict::Overcharged
     } else {
-        FixedBufferSends::Inconclusive(format!(
+        Verdict::Unclear(format!(
             "a {LEN}-byte send from a registered buffer was charged {fixed} bytes, \
              and from plain iovecs {plain}"
         ))
     }
 }
 
+/// Which send [`charge`] makes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// `SENDMSG_ZC` from plain iovecs.
+    Plain,
+    /// `SEND_ZC` from registered buffer 0.
+    Single,
+    /// `SENDMSG_ZC` from registered buffer 0.
+    Multi,
+}
+
 enum Charge {
     /// The send was taken; the change in the write queue's charge, in bytes.
     Sent(i64),
-    /// `EINVAL`: the kernel does not take `IORING_RECVSEND_FIXED_BUF` on
-    /// `SENDMSG_ZC`.
+    /// `EINVAL`: on a fixed send, the kernel does not take
+    /// `IORING_RECVSEND_FIXED_BUF` on its opcode.
     Refused,
 }
 
@@ -241,27 +294,30 @@ enum Failure {
     /// so the kernel may still read the probe buffer: the buffer and the ring
     /// must not be released.
     Leak(String),
-    /// Nothing the kernel holds refers to the buffer.
-    Other(String),
+    /// Nothing the kernel holds refers to the buffer, and measuring again
+    /// may succeed.
+    Transient(String),
+    /// Nothing the kernel holds refers to the buffer, and measuring again
+    /// would fail the same way.
+    Fixed(String),
 }
 
 impl From<String> for Failure {
     fn from(why: String) -> Self {
-        Failure::Other(why)
+        Failure::Transient(why)
     }
 }
 
-/// Send `LEN` bytes at `at` with `SENDMSG_ZC`, from registered buffer
-/// `buf_index` or, with `None`, from plain iovecs, on a connection whose
-/// write queue holds unsent data, and return the change in the queue's
-/// charge. Waits for the send's completion and notification before
-/// returning, and returns `Leak` when either does not arrive. `ready` holds
+/// Send `LEN` bytes at `at` as `kind` says, on a connection whose write
+/// queue holds unsent data, and return the change in the queue's charge.
+/// Waits for the send's completion and notification before returning, and
+/// returns `Leak` when either does not arrive. `ready` holds
 /// completions reaped and not yet consumed.
 fn charge(
     engine: &mut ActiveEngine,
     ready: &mut Vec<(u64, i32, u32)>,
     at: *mut u8,
-    buf_index: Option<u16>,
+    kind: Kind,
 ) -> Result<Charge, Failure> {
     let (client, peer) = stuck_connection()?;
     let fd = client.as_raw_fd();
@@ -278,17 +334,24 @@ fn charge(
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     let flags = libc::MSG_DONTWAIT as u32;
-    let op = match buf_index {
-        Some(buf_index) => Op::SendMsgZcFixed {
+    let op = match kind {
+        Kind::Plain => Op::SendMsgZc {
             fd: Fd::Raw(fd),
             msg: &msg,
             flags,
-            buf_index,
         },
-        None => Op::SendMsgZc {
+        Kind::Single => Op::SendZcFixed {
+            fd: Fd::Raw(fd),
+            buf: at,
+            len: LEN as u32,
+            flags: libc::MSG_DONTWAIT,
+            buf_index: 0,
+        },
+        Kind::Multi => Op::SendMsgZcFixed {
             fd: Fd::Raw(fd),
             msg: &msg,
             flags,
+            buf_index: 0,
         },
     };
     // SAFETY: `msg`, `iov` and the bytes at `at` stay valid until the send's
@@ -299,7 +362,7 @@ fn charge(
     let (result, cqe_flags) = next_completion(engine, ready).map_err(Failure::Leak)?;
     let more = cqueue::more(cqe_flags);
 
-    let outcome = if result == -libc::EINVAL && buf_index.is_some() {
+    let outcome = if result == -libc::EINVAL {
         Ok(Charge::Refused)
     } else if result != LEN as i32 {
         Err(format!("the probe's send returned {result}, not {LEN}"))
@@ -350,7 +413,7 @@ fn charge(
             Err(why) => return Err(Failure::Leak(why)),
         }
     }
-    outcome.map_err(Failure::Other)
+    outcome.map_err(Failure::Transient)
 }
 
 /// The next completion's result and flags, waiting up to `WAIT`. `ready`
@@ -670,20 +733,17 @@ mod tests {
 
     #[test]
     fn verdict_passes_equal_charges_and_names_the_fault() {
-        assert_eq!(verdict(4352, 4352), FixedBufferSends::Enabled);
-        assert_eq!(verdict(4352 + 4096, 4352), FixedBufferSends::Enabled);
-        assert_eq!(verdict(2 << 20, 4352), FixedBufferSends::Overcharged);
-        assert!(matches!(
-            verdict(64 << 10, 4352),
-            FixedBufferSends::Inconclusive(_)
-        ));
+        assert_eq!(verdict(4352, 4352), Verdict::Pass);
+        assert_eq!(verdict(4352 + 4096, 4352), Verdict::Pass);
+        assert_eq!(verdict(2 << 20, 4352), Verdict::Overcharged);
+        assert!(matches!(verdict(64 << 10, 4352), Verdict::Unclear(_)));
     }
 
-    /// The probe returns a result that matches the running kernel's version
-    /// where the version decides it: before 6.15 the kernel refuses the flag
-    /// on `SENDMSG_ZC`. From 6.15 the result depends on whether the kernel
-    /// carries the charge fix, which its version does not say; the test
-    /// prints it.
+    /// The probe's result agrees with the running kernel's version where the
+    /// version decides it: before 6.15 the kernel refuses the flag on
+    /// `SENDMSG_ZC`, so several guards never name a buffer. Whether a kernel
+    /// carries the charge fix its version does not say; the test prints the
+    /// result. `modes` reports what the result says.
     #[test]
     fn the_probe_agrees_with_the_kernel_version() {
         let result = probe_once();
@@ -691,13 +751,17 @@ mod tests {
         let kernel = crate::memlock::KernelVersion::current().expect("kernel version");
         if (kernel.major, kernel.minor) < (6, 15) {
             assert!(
-                matches!(
-                    result,
-                    FixedBufferSends::Unsupported | FixedBufferSends::Inconclusive(_)
-                ),
+                !matches!(result, FixedBufferSends::Enabled { multi_guard: true }),
                 "{kernel}: {result:?}"
             );
         }
-        assert_eq!(enabled(), result == FixedBufferSends::Enabled);
+        let want = match result {
+            FixedBufferSends::Enabled { multi_guard } => Modes {
+                single: true,
+                multi: multi_guard,
+            },
+            _ => Modes::default(),
+        };
+        assert_eq!(modes(), want);
     }
 }

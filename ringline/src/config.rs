@@ -1384,22 +1384,24 @@ impl ConfigBuilder {
     }
 
     /// Whether a send whose parts are all guards in one registered region
-    /// goes out as `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF`, naming that
-    /// region's buffer, so the kernel does not look up and pin the pages of
-    /// each send. Default: `true`.
+    /// names that region's buffer (`IORING_RECVSEND_FIXED_BUF`), so the kernel
+    /// does not look up and pin the pages of each send. A send of one guard
+    /// goes out as `SEND_ZC`, and a send of several as `SENDMSG_ZC`.
+    /// Default: `true`.
     ///
     /// When `true`, a probe of the running kernel decides, once per process.
     /// It runs at the first launch with
     /// [`registered_regions`](Self::registered_regions), the first
     /// [`Runtime::register_region`](crate::Runtime::register_region), or the
     /// first [`Runtime::fixed_buffer_sends`](crate::Runtime::fixed_buffer_sends),
-    /// whichever comes first, and that call blocks while it runs. Fixed sends
-    /// are used only when the kernel takes the flag (Linux 6.15) and charges
-    /// such a send to the socket's send buffer the same as the send from plain
-    /// iovecs. `Runtime::fixed_buffer_sends` reports the result.
+    /// whichever comes first, and that call blocks while it runs. Each kind of
+    /// send names the buffer only when the kernel takes the flag on its
+    /// opcode (`SEND_ZC` from Linux 6.0, `SENDMSG_ZC` from 6.15) and charges
+    /// it to the socket's send buffer the same as the send from plain iovecs.
+    /// `Runtime::fixed_buffer_sends` reports the result.
     ///
     /// The probe usually takes a few milliseconds. Its waits on the sockets
-    /// and the ring are bounded at about 22 s per measurement, and it makes at
+    /// and the ring are bounded at about 33 s per measurement, and it makes at
     /// most three. Allocating the huge page can wait for memory compaction,
     /// and the check that it is a huge page reads `/proc/self/smaps`; neither
     /// is bounded. It maps 6 MiB, collapses a 2 MiB transparent huge

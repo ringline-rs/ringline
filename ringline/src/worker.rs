@@ -376,7 +376,7 @@ impl Runtime {
         #[cfg(has_io_uring)]
         {
             // The probe runs before the first region is registered, so a
-            // send from the region finds its result (`fixed_send::enabled`).
+            // send from the region finds its result (`fixed_send::modes`).
             if self.fixed_buffer_sends {
                 crate::backend::uring::fixed_send::probe_once();
             }
@@ -395,7 +395,8 @@ impl Runtime {
     /// Whether a send whose parts are all guards in one registered region
     /// names that region's buffer
     /// ([`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)),
-    /// and if not, why. The first call runs the kernel probe if no earlier
+    /// and if not, why. With `Enabled { multi_guard: false }`, only a send of
+    /// one guard does. The first call runs the kernel probe if no earlier
     /// call ran it, and blocks for it. The result holds for the life of the
     /// process. On the mio backend it is always
     /// [`Unsupported`](crate::FixedBufferSends::Unsupported), whatever the
@@ -424,7 +425,8 @@ impl Runtime {
     /// After it returns, the underlying memory may be safely unmapped.
     ///
     /// With [`fixed_buffer_sends`](Self::fixed_buffer_sends) `Enabled`, a send
-    /// whose parts are all guards naming this region references the slot from
+    /// of one guard naming this region, and with `multi_guard` a send of
+    /// several guards all naming it, references the slot from
     /// the call that submits it until its
     /// [`SendCompletion`](crate::SendCompletion) resolves, including while it
     /// waits in the connection's send queue. Await those sends first: one

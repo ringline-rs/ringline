@@ -362,8 +362,8 @@ pub mod ring {
     /// blocks until a completion or the retry is due; the wait starts at
     /// 50 µs and doubles up to 10 ms.
     pub const PUSH_RETRY_WAITS: usize = 9;
-    /// io_uring: sends built as `SENDMSG_ZC` from a registered buffer
-    /// (`ConfigBuilder::fixed_buffer_sends`), counted when built. A send that
+    /// io_uring: sends built as `SEND_ZC` or `SENDMSG_ZC` from a registered
+    /// buffer (`ConfigBuilder::fixed_buffer_sends`), counted when built. A send that
     /// waits in the send queue and is dropped when its connection closes is
     /// counted but never submitted. A send the kernel returns short or refuses
     /// with `EAGAIN` is resent from plain iovecs and still counted once.

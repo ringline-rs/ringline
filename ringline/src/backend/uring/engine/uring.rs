@@ -1346,6 +1346,18 @@ impl Sqe {
             Op::SendMsgZc { fd, msg, flags } => {
                 on!(fd, |t| opcode::SendMsgZc::new(t, msg).flags(flags).build())
             }
+            Op::SendZcFixed {
+                fd,
+                buf,
+                len,
+                flags,
+                buf_index,
+            } => {
+                on!(fd, |t| opcode::SendZc::new(t, buf, len)
+                    .buf_index(Some(buf_index))
+                    .flags(flags)
+                    .build())
+            }
             Op::SendMsgZcFixed {
                 fd,
                 msg,
@@ -1907,6 +1919,18 @@ mod encode_tests {
         want[2..4].copy_from_slice(&4u16.to_ne_bytes());
         want[40..42].copy_from_slice(&0x0305u16.to_ne_bytes());
         assert_eq!(fixed, want);
+    }
+
+    /// A fixed-buffer `SEND_ZC` is `IORING_OP_SEND_ZC` (47) with
+    /// `IORING_RECVSEND_FIXED_BUF` (1 << 2) in `ioprio` at byte offset 2 and
+    /// the buffer index in `buf_index` at byte offset 40.
+    #[test]
+    fn a_fixed_buffer_send_zc_sets_ioprio_and_buf_index() {
+        let e = bytes(&Sqe::send_zc_fixed(9, 0x1000 as *const u8, 77, 0x0305, 0x42).encode());
+        assert_eq!(e[0], 47, "IORING_OP_SEND_ZC");
+        assert_eq!(u16::from_ne_bytes([e[2], e[3]]), 4, "ioprio");
+        assert_eq!(u16::from_ne_bytes([e[40], e[41]]), 0x0305, "buf_index");
+        assert_eq!(u32::from_ne_bytes([e[24], e[25], e[26], e[27]]), 77, "len");
     }
 
     /// `MAX_FILE_INDEX` is the largest slot the crate's `DestinationSlot`

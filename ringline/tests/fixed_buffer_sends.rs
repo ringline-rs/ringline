@@ -1,6 +1,7 @@
-//! A send of three guards from one registered region delivers its bytes in
-//! order, and is submitted from the region's buffer exactly when the kernel
-//! probe enabled fixed-buffer sends (`Runtime::fixed_buffer_sends`). The op
+//! A send of one guard and a send of three guards from one registered region
+//! deliver their bytes in order. Each is submitted from the region's buffer
+//! exactly when the kernel probe enabled that kind of send
+//! (`Runtime::fixed_buffer_sends`). The op
 //! each kind of send is pushed as is checked by the lib test
 //! `a_guard_only_send_from_one_region_uses_its_buffer`.
 
@@ -21,9 +22,10 @@ use ringline::{
 };
 
 const REGION_LEN: usize = 64 << 10;
-/// Each guard's length, and the order the guards are sent in, by offset.
+/// Each guard's length, and the order the guards are sent in, by offset: the
+/// first send is the first part alone, the second the rest.
 const PART: usize = 16 << 10;
-const ORDER: [usize; 3] = [2, 0, 3];
+const ORDER: [usize; 4] = [1, 2, 0, 3];
 
 /// The leaked memory the test registers, and the id the runtime gave it.
 static REGION: OnceLock<(usize, RegionId)> = OnceLock::new();
@@ -49,20 +51,20 @@ impl AsyncEventHandler for Handler {
         async move {
             let mut conn = conn;
             let &(base, region) = REGION.get().expect("registered before the connect");
-            let parts = ORDER
-                .iter()
-                .map(|&i| {
-                    ringline::SendPart::Guard(GuardBox::new(RegionGuard {
-                        ptr: base + i * PART,
-                        region,
-                    }))
-                })
-                .collect();
-            let (_, sent) = conn
-                .send_parts()
-                .submit_batch(parts)
-                .expect("send submitted");
-            let _ = sent.await;
+            let guard = |i: usize| {
+                ringline::SendPart::Guard(GuardBox::new(RegionGuard {
+                    ptr: base + i * PART,
+                    region,
+                }))
+            };
+            for parts in [&ORDER[..1], &ORDER[1..]] {
+                let parts = parts.iter().map(|&i| guard(i)).collect();
+                let (_, sent) = conn
+                    .send_parts()
+                    .submit_batch(parts)
+                    .expect("send submitted");
+                let _ = sent.await;
+            }
             // Hold the connection until the client has read the reply and
             // closed.
             let _ = conn
@@ -84,7 +86,7 @@ fn sent_fixed() -> u64 {
 }
 
 #[test]
-fn three_guards_from_one_region_arrive_in_order() {
+fn guard_sends_from_one_region_arrive_in_order() {
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
@@ -151,10 +153,13 @@ fn three_guards_from_one_region_arrive_in_order() {
         .collect();
     assert!(got == want, "the bytes arrived as sent, in part order");
     let fixed = sent_fixed() - before;
-    if status == FixedBufferSends::Enabled {
-        assert_eq!(fixed, 1, "the send named the region's buffer");
-    } else {
-        assert_eq!(fixed, 0, "{status:?}: the send used plain iovecs");
-    }
+    let want = match status {
+        FixedBufferSends::Enabled { multi_guard } => 1 + u64::from(multi_guard),
+        _ => 0,
+    };
+    assert_eq!(
+        fixed, want,
+        "{status:?}: sends that named the region's buffer"
+    );
     common::join_workers(&runtime, handles);
 }
