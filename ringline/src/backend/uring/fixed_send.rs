@@ -29,7 +29,7 @@
 //! `SK_MEMINFO_WMEM_QUEUED` across each fixed send with the plain one's. The
 //! kernel's fault in the charge raises a fixed send's charge by about 2 MiB.
 //!
-//! The probe usually takes a few milliseconds. Its waits on the sockets and
+//! The probe's duration has not been measured. Its waits on the sockets and
 //! the ring are bounded: 1 s for each connection's setup and prefill, and 5 s
 //! for each completion, about 11 s per send. It makes at most three
 //! measurements. A measurement that reaches the multi-guard send is the last,

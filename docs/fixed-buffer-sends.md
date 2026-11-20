@@ -8,9 +8,13 @@ the send shapes an application needs to benefit.
 Sources: `io_uring/net.c` and `io_uring/rsrc.c` read in the stable tree at
 the tags named; the probe's results in the table under "The probe", run in
 SystemsLab guests; and the measurements cited. The kernels listed "with the
-charge fix" are images patched on 2026-11-17 to charge `bv_len`, before the
-fix below was posted; they remove the overcharge as the posted fix does, but
-charge a send that crosses a page boundary one page less. A distribution kernel can
+charge fix" are images patched on 2026-11-17 to charge each segment its
+length (`bv_len`), before the fix below was posted. Both remove the
+overcharge. The posted fix charges the whole pages a segment touches, so the
+patched images charge less for any send that does not start and end on a
+page boundary: a 4096-byte send at an offset that is not page-aligned one
+page less, a 20-byte guard 20 bytes instead of a page. The probe's send is
+one aligned page, which both charge the same. A distribution kernel can
 carry any of these changes, or lack them, under any version number, which is
 why ringline probes the running kernel instead of reading its version.
 
@@ -27,8 +31,8 @@ In a cache server's GET replies, perf profiles (one run per arm at 16,000
 and 56,000 bytes) showed `zerocopy_fill_skb_from_iter` at 7.4–7.7% inclusive
 of the server's samples, and absent with fixed sends. At 56,000 bytes, on a
 link-bound 40 Gb/s bond, sending from a registered buffer cut server CPU per
-GB sent by 3.4% (four runs a side; a prototype of #987's path, on a 7.3
-kernel patched to charge `bv_len`). At 16,000 bytes the difference was
+GB sent by 3.4% (four runs a side; a prototype of the path #987 later
+added, on a 7.3 kernel patched to charge `bv_len`). At 16,000 bytes the difference was
 inside the run-to-run spread.
 
 ## Kernel behaviour
@@ -42,7 +46,7 @@ inside the run-to-run spread.
 
 A fixed `SENDMSG_ZC` takes one `buf_index`, and every iovec must lie inside
 that registered buffer: `validate_fixed_range` returns `EFAULT` otherwise
-(called from `io_import_reg_vec`). A
+(reached from `io_import_reg_vec` through `io_vec_fill_bvec`). A
 send whose parts lie in two regions, or that has a copy part (a copy part
 lives in ringline's send pool, which is not registered), cannot name a
 buffer.
@@ -54,8 +58,8 @@ buffer.
 | up to 7.1 (6.18 LTS, 7.0.y, 7.1.y included) | 1 GiB (`SZ_1G` in `io_uring/rsrc.c`) |
 | 7.2 and later | 1 TiB (`SZ_1T`, b4e41050b212 "io_uring/rsrc: raise registered buffer 1GB limit") |
 
-None of 6.1.y, 6.6.y, 6.12.y (6.12.118), 6.18.y (6.18.64), 7.0.y (7.0.14)
-or 7.1.y (7.1.13) has the raise. A region larger than 1 GiB is refused before 7.2, so an
+None of 6.1.y (6.1.192), 6.6.y (6.6.162), 6.12.y (6.12.118), 6.18.y
+(6.18.64), 7.0.y (7.0.14) or 7.1.y (7.1.13) has the raise. A region larger than 1 GiB is refused before 7.2, so an
 application with a larger arena registers it as several regions there, and
 a send can name only one of them.
 
