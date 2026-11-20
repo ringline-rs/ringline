@@ -1401,13 +1401,12 @@ impl ConfigBuilder {
     /// `Runtime::fixed_buffer_sends` reports the result.
     ///
     /// The probe usually takes a few milliseconds. Its waits on the sockets
-    /// and the ring are bounded at about 33 s per measurement, and it makes at
-    /// most three. Allocating the huge page can wait for memory compaction,
-    /// and the check that it is a huge page reads `/proc/self/smaps`; neither
-    /// is bounded. It maps 6 MiB, collapses a 2 MiB transparent huge
-    /// page inside it, registers that on a ring of its own, and unmaps it when
-    /// done; if a send's completion does not arrive, the mapping and the ring
-    /// are kept for the life of the process.
+    /// and the ring are bounded at about 99 s in all. Allocating the huge page
+    /// can wait for memory compaction, and the check that it is a huge page
+    /// reads `/proc/self/smaps`; neither is bounded. It maps 6 MiB, collapses
+    /// a 2 MiB transparent huge page inside it, registers that on a ring of
+    /// its own, and unmaps it when done; if a send's completion does not
+    /// arrive, the mapping and the ring are kept for the life of the process.
     ///
     /// Each launch with this on, until the probe has run, raises the soft
     /// `RLIMIT_MEMLOCK` when it is below what the workers need plus the
