@@ -51,8 +51,7 @@ fn expected() -> Vec<u8> {
 }
 
 /// On a byte from the peer: a copy, guard, copy `send_parts`; a guard-only
-/// `send_parts`; then, on a
-/// second byte, "ok".
+/// `send_parts`; then, on a second byte, "ok".
 struct GuardSender;
 
 impl AsyncEventHandler for GuardSender {

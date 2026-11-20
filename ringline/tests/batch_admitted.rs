@@ -214,8 +214,8 @@ static OVER_CAP_ERRORS: Mutex<Vec<(u8, SendError)>> = Mutex::new(Vec::new());
 
 /// Three zero-copy batches larger than the socket takes, to a client that
 /// does not read, hold three of the slab's four entries. A zero-copy batch on
-/// the same connection is then tried three ways: `submit_batch_admitted`
-/// (recorded as `OVER_CAP`), `submit_batch` (`OVER_CAP_PLAIN`). Last, a
+/// the same connection is then tried two ways: `submit_batch_admitted`
+/// (recorded as `OVER_CAP`) and `submit_batch` (`OVER_CAP_PLAIN`). Last, a
 /// `submit_batch` below `send_zc_threshold`, which is gathered into one pool
 /// slot (`OVER_CAP_SMALL`).
 #[cfg(has_io_uring)]

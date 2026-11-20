@@ -104,7 +104,7 @@ io_uring backend, each worker also owns:
 | Multishot recv | UDP — one SQE, many completions |
 | SendMsgZc | Zero-copy scatter-gather send — kernel DMAs directly from app buffers |
 | Fixed file table | Direct descriptors — no per-syscall fd table lookup |
-| IO_LINK chains | Atomic multi-step operations (connect + timeout) |
+| IO_HARDLINK chains | A close's lead (shutdown or cancel) and its `Close`; `abort`'s disconnect, lead and `Close` |
 | COOP_TASKRUN (not with SQPOLL) | Reduced context switches |
 | SINGLE_ISSUER | Lock-free kernel-side optimizations |
 

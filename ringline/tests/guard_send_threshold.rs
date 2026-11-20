@@ -294,15 +294,9 @@ fn wait_for_server(addr: &str) {
 /// Launch a `GuardPartsSender::<VLEN>` server with `config`, trigger one
 /// guard send, and assert the byte-exact `PREFIX ++ value ++ SUFFIX` echo.
 fn run_case<const VLEN: usize>(config: Config) {
-    run_case_with::<GuardPartsSender<VLEN>, VLEN>(config, 1);
-}
-
-/// Launch `H` with `config`, trigger one send, and assert `copies`
-/// byte-exact repetitions of `PREFIX ++ value ++ SUFFIX`.
-fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Config, copies: usize) {
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<H>()
+        .launch::<GuardPartsSender<VLEN>>()
         .expect("launch failed");
     let bound = shutdown
         .bound_addr()
@@ -319,7 +313,7 @@ fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Conf
     stream.write_all(b"go").unwrap();
     stream.flush().unwrap();
 
-    let expected: Vec<u8> = expected_payload(VLEN).repeat(copies);
+    let expected: Vec<u8> = expected_payload(VLEN);
     let mut buf = vec![0u8; expected.len()];
     let mut total = 0;
     let want = expected.len();

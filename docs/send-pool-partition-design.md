@@ -1,8 +1,8 @@
 # Send pool: bounded sends, per-connection tickets, and a cap
 
 Status: proposal. Experiment stage 0 has run
-(`docs/journal/2026-11-send-pool-stage0.md`). Of the order of work, only the
-removal of `send_chain` (part of step 4) is implemented.
+(`docs/journal/2026-11-send-pool-stage0.md`). Of the runtime changes, only
+the removal of `send_chain` is implemented, ahead of the rest of step 4.
 
 Terms: the worker queue is the worker's queue of sends waiting for
 send-pool slots, which `docs/send-admission-design.md` calls the FIFO
@@ -702,7 +702,8 @@ checked, the entry says so.
    queue (sections 2 and 3), with
    receive-path TLS output waiting in order instead of failing the
    connection; bounded sends by default, the `try_` forms, `SendRefused` and
-   the method that reports a refusal in advance; the removal of `send_chain`;
+   the method that reports a refusal in advance; the removal of `send_chain`
+   (done ahead of the rest);
    and the in-tree callers (sections 1, 2 and 6, In-tree callers).
 5. The cap above half occupancy, `M` = 64 by default (section 5), and its
    mio account (the mio section).

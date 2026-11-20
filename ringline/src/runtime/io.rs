@@ -1489,12 +1489,11 @@ impl ConnCtx {
     ///
     /// Sends a TCP FIN to the peer. The read side remains open.
     ///
-    /// Any `send_backpressured` still waiting for
-    /// pool capacity on this connection fails with
-    /// [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather than waiting for a
-    /// turn it could no longer use. Already-submitted sends are left alone:
-    /// their bytes may already be on the way, and the FIN is ordered behind them. Plain `send` is
-    /// unaffected either way.
+    /// Any `send_backpressured` still waiting for pool capacity on this
+    /// connection fails with [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather
+    /// than waiting for a turn it could no longer use. Already-submitted sends
+    /// are left alone: their bytes may already be on the way, and the FIN is
+    /// ordered behind them. Plain `send` is unaffected either way.
     pub(crate) fn shutdown_write(&self) {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
@@ -1838,12 +1837,13 @@ impl AsyncSendBuilder {
 /// Withdraws a registered send id when dropped, unless disarmed.
 ///
 /// `AsyncSendBuilder::build` registers the id before its closure runs, and
-/// `AsyncSendBuilder::submit_batch` before the guards' code runs. A panic there unwinds past the withdrawal that
-/// follows, and the entry would stay in the completion table for the life
-/// of the worker: no future holds it, so nothing would free it, and a send
-/// that was submitted before the panic would settle it for nobody. Dropped
-/// while unwinding, this withdraws it, as `SendCompletion`'s `Drop` cancels
-/// its entry, through the thread-local driver state.
+/// `AsyncSendBuilder::submit_batch` before the guards' code runs. A panic there
+/// unwinds past the withdrawal that follows, and the entry would stay in the
+/// completion table for the life of the worker: no future holds it, so nothing
+/// would free it, and a send that was submitted before the panic would settle
+/// it for nobody. Dropped while unwinding, this withdraws it, as
+/// `SendCompletion`'s `Drop` cancels its entry, through the thread-local driver
+/// state.
 #[cfg(has_io_uring)]
 struct WithdrawUnlessDisarmed(Option<SendId>);
 
@@ -3665,9 +3665,9 @@ impl SendHalf {
     ///
     /// Any `send_backpressured` still waiting for pool capacity on this
     /// connection fails with [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather
-    /// than waiting for a turn it could no longer use. Already-submitted
-    /// sends are left alone: their bytes may already be on the way, and the FIN is ordered behind them.
-    /// Plain `send` is unaffected either way.
+    /// than waiting for a turn it could no longer use. Already-submitted sends
+    /// are left alone: their bytes may already be on the way, and the FIN is
+    /// ordered behind them. Plain `send` is unaffected either way.
     ///
     /// On io_uring the shutdown runs on the worker's io-wq pool, and a close
     /// issued before it finishes waits for it; see

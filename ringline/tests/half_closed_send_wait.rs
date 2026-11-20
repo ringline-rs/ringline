@@ -5,7 +5,9 @@
 //!
 //! Most tests send more than loopback's socket buffers hold for a peer that does
 //! not read, check that the send has stalled, and count the process's `iou-wrk`
-//! threads.
+//! threads. The control pushes a `MSG_WAITALL` send through its own ring, which
+//! io_uring hands to an io-wq worker once the peer half-closes, and expects a
+//! thread.
 //!
 //! The tests share counters, so they take a lock.
 
@@ -557,4 +559,38 @@ fn unix_peers_shut_rd_fails_the_send(tick_us: u64) {
     drop(peer);
     stop(&runtime, handles);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The control: a `MSG_WAITALL` send, pushed through a ring of the test's own
+/// with no runtime, on a full socket whose peer has half-closed holds an
+/// `iou-wrk` thread. It shows `iou_threads` counts them.
+#[test]
+fn a_waitall_send_on_a_half_closed_peer_holds_a_thread() {
+    use io_uring::{IoUring, opcode, types};
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (ours, _) = listener.accept().unwrap();
+    let data = vec![7u8; 64 << 20];
+    let mut ring = IoUring::new(8).expect("ring");
+    let send = opcode::Send::new(
+        types::Fd(ours.as_raw_fd()),
+        data.as_ptr(),
+        data.len() as u32,
+    )
+    .flags(libc::MSG_WAITALL)
+    .build()
+    .user_data(1);
+    unsafe { ring.submission().push(&send) }.expect("push");
+    ring.submit().expect("submit");
+    std::thread::sleep(Duration::from_millis(500));
+    peer.shutdown(Shutdown::Write).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let threads = iou_threads();
+    // Closing the peer with unread bytes resets the connection, so the send
+    // fails. Wait for its completion before `data` and the ring go.
+    drop(peer);
+    ring.submit_and_wait(1).expect("wait");
+    drop(ours);
+    assert!(threads >= 1, "the send should hold a worker thread");
 }

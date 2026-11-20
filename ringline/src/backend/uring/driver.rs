@@ -2315,15 +2315,15 @@ impl Driver {
     ///
     /// The caller (`ConnCtx::abort`) has failed the reader and the sends
     /// waiting for capacity or in flight. Here, as `close_connection` and
-    /// `force_finalize_close` do: the connection is marked closing, its
-    /// queued sends are failed and released, and a retained close_notify is dropped. On TCP the `Close`
-    /// is preceded by a disconnect (`Ring::submit_abort_close`), which resets
-    /// the socket and purges its write queue, so the zero-copy notifications
-    /// of the sends the kernel holds land and release their slab entries
-    /// without waiting for the fixed file's release (before Linux 6.13, the
-    /// end of older requests on any connection). A send still in the kernel
-    /// completes (with an error or a short count) and releases its own slot or
-    /// slab entry.
+    /// `force_finalize_close` do: the connection is marked closing, its queued
+    /// sends are failed and released, and a retained close_notify is dropped.
+    /// On TCP the `Close` is preceded by a disconnect
+    /// (`Ring::submit_abort_close`), which resets the socket and purges its
+    /// write queue, so the zero-copy notifications of the sends the kernel
+    /// holds land and release their slab entries without waiting for the fixed
+    /// file's release (before Linux 6.13, the end of older requests on any
+    /// connection). A send still in the kernel completes (with an error or a
+    /// short count) and releases its own slot or slab entry.
     ///
     /// The `Close` is committed here, pushed or queued for retry as the whole
     /// chain, except while a `Shutdown` from `shutdown_write` is in flight:
@@ -2511,10 +2511,10 @@ impl Driver {
         }
     }
 
-    /// Whether `conn_index` has no send queued or in flight and its most recent send did not wait for room in the
-    /// socket: the condition `SendAdmissionOrder::Budget` puts on the
-    /// connection of a send that passes a waiting head. Meaningful only
-    /// while `track_room_waits` is set.
+    /// Whether `conn_index` has no send queued or in flight and its most recent
+    /// send did not wait for room in the socket: the condition
+    /// `SendAdmissionOrder::Budget` puts on the connection of a send that
+    /// passes a waiting head. Meaningful only while `track_room_waits` is set.
     pub(crate) fn send_idle(&self, conn_index: u32) -> bool {
         let state = &self.send_queues[conn_index as usize];
         state.queue.is_empty() && !state.in_flight && !state.room_waited

@@ -10,9 +10,10 @@ use crate::guard::GuardBox;
 
 /// Per-connection send queue state.
 ///
-/// At most one stream send operation is in the kernel per connection: one
-/// SQE or one coalesced `sendmsg`. While one is in flight, later sends are queued, and the next is pushed from the
-/// completion handler before control returns to the event loop.
+/// At most one stream send operation is in the kernel per connection: one SQE
+/// or one coalesced `sendmsg`. While one is in flight, later sends are queued,
+/// and the next is pushed from the completion handler before control returns to
+/// the event loop.
 pub(crate) struct ConnSendState {
     pub in_flight: bool,
     pub queue: VecDeque<BuiltSend>,
@@ -398,8 +399,8 @@ impl std::fmt::Display for ListenerId {
 
 // ── io_uring DriverCtx + send builders ──────────────��───────────────────
 //
-// The entire DriverCtx implementation and SendBuilder are io_uring-specific. On the mio backend, a minimal
-// DriverCtx is provided below.
+// The entire DriverCtx implementation and SendBuilder are io_uring-specific. On
+// the mio backend, a minimal DriverCtx is provided below.
 
 /// How many send-copy-pool slots a **bounded** send of `len` bytes on
 /// `conn_index` can need, or why it can never be admitted.
@@ -1011,9 +1012,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit the sends just queued on `conn_index`, as one `sendmsg`
     /// (`submit_coalesced_run`), or the head alone if the run cannot be
-    /// coalesced. With a send already in flight they wait in the queue, as in `submit_or_queue`.
-    /// Infallible in the same way: on a full SQ the head is parked and the
-    /// connection goes on `pending_send_retries`.
+    /// coalesced. With a send already in flight they wait in the queue, as in
+    /// `submit_or_queue`. Infallible in the same way: on a full SQ the head is
+    /// parked and the connection goes on `pending_send_retries`.
     pub(crate) fn submit_queued_run(&mut self, conn_index: u32) {
         let ci = conn_index as usize;
         let state = &mut self.send_queues[ci];

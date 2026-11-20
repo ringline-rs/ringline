@@ -4997,10 +4997,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 continue;
             }
-            // Nothing parked any more — the queue was released, or another
-            // path already pushed the head: the
-            // entry is stale, and pushing now would put a second SQE on the
-            // stream alongside the one in flight.
+            // Nothing parked any more: the entry is stale, and pushing now
+            // would put a second SQE on the stream alongside the one in flight.
             let state = &self.driver.send_queues[conn_index as usize];
             if !state.parked || state.queue.is_empty() {
                 continue;
