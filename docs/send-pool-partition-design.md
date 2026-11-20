@@ -2,7 +2,10 @@
 
 Status: proposal. Experiment stage 0 has run
 (`docs/journal/2026-11-send-pool-stage0.md`). Of the runtime changes, only
-the removal of `send_chain` is implemented, ahead of the rest of step 4.
+the held count per connection (order of work step 2) and the removal of
+`send_chain` (ahead of the rest of step 4) are implemented. The held count
+covers slots in use and reserved on io_uring, permits on mio; the mio count
+does not yet include queued entries that carry no permit (see mio).
 
 Terms: the worker queue is the worker's queue of sends waiting for
 send-pool slots, which `docs/send-admission-design.md` calls the FIFO
@@ -695,7 +698,9 @@ checked, the entry says so.
 
 1. Experiment stage 0 (done).
 2. The held count per connection, keyed by generation, with tests and no
-   behaviour change.
+   behaviour change (done: `SendCopyPool::held_by`, read through
+   `SendHalf::send_pool_held` and the `conn_held_max` and `unowned_held`
+   admission counters).
 3. Taking slots for an operation and returning the excess, for copy sends,
    TLS application data and receive-path TLS output (section 4).
 4. In one breaking release: the per-connection ticket queue and the worker

@@ -774,8 +774,9 @@ fn assert_head_kept(order: ringline::SendAdmissionOrder, passing: &Passing) {
     );
 }
 
-/// Under `Strict` nothing passes the waiting head, and every count stays
-/// zero; the pool's free slots are the four the stalled sends leave.
+/// Under `Strict` nothing passes the waiting head, and every passing and
+/// scan count stays zero; the pool's free slots are the four the stalled
+/// sends leave, and the stalled connection held those four.
 #[test]
 fn strict_admits_nothing_past_a_waiting_head() {
     let order = ringline::SendAdmissionOrder::Strict;
@@ -788,6 +789,7 @@ fn strict_admits_nothing_past_a_waiting_head() {
         passing.counters,
         ringline::SendAdmissionCounters {
             main_free: 4,
+            conn_held_max: 4,
             ..ringline::SendAdmissionCounters::default()
         }
     );

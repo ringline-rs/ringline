@@ -1715,7 +1715,10 @@ pub(crate) mod tests {
         // Starve the pool down to exactly what was admitted.
         let mut held = Vec::new();
         while driver.send_copy_pool.free_count() > needed {
-            let (slot, _p, _l) = driver.send_copy_pool.copy_in(b"x").unwrap();
+            let (slot, _p, _l) = driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+                .unwrap();
             held.push(slot);
         }
         assert_eq!(driver.send_copy_pool.free_count(), needed);
@@ -2647,7 +2650,7 @@ pub(crate) mod tests {
 
         let permit = driver
             .send_copy_pool
-            .reserve_slots(1)
+            .reserve_slots(crate::buffer::send_copy::SlotOwner::NONE, 1)
             .expect("a free slot to promise");
         driver.pending_sends[idx].push_back(PendingSend::bounded(Vec::new(), id, 0, permit));
         assert_eq!(driver.send_copy_pool.free_count(), 3);

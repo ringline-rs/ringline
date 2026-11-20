@@ -217,8 +217,9 @@ pub(crate) enum Admit {
 
 /// What admission did on one worker. Read with
 /// [`send_admission_counters`]. Every count starts at zero when the worker
-/// starts and only grows, except `passing_held` and `main_free`, which are
-/// figures of now; under `Strict` all but `main_free` stay zero.
+/// starts and only grows, except `passing_held`, `main_free` and
+/// `unowned_held`, which are figures of now; under `Strict` the passing and
+/// scan counts stay zero.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SendAdmissionCounters {
@@ -237,6 +238,11 @@ pub struct SendAdmissionCounters {
     pub scan_wakes: u64,
     /// Slots of the copy pool free now.
     pub main_free: u64,
+    /// The most copy-pool slots one connection has held at once
+    /// (`SendHalf::send_pool_held`).
+    pub conn_held_max: u64,
+    /// Copy-pool slots held now by sends that belong to no connection (UDP).
+    pub unowned_held: u64,
 }
 
 /// The admission counters of the worker this runs on: see
@@ -1646,6 +1652,8 @@ impl Executor {
             passing_held: pool.passing_held() as u64,
             passing_held_max: pool.passing_peak() as u64,
             main_free: pool.free_count() as u64,
+            conn_held_max: pool.held_peak() as u64,
+            unowned_held: pool.unowned_held() as u64,
             ..self.send_completions.counters
         }
     }
@@ -2690,7 +2698,12 @@ mod tests {
         copy_pool.track_passing();
         // Sends outside the FIFO hold all but 8 slots, so the head waits.
         let held: Vec<u16> = (0..slots - 8)
-            .map(|_| copy_pool.copy_in(b"x").unwrap().0)
+            .map(|_| {
+                copy_pool
+                    .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+                    .unwrap()
+                    .0
+            })
             .collect();
         q.enqueue(1, 0, head_needs, task(1));
         let limit = usize::from(budget).min(usize::from(slots) - head_needs);
@@ -2701,7 +2714,9 @@ mod tests {
                 Admit::Pass { slots } => {
                     copy_pool.begin_passing();
                     for _ in 0..slots {
-                        copy_pool.copy_in(b"p").unwrap();
+                        copy_pool
+                            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"p")
+                            .unwrap();
                     }
                     copy_pool.end_passing();
                     q.mark_submitted(id);
@@ -2932,8 +2947,12 @@ mod tests {
         let mut copy_pool = SendCopyPool::new(8, 8);
         copy_pool.track_passing();
         copy_pool.begin_passing();
-        let (first, _p, _l) = copy_pool.copy_in(b"p").unwrap();
-        copy_pool.copy_in(b"q").unwrap();
+        let (first, _p, _l) = copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"p")
+            .unwrap();
+        copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"q")
+            .unwrap();
         copy_pool.end_passing();
         copy_pool.release(first);
         let counters = exec.send_admission_counters(&copy_pool);

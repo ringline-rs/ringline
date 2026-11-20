@@ -9278,7 +9278,11 @@ mod tests {
         drop(ours);
 
         if waitall {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(&[7u8; 16384]).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &[7u8; 16384])
+                .unwrap();
             let payload = UserData::send_payload(slot, generation);
             let ud = UserData::encode(OpTag::Send, conn_index, payload);
             let entry = crate::backend::uring::sqe::Sqe::new(
@@ -9536,7 +9540,11 @@ mod tests {
 
         // Allocate a pool slot (simulating a copy send).
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         // Simulate send CQE: all bytes sent.
@@ -9557,7 +9565,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         // Simulate send error (ECONNRESET = -104).
@@ -9577,7 +9589,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, data.len() as u32);
 
         let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
@@ -9607,8 +9623,16 @@ mod tests {
         let chunk0 = vec![b'a'; 16384];
         let chunk1 = vec![b'b'; 4096];
         let total = (chunk0.len() + chunk1.len()) as u32;
-        let (slot0, _p0, _l0) = el.driver.send_copy_pool.copy_in(&chunk0).unwrap();
-        let (slot1, ptr1, len1) = el.driver.send_copy_pool.copy_in(&chunk1).unwrap();
+        let (slot0, _p0, _l0) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &chunk0)
+            .unwrap();
+        let (slot1, ptr1, len1) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &chunk1)
+            .unwrap();
         // One logical send split across two slots: only the last carries the id.
         let id = await_slot(&mut el, conn_index, slot1, total);
 
@@ -9661,9 +9685,21 @@ mod tests {
         let token = crate::handler::ConnId::new(conn_index, generation);
 
         // Hold three of the four slots so only one is free.
-        let (_f1, _, _) = el.driver.send_copy_pool.copy_in(b"a").unwrap();
-        let (_f2, _, _) = el.driver.send_copy_pool.copy_in(b"b").unwrap();
-        let (_f3, _, _) = el.driver.send_copy_pool.copy_in(b"c").unwrap();
+        let (_f1, _, _) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"a")
+            .unwrap();
+        let (_f2, _, _) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"b")
+            .unwrap();
+        let (_f3, _, _) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"c")
+            .unwrap();
         assert_eq!(el.driver.send_copy_pool.free_count(), 1);
 
         // 100 bytes over 64-byte slots needs 2 slots; only 1 is free.
@@ -9738,7 +9774,11 @@ mod tests {
         // Pool of 6, one slot held, a 4-slot send: the final free count then
         // tells "reservation consumed" (1 free) from "reservation still
         // outstanding" (0 free).
-        let (_held, _, _) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+        let (_held, _, _) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+            .unwrap();
         assert_eq!(el.driver.send_copy_pool.free_count(), 5);
 
         // With a send already in flight, every chunk is queued rather than
@@ -9786,7 +9826,11 @@ mod tests {
         data: &[u8],
     ) -> crate::handler::BuiltSend {
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, ptr, len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -10368,7 +10412,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let tls_send = |el: &mut AsyncEventLoop<NoopHandler>, data: &[u8]| {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+                .unwrap();
             let ud = UserData::encode(
                 OpTag::TlsSend,
                 conn_index,
@@ -10445,8 +10493,16 @@ mod tests {
         // pass for the other.
         let a = b"HELLO";
         let b = b"WORLD!!";
-        let (slot_a, _pa, _la) = el.driver.send_copy_pool.copy_in(a).unwrap();
-        let (slot_b, ptr_b, len_b) = el.driver.send_copy_pool.copy_in(b).unwrap();
+        let (slot_a, _pa, _la) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, a)
+            .unwrap();
+        let (slot_b, ptr_b, len_b) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b)
+            .unwrap();
         let id_a = await_slot(&mut el, conn_index, slot_a, a.len() as u32);
         let id_b = await_slot(&mut el, conn_index, slot_b, b.len() as u32);
 
@@ -10501,7 +10557,11 @@ mod tests {
         let old_gen = el.driver.connections.generation(conn_index);
 
         // A copy send in flight when the connection goes away.
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"orphaned bytes").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"orphaned bytes")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -10515,7 +10575,11 @@ mod tests {
         assert_ne!(el.driver.connections.generation(conn_index), old_gen);
 
         // The new occupant has its own send slot outstanding.
-        let (slot2, _p2, _l2) = el.driver.send_copy_pool.copy_in(b"new occupant").unwrap();
+        let (slot2, _p2, _l2) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"new occupant")
+            .unwrap();
 
         // Stale partial-send CQE for the old occupant.
         el.test_dispatch_cqe(ud.raw(), 3, 0);
@@ -10531,7 +10595,11 @@ mod tests {
 
         // Error-result variant: must not drain the new occupant's queue or
         // fail its send.
-        let (slot3, _p3, _l3) = el.driver.send_copy_pool.copy_in(b"orphan two").unwrap();
+        let (slot3, _p3, _l3) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"orphan two")
+            .unwrap();
         let ud3 = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -10625,7 +10693,11 @@ mod tests {
 
         // A send in flight; close is forced past it (deadline path):
         // in_flight cleared, close_pending set, finalize submits Close.
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"stuck send").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"stuck send")
+            .unwrap();
         el.driver.send_queues[conn_index as usize].close_pending = true;
         el.driver.force_finalize_close(conn_index);
         assert!(
@@ -10668,7 +10740,11 @@ mod tests {
         }
         assert!(!el.driver.send_queues[conn_index as usize].close_submitted);
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"response").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"response")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -10950,7 +11026,11 @@ mod tests {
     /// make a close find the pool exhausted and then hand slots back.
     fn exhaust_send_pool(el: &mut AsyncEventLoop<NoopHandler>) -> Vec<u16> {
         let mut held = Vec::new();
-        while let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"x") {
+        while let Some((slot, _, _)) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+        {
             held.push(slot);
         }
         assert_eq!(el.driver.send_copy_pool.free_count(), 0);
@@ -11036,7 +11116,11 @@ mod tests {
 
         // A send SQE is in the kernel.
         el.driver.send_queues[conn_index as usize].in_flight = true;
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"in flight").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"in flight")
+            .unwrap();
 
         {
             let mut ctx = el.driver.make_ctx();
@@ -11602,7 +11686,11 @@ mod tests {
         // A send is in the kernel when the FIN arrives, so the close waits
         // on its CQE.
         el.driver.send_queues[conn_index as usize].in_flight = true;
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data")
+            .unwrap();
         let send_ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -12947,7 +13035,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         // Simulate full TLS send completion (all bytes sent, try_advance returns None).
@@ -12967,7 +13059,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         // Simulate TLS send error (result < 0).
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
@@ -12995,7 +13091,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
         el.test_dispatch_cqe(ud.raw(), 0, 0);
 
@@ -13018,7 +13118,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let before = metrics::BYTES.value(metrics::bytes::SENT).unwrap_or(0);
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
         el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
@@ -13067,7 +13171,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"reply").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"reply")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -13122,7 +13230,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let plain_send = |el: &mut AsyncEventLoop<NoopHandler>, data: &[u8]| {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+                .unwrap();
             let ud = UserData::encode(
                 OpTag::Send,
                 conn_index,
@@ -13164,7 +13276,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"ciphertext").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"ciphertext")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::TlsSend,
             conn_index,
@@ -13184,7 +13300,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"reply").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"reply")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -13220,7 +13340,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
         el.test_dispatch_cqe(ud.raw(), -(libc::EAGAIN), 0);
@@ -13295,7 +13419,11 @@ mod tests {
     fn stage_send(el: &mut AsyncEventLoop<NoopHandler>, data: &[u8]) -> (u32, u16, UserData) {
         let conn_index = accept_connection(el);
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let payload = UserData::send_payload(slot, generation);
         (
@@ -13313,7 +13441,11 @@ mod tests {
         let mut iovecs = Vec::new();
         let mut slots = Vec::new();
         for _ in 0..2 {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(&data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &data)
+                .unwrap();
             iovecs.push(libc::iovec {
                 iov_base: ptr as *mut libc::c_void,
                 iov_len: len as usize,
@@ -13562,7 +13694,11 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), 100, 0);
         assert!(!el.driver.send_copy_pool.in_use(slot));
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(&[7u8; 100]).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &[7u8; 100])
+            .unwrap();
         let generation = el.driver.connections.generation(conn_index);
         let payload = UserData::send_payload(slot, generation);
         let next = UserData::encode(OpTag::Send, conn_index, payload);
@@ -14179,7 +14315,11 @@ mod tests {
         // Allocate and immediately release a slot, then deliver a stale
         // TlsSend CQE for it (Close CQE processed earlier in the same batch).
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         el.driver.send_copy_pool.release(slot);
         let free_before = el.driver.send_copy_pool.free_count();
 
@@ -14210,7 +14350,11 @@ mod tests {
         }
 
         let data = b"datagram";
-        let (pool_slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (pool_slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         // Pop the send slot we'll "simulate" — so the CQE pushes it back cleanly
@@ -14246,7 +14390,11 @@ mod tests {
         el.executor.udp_send_ready_waiters[0] = Some(42);
 
         let data = b"wake";
-        let (pool_slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (pool_slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let slot_idx = el.driver.udp_sockets[0].send_freelist.pop().unwrap();
 
         let payload = crate::backend::uring::driver::encode_udp_send_payload(slot_idx, pool_slot);
@@ -14279,7 +14427,11 @@ mod tests {
 
         // Allocate a pool slot with 10 bytes.
         let data = b"0123456789";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         // Mark send as in-flight.
         el.driver.send_queues[conn_index as usize].in_flight = true;
@@ -14303,7 +14455,11 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, data.len() as u32);
 
         // Simulate send error (ECONNRESET).
@@ -14405,7 +14561,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
@@ -14425,7 +14585,11 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, data.len() as u32);
 
         // Inject ECONNRESET through real io_uring.
@@ -14488,7 +14652,11 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, data.len() as u32);
 
         let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
@@ -14629,7 +14797,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
@@ -14644,7 +14816,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
         el.inject_and_dispatch(ud.raw(), -104);
@@ -14680,7 +14856,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data")
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, 4);
 
         let send_ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
@@ -14719,7 +14899,11 @@ mod tests {
         let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data")
+            .unwrap();
 
         // Recv EOF + stale send in the same batch.
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
@@ -14750,8 +14934,16 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
-        let (slot1, _p, _l) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (slot2, _p, _l) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (slot1, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"aaa")
+            .unwrap();
+        let (slot2, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"bbb")
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         let ud1 = UserData::encode(OpTag::Send, conn_index, slot1 as u32);
@@ -14776,8 +14968,16 @@ mod tests {
         el.driver.send_queues[c1 as usize].in_flight = true;
         el.driver.send_queues[c2 as usize].in_flight = true;
 
-        let (s1, _p, _l) = el.driver.send_copy_pool.copy_in(b"hello").unwrap();
-        let (s2, _p, _l) = el.driver.send_copy_pool.copy_in(b"world").unwrap();
+        let (s1, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"hello")
+            .unwrap();
+        let (s2, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"world")
+            .unwrap();
         let id1 = await_slot(&mut el, c1, s1, 5);
         let id2 = await_slot(&mut el, c2, s2, 5);
 
@@ -14810,7 +15010,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"retry-data";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let generation = el.driver.connections.generation(conn_index);
 
         // Queue the retry.
@@ -14844,7 +15048,11 @@ mod tests {
         let old_generation = el.driver.connections.generation(conn_index);
 
         let data = b"retry-data";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         // Queue the retry with the old generation.
         el.driver
@@ -14885,7 +15093,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let old_generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"retry-data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"retry-data")
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, 10);
         el.driver
             .push_copy_retry(conn_index, old_generation, slot, OpTag::Send);
@@ -15272,7 +15484,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data")
+            .unwrap();
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let id = await_slot(&mut el, conn_index, slot, 4);
 
@@ -15791,7 +16007,11 @@ mod tests {
     fn hold_all_but(el: &mut AsyncEventLoop<NoopHandler>, leave: usize) -> Vec<u16> {
         let mut held = Vec::new();
         while el.driver.send_copy_pool.free_count() > leave {
-            let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+            let (slot, _p, _l) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+                .unwrap();
             held.push(slot);
         }
         held
@@ -16154,7 +16374,11 @@ mod tests {
         // three-slot ciphertext bound.
         let mut held = Vec::new();
         while el.driver.send_copy_pool.free_count() > 2 {
-            let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+            let (slot, _p, _l) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+                .unwrap();
             held.push(slot);
         }
 
@@ -16349,7 +16573,11 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let data = [b'p'; 20];
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(&data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &data)
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 20);
         let ud = UserData::encode(
             OpTag::Send,
@@ -16456,7 +16684,11 @@ mod tests {
     fn a_queued_awaited_send_fails_when_the_send_ahead_of_it_fails() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"ahead").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"ahead")
+            .unwrap();
         let ahead = await_slot(&mut el, conn_index, slot, 5);
         let behind = built_copy_send(&mut el, conn_index, b"behind");
         let queued = await_slot(&mut el, conn_index, behind.pool_slot, 6);
@@ -16735,7 +16967,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let old_gen = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"orphaned").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"orphaned")
+            .unwrap();
         crate::runtime::CURRENT_TASK_ID.with(|c| c.set(conn_index));
         let id = await_slot(&mut el, conn_index, slot, 8);
         let ud = UserData::encode(
@@ -16885,7 +17121,11 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"doomed").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"doomed")
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 6);
         let ud = UserData::encode(
             OpTag::Send,
@@ -16920,7 +17160,11 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"nothing went").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"nothing went")
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 12);
         let ud = UserData::encode(
             OpTag::Send,
@@ -16956,7 +17200,11 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let ciphertext = [b'c'; 30];
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&ciphertext).unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &ciphertext)
+            .unwrap();
         // 12 bytes of plaintext became 30 bytes on the wire.
         el.driver.send_copy_pool.set_send_id(slot, id, 12);
         let ud = UserData::encode(
@@ -17167,7 +17415,11 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let data = [b'x'; 20];
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&data).unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &data)
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 20);
         el.driver.send_queues[conn_index as usize].close_submitted = true;
 
@@ -17202,7 +17454,11 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let ciphertext = [b'c'; 20];
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&ciphertext).unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &ciphertext)
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 20);
         el.driver.send_queues[conn_index as usize].close_submitted = true;
 
@@ -17237,7 +17493,11 @@ mod tests {
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"stuck").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"stuck")
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 5);
         el.driver.send_queues[conn_index as usize].in_flight = true;
         el.driver
@@ -17521,7 +17781,11 @@ mod tests {
             (OpTag::TlsSend, &b"record-1"[..]),
             (OpTag::Send, b"record-2"),
         ] {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+                .unwrap();
             let ud = UserData::encode(tag, conn_index, UserData::send_payload(slot, generation));
             let entry =
                 crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
@@ -17554,7 +17818,11 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
         el.driver.send_queues[conn_index as usize].in_flight = true;
         for data in [&b"record-1"[..], b"record-2"] {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+                .unwrap();
             let ud = UserData::encode(
                 OpTag::Send,
                 conn_index,
@@ -17702,8 +17970,16 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (s0, p0, l0) = el.driver.send_copy_pool.copy_in(b"aa").unwrap();
-        let (s1, p1, l1) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (s0, p0, l0) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"aa")
+            .unwrap();
+        let (s1, p1, l1) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"bbb")
+            .unwrap();
         let iovecs = [
             libc::iovec {
                 iov_base: p0 as *mut libc::c_void,
@@ -18258,7 +18534,11 @@ mod tests {
     fn a_forced_close_abandoning_an_unawaited_send_releases_capacity() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(b"unawaited").unwrap();
+        let (slot, ptr, len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"unawaited")
+            .unwrap();
         let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
         let entry = crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
         {
@@ -18302,7 +18582,11 @@ mod tests {
         let old_gen = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, old_gen);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"orphaned").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"orphaned")
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 8);
         let ud = UserData::encode(
             OpTag::Send,
@@ -18316,7 +18600,11 @@ mod tests {
         assert_eq!(reused, conn_index, "test premise: index reused");
         assert_ne!(el.driver.connections.generation(conn_index), old_gen);
         // The new occupant has a send of its own outstanding.
-        let (slot2, _p2, _l2) = el.driver.send_copy_pool.copy_in(b"new occupant").unwrap();
+        let (slot2, _p2, _l2) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"new occupant")
+            .unwrap();
 
         el.test_dispatch_cqe(ud.raw(), 8, 0);
 
@@ -18479,7 +18767,7 @@ mod tests {
         let (slot, _ptr, _len) = el
             .driver
             .send_copy_pool
-            .copy_in(data)
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
             .expect("free pool slot");
         el.driver.send_copy_pool.set_send_id(slot, id, logical_len);
         (id, slot)
@@ -18766,8 +19054,16 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (s0, p0, l0) = el.driver.send_copy_pool.copy_in(b"aa").unwrap();
-        let (s1, p1, l1) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (s0, p0, l0) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"aa")
+            .unwrap();
+        let (s1, p1, l1) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"bbb")
+            .unwrap();
         let iovecs = [
             libc::iovec {
                 iov_base: p0 as *mut libc::c_void,
@@ -18835,8 +19131,16 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (s0, p0, l0) = el.driver.send_copy_pool.copy_in(b"aa").unwrap();
-        let (s1, p1, l1) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (s0, p0, l0) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"aa")
+            .unwrap();
+        let (s1, p1, l1) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"bbb")
+            .unwrap();
         let iovecs = [
             libc::iovec {
                 iov_base: p0 as *mut libc::c_void,
@@ -19784,7 +20088,11 @@ mod tests {
         let probe = probe_ud(&el, conn_index);
         assert_last_poll(&el, probe, false);
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(&[7u8; 100]).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &[7u8; 100])
+            .unwrap();
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let ud = UserData::encode(
             OpTag::Send,
@@ -20364,7 +20672,7 @@ mod tests {
 
                 for action in &actions {
                     let data = b"test";
-                    let (slot, _, _) = match el.driver.send_copy_pool.copy_in(data) {
+                    let (slot, _, _) = match el.driver.send_copy_pool.copy_in(crate::buffer::send_copy::SlotOwner::NONE, data) {
                         Some(s) => s,
                         None => break, // pool exhausted — stop sequence
                     };
@@ -20515,7 +20823,7 @@ mod tests {
                         // Send success on a random live connection.
                         1 if !live_conns.is_empty() => {
                             let ci = live_conns[0];
-                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
+                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data") {
                                 let ud = UserData::encode(
                                     OpTag::Send,
                                     ci,
@@ -20532,7 +20840,7 @@ mod tests {
                         // closes it, and the Close CQE follows.
                         2 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
-                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
+                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data") {
                                 let ud = UserData::encode(
                                     OpTag::Send,
                                     ci,
@@ -20619,7 +20927,7 @@ mod tests {
                         // Send + Recv EOF in same batch (the cross-CQE bug pattern).
                         7 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
-                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
+                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data") {
                                 pool_slots_in_flight.push(slot);
                                 let send_ud = UserData::encode(
                                     OpTag::Send,
