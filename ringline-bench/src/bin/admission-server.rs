@@ -96,6 +96,39 @@
 //! `--settle-limit-ms` from admission for it to settle, then reads the next
 //! request.
 //!
+//! # A per-connection bound, `--conn-slot-cap`
+//!
+//! With `--conn-slot-cap M` above 0, a connection that has read a request
+//! waits, before it sends the reply, while its replies in `Unsettled` hold at
+//! least M slots. It waits for the oldest to settle, bounded by
+//! `--settle-limit-ms` as the `--pipeline` wait is, and a reply that stalls
+//! aborts the connection and counts as a settle abort, as there. A reply is
+//! sent whatever its size while the connection holds fewer than M slots. The
+//! connection reads no request while it waits, since the serve loop reads
+//! only between replies. This is the stand-in for the cap of
+//! `docs/send-pool-partition-design.md`, stage 0.
+//!
+//! - A reply's slots are counted as the held-slot samples count them
+//!   (Measurements), `ceil(len / --slot-size)` or the TLS rule.
+//! - A reply in pieces counts each piece's slots as the piece is admitted.
+//!   Each piece but the last settles before the next is admitted and is not
+//!   in `Unsettled`, so the connection's held slots when a piece is admitted
+//!   are those of its earlier replies, which only fall during the reply: one
+//!   wait before the reply covers every piece. The last piece counts its own
+//!   slots in `Unsettled`, not the whole reply's.
+//! - Replies sent outside the FIFO (flag bit 1) neither wait nor count.
+//! - Both bounds apply: the `--pipeline` wait comes first, before the read,
+//!   and the cap's after it.
+//! - `cap_waits` counts the waits that found the connection at the cap after
+//!   its settled replies were dropped, over every request, and `cap_wait_us`
+//!   their total time in microseconds. The wait comes before the admitting
+//!   call, so it counts in a reply's delay from its scheduled time and not in
+//!   its delay from the call.
+//! - `max_conn_slots` is the most slots one connection's unsettled replies
+//!   held, counted the same way, with or without `--conn-slot-cap`. A reply
+//!   stays counted until the connection sees it settle, so this can exceed
+//!   what the pool held for that connection at that moment.
+//!
 //! # Measurements
 //!
 //! Replies fall in three classes: small replies to fast readers, small
@@ -127,7 +160,8 @@
 //!   samples from its scheduled time to its end, and the smallest read just
 //!   after each admission of the reply or of its pieces (a reply in gated
 //!   pieces can take less time than a sample's 10 ms), and its pieces
-//!   admitted past a waiting head.
+//!   admitted past a waiting head. Only the first 100,000 large replies in
+//!   the window get a record; `large_replies_unrecorded` counts the rest.
 //! - Per class, admitted sends the runtime admitted past a waiting head
 //!   (`SendCompletion::passed_head`), and for those that settled, the time
 //!   from admission to settlement. Each piece of a reply counts as a send.
@@ -155,7 +189,7 @@
 //! the worker has exited and `main` reads it, and `thread_local!` storage
 //! would be dropped with the worker thread. One worker, so every connection
 //! shares one send pool and one FIFO. The counters, the configuration
-//! (order, budget, pool, pieces and gate) and the statistics are printed as
+//! (order, budget, pool, pieces, gate and cap) and the statistics are printed as
 //! one JSON line on SIGINT or SIGTERM. With `--summary-file`, the same object
 //! without the per-large-reply records and the free-slot samples, which run
 //! to hundreds of KiB, is written to that file as well, for a log line.
@@ -267,6 +301,10 @@ struct Args {
     /// (`SendHalf::writable`).
     #[arg(long)]
     stream_gate: bool,
+    /// Before sending a reply, wait while the connection's unsettled replies
+    /// hold at least this many slots; 0 never waits.
+    #[arg(long, default_value_t = 0)]
+    conn_slot_cap: u32,
     /// Also write the output, without the per-large-reply records and the
     /// free-slot samples, to this file.
     #[arg(long)]
@@ -283,6 +321,8 @@ struct Settings {
     tls: bool,
     stream_piece: usize,
     stream_gate: bool,
+    /// `--conn-slot-cap`; 0 never waits.
+    conn_slot_cap: u64,
 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
@@ -350,6 +390,17 @@ static OUTSIDE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Send-pool slots held by admitted replies that have not been seen to
 /// settle, per class. See the module docs for what this over-counts.
 static HELD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `--conn-slot-cap` waits that found the connection at the cap, and their
+/// total time in microseconds, over every request.
+static CAP_WAITS: AtomicU64 = AtomicU64::new(0);
+static CAP_WAIT_US: AtomicU64 = AtomicU64::new(0);
+
+/// The most slots any one connection's unsettled replies held, over every
+/// request, counted as `--conn-slot-cap` counts them: a reply's slots stay
+/// counted until the connection sees it settle, so this can exceed what the
+/// pool held at that moment.
+static MAX_CONN_SLOTS: AtomicU64 = AtomicU64::new(0);
 
 /// Connections the server aborted, by cause, over every request, indexed by
 /// `Abort as usize`.
@@ -563,6 +614,8 @@ struct Recorder {
     /// `Ended as usize`.
     ended: [[u64; 4]; 3],
     large: Vec<LargeRecord>,
+    /// In-window large replies past `LARGE_RECORDS_MAX`, which get no record.
+    large_unrecorded: u64,
     samples: Vec<Sample>,
     /// The earliest and latest scheduled time of a recorded request.
     window_ns: Option<(u64, u64)>,
@@ -583,6 +636,7 @@ static RECORDER: Mutex<Recorder> = Mutex::new(Recorder {
     unadmitted: [[0; 5]; 3],
     ended: [[0; 4]; 3],
     large: Vec::new(),
+    large_unrecorded: 0,
     samples: Vec::new(),
     window_ns: None,
     passed: [0; 3],
@@ -721,6 +775,8 @@ impl Drop for Held {
 struct Unsettled {
     queue: VecDeque<Pending>,
     limit: Duration,
+    /// The slots the replies in `queue` hold, for `--conn-slot-cap`.
+    slots: u64,
 }
 
 impl Unsettled {
@@ -728,11 +784,18 @@ impl Unsettled {
         Unsettled {
             queue: VecDeque::new(),
             limit,
+            slots: 0,
         }
     }
 
     fn len(&self) -> usize {
         self.queue.len()
+    }
+
+    /// The slots the unsettled replies hold, as the held-slot samples count
+    /// them.
+    fn slots(&self) -> u64 {
+        self.slots
     }
 
     /// Watch `sent`, a reply just admitted.
@@ -745,6 +808,8 @@ impl Unsettled {
         large: Option<usize>,
     ) {
         HELD[class].fetch_add(slots, Relaxed);
+        self.slots += slots;
+        MAX_CONN_SLOTS.fetch_max(self.slots, Relaxed);
         let passed = sent.passed_head();
         if passed && recorded {
             recorder().passed[class] += 1;
@@ -820,6 +885,7 @@ impl Unsettled {
     /// next one's clock now if it was admitted earlier.
     fn pop(&mut self, result: Result<(), std::io::ErrorKind>) {
         let front = self.queue.pop_front().expect("a reply to pop");
+        self.slots -= front.slots;
         match result {
             Ok(()) => {
                 count(&COUNTERS.replies, front.class);
@@ -847,6 +913,7 @@ impl Unsettled {
         tx.abort();
         count_abort(Abort::SettleTimeout);
         if let Some(front) = self.queue.pop_front() {
+            self.slots -= front.slots;
             count(&COUNTERS.settle_aborts, front.class);
             record_end(&front, Ended::SettleAbort, None);
         }
@@ -856,6 +923,7 @@ impl Unsettled {
     /// Forget every reply after an abort: they fail without reaching the
     /// peer.
     fn discard(&mut self) {
+        self.slots = 0;
         for p in self.queue.drain(..) {
             count(&COUNTERS.discarded, p.class);
             record_end(&p, Ended::Discarded, None);
@@ -921,6 +989,9 @@ async fn serve(conn: Connection) {
             continue;
         }
         unsettled.prune().await;
+        if !wait_below_cap(&mut tx, &mut unsettled).await {
+            break;
+        }
         if !send_reply(&mut tx, &mut unsettled, &reply, &req).await {
             break;
         }
@@ -928,6 +999,38 @@ async fn serve(conn: Connection) {
     // Once the task returns, ringline's close drains the queued replies with
     // no time bound. Wait for them here, and abort if one stalls.
     unsettled.finish(&mut tx).await;
+}
+
+/// With `--conn-slot-cap M`, wait while the connection's unsettled replies
+/// hold at least M slots, for the oldest to settle, as the `--pipeline` wait
+/// in `serve` does: a reply unsettled for `--settle-limit-ms` aborts the
+/// connection, and a reply that settles with an error ends it. Called after
+/// `Unsettled::prune`, so a wait that starts at the cap blocks. Returns false
+/// if the connection should end.
+async fn wait_below_cap(tx: &mut SendHalf, unsettled: &mut Unsettled) -> bool {
+    let cap = settings().conn_slot_cap;
+    if cap == 0 || unsettled.slots() < cap {
+        return true;
+    }
+    let began = Instant::now();
+    let mut open = true;
+    while unsettled.slots() >= cap {
+        match unsettled.settle_front().await {
+            Settle::Settled => {}
+            Settle::Failed => {
+                open = false;
+                break;
+            }
+            Settle::Stalled => {
+                unsettled.abort_stalled(tx);
+                open = false;
+                break;
+            }
+        }
+    }
+    CAP_WAITS.fetch_add(1, Relaxed);
+    CAP_WAIT_US.fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    open
 }
 
 /// Send a small or large reply and watch it in `unsettled`. Returns false if
@@ -1206,13 +1309,23 @@ fn piece_failed(
     false
 }
 
+/// The most in-window large replies that get a record. A cell with many
+/// large replies (hundreds of thousands a second) would otherwise hold more
+/// records than the server's memory.
+const LARGE_RECORDS_MAX: usize = 100_000;
+
 /// Start the record of an in-window large reply sent in `pieces` pieces, and
-/// return its index; `None` for a small reply or one outside the window.
+/// return its index; `None` for a small reply, one outside the window, or one
+/// past `LARGE_RECORDS_MAX`.
 fn begin_large(req: &Request, class: usize, pieces: u32) -> Option<usize> {
     if class != LARGE || !req.recorded() {
         return None;
     }
     let mut r = recorder();
+    if r.large.len() >= LARGE_RECORDS_MAX {
+        r.large_unrecorded += 1;
+        return None;
+    }
     r.large.push(LargeRecord {
         tag: req.tag,
         len: req.len,
@@ -1443,6 +1556,7 @@ fn statistics(r: &mut Recorder, admit_limit_ms: u64) -> Value {
     json!({
         "classes": classes,
         "large_replies": large,
+        "large_replies_unrecorded": r.large_unrecorded,
         "held_run": held_mean(&r.samples, 0, u64::MAX),
         "admission_counters": r.counters.map(|c| json!({
             "passing_admissions": c.passing_admissions,
@@ -1505,6 +1619,7 @@ fn main() {
         tls: args.tls,
         stream_piece: args.stream_piece as usize,
         stream_gate: args.stream_gate,
+        conn_slot_cap: u64::from(args.conn_slot_cap),
     };
     // Set once, before any connection reads it.
     let _ = SETTINGS.set(settings);
@@ -1536,7 +1651,7 @@ fn main() {
         "admitted"
     };
     eprintln!(
-        "admission-server: ready on {} (small_send={small_send}, order={}, budget={}, tls={}, admit={} ms, settle={} ms, pipeline={}, stream_piece={}, stream_gate={})",
+        "admission-server: ready on {} (small_send={small_send}, order={}, budget={}, tls={}, admit={} ms, settle={} ms, pipeline={}, stream_piece={}, stream_gate={}, conn_slot_cap={})",
         args.addr,
         args.order.name(),
         args.budget,
@@ -1545,7 +1660,8 @@ fn main() {
         args.settle_limit_ms,
         args.pipeline,
         args.stream_piece,
-        args.stream_gate
+        args.stream_gate,
+        args.conn_slot_cap
     );
     runtime.wait_on_signal();
     for h in handles {
@@ -1587,6 +1703,10 @@ fn main() {
             "small_max": args.small_max,
             "stream_piece": args.stream_piece,
             "stream_gate": args.stream_gate,
+            "conn_slot_cap": args.conn_slot_cap,
+            "cap_waits": CAP_WAITS.load(Relaxed),
+            "cap_wait_us": CAP_WAIT_US.load(Relaxed),
+            "max_conn_slots": MAX_CONN_SLOTS.load(Relaxed),
             "aborts": ABORT_NAMES
                 .iter()
                 .zip(ABORTS.iter())
@@ -1596,7 +1716,9 @@ fn main() {
     });
     println!("{out}");
     if let Some(path) = &args.summary_file {
-        let mut summary = out.clone();
+        // `out` is not used again, so the summary takes it rather than a
+        // copy: with many large replies the output is hundreds of MB.
+        let mut summary = out;
         if let Some(st) = summary["statistics"].as_object_mut() {
             let larges = st.remove("large_replies");
             st.remove("main_free_samples");
