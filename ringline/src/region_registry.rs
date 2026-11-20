@@ -40,6 +40,14 @@ pub(crate) enum RegionControlMsg {
     },
 }
 
+/// The bytes of base pages `region` touches, which is what the kernel charges
+/// for it unless it is on huge pages.
+pub(crate) fn page_rounded(region: &MemoryRegion) -> u64 {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let start = region.ptr() as u64;
+    ((start + region.len() as u64).div_ceil(page) - start / page) * page
+}
+
 /// Per-worker receiver. The event loop owns this and drains it each tick.
 pub(crate) type RegionControlRx = Receiver<RegionControlMsg>;
 
@@ -54,9 +62,10 @@ pub(crate) struct RegionRegistrar {
 struct RegistrarInner {
     /// Stack of free slot indices, popped on `register`, pushed on `unregister`.
     free_slots: Vec<u16>,
-    /// The length of the region in each slot, 0 for a free slot. A failed
-    /// register with `ENOMEM` reports their sum, which io_uring has charged
-    /// once for each worker's ring.
+    /// The length of the region in each slot, rounded out to base pages, 0
+    /// for a free slot. A failed register with `ENOMEM` reports their sum,
+    /// which io_uring has charged once for each worker's ring. A region whose
+    /// registration is still in progress on another thread is not in it.
     bytes: Vec<u64>,
 }
 
@@ -105,11 +114,11 @@ impl RegionRegistrar {
         }) {
             Ok(()) => {
                 let mut inner = self.inner.lock().expect("registrar mutex poisoned");
-                inner.bytes[slot as usize] = region.len() as u64;
+                inner.bytes[slot as usize] = page_rounded(&region);
                 Ok(RegionId(slot))
             }
             Err(e) => {
-                let e = self.with_charge(e, region.len() as u64);
+                let e = self.with_charge(e, page_rounded(&region));
                 if self
                     .broadcast(|ack| RegionControlMsg::Release { slot, ack })
                     .is_ok()
@@ -297,6 +306,8 @@ mod tests {
 
         let mut backing = [0u8; 8192];
         let region = unsafe { MemoryRegion::new(backing.as_mut_ptr(), backing.len()) };
+        let rounded = page_rounded(&region);
+        assert!(rounded >= 8192 && rounded.is_multiple_of(4096), "{rounded}");
         let id = registrar.register(region).unwrap();
 
         let limit = crate::error::MemlockLimit {
@@ -308,10 +319,15 @@ mod tests {
             .with_charge_under(oom, 1024, Some(&limit))
             .to_string();
         assert!(text.starts_with("ENOMEM from a worker "), "{text}");
-        // 4096 + 8192 bytes held, on each of 2 rings; with 1024 more, 26624.
-        assert!(text.contains("2 registered region(s) of 12 KiB"), "{text}");
-        assert!(text.contains("charged about 24 KiB"), "{text}");
-        assert!(text.contains("need about 26 KiB"), "{text}");
+        // The reserved 4096 bytes plus the region in whole pages, on each of
+        // 2 rings, then with 1024 bytes more.
+        let held = 4096 + rounded;
+        let want = format!("2 registered region(s) of {} KiB", held / 1024);
+        assert!(text.contains(&want), "{text}");
+        let want = format!("charged {} KiB", 2 * held / 1024);
+        assert!(text.contains(&want), "{text}");
+        let want = format!("the rings need {} KiB", (2 * (held + 1024)) / 1024);
+        assert!(text.contains(&want), "{text}");
 
         // Unregistering removes the region from the count.
         registrar.unregister(id).unwrap();

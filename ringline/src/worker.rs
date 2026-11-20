@@ -2454,7 +2454,7 @@ impl RinglineBuilder {
                 .config
                 .registered_regions
                 .iter()
-                .map(|r| r.len() as u64)
+                .map(crate::region_registry::page_rounded)
                 .collect::<Vec<_>>(),
             region_txs,
             worker_wake_handles.clone(),

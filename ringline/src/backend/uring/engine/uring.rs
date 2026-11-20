@@ -14,7 +14,7 @@ use crate::backend::uring::ring::{CloseLead, close_lead_for};
 use crate::backend::uring::sqe::{Fd, Link, Op, Sqe};
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::config::Config;
-use crate::error::{Error, MemlockLimit, describe_buffer_registration_failure, errno_name};
+use crate::error::{Error, MemlockLimit, Pinned, describe_buffer_registration_failure, errno_name};
 use crate::memlock::KernelVersion;
 
 /// Ubuntu's 6.8 kernels (from 6.8.0-139) invert the check on the reserved
@@ -674,12 +674,12 @@ impl Engine for UringEngine {
         // against the total; an `EFAULT` is about the one buffer.
         let total: u64 = iovecs.iter().map(|iov| iov.iov_len as u64).sum();
         let attribute = |e: io::Error, len: usize| {
-            let bytes = if e.raw_os_error() == Some(libc::EFAULT) {
-                len as u64
+            let (bytes, pinned) = if e.raw_os_error() == Some(libc::EFAULT) {
+                (len as u64, Pinned::Buffer)
             } else {
-                total
+                (total, Pinned::RingRegions)
             };
-            Error::buffer_registration(e, bytes, MemlockLimit::read().ok().as_ref())
+            Error::buffer_registration(e, bytes, MemlockLimit::read().ok().as_ref(), pinned)
         };
         let submitter = self.ring.submitter();
         // The sparse table pins no pages and is not charged to
@@ -735,6 +735,7 @@ impl Engine for UringEngine {
                         &e,
                         iov.iov_len as u64,
                         MemlockLimit::read().ok().as_ref(),
+                        Pinned::Buffer,
                     );
                     io::Error::new(e.kind(), text)
                 })?;
