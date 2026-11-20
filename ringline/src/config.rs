@@ -238,6 +238,9 @@ pub struct Config {
     /// Sends at or above the threshold, or that don't fit a send pool slot,
     /// use the zero-copy path as before. Default: `4096`.
     pub(crate) send_zc_threshold: u32,
+    /// Whether a guard-only send from one registered region names that
+    /// region's buffer. See [`ConfigBuilder::fixed_buffer_sends`].
+    pub(crate) fixed_buffer_sends: bool,
     /// Number of `InFlightSendSlab` entries. A zero-copy send (`send_parts`
     /// with a guard, when the batch totals at least `send_zc_threshold`)
     /// holds one until the
@@ -534,6 +537,7 @@ impl Default for Config {
             send_copy_count: 1024,
             send_copy_slot_size: 16448,
             send_zc_threshold: 4096,
+            fixed_buffer_sends: true,
             send_slab_slots: 512,
             send_admission_order: crate::SendAdmissionOrder::Budget { slots: 32 },
             flush_interval_us: 100,
@@ -591,6 +595,12 @@ impl Config {
     /// [`ConfigBuilder::send_zc_threshold`].
     pub fn send_zc_threshold(&self) -> u32 {
         self.send_zc_threshold
+    }
+
+    /// Whether guard-only sends from one registered region may use the
+    /// region's buffer. See [`ConfigBuilder::fixed_buffer_sends`].
+    pub fn fixed_buffer_sends(&self) -> bool {
+        self.fixed_buffer_sends
     }
 
     /// A TLS connection encrypts into the same `SendCopyPool` slots that plain
@@ -1370,6 +1380,52 @@ impl ConfigBuilder {
     /// Set the zero-copy guard send threshold in bytes (0 = always zero-copy).
     pub fn send_zc_threshold(mut self, bytes: u32) -> Self {
         self.config.send_zc_threshold = bytes;
+        self
+    }
+
+    /// Whether a send whose parts are all guards in one registered region
+    /// goes out as `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF`, naming that
+    /// region's buffer, so the kernel does not look up and pin the pages of
+    /// each send. Default: `true`.
+    ///
+    /// When `true`, a probe of the running kernel decides, once per process.
+    /// It runs at the first launch with
+    /// [`registered_regions`](Self::registered_regions), the first
+    /// [`Runtime::register_region`](crate::Runtime::register_region), or the
+    /// first [`Runtime::fixed_buffer_sends`](crate::Runtime::fixed_buffer_sends),
+    /// whichever comes first, and that call blocks while it runs. Fixed sends
+    /// are used only when the kernel takes the flag (Linux 6.15) and charges
+    /// such a send to the socket's send buffer the same as the send from plain
+    /// iovecs. `Runtime::fixed_buffer_sends` reports the result.
+    ///
+    /// The probe usually takes a few milliseconds. Its waits on the sockets
+    /// and the ring are bounded at about 22 s per measurement, and it makes at
+    /// most three. Allocating the huge page can wait for memory compaction,
+    /// and the check that it is a huge page reads `/proc/self/smaps`; neither
+    /// is bounded. It maps 6 MiB, collapses a 2 MiB transparent huge
+    /// page inside it, registers that on a ring of its own, and unmaps it when
+    /// done; if a send's completion does not arrive, the mapping and the ring
+    /// are kept for the life of the process.
+    ///
+    /// Each launch with this on, until the probe has run, raises the soft
+    /// `RLIMIT_MEMLOCK` when it is below what the workers need plus the
+    /// probe's charge (2 MiB, plus a small ring on a kernel that charges
+    /// rings), to that sum if the hard limit allows, whether or not regions
+    /// are registered. Processes started afterwards inherit the
+    /// raised limit. When the hard limit does not allow it, the probe does not
+    /// run and fixed sends stay off.
+    ///
+    /// With fixed sends on, a guard-only send from a region uses the region's
+    /// slot until it completes; see
+    /// [`Runtime::unregister_region`](crate::Runtime::unregister_region).
+    ///
+    /// A send with a copy part, a guard outside a registered region, or
+    /// guards in more than one region uses plain iovecs, as does a send on a
+    /// Unix-domain connection. A fixed send that the kernel returns short or
+    /// refuses with `EAGAIN` is resent from plain iovecs.
+    /// The mio backend ignores this setting.
+    pub fn fixed_buffer_sends(mut self, enabled: bool) -> Self {
+        self.config.fixed_buffer_sends = enabled;
         self
     }
 

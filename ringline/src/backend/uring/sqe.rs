@@ -78,6 +78,15 @@ pub(crate) enum Op {
         msg: *const libc::msghdr,
         flags: u32,
     },
+    /// `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF` (Linux 6.15): every
+    /// iovec of `msg` must lie inside registered buffer `buf_index`, or the
+    /// send fails with `EFAULT`.
+    SendMsgZcFixed {
+        fd: Fd,
+        msg: *const libc::msghdr,
+        flags: u32,
+        buf_index: u16,
+    },
     Read {
         fd: Fd,
         buf: *mut u8,
@@ -240,6 +249,26 @@ impl Sqe {
                 fd: Fd::Fixed(index),
                 msg,
                 flags: crate::completion::STREAM_SEND_FLAGS as u32,
+            },
+            user_data,
+        )
+    }
+
+    /// A zero-copy stream `sendmsg` on registered file `index` whose iovecs
+    /// all lie inside registered buffer `buf_index`, with `MSG_DONTWAIT`
+    /// (Domain Invariant 5).
+    pub(crate) fn send_msg_zc_fixed(
+        index: u32,
+        msg: *const libc::msghdr,
+        buf_index: u16,
+        user_data: u64,
+    ) -> Self {
+        Sqe::new(
+            Op::SendMsgZcFixed {
+                fd: Fd::Fixed(index),
+                msg,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
+                buf_index,
             },
             user_data,
         )
