@@ -4,6 +4,9 @@
 //! is Linux 6.0), and a send of several as `SENDMSG_ZC` (the flag is Linux
 //! 6.15).
 //!
+//! `docs/fixed-buffer-sends.md` describes the kernel behaviour this decides
+//! on, the settings involved, and the send shapes that benefit.
+//!
 //! The kernel must accept the flag, and must charge a send from a registered
 //! buffer to the socket's send buffer the same as a send of the same bytes
 //! from plain iovecs. From Linux 6.3, a
