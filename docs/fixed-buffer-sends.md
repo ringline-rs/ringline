@@ -129,13 +129,36 @@ running kernel.
 ### The probe
 
 `ringline/src/backend/uring/fixed_send.rs` decides, once per process,
-whether each kind of fixed send is used. It maps a 2 MiB transparent huge
-page, registers it on a ring of its own, and on loopback connections whose
+whether each kind of fixed send is used, for two kinds of region: one in
+base pages only, and any other. It maps two buffers, four base pages advised
+`MADV_NOHUGEPAGE` before they are touched and a 2 MiB transparent huge page,
+registers both on a ring of its own, and on loopback connections whose
 receiver does not read compares the change in `SK_MEMINFO_WMEM_QUEUED`
-across a 4 KiB send from the page's last page: from plain iovecs, as a fixed
-`SEND_ZC`, and, when that passes, as a fixed `SENDMSG_ZC`. A fixed send that
-is charged within a page of the plain one passes; one charged about the
-folio's size more is the fault above.
+across a 4 KiB send from plain iovecs with the same send from each buffer's
+last page as a fixed `SEND_ZC` and, when that passes, as a fixed
+`SENDMSG_ZC`. A fixed send that is charged within a page of the plain one
+passes; one charged about the folio's size more is the fault above. Base
+pages are not coalesced, so sends from them are charged correctly whether
+or not the kernel has the fix, and a kernel that takes the flag passes them.
+
+A region is in base pages only when, at its registration (or at launch, for
+`registered_regions`), `/proc/self/smaps` shows every mapping that overlaps
+it to be private anonymous memory (inode 0) with `nh` (`MADV_NOHUGEPAGE`)
+and not `ht` (hugetlb) in `VmFlags`, and no PMD-mapped huge page
+(`AnonHugePages`, `ShmemPmdMapped`, `FilePmdMapped` all 0). smaps does not
+show smaller multi-page folios (mTHP), and `MADV_NOHUGEPAGE` stops new ones
+without splitting those already faulted in, so advise the memory before it
+is first touched. No region counts as base pages while a size of those
+folios is set to `always`
+(`/sys/kernel/mm/transparent_hugepage/hugepages-<size>kB/enabled`, or
+`inherit` with the top-level `enabled` at `always`): memory touched before
+it was advised may hold such folios, and smaps does not show them. On a
+kernel built without transparent huge pages, where `MADV_NOHUGEPAGE` fails
+with `EINVAL`, `nh` is not required. The read of smaps takes longer the more
+memory the process has mapped; its cost has not been measured.
+`Runtime::region_fixed_buffer_sends(id)` gives the result
+that applies to a region; `Runtime::fixed_buffer_sends()` gives the result
+for regions not in base pages only.
 
 | Result (`FixedBufferSends`) | Meaning | Sends that name the buffer |
 |---|---|---|
@@ -143,51 +166,58 @@ folio's size more is the fault above.
 | `Enabled { multi_guard: false }` | `SEND_ZC` passes; `SENDMSG_ZC` is refused (before 6.15) or fails | one guard |
 | `Overcharged` | the kernel has the charge fault | none |
 | `Unsupported` | the mio backend, or `SEND_ZC` refuses the flag | none |
-| `Inconclusive(reason)` | the probe could not decide: for example, no huge page for its buffer, no `RLIMIT_MEMLOCK` room, or measurements that kept failing | none |
+| `Inconclusive(reason)` | the probe could not decide: for example, no huge page for its buffer (this leaves the base-page result measured), no `RLIMIT_MEMLOCK` room, or measurements that kept failing | none |
 | `Disabled` | `ConfigBuilder::fixed_buffer_sends(false)` on io_uring | none |
 
 Measured results:
 
-| Kernel | Result |
-|---|---|
-| Debian 6.12 | `Overcharged` |
-| Debian 6.12 with the charge fix | `Enabled { multi_guard: false }` |
-| kernel.org 7.3.4 | `Overcharged` |
-| kernel.org 7.3.4 with the charge fix | `Enabled { multi_guard: true }` |
+| Kernel | Other regions | Regions in base pages |
+|---|---|---|
+| Debian 6.12 | `Overcharged` | `Enabled { multi_guard: false }` |
+| Debian 6.12 with the charge fix | `Enabled { multi_guard: false }` | `Enabled { multi_guard: false }` |
+| kernel.org 7.3.4 | `Overcharged` | `Enabled { multi_guard: true }` |
+| kernel.org 7.3.4 with the charge fix | `Enabled { multi_guard: true }` | `Enabled { multi_guard: true }` |
 
 The probe runs at the first launch with `registered_regions`, the first
-`Runtime::register_region`, or the first `Runtime::fixed_buffer_sends`,
-whichever comes first, and that call blocks while it runs. Its socket and
-ring waits are bounded at about 99 s in all; allocating its huge page
-(memory compaction) and reading `/proc/self/smaps` are not bounded. Its
-duration has not been measured. Until it
-has run, each launch raises the soft `RLIMIT_MEMLOCK` to cover it when the
-hard limit allows, and otherwise keeps it from running.
+`Runtime::register_region`, or the first `Runtime::fixed_buffer_sends` or
+`Runtime::region_fixed_buffer_sends`, whichever comes first, and that call
+blocks while it runs. It makes at most fifteen sends, each of whose socket
+and ring waits are bounded at about 11 s, so about 165 s in all: up to three
+tries at the plain send, and for each buffer up to three at the `SEND_ZC`
+and three at the `SENDMSG_ZC`. Allocating its huge page (memory compaction)
+and reading `/proc/self/smaps` are not bounded. Its duration has not been
+measured. Until it has run, each launch raises the soft `RLIMIT_MEMLOCK` to
+cover it when the hard limit allows, and otherwise keeps it from running.
 
-When the probe runs it logs one line through the `log` crate saying whether
-fixed sends are on, for which sends, and if not why, with the result's name
-(for example `fixed-buffer sends off: this kernel does not have the fix to how
-they are charged to the socket (Overcharged); …`): at `debug` when fixed sends
-are on, at `warn` when they are off. Nothing is printed unless the application
-installs a logger. It also sets the gauge
-`ringline/ring/fixed_buffer_sends`: 0 when no fixed send is used (the probe has
-not run, or did not pass), 1 for sends of one guard, 2 for sends of one or
-several guards. A kernel upgrade that carries the charge fix changes the
-result without a code change, and the line and the gauge show it.
+The probe logs its two results at `debug` through the `log` crate. Each
+registration with the setting on then logs one line for its region saying
+whether the region's sends name its buffer, for which sends, and if not why,
+with the result's name (for example `region 2 (4294967296 bytes, not shown to
+be in base pages): fixed-buffer sends off: this kernel does not have the fix
+to how they are charged to the socket (Overcharged); …`): at `debug` when
+they do, and when they do not at `warn` for the first region of its kind in
+the process and at `debug` after that. Nothing is printed unless the
+application installs a logger. The probe also sets the gauges
+`ringline/ring/fixed_buffer_sends` (regions not in base pages only) and
+`ringline/ring/fixed_buffer_sends_base_pages`: 0 when no fixed send is used
+(the probe has not run, or did not pass), 1 for sends of one guard, 2 for
+sends of one or several guards. A kernel upgrade that carries the charge fix
+changes the result without a code change, and the lines and the gauges show
+it.
 
 ### The send path
 
-In `SendBuilder::build_with_guards`, a send whose parts are all guards in one
-registered region, when the setting is on and the probe passed that kind of
-send, goes out as a fixed `SEND_ZC` (one guard) or a fixed `SENDMSG_ZC`
-(several), counted in `ringline/ring` `op=send_fixed_buffer`. Everything
-else uses plain iovecs, or for TLS is encrypted into pool slots: a send
-with a copy part, guards in several regions or outside any, a send on a
-Unix-domain or TLS connection. A guarded send below `send_zc_threshold` is
-gathered into one pool slot and copied, unless the pool has no free slot or
-the send does not fit one slot; it then goes out zero-copy like any other. A
-fixed send that the kernel returns
-short or refuses with `EAGAIN` is resent from plain iovecs.
+In `SendBuilder::build_with_guards`, a send whose parts are all guards in
+one registered region, when the setting is on and the probe passed that kind
+of send for the region's kind (base pages only, or not), goes out as a fixed
+`SEND_ZC` (one guard) or a fixed `SENDMSG_ZC` (several), counted in
+`ringline/ring` `op=send_fixed_buffer`. Everything else uses plain iovecs,
+or for TLS is encrypted into pool slots: a send with a copy part, guards in
+several regions or outside any, a send on a Unix-domain or TLS connection. A
+guarded send below `send_zc_threshold` is gathered into one pool slot and
+copied, unless the pool has no free slot or the send does not fit one slot;
+it then goes out zero-copy like any other. A fixed send that the kernel
+returns short or refuses with `EAGAIN` is resent from plain iovecs.
 
 A guard-only send from one region holds that region's slot from the call
 that submits it until its completion resolves, including while it waits in
@@ -226,10 +256,17 @@ application lays out what it sends to match:
   notification. This layout has not been measured.
 - Before 7.2, keep each region to 1 GiB, with its own staging for the
   values in it.
+- On a kernel without the charge fix, put the memory a reply is sent from in
+  base pages: allocate it as private anonymous memory, advise it
+  `MADV_NOHUGEPAGE` before it is first touched, and keep the staging area in
+  the same mapping. Such a region takes the probe's base-page result, which
+  is `Enabled` wherever the kernel takes the flag, unless the probe could
+  not decide. A region in base pages registers
+  one entry per 4 KiB page, 262,144 per GiB (see "Huge pages and
+  registration cost"), so this suits buffers of moderate size, such as the
+  slots a disk read lands in, more than a value store of many GiB.
 
-Every one of these takes effect only where the probe passes, which today
-means a kernel carrying the charge fix. The probe tests a huge page and
-decides for every region: on a kernel without the fix, a region on 4 KiB
-pages, which is charged correctly, gets no fixed sends either, and with
-transparent huge pages unavailable the probe is `Inconclusive` and fixed
-sends stay off.
+Sends from a region not in base pages only name its buffer where the
+probe's other result passes, which today means a kernel carrying the charge
+fix. With transparent huge pages unavailable that result is `Inconclusive`,
+and the base-page result is still measured.

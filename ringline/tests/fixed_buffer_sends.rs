@@ -1,8 +1,13 @@
 //! A send of one guard and a send of three guards from one registered region
 //! deliver their bytes in order. Each is submitted from the region's buffer
-//! exactly when the kernel probe enabled that kind of send
-//! (`Runtime::fixed_buffer_sends`). The op
-//! each kind of send is pushed as is checked by the lib test
+//! exactly when the kernel probe enabled that kind of send for the region
+//! (`Runtime::region_fixed_buffer_sends`). It runs for a heap buffer, which
+//! takes the result for memory that may be in huge pages
+//! (`Runtime::fixed_buffer_sends`), and for a mapping advised
+//! `MADV_NOHUGEPAGE` before it is touched, which takes the result for base
+//! pages. On a kernel without transparent huge pages the heap counts as base
+//! pages too, and the heap check below does not hold; the rack's kernels all
+//! have them. The op each kind of send is pushed as is checked by the lib test
 //! `a_guard_only_send_from_one_region_uses_its_buffer`.
 
 #![cfg(all(target_os = "linux", has_io_uring))]
@@ -13,7 +18,7 @@ mod common;
 use std::future::Future;
 use std::io::Read;
 use std::net::TcpStream;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ringline::{
@@ -27,8 +32,11 @@ const REGION_LEN: usize = 64 << 10;
 const PART: usize = 16 << 10;
 const ORDER: [usize; 4] = [1, 2, 0, 3];
 
-/// The leaked memory the test registers, and the id the runtime gave it.
-static REGION: OnceLock<(usize, RegionId)> = OnceLock::new();
+/// The leaked memory the next connection sends from, the id the runtime gave
+/// it, and whether that connection is the test's last, after which the
+/// handler shuts the runtime down. Set before the connect, and read when the
+/// connection is accepted.
+static REGION: Mutex<Option<(usize, RegionId, bool)>> = Mutex::new(None);
 
 struct RegionGuard {
     ptr: usize,
@@ -50,7 +58,10 @@ impl AsyncEventHandler for Handler {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let mut conn = conn;
-            let &(base, region) = REGION.get().expect("registered before the connect");
+            let (base, region, last) = REGION
+                .lock()
+                .unwrap()
+                .expect("registered before the connect");
             let guard = |i: usize| {
                 ringline::SendPart::Guard(GuardBox::new(RegionGuard {
                     ptr: base + i * PART,
@@ -70,7 +81,9 @@ impl AsyncEventHandler for Handler {
             let _ = conn
                 .with_data(|d| ringline::ParseResult::Consumed(d.len()))
                 .await;
-            ringline::request_shutdown().ok();
+            if last {
+                ringline::request_shutdown().ok();
+            }
         }
     }
 
@@ -102,7 +115,62 @@ fn guard_sends_from_one_region_arrive_in_order() {
         .expect("launch failed");
     let addr = runtime.bound_addr().expect("bound");
 
-    let backing: &'static mut [u8] = Box::leak(vec![0u8; REGION_LEN].into_boxed_slice());
+    let heap: &'static mut [u8] = Box::leak(vec![0u8; REGION_LEN].into_boxed_slice());
+    let base_pages = base_page_mapping();
+    let huge = runtime.fixed_buffer_sends();
+    for (kind, backing) in [("heap", heap), ("base pages", base_pages)] {
+        let status = send_from(&runtime, addr, backing, kind == "base pages");
+        eprintln!("{kind}: {status:?}");
+        if kind == "heap" {
+            assert_eq!(status, huge, "a heap buffer takes the huge-page result");
+        }
+        // A run on a known kernel names the result it expects; `decided`
+        // accepts any result but `Inconclusive`.
+        let var = match kind {
+            "heap" => "RINGLINE_EXPECT_FIXED_SEND",
+            _ => "RINGLINE_EXPECT_FIXED_SEND_BASE_PAGES",
+        };
+        match std::env::var(var).as_deref() {
+            Ok("decided") => assert!(
+                !matches!(status, FixedBufferSends::Inconclusive(_)),
+                "{kind}: the probe could not decide: {status:?}"
+            ),
+            Ok(want) => assert_eq!(format!("{status:?}"), want, "{kind}: the probe's result"),
+            Err(_) => {}
+        }
+    }
+    common::join_workers(&runtime, handles);
+}
+
+/// `REGION_LEN` bytes of private anonymous memory advised `MADV_NOHUGEPAGE`
+/// before it is touched, leaked.
+fn base_page_mapping() -> &'static mut [u8] {
+    // SAFETY: a new private anonymous mapping, checked, and never unmapped.
+    unsafe {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            REGION_LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap");
+        libc::madvise(ptr, REGION_LEN, libc::MADV_NOHUGEPAGE);
+        std::slice::from_raw_parts_mut(ptr.cast(), REGION_LEN)
+    }
+}
+
+/// Fill `backing`, register it, have the server send its parts on one
+/// connection, and check the bytes and how many sends named its buffer. The
+/// server shuts down after the connection when `last`. Returns the region's
+/// probe result.
+fn send_from(
+    runtime: &ringline::Runtime,
+    addr: std::net::SocketAddr,
+    backing: &'static mut [u8],
+    last: bool,
+) -> FixedBufferSends {
     for (i, b) in backing.iter_mut().enumerate() {
         *b = (i / PART) as u8 ^ (i % 251) as u8;
     }
@@ -124,19 +192,10 @@ fn guard_sends_from_one_region_arrive_in_order() {
             }
         }
     };
-    REGION.set((backing.as_ptr() as usize, id)).unwrap();
-    let status = runtime.fixed_buffer_sends();
-    eprintln!("fixed-buffer sends: {status:?}");
-    // A run on a known kernel names the result it expects; `decided` accepts
-    // any result but `Inconclusive`.
-    match std::env::var("RINGLINE_EXPECT_FIXED_SEND").as_deref() {
-        Ok("decided") => assert!(
-            !matches!(status, FixedBufferSends::Inconclusive(_)),
-            "the probe could not decide: {status:?}"
-        ),
-        Ok(want) => assert_eq!(format!("{status:?}"), want, "the probe's result"),
-        Err(_) => {}
-    }
+    *REGION.lock().unwrap() = Some((backing.as_ptr() as usize, id, last));
+    let status = runtime
+        .region_fixed_buffer_sends(id)
+        .expect("a registered region");
     let before = sent_fixed();
 
     let mut client = TcpStream::connect(addr).expect("connect");
@@ -152,6 +211,8 @@ fn guard_sends_from_one_region_arrive_in_order() {
         .flat_map(|&i| backing[i * PART..(i + 1) * PART].iter().copied())
         .collect();
     assert!(got == want, "the bytes arrived as sent, in part order");
+    // The server counts its sends before it resolves them; the client has
+    // all the bytes, so both have been counted.
     let fixed = sent_fixed() - before;
     let want = match status {
         FixedBufferSends::Enabled { multi_guard } => 1 + u64::from(multi_guard),
@@ -161,5 +222,5 @@ fn guard_sends_from_one_region_arrive_in_order() {
         fixed, want,
         "{status:?}: sends that named the region's buffer"
     );
-    common::join_workers(&runtime, handles);
+    status
 }

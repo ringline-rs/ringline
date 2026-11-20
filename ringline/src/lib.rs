@@ -189,6 +189,8 @@ pub(crate) mod resolver;
 #[cfg(target_os = "linux")]
 pub(crate) mod reuseport_bpf;
 pub(crate) mod runtime;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+pub(crate) mod smaps;
 pub(crate) mod spawner;
 pub(crate) mod task_panic;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
@@ -466,7 +468,7 @@ pub use runtime::stream::ConnStream;
 // ── Re-exports: Shared types ────────────────────────────────────────────
 
 /// Whether guard-only sends use a registered buffer; see
-/// [`Runtime::fixed_buffer_sends`].
+/// [`Runtime::region_fixed_buffer_sends`] and [`Runtime::fixed_buffer_sends`].
 pub use buffer::fixed::FixedBufferSends;
 /// Memory region for io_uring fixed buffer registration.
 pub use buffer::fixed::MemoryRegion;

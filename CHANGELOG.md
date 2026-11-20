@@ -23,24 +23,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     charge such a send to the socket's send buffer by the bytes sent:
     from Linux 6.3, kernels without the fix to `io_sg_from_iter` charge a send
     from a huge page by its offset in the page, which stalls the connection.
-    On those kernels the sends keep using plain iovecs.
-  - The probe logs one line through the `log` crate saying whether fixed
-    sends are on, for which sends, and if not why (`fixed-buffer sends on …`
-    at `debug`, `fixed-buffer sends off: …` at `warn`), and sets the gauge
-    `ringline/ring/fixed_buffer_sends` (0 no fixed sends, 1 one guard, 2 one
-    or several guards).
-  - `Runtime::fixed_buffer_sends` returns the result as a `FixedBufferSends`;
-    `Enabled { multi_guard }` says whether sends of several guards use the
-    buffer too.
+    On those kernels sends from a region keep using plain iovecs, unless the
+    region is in base pages only: private anonymous memory advised
+    `MADV_NOHUGEPAGE` before it was first touched, with no huge page in it,
+    as `/proc/self/smaps` shows at registration, while no multi-page folio
+    size below a PMD is set to `always`. Sends from such a region are
+    charged correctly on every kernel and use its buffer wherever the kernel
+    takes the flag and the probe's base-page result is `Enabled`.
+  - Each registration logs one line through the `log` crate saying whether
+    the region's sends use its buffer, for which sends, and if not why (at
+    `debug` when they do; when they do not, at `warn` for the first region
+    of its kind and at `debug` after that). The probe sets the
+    gauges `ringline/ring/fixed_buffer_sends` and
+    `ringline/ring/fixed_buffer_sends_base_pages` (0 no fixed sends, 1 one
+    guard, 2 one or several guards).
+  - `Runtime::fixed_buffer_sends` returns the result for a region not in base
+    pages only as a `FixedBufferSends`, and
+    `Runtime::region_fixed_buffer_sends(id)` the result that applies to a
+    registered region; `Enabled { multi_guard }` says whether sends of
+    several guards use the buffer too.
     `ringline/ring` `op=send_fixed_buffer` counts the sends.
   - The probe maps 6 MiB, collapses a 2 MiB transparent huge page inside it,
-    and registers that on a ring of its own. It gives `Inconclusive`, and
-    fixed sends stay off, when no huge page is available or `RLIMIT_MEMLOCK`
-    has no room for it.
+    maps four base pages advised `MADV_NOHUGEPAGE`, and registers both on a
+    ring of its own. Without a huge page its result for other regions is
+    `Inconclusive` and the base-page result is still measured; without
+    `RLIMIT_MEMLOCK` room for it both are `Inconclusive`, and fixed sends
+    stay off.
   - Changed for existing callers, with the default config: each launch, until
     the probe has run, raises the process's soft `RLIMIT_MEMLOCK` when it is
-    below what the workers need plus the probe's charge (2 MiB, plus a small
-    ring on a kernel that charges rings), to that sum if the hard limit
+    below what the workers need plus the probe's charge (2 MiB and four base
+    pages, plus a small ring on a kernel that charges rings), to that sum if
+    the hard limit
     allows, whether or not regions are registered.
     A guard-only send whose guards all name one region now holds the region's
     slot until it completes, including while it waits in the send queue.
