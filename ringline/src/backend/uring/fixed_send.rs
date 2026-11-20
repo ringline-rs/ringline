@@ -167,27 +167,31 @@ pub(crate) fn probe_once() -> FixedBufferSends {
 fn describe(result: &FixedBufferSends) -> String {
     const DOC: &str =
         "https://github.com/ringline-rs/ringline/blob/main/docs/fixed-buffer-sends.md";
+    const SAME: &str = "sends use plain iovecs as before";
     match result {
         FixedBufferSends::Enabled { multi_guard: true } => {
             "fixed-buffer sends on, for sends of one guard and of several".into()
         }
-        FixedBufferSends::Enabled { multi_guard: false } => {
-            "fixed-buffer sends on for sends of one guard; the kernel refuses them \
-             for several (before Linux 6.15)"
-                .into()
-        }
+        FixedBufferSends::Enabled { multi_guard: false } => format!(
+            "fixed-buffer sends on for sends of one guard, not of several: the \
+             kernel refused them (it does before Linux 6.15) or the probe could not \
+             measure them; those {SAME}. See {DOC}"
+        ),
         FixedBufferSends::Overcharged => format!(
             "fixed-buffer sends off: this kernel does not have the fix to how they \
-             are charged to the socket (Overcharged); sends use plain iovecs as \
-             before. See {DOC}"
+             are charged to the socket (Overcharged); {SAME}. See {DOC}"
         ),
         FixedBufferSends::Unsupported => {
-            "fixed-buffer sends off: the kernel refuses them (Unsupported)".into()
+            format!(
+                "fixed-buffer sends off: the kernel refuses them (Unsupported); {SAME}. See {DOC}"
+            )
         }
         FixedBufferSends::Inconclusive(why) => {
-            format!("fixed-buffer sends off: the probe could not decide: {why}")
+            format!("fixed-buffer sends off: the probe could not decide ({why}); {SAME}. See {DOC}")
         }
-        other => format!("fixed-buffer sends: {other:?}"),
+        FixedBufferSends::Disabled => {
+            "fixed-buffer sends off: ConfigBuilder::fixed_buffer_sends is false".into()
+        }
     }
 }
 
@@ -799,7 +803,8 @@ mod tests {
     #[test]
     fn the_probe_line_says_on_or_off() {
         assert!(describe(&FixedBufferSends::Enabled { multi_guard: true }).contains("sends on"));
-        assert!(describe(&FixedBufferSends::Enabled { multi_guard: false }).contains("one guard"));
+        let single = describe(&FixedBufferSends::Enabled { multi_guard: false });
+        assert!(single.contains("one guard, not of several"), "{single}");
         let over = describe(&FixedBufferSends::Overcharged);
         assert!(
             over.contains("sends off") && over.contains("(Overcharged)"),
@@ -807,7 +812,8 @@ mod tests {
         );
         assert!(over.contains("https://"), "{over}");
         let why = describe(&FixedBufferSends::Inconclusive("no huge page".into()));
-        assert!(why.ends_with("could not decide: no huge page"), "{why}");
+        assert!(why.contains("could not decide (no huge page)"), "{why}");
+        assert!(why.contains("as before"), "{why}");
     }
 
     #[test]
