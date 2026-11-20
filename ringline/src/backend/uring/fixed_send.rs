@@ -20,19 +20,23 @@
 //! the probe measures the charge instead of reading the version.
 //!
 //! The probe sends 4 KiB from the last page of a registered 2 MiB transparent
-//! huge page up to three times: from plain iovecs, as a fixed `SEND_ZC`, and,
-//! when that passes, as a fixed `SENDMSG_ZC`. Each send is on a fresh loopback connection whose
+//! huge page: from plain iovecs, as a fixed `SEND_ZC`, and, when that passes,
+//! as a fixed `SENDMSG_ZC`. Each send is on a fresh loopback connection whose
 //! receiver does not read, and the probe compares the change in
 //! `SK_MEMINFO_WMEM_QUEUED` across each fixed send with the plain one's. The
 //! kernel's fault in the charge raises a fixed send's charge by about 2 MiB.
 //!
 //! The probe usually takes a few milliseconds. Its waits on the sockets and
 //! the ring are bounded: 1 s for each connection's setup and prefill, and 5 s
-//! for each completion, about 33 s for one measurement and 99 s for the three
-//! it makes at most. Two steps are not bounded: the huge
-//! page is allocated with `MADV_HUGEPAGE` and `MADV_COLLAPSE`, which can wait
-//! for memory compaction, and the check that it is one huge page reads
-//! `/proc/self/smaps`, which takes longer the more the process has mapped.
+//! for each completion, about 11 s per send. It makes at most three
+//! measurements. A measurement that reaches the multi-guard send is the last,
+//! and it tries that send up to three times, so at most nine sends
+//! (2 + 2 + 5) and about 99 s in all.
+//!
+//! Two steps are not bounded. The huge page is allocated with `MADV_HUGEPAGE`
+//! and `MADV_COLLAPSE`, which can wait for memory compaction, and the check
+//! that it is one huge page reads `/proc/self/smaps`, which takes longer the
+//! more the process has mapped.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -235,15 +239,24 @@ fn measure(engine: &mut ActiveEngine, buf: &HugeBuffer) -> Result<FixedBufferSen
         Verdict::Overcharged => return Ok(FixedBufferSends::Overcharged),
         Verdict::Unclear(why) => return Err(Failure::Transient(why)),
     }
-    // The single send passed. A multi-guard send that does not pass, or that
-    // cannot be measured, leaves sends of several guards on plain iovecs;
-    // only a `Leak` discards the single send's result.
-    let multi_guard = match charge(engine, &mut ready, at, Kind::Multi) {
-        Ok(Charge::Sent(bytes)) => verdict(bytes, plain) == Verdict::Pass,
-        Ok(Charge::Refused) | Err(Failure::Transient(_) | Failure::Fixed(_)) => false,
-        Err(leak @ Failure::Leak(_)) => return Err(leak),
-    };
-    Ok(FixedBufferSends::Enabled { multi_guard })
+    // The single send passed, and its result stands: the multi-guard send is
+    // measured up to `ATTEMPTS` times on its own. One that is refused or
+    // overcharged, or that fails transiently or measures unclear on every
+    // try, leaves sends of several guards on plain iovecs. Only a `Leak` ends
+    // the probe.
+    for _ in 0..ATTEMPTS {
+        match charge(engine, &mut ready, at, Kind::Multi) {
+            Ok(Charge::Sent(bytes)) => match verdict(bytes, plain) {
+                Verdict::Pass => return Ok(FixedBufferSends::Enabled { multi_guard: true }),
+                Verdict::Overcharged => break,
+                Verdict::Unclear(_) => {}
+            },
+            Ok(Charge::Refused) | Err(Failure::Fixed(_)) => break,
+            Err(Failure::Transient(_)) => {}
+            Err(leak @ Failure::Leak(_)) => return Err(leak),
+        }
+    }
+    Ok(FixedBufferSends::Enabled { multi_guard: false })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -284,8 +297,9 @@ enum Kind {
 enum Charge {
     /// The send was taken; the change in the write queue's charge, in bytes.
     Sent(i64),
-    /// `EINVAL`: on a fixed send, the kernel does not take
-    /// `IORING_RECVSEND_FIXED_BUF` on its opcode.
+    /// `EINVAL`. On a fixed send, the kernel does not take
+    /// `IORING_RECVSEND_FIXED_BUF` on its opcode; on a plain send, `measure`
+    /// treats it as a failure that measuring again would repeat.
     Refused,
 }
 
@@ -360,6 +374,14 @@ fn charge(
     unsafe { engine.push(&Sqe::new(op, 1)) }.map_err(|e| format!("pushing the send: {e}"))?;
     // From here every failure is `Leak` until the notification is reaped.
     let (result, cqe_flags) = next_completion(engine, ready).map_err(Failure::Leak)?;
+    // A notification here would be an earlier send's, posted without
+    // `F_MORE` on its completion; this send's completion is then still to
+    // come, and the completions after it would be misattributed.
+    if cqueue::notif(cqe_flags) {
+        return Err(Failure::Leak(
+            "the probe's send was answered by a zero-copy notification".into(),
+        ));
+    }
     let more = cqueue::more(cqe_flags);
 
     let outcome = if result == -libc::EINVAL {
