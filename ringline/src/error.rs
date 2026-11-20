@@ -578,6 +578,57 @@ pub(crate) fn describe_memlock_shortfall(
     )
 }
 
+/// The `ENOMEM` hint for a buffer that fits under the soft limit by itself.
+/// The kernel compares the limit with this buffer plus everything the user
+/// has already charged, so the shortfall is in what came before it.
+#[cfg(any(has_io_uring, test))]
+fn describe_memlock_already_charged(bytes: u64, limit: &MemlockLimit) -> String {
+    format!(
+        "This buffer's {} KiB is within the RLIMIT_MEMLOCK soft limit of {} (hard {}) \
+         by itself, so if the limit is the cause, memory the same user had already \
+         charged used the rest of it: buffers registered earlier on this ring and on \
+         the process's other rings (io_uring charges each ring for the memory \
+         registered on it, so a region registered on every worker counts once per \
+         worker), the rings themselves on kernels that charge them, and memory \
+         pinned by the user's other processes. Raise the limit to cover all of it \
+         (`ulimit -l`, or `LimitMEMLOCK=` in the systemd unit), or grant the process \
+         CAP_IPC_LOCK, which exempts it from the limit.",
+        kib_ceil(bytes),
+        rlim_kib(limit.soft),
+        rlim_kib(limit.hard),
+    )
+}
+
+/// What a `Runtime::register_region` that failed with `ENOMEM` adds to the
+/// workers' error: the regions already registered, which io_uring charged
+/// once for each of the `rings`, and the total the rings need with this one.
+/// `None` when the soft limit is unlimited, so it is not the cause.
+#[cfg(any(has_io_uring, test))]
+pub(crate) fn describe_region_charge(
+    held: u64,
+    regions: usize,
+    rings: usize,
+    adding: u64,
+    limit: &MemlockLimit,
+) -> Option<String> {
+    if limit.soft == libc::RLIM_INFINITY {
+        return None;
+    }
+    let rings_u64 = rings as u64;
+    Some(format!(
+        "Before this region, {regions} registered region(s) of {} KiB in all were on each \
+         of the {rings} worker rings, charged about {} KiB in all; with this region of \
+         {} KiB the rings need about {} KiB of RLIMIT_MEMLOCK (soft limit {}), besides \
+         the rings' own memory on kernels that charge it and memory the same user has \
+         pinned in other processes.",
+        kib_ceil(held),
+        kib_ceil(held.saturating_mul(rings_u64)),
+        kib_ceil(adding),
+        kib_ceil(held.saturating_add(adding).saturating_mul(rings_u64)),
+        rlim_kib(limit.soft),
+    ))
+}
+
 /// The page-migration cause of a failed buffer registration, shared by the
 /// `EFAULT` and `ENOMEM` hints. The kernel pins registered buffers long-term
 /// (`FOLL_LONGTERM`): it pins the range, then unpins and migrates every page
@@ -619,6 +670,10 @@ pub(crate) fn describe_buffer_registration_failure(
             match limit {
                 Some(limit) if limit.soft == libc::RLIM_INFINITY => {
                     msg.push_str("RLIMIT_MEMLOCK is unlimited, so it is not the cause. ")
+                }
+                Some(limit) if bytes <= limit.soft => {
+                    msg.push_str(&describe_memlock_already_charged(bytes, limit));
+                    msg.push(' ');
                 }
                 Some(limit) => {
                     msg.push_str(&describe_memlock_shortfall(
@@ -1121,6 +1176,53 @@ mod tests {
         assert!(memlock < migration, "{text}");
         assert!(text.contains("in others. The kernel"), "{text}");
         assert!(text.contains("CmaTotal 0"), "{text}");
+    }
+
+    #[test]
+    fn enomem_for_a_buffer_within_the_limit_names_what_was_charged_before() {
+        // A 1 GiB chunk under a 31 GiB limit: the chunk is not the shortfall,
+        // so the hint must not tell the reader to raise the limit to 1 GiB.
+        let err = io::Error::from_raw_os_error(libc::ENOMEM);
+        let text = describe_buffer_registration_failure(
+            &err,
+            1024 * MIB,
+            Some(&limit(31 * 1024 * MIB, 31 * 1024 * MIB)),
+        );
+        assert!(!text.contains("RLIMIT_MEMLOCK too low"), "{text}");
+        assert!(!text.contains("ulimit -l 1048576"), "{text}");
+        assert!(
+            text.contains("1048576 KiB is within the RLIMIT_MEMLOCK soft limit of 32505856 KiB"),
+            "{text}"
+        );
+        assert!(text.contains("counts once per worker"), "{text}");
+        let memlock = text.find("CAP_IPC_LOCK").expect(&text);
+        let migration = text.find("pgmigrate_fail").expect(&text);
+        assert!(memlock < migration, "{text}");
+    }
+
+    #[test]
+    fn region_charge_multiplies_the_held_regions_by_the_rings() {
+        let text = describe_region_charge(
+            31 * 1024 * MIB,
+            31,
+            8,
+            1024 * MIB,
+            &limit(31 * 1024 * MIB, 31 * 1024 * MIB),
+        )
+        .expect("a finite limit gets the context");
+        assert!(
+            text.contains("31 registered region(s) of 32505856 KiB"),
+            "{text}"
+        );
+        assert!(text.contains("charged about 260046848 KiB"), "{text}");
+        assert!(text.contains("need about 268435456 KiB"), "{text}");
+        assert!(text.contains("soft limit 32505856 KiB"), "{text}");
+    }
+
+    #[test]
+    fn region_charge_is_silent_under_an_unlimited_soft_limit() {
+        let unlimited = limit(libc::RLIM_INFINITY, libc::RLIM_INFINITY);
+        assert!(describe_region_charge(MIB, 1, 8, MIB, &unlimited).is_none());
     }
 
     #[test]
