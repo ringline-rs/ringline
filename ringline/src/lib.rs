@@ -465,6 +465,9 @@ pub use runtime::stream::ConnStream;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────
 
+/// Whether guard-only sends use a registered buffer; see
+/// [`Runtime::fixed_buffer_sends`].
+pub use buffer::fixed::FixedBufferSends;
 /// Memory region for io_uring fixed buffer registration.
 pub use buffer::fixed::MemoryRegion;
 /// Region identifier for [`SendGuard`] implementations.

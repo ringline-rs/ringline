@@ -7303,6 +7303,166 @@ mod tests {
         assert_eq!(result, -libc::EINVAL, "an unaligned O_DIRECT write");
     }
 
+    /// A send whose parts are all guards in one registered region is pushed
+    /// with that region's buffer index when the setting is on and the probe
+    /// passed that kind of send: `SEND_ZC` for one guard, `SENDMSG_ZC` for
+    /// several. Guards in two regions, guards outside any region,
+    /// a copy part, the setting off, or the probe failed each give the plain
+    /// `SENDMSG_ZC`.
+    #[test]
+    fn a_guard_only_send_from_one_region_uses_its_buffer() {
+        use crate::backend::uring::fixed_send::Modes;
+        use crate::backend::uring::sqe::Op;
+        use crate::buffer::fixed::{MemoryRegion, RegionId};
+        use crate::handler::SendPart;
+        const BOTH: Modes = Modes {
+            single: true,
+            multi: true,
+        };
+
+        struct RegionGuard {
+            ptr: *const u8,
+            len: u32,
+            region: RegionId,
+        }
+        // Safety: the memory is leaked and never written while sent.
+        unsafe impl Send for RegionGuard {}
+        impl crate::SendGuard for RegionGuard {
+            fn as_ptr_len(&self) -> (*const u8, u32) {
+                (self.ptr, self.len)
+            }
+            fn region(&self) -> RegionId {
+                self.region
+            }
+        }
+        // Registered memory must outlive the ring, so it is leaked.
+        let leak = || Box::leak(vec![5u8; 16384].into_boxed_slice()).as_mut_ptr();
+        let (a, b, outside) = (leak(), leak(), leak());
+        // Safety: leaked, so valid and unmoved for the life of the process.
+        let regions = unsafe { vec![MemoryRegion::new(a, 16384), MemoryRegion::new(b, 16384)] };
+        // Each case takes a slab entry that is never released: more than the
+        // default test slab's 8.
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .registered_regions(regions)
+                .max_registered_regions(4)
+                .send_slab_slots(32)
+                .build()
+                .expect("valid config"),
+        );
+        el.driver.probe_passed = Some(BOTH);
+        let guard = |ptr: *mut u8, offset: usize, region: u16| {
+            crate::GuardBox::new(RegionGuard {
+                ptr: ptr.wrapping_add(offset),
+                len: 4096,
+                region: RegionId(region),
+            })
+        };
+        let send = |el: &mut AsyncEventLoop<NoopHandler>, parts: Vec<SendPart<'_>>| {
+            let conn_index = accept_connection(el);
+            let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+            with_driver_state(el, || conn.send_parts().submit_batch(parts)).expect("submitted");
+            last_pushed_op(el)
+        };
+
+        let op = send(
+            &mut el,
+            vec![
+                SendPart::Guard(guard(b, 0, 1)),
+                SendPart::Guard(guard(b, 8192, 1)),
+                SendPart::Guard(guard(b, 4096, 1)),
+            ],
+        );
+        assert!(
+            matches!(op, Op::SendMsgZcFixed { buf_index: 1, .. }),
+            "three guards in region 1: {op:?}"
+        );
+        let op = send(&mut el, vec![SendPart::Guard(guard(b, 8192, 1))]);
+        assert!(
+            matches!(
+                op,
+                Op::SendZcFixed {
+                    buf_index: 1,
+                    len: 4096,
+                    ..
+                }
+            ),
+            "one guard in region 1: {op:?}"
+        );
+        let op = send(
+            &mut el,
+            vec![SendPart::Guard(guard(outside, 0, RegionId::UNREGISTERED.0))],
+        );
+        assert!(
+            matches!(op, Op::SendMsgZc { .. }),
+            "one guard outside any region: {op:?}"
+        );
+
+        // A kernel that takes the flag on `SEND_ZC` only (before 6.15).
+        el.driver.probe_passed = Some(Modes {
+            single: true,
+            multi: false,
+        });
+        let op = send(&mut el, vec![SendPart::Guard(guard(a, 0, 0))]);
+        assert!(
+            matches!(op, Op::SendZcFixed { buf_index: 0, .. }),
+            "single only, one guard: {op:?}"
+        );
+        let op = send(
+            &mut el,
+            vec![
+                SendPart::Guard(guard(a, 0, 0)),
+                SendPart::Guard(guard(a, 4096, 0)),
+            ],
+        );
+        assert!(
+            matches!(op, Op::SendMsgZc { .. }),
+            "single only, two guards: {op:?}"
+        );
+        el.driver.probe_passed = Some(BOTH);
+
+        let cases: Vec<(&str, Vec<SendPart<'_>>)> = vec![
+            (
+                "guards in two regions",
+                vec![
+                    SendPart::Guard(guard(a, 0, 0)),
+                    SendPart::Guard(guard(b, 0, 1)),
+                ],
+            ),
+            (
+                "a guard outside any region",
+                vec![
+                    SendPart::Guard(guard(a, 0, 0)),
+                    SendPart::Guard(guard(outside, 0, RegionId::UNREGISTERED.0)),
+                ],
+            ),
+            (
+                "every guard outside any region",
+                vec![
+                    SendPart::Guard(guard(outside, 0, RegionId::UNREGISTERED.0)),
+                    SendPart::Guard(guard(outside, 4096, RegionId::UNREGISTERED.0)),
+                ],
+            ),
+            (
+                "a copy part",
+                vec![SendPart::Copy(&[1; 64]), SendPart::Guard(guard(a, 0, 0))],
+            ),
+        ];
+        for (case, parts) in cases {
+            let op = send(&mut el, parts);
+            assert!(matches!(op, Op::SendMsgZc { .. }), "{case}: {op:?}");
+        }
+
+        el.driver.probe_passed = Some(Modes::default());
+        let op = send(&mut el, vec![SendPart::Guard(guard(a, 0, 0))]);
+        assert!(matches!(op, Op::SendMsgZc { .. }), "probe failed: {op:?}");
+
+        el.driver.probe_passed = Some(BOTH);
+        el.driver.fixed_buffer_sends = false;
+        let op = send(&mut el, vec![SendPart::Guard(guard(a, 0, 0))]);
+        assert!(matches!(op, Op::SendMsgZc { .. }), "setting off: {op:?}");
+    }
+
     /// A read or write whose buffer names a registered region is submitted
     /// as `READ_FIXED` / `WRITE_FIXED` with the region's index and moves the
     /// data; the same file with an unregistered buffer gets a plain `WRITE`;

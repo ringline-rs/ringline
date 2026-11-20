@@ -58,6 +58,41 @@ impl RegionId {
     pub const UNREGISTERED: Self = RegionId(u16::MAX);
 }
 
+/// Whether guard-only sends from one registered region name the region's
+/// buffer (`IORING_RECVSEND_FIXED_BUF`)
+/// ([`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)),
+/// as [`Runtime::fixed_buffer_sends`](crate::Runtime::fixed_buffer_sends)
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FixedBufferSends {
+    /// A send of one guard in a registered region names that region's
+    /// buffer (`SEND_ZC`), and the kernel does not look up and pin its pages.
+    /// With `multi_guard`, so does a send of several guards that all lie in
+    /// one region (`SENDMSG_ZC`, which takes the flag from Linux 6.15).
+    Enabled {
+        /// Sends of several guards in one region name its buffer too.
+        multi_guard: bool,
+    },
+    /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)
+    /// is `false`.
+    Disabled,
+    /// The backend is mio, or the kernel refuses `IORING_RECVSEND_FIXED_BUF`
+    /// on `SEND_ZC`.
+    Unsupported,
+    /// The kernel charges a send from a registered buffer that lies in a huge
+    /// page to the socket's send buffer by the send's offset in the page, up
+    /// to the page's size, instead of by the bytes sent. Sending from it would
+    /// exhaust the send buffer and stall the connection. Linux 6.3 and later
+    /// show this unless they carry the fix to `io_sg_from_iter`'s charge
+    /// (<https://lore.kernel.org/io-uring/20261119232935.1708458-1-thiery.louis@gmail.com/>).
+    Overcharged,
+    /// The probe could not decide, for the reason given: for example, no
+    /// transparent huge page was available for its buffer, or
+    /// `RLIMIT_MEMLOCK` had no room to register it. Fixed sends stay off.
+    Inconclusive(String),
+}
+
 /// Registry of user-registered memory regions for io_uring fixed buffers.
 ///
 /// The iovec array is sized to `max_regions` at construction time and matches
