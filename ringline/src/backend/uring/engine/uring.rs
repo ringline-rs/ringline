@@ -221,8 +221,8 @@ pub(crate) struct UringEngine {
     /// `EBUSY` or `EAGAIN`, or submitted only some of them
     /// (`Engine::submit_refused`).
     submit_refused: std::sync::atomic::AtomicBool,
-    /// Reusable Entry128 conversion scratch for chain pushes — avoids a
-    /// heap allocation per chained send.
+    /// Reusable Entry128 conversion scratch for chain pushes, so a push does
+    /// not allocate.
     chain_scratch: Vec<squeue::Entry128>,
     /// Whether the ring was set up with `IORING_SETUP_DEFER_TASKRUN`. When
     /// set, the kernel runs task_work — and so posts the CQEs it generates —
@@ -1278,7 +1278,6 @@ impl Sqe {
         };
         match self.link {
             Link::None => e,
-            Link::Soft => e.flags(Flags::IO_LINK),
             Link::Hard => e.flags(Flags::IO_HARDLINK),
         }
     }
@@ -1550,12 +1549,6 @@ mod encode_tests {
                     .build()),
             ),
             (
-                Sqe::chain_send(9, p, 77, ud),
-                e(opcode::Send::new(fx, p, 77)
-                    .flags(crate::completion::CHAIN_SEND_FLAGS)
-                    .build()),
-            ),
-            (
                 Sqe::new(
                     Op::Send {
                         fd: Fd::Raw(11),
@@ -1601,18 +1594,6 @@ mod encode_tests {
                 Sqe::send_msg(9, msg, ud),
                 e(opcode::SendMsg::new(fx, msg)
                     .flags(crate::completion::STREAM_SEND_FLAGS as u32)
-                    .build()),
-            ),
-            (
-                Sqe::chain_send_msg(9, msg, ud),
-                e(opcode::SendMsg::new(fx, msg)
-                    .flags(crate::completion::CHAIN_SEND_FLAGS as u32)
-                    .build()),
-            ),
-            (
-                Sqe::chain_send_msg_zc(9, msg, ud),
-                e(opcode::SendMsgZc::new(fx, msg)
-                    .flags(crate::completion::CHAIN_SEND_FLAGS as u32)
                     .build()),
             ),
             (
@@ -1902,7 +1883,6 @@ mod encode_tests {
         let plain: Entry128 = opcode::AsyncCancel::new(1).build().user_data(2).into();
         let cases = [
             (Link::None, plain.clone()),
-            (Link::Soft, plain.clone().flags(Flags::IO_LINK)),
             (Link::Hard, plain.flags(Flags::IO_HARDLINK)),
         ];
         for (link, want) in cases {

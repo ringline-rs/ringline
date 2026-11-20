@@ -36,9 +36,6 @@ const UNAWAITED_THEN_COPY_BATCH: u8 = b'2';
 /// A `send` whose completion is dropped, then an awaited zero-copy
 /// `submit_batch`.
 const UNAWAITED_THEN_ZC_BATCH: u8 = b'3';
-/// A `send_chain` whose completion is dropped, then an awaited `send`.
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
-const CHAIN_UNAWAITED_THEN_SEND: u8 = b'4';
 /// An awaited `send`, then a `send` submitted before the await whose
 /// completion is dropped.
 const SEND_THEN_UNAWAITED: u8 = b'5';
@@ -46,9 +43,6 @@ const SEND_THEN_UNAWAITED: u8 = b'5';
 const TWO_AWAITED: u8 = b'6';
 /// An awaited `send` of no bytes.
 const EMPTY_SEND: u8 = b'7';
-/// A `send_chain` whose closure submits nothing.
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
-const EMPTY_CHAIN: u8 = b'8';
 
 struct VecGuard(Vec<u8>);
 
@@ -104,15 +98,6 @@ impl AsyncEventHandler for Scenarios {
                         Err(e) => Err(e),
                     }
                 }
-                #[cfg(has_io_uring)]
-                CHAIN_UNAWAITED_THEN_SEND => {
-                    conn.send_chain(|chain| chain.copy(&[b'a'; FIRST]).finish())
-                        .expect("unawaited chain");
-                    match conn.send(&[b'b'; SECOND]) {
-                        Ok(fut) => fut.await,
-                        Err(e) => Err(e),
-                    }
-                }
                 SEND_THEN_UNAWAITED => match conn.send(&[b'b'; SECOND]) {
                     Ok(fut) => {
                         conn.send(&[b'a'; FIRST]).expect("unawaited send");
@@ -137,14 +122,6 @@ impl AsyncEventHandler for Scenarios {
                     // Something to read, so the client knows the send ran.
                     conn.send(&[b'a'; FIRST]).expect("unawaited send");
                     match conn.send(&[]) {
-                        Ok(fut) => fut.await,
-                        Err(e) => Err(e),
-                    }
-                }
-                #[cfg(has_io_uring)]
-                EMPTY_CHAIN => {
-                    conn.send(&[b'a'; FIRST]).expect("unawaited send");
-                    match conn.send_chain(|_chain| Ok(())) {
                         Ok(fut) => fut.await,
                         Err(e) => Err(e),
                     }
@@ -238,16 +215,6 @@ fn an_awaited_zero_copy_batch_reports_its_own_length() {
     );
 }
 
-#[cfg(has_io_uring)]
-#[test]
-fn a_send_after_an_unawaited_chain_reports_its_own_length() {
-    let n = run(CHAIN_UNAWAITED_THEN_SEND, FIRST + SECOND).expect("the awaited send failed");
-    assert_eq!(
-        n as usize, SECOND,
-        "the awaited send resolved with the chain's result"
-    );
-}
-
 /// The ordering opposite to #617: the awaited send goes first, and the
 /// unawaited send behind it must not settle it. This passed before #617 was
 /// fixed too; it guards the fix against settling the last send queued
@@ -277,10 +244,4 @@ fn two_awaited_sends_in_flight_each_report_their_own_length() {
 #[test]
 fn an_awaited_empty_send_resolves_with_zero() {
     assert_eq!(run(EMPTY_SEND, FIRST).expect("the empty send failed"), 0);
-}
-
-#[cfg(has_io_uring)]
-#[test]
-fn a_chain_that_submits_nothing_resolves_with_zero() {
-    assert_eq!(run(EMPTY_CHAIN, FIRST).expect("the empty chain failed"), 0);
 }

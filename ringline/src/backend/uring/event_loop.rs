@@ -9,7 +9,6 @@ use crate::handler::{Disconnect, SendPoll, SendProbe, WritableEvent};
 
 use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
-use crate::chain::ChainEvent;
 use crate::completion::{OpTag, UserData};
 use crate::connection::{Lifecycle, ReadHalf};
 use crate::metrics;
@@ -1115,11 +1114,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Commit every close registered on `pending_finalize_closes` this
     /// iteration: by `close_connection` from a CQE handler or the task-exit
     /// arm, by `DriverCtx::close` from a task, or by `defer_finalize_close`
-    /// from the completion that drained the connection's sends, chain or
+    /// from the completion that drained the connection's sends or
     /// `Shutdown`. Runs after `poll_ready_tasks`, so a task woken by a read
     /// error is polled, and a send it queues drains, before the Close is
     /// committed (#371). `try_finalize_close` is guarded: a connection with
-    /// sends, a chain or a `Shutdown` still outstanding is dropped from the
+    /// sends or a `Shutdown` still outstanding is dropped from the
     /// list here and registered again by the completion that drains it.
     fn finalize_pending_closes(&mut self) {
         if self.driver.pending_finalize_closes.is_empty() {
@@ -2466,7 +2465,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // The socket belongs to the target worker from here. Commit the Close
         // now so every send path refuses (`close_submitted`) instead of
         // queueing bytes, unencrypted once the TLS state has left, onto it.
-        // The gate guaranteed no sends, chain or shutdown, so this sets
+        // The gate guaranteed no sends or shutdown, so this sets
         // `close_submitted` and pushes the Close, or queues it on
         // `pending_close_retries` when the SQ is full.
         self.driver.try_finalize_close(conn_index);
@@ -3084,33 +3083,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.executor.forget_send(id);
             }
             self.release_pool_slot(pool_slot);
-            return;
-        }
-
-        // Chain path.
-        if self.driver.chain_table.is_active(conn_index) {
-            // A chain's SQEs are tagged `OpTag::Send` and bypass the send
-            // queue, so while one is active this branch claims *every* Send
-            // CQE on the connection. A TLS connection never has one:
-            // `send_chain` on it encrypts and queues instead
-            // (`SendChainBuilder::finish_tls`). Sends submitted while a chain is active
-            // are queued behind it, so no other send's CQE should land here;
-            // if one does, its id must not be dropped on the floor: take it
-            // (or `release` trips) and report this CQE's own outcome.
-            let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-            self.release_pool_slot(pool_slot);
-            if let Some((id, logical_len)) = settles {
-                let settled = if result > 0 {
-                    Ok(logical_len)
-                } else {
-                    Err(Self::send_error(result))
-                };
-                self.settle_send(id, settled);
-            }
-            let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
-            if matches!(event, ChainEvent::Complete { .. }) {
-                self.fire_chain_complete(conn_index);
-            }
             return;
         }
 
@@ -3982,44 +3954,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // Chain path.
-        if self.driver.chain_table.is_active(conn_index) {
-            if cqueue::notif(flags) {
-                self.driver.send_slab.dec_pending_notifs(slab_idx);
-                if self.driver.send_slab.should_release(slab_idx) {
-                    let ps = self.driver.send_slab.release(slab_idx);
-                    if ps != u16::MAX {
-                        self.release_pool_slot(ps);
-                    }
-                }
-                let event = self.driver.chain_table.on_notif_cqe(conn_index);
-                if matches!(event, ChainEvent::Complete { .. }) {
-                    self.fire_chain_complete(conn_index);
-                }
-                return;
-            }
-            if cqueue::more(flags) {
-                // A notification follows whenever the main CQE carries
-                // IORING_CQE_F_MORE -- on error and on a zero result too
-                // (`io_sendrecv_fail`, `io_sendmsg_zc`), -ECANCELED included.
-                // Hold the entry until it arrives.
-                self.driver.send_slab.inc_pending_notifs(slab_idx);
-                self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                self.driver.chain_table.inc_zc_notif(conn_index);
-            } else {
-                // No F_MORE: no notification is coming; release now.
-                let ps = self.driver.send_slab.release(slab_idx);
-                if ps != u16::MAX {
-                    self.release_pool_slot(ps);
-                }
-            }
-            let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
-            if matches!(event, ChainEvent::Complete { .. }) {
-                self.fire_chain_complete(conn_index);
-            }
-            return;
-        }
-
         if cqueue::notif(flags) {
             self.driver.send_slab.dec_pending_notifs(slab_idx);
             if self.driver.send_slab.should_release(slab_idx) {
@@ -4424,47 +4358,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.forward_zc_held[conn_index as usize] = None;
         self.driver.arrival[conn_index as usize].release();
         self.driver.connections.release(conn_index);
-    }
-
-    fn fire_chain_complete(&mut self, conn_index: u32) {
-        let chain = match self.driver.chain_table.take(conn_index) {
-            Some(c) => c,
-            None => return,
-        };
-
-        let failure = chain.failure();
-        let failed = failure.is_some();
-        if failed {
-            self.driver.drain_conn_send_queue(conn_index);
-        } else {
-            self.driver.submit_next_queued(conn_index);
-            self.wake_writable_if_unblocked(conn_index);
-        }
-
-        // `SendHalf::send_chain` attaches an id; a chain built through
-        // `DriverCtx::send_chain` has none.
-        if let Some(id) = chain.send_id {
-            let result = match failure {
-                Some(error) => Err(error),
-                None => {
-                    self.driver.end_logical_send(conn_index);
-                    Ok(chain.bytes_sent)
-                }
-            };
-            self.settle_send(id, result);
-        }
-
-        // The bytes of the chain and the queue behind it are gone, and a dropped
-        // `send_chain` future reports that to nobody but the reader. Later sends
-        // must not reach the peer after that gap.
-        if let Some(err) = chain.failure() {
-            self.abort_connection(conn_index, err);
-        }
-
-        // A close_connection that arrived while the chain was active deferred
-        // its Close on chain_drained. The chain state was just taken, so
-        // register the close for the end-of-iteration drain.
-        self.driver.defer_finalize_close(conn_index);
     }
 
     fn handle_recv_msg_udp(&mut self, ud: UserData, result: i32, flags: u32) {
@@ -5105,7 +4998,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             // Nothing parked any more — the queue was released, or another
-            // path (a completed send chain) already pushed the head: the
+            // path already pushed the head: the
             // entry is stale, and pushing now would put a second SQE on the
             // stream alongside the one in flight.
             let state = &self.driver.send_queues[conn_index as usize];
@@ -5254,16 +5147,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Test-only: inject multiple NOPs and dispatch them all in one batch.
-    /// This tests batch CQE processing where one handler's side effects
-    /// affect subsequent handlers in the same drain_completions() call.
+    /// Test-only: inject NOPs linked in order and dispatch them in one batch.
+    /// Every entry but the last has `IOSQE_IO_LINK` set. From Linux 6.10 the
+    /// kernel propagates a failure along the links; below that `inject`
+    /// models it.
     #[cfg(test)]
-    /// Test-only: submit a linked chain of NOP injects and dispatch.
-    /// The first N-1 SQEs have IO_LINK set; the last does not.
-    /// From Linux 6.10 this tests `IOSQE_IO_LINK` error propagation through
-    /// the kernel; below that it uses `inject`'s model of it.
-    #[cfg(test)]
-    pub(crate) fn inject_linked_chain_and_dispatch(&mut self, cqes: &[(u64, i32)]) {
+    pub(crate) fn inject_linked_and_dispatch(&mut self, cqes: &[(u64, i32)]) {
         let last = cqes.len() - 1;
         for (i, &(user_data_raw, result)) in cqes.iter().enumerate() {
             if i < last {
@@ -6008,17 +5897,6 @@ mod tests {
     ) -> crate::runtime::send_completion::SendId {
         let id = el.executor.register_send(conn_index);
         el.driver.send_slab.set_send_id(slab_idx, id, len);
-        id
-    }
-
-    /// Register an awaited send on `conn_index` and attach it to the
-    /// connection's active chain, as `send_chain` does.
-    fn await_chain(
-        el: &mut AsyncEventLoop<NoopHandler>,
-        conn_index: u32,
-    ) -> crate::runtime::send_completion::SendId {
-        let id = el.executor.register_send(conn_index);
-        el.driver.chain_table.set_send_id(conn_index, id);
         id
     }
 
@@ -9368,14 +9246,15 @@ mod tests {
     /// Whether a forced close (`force_finalize_close`, as when a TLS
     /// close_notify deadline passes) of a connection with a send stuck in the
     /// kernel, with `lead` ahead of its `Close`, releases the socket. The send
-    /// is a chain part, whose `MSG_WAITALL` keeps it in the kernel, or (with
-    /// `chain` false) a send waiting for room, which leaves only its poll
+    /// is a `MSG_WAITALL` send, which stays in the kernel until it finishes
+    /// (no send path submits one; the test pushes it directly), or (with
+    /// `waitall` false) a send waiting for room, which leaves only its poll
     /// there. Either holds the socket until something ends it; the peer never
     /// reads, and sees a hang-up once the socket is shut down or released
     /// (#586).
     fn forced_close_releases_a_stuck_send(
         lead: crate::backend::uring::ring::CloseLead,
-        chain: bool,
+        waitall: bool,
     ) -> bool {
         use std::os::fd::AsRawFd;
         let mut config = test_config();
@@ -9399,11 +9278,19 @@ mod tests {
         }
         drop(ours);
 
-        if chain {
+        if waitall {
             let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(&[7u8; 16384]).unwrap();
             let payload = UserData::send_payload(slot, generation);
             let ud = UserData::encode(OpTag::Send, conn_index, payload);
-            let entry = crate::backend::uring::sqe::Sqe::chain_send(conn_index, ptr, len, ud.raw());
+            let entry = crate::backend::uring::sqe::Sqe::new(
+                crate::backend::uring::sqe::Op::Send {
+                    fd: crate::backend::uring::sqe::Fd::Fixed(conn_index),
+                    buf: ptr,
+                    len,
+                    flags: libc::MSG_WAITALL,
+                },
+                ud.raw(),
+            );
             unsafe { el.driver.ring.push_sqe(&entry) }.expect("push");
             el.driver.send_queues[conn_index as usize].in_flight = true;
         } else {
@@ -10797,191 +10684,7 @@ mod tests {
         );
     }
 
-    /// close_connection must defer the Close SQE while a send chain's SQEs
-    /// are still in the kernel, and finalize once the chain drains.
-    /// A plain send issued while a chain is in flight must queue behind it.
-    /// io_uring does not order independent SQEs, so pushing it directly let
-    /// its bytes reach the peer interleaved with the chain's. Chain completion
-    /// already drains the send queue (`fire_chain_complete`); the send path
-    /// just never queued into it while only a chain was active.
-    #[test]
-    fn a_plain_send_queues_behind_an_active_chain() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnId::new(conn_index, generation);
-
-        el.driver.chain_table.start(conn_index, 1);
-        {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send(token, b"after the chain")
-                .expect("a send behind a chain is accepted");
-        }
-        assert_eq!(
-            el.driver.send_queues[conn_index as usize].queue.len(),
-            1,
-            "a send issued while a chain is active must wait in the queue"
-        );
-
-        // The chain completes; its completion submits what queued behind it.
-        let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
-        assert!(matches!(event, ChainEvent::Complete { .. }));
-        el.fire_chain_complete(conn_index);
-        let state = &el.driver.send_queues[conn_index as usize];
-        assert!(state.queue.is_empty(), "the queued send was not submitted");
-        assert!(state.in_flight, "the queued send is now in flight");
-
-        // And the next send waits behind it rather than pushing past it.
-        {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send(token, b"next").expect("accepted");
-        }
-        assert_eq!(
-            el.driver.send_queues[conn_index as usize].queue.len(),
-            1,
-            "a send issued after the chain completed overtook the queued one"
-        );
-    }
-
-    /// A chain issued while plain sends are queued or in flight would
-    /// overtake them, and the plain queue cannot hold a linked chain, so the
-    /// chain is refused with `WouldBlock` and releases what it built.
-    #[test]
-    fn a_chain_refuses_while_plain_sends_are_in_flight() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnId::new(conn_index, generation);
-        el.driver.send_queues[conn_index as usize].in_flight = true;
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        let result = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send_chain(token).copy(b"chained").finish()
-        };
-        let err = result.expect_err("a chain behind in-flight plain sends must be refused");
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert!(
-            !el.driver.chain_table.is_active(conn_index),
-            "a refused chain must not start"
-        );
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            free_before,
-            "a refused chain must release the slots it built"
-        );
-    }
-
-    /// Guarded memory for a chain's zero-copy part.
-    struct ChainTestGuard(Box<[u8]>);
-
-    impl crate::guard::SendGuard for ChainTestGuard {
-        fn as_ptr_len(&self) -> (*const u8, u32) {
-            (self.0.as_ptr(), self.0.len() as u32)
-        }
-        fn region(&self) -> crate::buffer::fixed::RegionId {
-            crate::buffer::fixed::RegionId::UNREGISTERED
-        }
-    }
-
-    /// A stale handle's chain must not be submitted on the slot's new
-    /// occupant. Its SQEs would write to the new occupant's socket, and the
-    /// `chain_table` entry it started would never complete, since the CQEs
-    /// carry the old generation.
-    #[test]
-    fn a_chain_refuses_a_stale_handle() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let old_gen = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, old_gen);
-
-        el.driver.connections.release(conn_index);
-        let reused = accept_connection(&mut el);
-        assert_eq!(reused, conn_index, "test premise: index reused");
-        let new_gen = el.driver.connections.generation(conn_index);
-        assert_ne!(new_gen, old_gen);
-
-        let pool_free = el.driver.send_copy_pool.free_count();
-        let slab_free = el.driver.send_slab.free_count();
-        let result = with_driver_state(&mut el, || {
-            stale.send_chain(|chain| {
-                chain
-                    .copy(b"chained")
-                    .parts()
-                    .copy(b"head")
-                    .guard(crate::guard::GuardBox::new(ChainTestGuard(
-                        vec![7u8; 8192].into_boxed_slice(),
-                    )))
-                    .add()
-                    .finish()
-            })
-        });
-        let Err(err) = result else {
-            panic!("a stale handle's chain must be refused");
-        };
-        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
-        assert!(
-            !el.driver.chain_table.is_active(conn_index),
-            "a stale handle must not start a chain on the new occupant"
-        );
-        assert_eq!(el.driver.send_copy_pool.free_count(), pool_free);
-        assert_eq!(el.driver.send_slab.free_count(), slab_free);
-
-        // The control: the new occupant's own handle still chains.
-        let current = ConnCtx::new(conn_index, new_gen);
-        let result = with_driver_state(&mut el, || {
-            current.send_chain(|chain| chain.copy(b"chained").finish())
-        });
-        assert!(result.is_ok(), "the current handle must still chain");
-        assert!(el.driver.chain_table.is_active(conn_index));
-    }
-
-    /// A chain on a handle whose connection is gone and whose slot is free
-    /// is refused before anything is submitted.
-    #[test]
-    fn a_chain_refuses_a_handle_whose_slot_is_free() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnId::new(conn_index, generation);
-        el.driver.connections.release(conn_index);
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        let result = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send_chain(token).copy(b"chained").finish()
-        };
-        let err = result.expect_err("a chain on a free slot must be refused");
-        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
-        assert!(!el.driver.chain_table.is_active(conn_index));
-        assert_eq!(el.driver.send_copy_pool.free_count(), free_before);
-    }
-
-    #[test]
-    fn close_defers_while_chain_active() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        el.driver.chain_table.start(conn_index, 1);
-        el.driver.close_connection(conn_index);
-        assert!(
-            el.driver.send_queues[conn_index as usize].close_pending,
-            "close must stay pending while the chain is active"
-        );
-
-        // The chain's operation CQE arrives and completes it; the
-        // end-of-iteration drain then commits the close.
-        let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
-        assert!(matches!(event, ChainEvent::Complete { .. }));
-        el.fire_chain_complete(conn_index);
-        el.finalize_pending_closes();
-        assert!(
-            !el.driver.send_queues[conn_index as usize].close_pending,
-            "close must finalize once the chain drains"
-        );
-    }
-
-    /// A copy-only batch, chain send or chain part wider than one send-pool
+    /// A copy-only batch wider than one send-pool
     /// slot can never fit: it is refused with `InvalidInput`, as the same
     /// data beside a guard part already is, not with the retryable `Other`
     /// of an exhausted pool. Nothing is taken from the pool.
@@ -10997,7 +10700,6 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
         let token = crate::handler::ConnId::new(conn_index, generation);
         let half = [0u8; 40];
-        let whole = [0u8; 100];
 
         let err = {
             let mut ctx = el.driver.make_ctx();
@@ -11009,38 +10711,12 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "send_parts: {err}");
 
-        let err = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send_chain(token)
-                .copy(&whole)
-                .finish()
-                .expect_err("100 bytes do not fit a 64-byte slot")
-        };
-        assert_eq!(
-            err.kind(),
-            io::ErrorKind::InvalidInput,
-            "send_chain copy: {err}"
-        );
-
-        let err = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send_chain(token)
-                .parts()
-                .copy(&half)
-                .copy(&half)
-                .add()
-                .finish()
-                .expect_err("80 bytes do not fit a 64-byte slot")
-        };
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "chain part: {err}");
-
         assert_eq!(
             el.driver.send_copy_pool.free_count(),
             4,
             "nothing was taken"
         );
         assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
-        assert!(!el.driver.chain_table.is_active(conn_index));
     }
 
     /// A `send_parts` batch whose parts carry no bytes queues nothing: no
@@ -11148,47 +10824,6 @@ mod tests {
             el.driver.connections.get(conn_index).unwrap().write,
             crate::connection::WriteHalf::Shutdown
         ));
-    }
-
-    /// `shutdown_write` while a send chain is active defers the FIN until
-    /// the chain completes. The chain's parts are linked SQEs with
-    /// `MSG_WAITALL` and set neither `in_flight` nor the queue, so a
-    /// Shutdown SQE pushed beside them is not ordered behind them: the FIN
-    /// queues behind the bytes already in the socket buffer and the parts
-    /// still waiting for room fail `EPIPE`.
-    #[test]
-    fn shutdown_write_defers_while_chain_active() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnId::new(conn_index, generation);
-
-        el.driver.chain_table.start(conn_index, 1);
-        el.driver.make_ctx().shutdown_write(token);
-        assert!(
-            matches!(
-                el.driver.connections.get(conn_index).unwrap().write,
-                crate::connection::WriteHalf::ShutdownPending
-            ),
-            "the FIN must wait for the chain"
-        );
-        assert!(
-            !el.driver.send_queues[conn_index as usize].shutdown_inflight,
-            "no Shutdown SQE beside the chain's linked parts"
-        );
-
-        // The chain's operation CQE completes it; the FIN goes out then.
-        let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
-        assert!(matches!(event, ChainEvent::Complete { .. }));
-        el.fire_chain_complete(conn_index);
-        assert!(
-            matches!(
-                el.driver.connections.get(conn_index).unwrap().write,
-                crate::connection::WriteHalf::Shutdown
-            ),
-            "the deferred FIN is submitted once the chain drains"
-        );
-        assert!(el.driver.send_queues[conn_index as usize].shutdown_inflight);
     }
 
     /// Dropping the last half closes gracefully, with a close_notify on TLS. An
@@ -13542,36 +13177,6 @@ mod tests {
         assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
     }
 
-    /// A chain whose first send fails closed the connection before; the
-    /// reader is now told why as well.
-    #[test]
-    fn a_chain_send_error_aborts_the_connection() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        el.driver.chain_table.start(conn_index, 2);
-        let ud1 = UserData::encode(
-            OpTag::Send,
-            conn_index,
-            UserData::send_payload(s1, generation),
-        );
-        let ud2 = UserData::encode(
-            OpTag::Send,
-            conn_index,
-            UserData::send_payload(s2, generation),
-        );
-
-        el.inject_linked_chain_and_dispatch(&[(ud1.raw(), -libc::ECONNRESET), (ud2.raw(), 0)]);
-
-        assert!(
-            !el.driver.chain_table.is_active(conn_index),
-            "the chain completed"
-        );
-        assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
-    }
-
     /// A send the close's lead cancelled is not a failure of the connection:
     /// the read half stays as the requested close left it, and no error is
     /// recorded for the reader.
@@ -15920,119 +15525,6 @@ mod tests {
         );
     }
 
-    // ── Linked SQE chain error propagation tests ───────────────────
-    //
-    // Submit linked NOP chains where the first SQE fails. The kernel
-    // cancels subsequent linked SQEs with ECANCELED. This tests the
-    // chain error handling path end-to-end through the real kernel.
-
-    #[test]
-    fn linked_chain_copy_send_first_fails_releases_all() {
-        // 3-SQE chain: first Send fails, second and third get ECANCELED.
-        // All pool slots should be released, chain should complete.
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // Allocate 3 pool slots for the chain.
-        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        let (s3, _, _) = el.driver.send_copy_pool.copy_in(b"ccc").unwrap();
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        // Register chain state: 3 SQEs, 9 total bytes.
-        el.driver.chain_table.start(conn_index, 3);
-        let id = await_chain(&mut el, conn_index);
-
-        // Submit linked NOPs: first with injected error, rest linked.
-        // The completions are: error CQE, ECANCELED CQE, ECANCELED CQE.
-        let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
-        let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
-        let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
-
-        el.inject_linked_chain_and_dispatch(&[
-            (ud1.raw(), -104), // ECONNRESET — first SQE fails
-            (ud2.raw(), 0),    // kernel sets result for linked NOPs
-            (ud3.raw(), 0),    // kernel sets result for linked NOPs
-        ]);
-
-        // All 3 pool slots should be released.
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            free_before + 3,
-            "not all pool slots released after chain error"
-        );
-
-        // Chain should be complete (no longer active).
-        assert!(
-            !el.driver.chain_table.is_active(conn_index),
-            "chain still active after all CQEs processed"
-        );
-
-        // The awaited chain settled with an error.
-        assert!(
-            matches!(send_result(&mut el, id), Some(Err(_))),
-            "chain result not stored"
-        );
-    }
-
-    #[test]
-    fn linked_chain_middle_fails_rest_canceled() {
-        // 3-SQE chain: first succeeds, second fails, third ECANCELED.
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        let (s3, _, _) = el.driver.send_copy_pool.copy_in(b"ccc").unwrap();
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        el.driver.chain_table.start(conn_index, 3);
-        let id = await_chain(&mut el, conn_index);
-
-        let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
-        let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
-        let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
-
-        el.inject_linked_chain_and_dispatch(&[
-            (ud1.raw(), 3),    // first succeeds (3 bytes)
-            (ud2.raw(), -104), // second fails
-            (ud3.raw(), 0),    // third ECANCELED
-        ]);
-
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            free_before + 3,
-            "not all pool slots released"
-        );
-        assert!(!el.driver.chain_table.is_active(conn_index));
-        assert!(matches!(send_result(&mut el, id), Some(Err(_))));
-    }
-
-    #[test]
-    fn linked_chain_all_succeed() {
-        // 3-SQE chain: all succeed. No errors.
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        let (s3, _, _) = el.driver.send_copy_pool.copy_in(b"ccc").unwrap();
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        el.driver.chain_table.start(conn_index, 3);
-        let id = await_chain(&mut el, conn_index);
-
-        let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
-        let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
-        let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
-
-        el.inject_linked_chain_and_dispatch(&[(ud1.raw(), 3), (ud2.raw(), 3), (ud3.raw(), 3)]);
-
-        assert_eq!(el.driver.send_copy_pool.free_count(), free_before + 3);
-        assert!(!el.driver.chain_table.is_active(conn_index));
-        assert_eq!(send_result(&mut el, id).unwrap().unwrap(), 9);
-    }
-
     // ── Bounded-send settlement, teardown and identity ─────────────
     //
     // Series PR 7b (`docs/uring-bounded-send-design.md`). A bounded send
@@ -17033,25 +16525,6 @@ mod tests {
         assert!(!el.driver.send_slab.in_use(slab_idx));
     }
 
-    /// A chain abandoned by a forced close fails the send it carries.
-    #[test]
-    fn a_force_closed_chain_fails_its_send() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver.chain_table.start(conn_index, 1);
-        let id = await_chain(&mut el, conn_index);
-
-        el.driver.force_finalize_close(conn_index);
-
-        assert_eq!(
-            send_result(&mut el, id)
-                .expect("the cancelled chain settled its send")
-                .expect_err("the chain never completed")
-                .kind(),
-            io::ErrorKind::ConnectionAborted
-        );
-    }
-
     /// A zero-copy send settles on its operation CQE, before the
     /// notification that frees its guards.
     #[test]
@@ -17094,16 +16567,12 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let conn = ConnCtx::new(conn_index, generation);
-        // Another send is in flight, so every chain is refused.
+        // Another send is in flight.
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let huge = vec![0u8; 1 << 24];
         let kind = |r: io::Result<crate::SendCompletion>| r.err().map(|e| e.kind());
         for _ in 0..10 {
             with_driver_state(&mut el, || {
-                let refused = conn.send_chain(|chain| chain.copy(b"x").finish());
-                assert_eq!(kind(refused), Some(io::ErrorKind::WouldBlock));
-                let empty = conn.send_chain(|_chain| Ok(()));
-                assert!(empty.is_ok());
                 assert_eq!(kind(conn.send(&huge)), Some(io::ErrorKind::InvalidInput));
 
                 // `build`: an empty batch, a closure that never submits, and
@@ -17168,10 +16637,10 @@ mod tests {
         assert_eq!(el.executor.send_completions.live(), 0);
     }
 
-    /// A `build` or `send_chain` closure that panics leaves no entry in the
-    /// completion table: the id was registered before the closure ran.
+    /// A `build` closure that panics leaves no entry in the completion table:
+    /// the id was registered before the closure ran.
     #[test]
-    fn a_panicking_build_or_chain_closure_leaves_no_entry() {
+    fn a_panicking_build_closure_leaves_no_entry() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
@@ -17183,12 +16652,6 @@ mod tests {
                 })
             }));
             assert!(built.is_err(), "the panic reached the caller");
-            let chained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_driver_state(&mut el, || {
-                    conn.send_chain(|_c| -> io::Result<()> { panic!("a chain closure panics") })
-                })
-            }));
-            assert!(chained.is_err(), "the panic reached the caller");
         }
         assert_eq!(el.executor.send_completions.live(), 0);
     }
@@ -17224,59 +16687,45 @@ mod tests {
         assert_eq!(el.executor.send_completions.live(), 0);
     }
 
-    /// A `build` or `send_chain` closure that panics after its send was
-    /// submitted leaves no entry, and the send's completion, when it arrives,
-    /// settles nothing: not the withdrawn id, and not a later send that took
-    /// its slot in the table.
+    /// A `build` closure that panics after its send was submitted leaves no
+    /// entry, and the send's completion, when it arrives, settles nothing: not
+    /// the withdrawn id, and not a later send that took its slot in the table.
     #[test]
-    fn a_panic_after_a_submitted_build_or_chain_settles_nothing() {
+    fn a_panic_after_a_submitted_build_settles_nothing() {
         let mut el = make_test_loop();
-        for chain in [false, true] {
-            let conn_index = accept_connection(&mut el);
-            let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_driver_state(&mut el, || {
-                    if chain {
-                        let _ = conn.send_chain(|c| -> io::Result<()> {
-                            c.copy(b"x").finish()?;
-                            panic!("a chain closure panics after finish")
-                        });
-                    } else {
-                        let _ = conn.send_parts().build(|b| -> io::Result<()> {
-                            b.copy(b"x").submit()?;
-                            panic!("a build closure panics after submit")
-                        });
-                    }
-                })
-            }));
-            assert!(
-                panicked.is_err(),
-                "the panic reached the caller (chain: {chain})"
-            );
-            assert_eq!(el.executor.send_completions.live(), 0, "chain: {chain}");
-            let ud = el
-                .driver
-                .ring
-                .last_pushed
-                .as_ref()
-                .expect("the send was pushed")
-                .user_data;
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_driver_state(&mut el, || {
+                let _ = conn.send_parts().build(|b| -> io::Result<()> {
+                    b.copy(b"x").submit()?;
+                    panic!("a build closure panics after submit")
+                });
+            })
+        }));
+        assert!(panicked.is_err(), "the panic reached the caller");
+        assert_eq!(el.executor.send_completions.live(), 0);
+        let ud = el
+            .driver
+            .ring
+            .last_pushed
+            .as_ref()
+            .expect("the send was pushed")
+            .user_data;
 
-            // A later send takes the withdrawn id's slot in the table.
-            let later = el.executor.register_send(conn_index);
-            el.test_dispatch_cqe(ud, 1, 0);
-            assert!(
-                !el.driver.send_queues[conn_index as usize].in_flight
-                    && !el.driver.chain_table.is_active(conn_index),
-                "the completion was handled (chain: {chain})"
-            );
-            assert!(
-                el.executor.take_send_result(later).is_none(),
-                "the completion settled a later send (chain: {chain})"
-            );
-            el.executor.withdraw_send(later);
-            assert_eq!(el.executor.send_completions.live(), 0, "chain: {chain}");
-        }
+        // A later send takes the withdrawn id's slot in the table.
+        let later = el.executor.register_send(conn_index);
+        el.test_dispatch_cqe(ud, 1, 0);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].in_flight,
+            "the completion was handled"
+        );
+        assert!(
+            el.executor.take_send_result(later).is_none(),
+            "the completion settled a later send"
+        );
+        el.executor.withdraw_send(later);
+        assert_eq!(el.executor.send_completions.live(), 0);
     }
 
     /// A send owned by its connection's own task is abandoned when the
@@ -18975,7 +18424,7 @@ mod tests {
     // `IORING_NOP_INJECT_RESULT` (Linux 6.10, modelled below it) is the
     // mechanism, as it is for the `nop_inject_*` tests above;
     // `inject_and_dispatch`,
-    // `inject_batch_and_dispatch` and `inject_linked_chain_and_dispatch` are
+    // `inject_batch_and_dispatch` and `inject_linked_and_dispatch` are
     // the three shapes.
 
     /// A generation whose low bits are a real pattern rather than 0 or 1.
@@ -19605,7 +19054,7 @@ mod tests {
             UserData::send_payload(slot, generation),
         );
         let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
-        el.inject_linked_chain_and_dispatch(&[(send_ud.raw(), 9), (close_ud.raw(), 0)]);
+        el.inject_linked_and_dispatch(&[(send_ud.raw(), 9), (close_ud.raw(), 0)]);
 
         assert!(
             el.driver.connections.get(conn_index).is_none(),
@@ -19654,7 +19103,7 @@ mod tests {
             UserData::send_payload(slot, generation),
         );
         let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
-        el.inject_linked_chain_and_dispatch(&[(close_ud.raw(), 0), (send_ud.raw(), 8)]);
+        el.inject_linked_and_dispatch(&[(close_ud.raw(), 0), (send_ud.raw(), 8)]);
 
         assert!(
             el.driver.connections.get(conn_index).is_none(),

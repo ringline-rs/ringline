@@ -1,8 +1,8 @@
 # Send pool: bounded sends, per-connection tickets, and a cap
 
 Status: proposal. Experiment stage 0 has run
-(`docs/journal/2026-11-send-pool-stage0.md`); nothing in the runtime is
-implemented.
+(`docs/journal/2026-11-send-pool-stage0.md`). Of the order of work, only the
+removal of `send_chain` (part of step 4) is implemented.
 
 Terms: the worker queue is the worker's queue of sends waiting for
 send-pool slots, which `docs/send-admission-design.md` calls the FIFO

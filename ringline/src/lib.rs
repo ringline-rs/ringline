@@ -165,8 +165,6 @@ pub mod buf;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod buffer;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
-pub(crate) mod chain;
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod completion;
 pub(crate) mod connection;
 pub mod direct_io;

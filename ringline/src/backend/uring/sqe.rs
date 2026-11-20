@@ -25,8 +25,6 @@ pub(crate) enum Fd {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Link {
     None,
-    /// `IOSQE_IO_LINK`: the next op runs only if this one succeeds.
-    Soft,
     /// `IOSQE_IO_HARDLINK`: the next op runs whatever this one's result.
     Hard,
 }
@@ -221,19 +219,6 @@ impl Sqe {
         )
     }
 
-    /// A stream send in a linked chain. See [`Sqe::chain_send_msg_zc`].
-    pub(crate) fn chain_send(index: u32, buf: *const u8, len: u32, user_data: u64) -> Self {
-        Sqe::new(
-            Op::Send {
-                fd: Fd::Fixed(index),
-                buf,
-                len,
-                flags: crate::completion::CHAIN_SEND_FLAGS,
-            },
-            user_data,
-        )
-    }
-
     /// A plain `sendmsg` on registered file `index`: the kernel copies the
     /// iovecs into the socket. For a socket that refuses `SENDMSG_ZC`, such as
     /// a Unix-domain one (#829).
@@ -248,19 +233,6 @@ impl Sqe {
         )
     }
 
-    /// A plain `sendmsg` in a linked chain. See [`Sqe::send_msg`] and
-    /// [`Sqe::chain_send_msg_zc`].
-    pub(crate) fn chain_send_msg(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
-        Sqe::new(
-            Op::SendMsg {
-                fd: Fd::Fixed(index),
-                msg,
-                flags: crate::completion::CHAIN_SEND_FLAGS as u32,
-            },
-            user_data,
-        )
-    }
-
     /// A zero-copy `sendmsg` on registered file `index`.
     pub(crate) fn send_msg_zc(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
         Sqe::new(
@@ -268,20 +240,6 @@ impl Sqe {
                 fd: Fd::Fixed(index),
                 msg,
                 flags: crate::completion::STREAM_SEND_FLAGS as u32,
-            },
-            user_data,
-        )
-    }
-
-    /// A zero-copy `sendmsg` in a linked chain. The kernel retries a short send
-    /// and fails the link if it cannot finish, because the next SQE of the
-    /// chain would otherwise follow a gap.
-    pub(crate) fn chain_send_msg_zc(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
-        Sqe::new(
-            Op::SendMsgZc {
-                fd: Fd::Fixed(index),
-                msg,
-                flags: crate::completion::CHAIN_SEND_FLAGS as u32,
             },
             user_data,
         )

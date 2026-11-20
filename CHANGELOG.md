@@ -1279,6 +1279,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** io_uring: `send_chain` on `Connection` and `SendHalf`, its
+  builders `SendChainBuilder` and
+  `ChainPartsBuilder`, and `ConfigBuilder::max_chain_length`. Send the parts
+  as one `send_parts(..).submit_batch(..)`, or as `send` calls one after
+  another: sends on a connection go out in the order they are made. A chain
+  part's `MSG_WAITALL` send held an io-wq thread while it waited on a
+  half-closed peer; no send does that now.
+- **Breaking:** `metrics::park_abandon::CHAIN` and the `chain` op of
+  `ringline/park_abandoned`. Slots 8 to 11 are unused.
+
 - **Breaking:** `fs::read` and `fs::write`, which took a raw pointer
   (#825). Use `fs::read_into` and `fs::write_from` (see Changed).
 

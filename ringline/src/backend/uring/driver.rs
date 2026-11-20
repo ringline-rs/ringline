@@ -15,7 +15,6 @@ use crate::backend::Ring;
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::buffer::send_slab::InFlightSendSlab;
-use crate::chain::SendChainTable;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, Lifecycle, ReadHalf, WriteHalf};
@@ -813,10 +812,6 @@ pub(crate) struct Driver {
     pub(crate) loop_diag: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
-    /// Per-connection send chain tracking for IOSQE_IO_LINK chains.
-    pub(crate) chain_table: SendChainTable,
-    /// Maximum SQEs per chain (0 = disabled).
-    pub(crate) max_chain_length: u16,
     /// Per-connection send queues for serializing sends (one in-flight at a time).
     pub(crate) send_queues: Vec<ConnSendState>,
     /// Connection indices that currently have a `close_notify_deadline`
@@ -1004,7 +999,7 @@ pub(crate) struct Driver {
     /// connection when it requests its close with nothing outstanding,
     /// `DriverCtx::close` whenever it requests one, and
     /// `defer_finalize_close` registers it from the completion that drains
-    /// its sends, chain or `Shutdown`. The drain runs
+    /// its sends or `Shutdown`. The drain runs
     /// after `poll_ready_tasks`, so a task woken in the same iteration is
     /// polled, and a send it queues drains, before the Close is committed
     /// (#371).
@@ -1116,9 +1111,6 @@ pub(crate) enum ParkBlocker {
     /// Invariant 1 requires outlive the operation, so the fd cannot leave
     /// until they land.
     Sends,
-    /// A send chain has SQEs in the kernel whose CQEs drive its own
-    /// accounting; it has to finish where it started.
-    Chain,
 }
 
 impl ParkBlocker {
@@ -1139,7 +1131,6 @@ impl ParkBlocker {
             ParkBlocker::NotOffered => pa::NOT_OFFERED,
             ParkBlocker::Closing => pa::CLOSING,
             ParkBlocker::Sends => pa::SENDS,
-            ParkBlocker::Chain => pa::CHAIN,
         }
     }
 }
@@ -1163,7 +1154,6 @@ mod park_blocker_tests {
             ParkBlocker::NotOffered,
             ParkBlocker::Closing,
             ParkBlocker::Sends,
-            ParkBlocker::Chain,
         ];
         let mut seen = std::collections::HashMap::new();
         for b in all {
@@ -1391,8 +1381,6 @@ impl Driver {
             tcp_nodelay: config.tcp_nodelay,
             loop_diag: config.loop_diag,
             send_zc_threshold: config.send_zc_threshold,
-            chain_table: SendChainTable::new(config.max_connections),
-            max_chain_length: config.max_chain_length,
             send_queues,
             close_notify_armed: Vec::new(),
             tls_out_scratch: Vec::new(),
@@ -1534,8 +1522,6 @@ impl Driver {
             send_zc_threshold: self.send_zc_threshold,
             zero_copy_hold_cap: self.zero_copy_hold_cap,
             connect_deadlines: &mut self.connect_deadlines,
-            chain_table: &mut self.chain_table,
-            max_chain_length: self.max_chain_length,
             send_queues: &mut self.send_queues,
             close_notify_armed: &mut self.close_notify_armed,
             nvme_devices: &mut self.nvme_devices,
@@ -1554,7 +1540,6 @@ impl Driver {
             capacity_released: &mut self.capacity_released,
             next_disk_io_seq: &mut self.next_disk_io_seq,
             write_orders: &mut self.write_orders,
-            tls_chain_carried: false,
             parts_id_carried: false,
         }
     }
@@ -1877,7 +1862,7 @@ impl Driver {
     /// `submit_next_queued`. The send handlers register the connection for
     /// the end-of-iteration drain (`defer_finalize_close`); with nothing
     /// queued or in flight, this method registers it itself. The drain's
-    /// `try_finalize_close` commits the Close once no send, chain or
+    /// `try_finalize_close` commits the Close once no send or
     /// `Shutdown` is outstanding. Park state is released here, since a slot
     /// that is never reused would hold a `ParkState` for the life of the
     /// process.
@@ -1910,11 +1895,6 @@ impl Driver {
         self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
-        // An active chain keeps its state: its SQEs are in the kernel and
-        // their CQEs drive the chain accounting (an error in one linked op
-        // cancels the rest, still with CQEs); `try_finalize_close` waits for
-        // it, so the Close cannot recycle the slot under them. Cancelling
-        // the chain here would drop that accounting.
         // The queue is neither released nor submitted here: entries not yet
         // submitted carry bytes the peer is owed, and io_uring does not
         // order independent SQEs (Domain Invariant 2), so they go out one
@@ -2155,9 +2135,6 @@ impl Driver {
         if send.in_flight || !send.queue.is_empty() {
             return Some(ParkBlocker::Sends);
         }
-        if self.chain_table.is_active(conn_index) {
-            return Some(ParkBlocker::Chain);
-        }
         None
     }
 
@@ -2196,23 +2173,19 @@ impl Driver {
         }
     }
 
-    /// Submit the deferred `Close` SQE once every pending send, send chain and
+    /// Submit the deferred `Close` SQE once every pending send and
     /// `Shutdown` for this connection has finished.
     ///
     /// Called from the event loop's end-of-iteration drain of
     /// `pending_finalize_closes`, from `force_finalize_close`, and from the
     /// park install, which commits the Close of a handed-off socket at once.
-    /// The send, chain and `Shutdown` completion handlers do not call this:
+    /// The send and `Shutdown` completion handlers do not call this:
     /// they call `defer_finalize_close`, so that when the last gating CQE
     /// lands in the same batch as a read error, the Close is committed after
     /// the task woken by the error has been polled.
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
         let state = &self.send_queues[conn_index as usize];
         let sends_drained = !state.in_flight && state.queue.is_empty();
-        // An active send chain has SQEs in the kernel whose CQEs drive its
-        // accounting; the chain completion handlers register the connection
-        // for the drain once the chain drains.
-        let chain_drained = !self.chain_table.is_active(conn_index);
         // A `Shutdown` SQE still in the kernel names this slot as
         // `Fixed(conn_index)`. `Close` frees the slot for the next accept to
         // register, so submitting it now lets the FIN land on that next
@@ -2224,12 +2197,7 @@ impl Driver {
         // before the `Close`: `handle_disconnect` registers the connection
         // for the drain once its CQE lands.
         let disconnect_drained = state.disconnect != Disconnect::Alone;
-        if !(state.close_pending
-            && sends_drained
-            && chain_drained
-            && shutdown_drained
-            && disconnect_drained)
-        {
+        if !(state.close_pending && sends_drained && shutdown_drained && disconnect_drained) {
             return;
         }
         // A close_notify the pool had no slot for at the close goes out now
@@ -2348,8 +2316,7 @@ impl Driver {
     /// The caller (`ConnCtx::abort`) has failed the reader and the sends
     /// waiting for capacity or in flight. Here, as `close_connection` and
     /// `force_finalize_close` do: the connection is marked closing, its
-    /// queued sends are failed and released, an active chain's accounting is
-    /// cancelled, and a retained close_notify is dropped. On TCP the `Close`
+    /// queued sends are failed and released, and a retained close_notify is dropped. On TCP the `Close`
     /// is preceded by a disconnect (`Ring::submit_abort_close`), which resets
     /// the socket and purges its write queue, so the zero-copy notifications
     /// of the sends the kernel holds land and release their slab entries
@@ -2403,9 +2370,6 @@ impl Driver {
             cs.write = WriteHalf::Open;
         }
         self.fail_send_ids(settles, had_queue);
-        if let Some(id) = self.chain_table.cancel(conn_index) {
-            self.fail_send_ids(vec![id], false);
-        }
         self.disarm_close_notify_deadline(conn_index);
         let tcp = !self
             .connections
@@ -2457,7 +2421,7 @@ impl Driver {
     /// Force a deferred close whose drain will never finish (close_notify
     /// deadline elapsed — the peer stopped reading, so the queued/in-flight
     /// sends are stuck). Deliberately abandons outstanding work: queued
-    /// (never-submitted) sends are released here; the in-flight send / chain
+    /// (never-submitted) sends are released here; the in-flight send
     /// SQEs are left to the kernel. The Close does not cancel them; the
     /// `CloseLead` linked ahead of it ends them (a shutdown before Linux
     /// 6.13, a cancel from 6.13). Their CQEs (`-ECANCELED`, `EPIPE`, or a
@@ -2505,10 +2469,6 @@ impl Driver {
             cs.write = WriteHalf::Open;
         }
         self.fail_send_ids(settles, had_queue);
-        // The chain's slots come back with its CQEs, which report them.
-        if let Some(id) = self.chain_table.cancel(conn_index) {
-            self.fail_send_ids(vec![id], false);
-        }
         // Disarm whether or not the Close commits now: the queue is
         // abandoned, and if a `Shutdown` holds the Close its CQE commits it.
         self.disarm_close_notify_deadline(conn_index);
@@ -2551,17 +2511,13 @@ impl Driver {
         }
     }
 
-    /// Whether `conn_index` has no send queued or in flight, no chain
-    /// active, and its most recent send did not wait for room in the
+    /// Whether `conn_index` has no send queued or in flight and its most recent send did not wait for room in the
     /// socket: the condition `SendAdmissionOrder::Budget` puts on the
     /// connection of a send that passes a waiting head. Meaningful only
     /// while `track_room_waits` is set.
     pub(crate) fn send_idle(&self, conn_index: u32) -> bool {
         let state = &self.send_queues[conn_index as usize];
-        state.queue.is_empty()
-            && !state.in_flight
-            && !state.room_waited
-            && !self.chain_table.is_active(conn_index)
+        state.queue.is_empty() && !state.in_flight && !state.room_waited
     }
 
     /// [`submit_next_queued`](Self::submit_next_queued) without clearing the
@@ -2657,16 +2613,10 @@ impl Driver {
         conn_index: u32,
         built: crate::handler::BuiltSend,
     ) {
-        // An active IO_LINK chain counts as in flight: io_uring does not order
-        // independent SQEs, so pushing this send now could interleave its bytes
-        // with the chain's on the wire. Queue it and mark the queue as owning
-        // the send order (`in_flight`), as parking does; the invariant is that
-        // a non-empty queue implies `in_flight`, which `submit_next_queued`
-        // relies on. Chain completion submits the queue
-        // (`fire_chain_complete` -> `submit_next_queued`).
-        let chain_active = self.chain_table.is_active(conn_index);
+        // A non-empty queue implies `in_flight`, which `submit_next_queued`
+        // relies on.
         let state = &mut self.send_queues[conn_index as usize];
-        if state.in_flight || chain_active {
+        if state.in_flight {
             state.queue.push_back(built);
             state.in_flight = true;
             return;

@@ -21,8 +21,6 @@ const BIG: usize = 1 << 20;
 const SMALL: usize = 8192;
 const PREFIX: &[u8] = b"prefix:";
 const SUFFIX: &[u8] = b":suffix";
-#[cfg(has_io_uring)]
-const TAIL: &[u8] = b"after the chain";
 
 struct VecGuard(Vec<u8>);
 
@@ -48,18 +46,13 @@ fn expected() -> Vec<u8> {
     out.extend_from_slice(&pattern(BIG, 1));
     out.extend_from_slice(SUFFIX);
     out.extend_from_slice(&pattern(SMALL, 2));
-    #[cfg(has_io_uring)]
-    {
-        out.extend_from_slice(&pattern(SMALL, 3));
-        out.extend_from_slice(TAIL);
-    }
     out.extend_from_slice(b"ok");
     out
 }
 
 /// On a byte from the peer: a copy, guard, copy `send_parts`; a guard-only
-/// `send_parts`; on io_uring a `send_chain` of a guard part and a copied tail;
-/// then, on a second byte, "ok".
+/// `send_parts`; then, on a
+/// second byte, "ok".
 struct GuardSender;
 
 impl AsyncEventHandler for GuardSender {
@@ -81,18 +74,8 @@ impl AsyncEventHandler for GuardSender {
                 .send_parts()
                 .submit_batch(vec![SendPart::Guard(small)])
                 .expect("guard-only send accepted");
-            // A chain starts only once the earlier sends have completed.
             mixed.await.expect("mixed guard send");
             guard_only.await.expect("guard-only send");
-            // `send_chain` is io_uring only.
-            #[cfg(has_io_uring)]
-            {
-                let chained = GuardBox::new(VecGuard(pattern(SMALL, 3)));
-                conn.send_chain(|c| c.parts().guard(chained).add().copy(TAIL).finish())
-                    .expect("chain accepted")
-                    .await
-                    .expect("chain sent");
-            }
             if conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
                 .await

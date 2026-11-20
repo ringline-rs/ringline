@@ -346,11 +346,6 @@ pub struct Config {
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
     /// iteration while enabled. io_uring backend only. Default: false.
     pub(crate) loop_diag: bool,
-    /// Maximum parts in one `send_chain` (`SendChainBuilder::copy` and
-    /// `ChainPartsBuilder::add` each count one). A chain that would exceed
-    /// it fails with `InvalidInput`. 0 refuses every chain. It does not
-    /// affect `send` or `send_parts`. Default: 16.
-    pub(crate) max_chain_length: u16,
     /// Maximum number of standalone async tasks (not bound to connections)
     /// per worker. Used with [`spawn()`](crate::spawn).
     /// Default: 256.
@@ -563,7 +558,6 @@ impl Default for Config {
             peer_accept: Vec::new(),
             peer_park: Vec::new(),
             loop_diag: false,
-            max_chain_length: 16,
             standalone_task_capacity: 256,
             udp_bind: Vec::new(),
             udp_connect_peers: Vec::new(),
@@ -1324,8 +1318,8 @@ impl ConfigBuilder {
     /// guarded send on a connection that holds `cap` entries is refused:
     /// [`submit_batch_admitted`](crate::AsyncSendBuilder::submit_batch_admitted)
     /// returns its parts with `WouldBlock`, as for a full slab, and the caller
-    /// can send their bytes with a copy send. `submit_batch`, `build` and a
-    /// send chain return `Other` and drop the guards. The check counts the
+    /// can send their bytes with a copy send. `submit_batch` and `build`
+    /// return `Other` and drop the guards. The check counts the
     /// connection's own entries, so one connection alone is refused once it
     /// holds more than half the slab. Entries of every kind count, including
     /// those of coalesced copy sends and of
@@ -1453,14 +1447,6 @@ impl ConfigBuilder {
     /// Set the deadline-based flush interval in microseconds. 0 = disabled.
     pub fn flush_interval_us(mut self, us: u64) -> Self {
         self.config.flush_interval_us = us;
-        self
-    }
-
-    // ── Chain settings ───────────────────────────────────────────────
-
-    /// Set the maximum number of SQEs per IO_LINK chain. 0 disables chaining.
-    pub fn max_chain_length(mut self, n: u16) -> Self {
-        self.config.max_chain_length = n;
         self
     }
 

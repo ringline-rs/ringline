@@ -1028,44 +1028,6 @@ impl Ring {
         Ok(())
     }
 
-    /// Push a chain of linked SQEs atomically.
-    ///
-    /// Sets `IOSQE_IO_LINK` on all entries except the last, so the kernel
-    /// executes them sequentially. The engine queues them contiguously
-    /// (`Engine::push_chain`).
-    ///
-    /// # Safety
-    /// All SQEs must reference valid memory for the lifetime of their operations.
-    pub(crate) unsafe fn push_sqe_chain(&mut self, entries: &mut [Sqe]) -> io::Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        // A short part would be followed by the next one across a gap, and the
-        // chain's accounting does not resubmit one (#734).
-        debug_assert!(
-            entries.iter().all(|entry| match entry.op {
-                Op::Send { flags, .. } => flags == crate::completion::CHAIN_SEND_FLAGS,
-                Op::SendMsg { flags, .. } | Op::SendMsgZc { flags, .. } => {
-                    flags == crate::completion::CHAIN_SEND_FLAGS as u32
-                }
-                _ => true,
-            }),
-            "a chain part must be built with the chain send flags"
-        );
-        if entries.len() == 1 {
-            return unsafe { self.push_sqe(&entries[0]) };
-        }
-
-        // Link every entry to the next, except the last.
-        let last = entries.len() - 1;
-        for entry in entries[..last].iter_mut() {
-            debug_assert_eq!(entry.link, Link::None, "a chain sets its own links");
-            entry.link = Link::Soft;
-        }
-
-        unsafe { self.engine.push_chain(entries) }
-    }
-
     /// Close fixed-file slot `fd_index` with `IORING_OP_CLOSE`: an fs file's
     /// or NVMe device's, which the caller keeps allocated in its table until
     /// the completion (tag `FileClose`), so no open installs into the slot

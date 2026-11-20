@@ -1483,53 +1483,6 @@ impl ConnCtx {
 
     // ── Connect ──────────────────────────────────────────────────────
 
-    // ── Send chain ────────────────────────────────────────────────────
-
-    /// Build an IO_LINK chained send. See [`SendHalf::send_chain`].
-    ///
-    /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder) for
-    /// constructing linked SQEs. Call `.copy()`, `.parts()...add()` to build the
-    /// chain, then `.finish()` to submit it. Returns a [`SendCompletion`] that
-    /// resolves with the bytes the chain sent, or `Ok(0)` when the closure
-    /// submitted nothing.
-    #[cfg(has_io_uring)]
-    pub(crate) fn send_chain<F>(&self, f: F) -> io::Result<SendCompletion>
-    where
-        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
-    {
-        with_state(|driver, executor| {
-            let id = executor.register_send(self.conn_index);
-            let unwinding = WithdrawUnlessDisarmed(Some(id));
-            let mut ctx = driver.make_ctx();
-            let token = ConnId::new(self.conn_index, self.generation);
-            let builder = ctx.send_chain_awaited(token, id);
-            let built = f(builder);
-            unwinding.disarm();
-            if let Err(e) = built {
-                executor.withdraw_send(id);
-                return Err(e);
-            }
-            // A TLS chain is queued as one encrypted send, not through
-            // `chain_table`.
-            let tls_carried = ctx.tls_chain_carried;
-            // A closure that submitted nothing (an empty chain, or no
-            // `finish`) sent nothing.
-            if !tls_carried && !driver.chain_table.carries(self.conn_index, id) {
-                executor.withdraw_send(id);
-                return Ok(SendCompletion::ready(
-                    self.conn_index,
-                    self.generation,
-                    Ok(0),
-                ));
-            }
-            Ok(SendCompletion::pending(
-                self.conn_index,
-                self.generation,
-                id,
-            ))
-        })
-    }
-
     // ── Shutdown / cancel ─────────────────────────────────────────────
 
     /// Shutdown the write side of the connection (half-close).
@@ -1539,9 +1492,8 @@ impl ConnCtx {
     /// Any `send_backpressured` still waiting for
     /// pool capacity on this connection fails with
     /// [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather than waiting for a
-    /// turn it could no longer use. Already-submitted sends, and the parts
-    /// of an active `send_chain`, are left alone: their bytes may already be
-    /// on the way, and the FIN is ordered behind them. Plain `send` is
+    /// turn it could no longer use. Already-submitted sends are left alone:
+    /// their bytes may already be on the way, and the FIN is ordered behind them. Plain `send` is
     /// unaffected either way.
     pub(crate) fn shutdown_write(&self) {
         with_state(|driver, executor| {
@@ -1757,10 +1709,8 @@ impl AsyncSendBuilder {
     /// total length of its parts once the send completes.
     ///
     /// The closure chains `.copy()` / `.guard()` calls and ends with
-    /// `.submit()`, as a [`send_chain`](SendHalf::send_chain) closure ends
-    /// with `.finish()`. `submit` refuses a batch that carries no bytes with
-    /// `InvalidInput`. Unlike `send_chain`, whose closure may submit nothing
-    /// and resolve `Ok(0)`, a `build` that submits nothing is refused with
+    /// `.submit()`. `submit` refuses a batch that carries no bytes with
+    /// `InvalidInput`. A `build` that submits nothing is refused with
     /// `InvalidInput`: a closure that returns `Ok` without a successful
     /// `submit`, including one that discards `submit`'s error, sent nothing.
     ///
@@ -1887,9 +1837,8 @@ impl AsyncSendBuilder {
 
 /// Withdraws a registered send id when dropped, unless disarmed.
 ///
-/// `AsyncSendBuilder::build` and `ConnCtx::send_chain` register the id
-/// before their closure runs, and `AsyncSendBuilder::submit_batch` before
-/// the guards' code runs. A panic there unwinds past the withdrawal that
+/// `AsyncSendBuilder::build` registers the id before its closure runs, and
+/// `AsyncSendBuilder::submit_batch` before the guards' code runs. A panic there unwinds past the withdrawal that
 /// follows, and the entry would stay in the completion table for the life
 /// of the worker: no future holds it, so nothing would free it, and a send
 /// that was submitted before the panic would settle it for nobody. Dropped
@@ -3310,15 +3259,6 @@ impl Connection {
         self.tx.conn.forward_recv_buf(data)
     }
 
-    /// See [`SendHalf::send_chain`].
-    #[cfg(has_io_uring)]
-    pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendCompletion>
-    where
-        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
-    {
-        self.tx.conn.send_chain(f)
-    }
-
     /// See [`SendHalf::shutdown_write`].
     pub fn shutdown_write(&mut self) {
         self.tx.conn.shutdown_write();
@@ -3432,7 +3372,7 @@ impl SendHalf {
     /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap): the
     /// connection holds that many send slab entries and the worker's slab is
     /// over half used. A caller that cannot get its parts back from a refusal
-    /// (`submit_batch`, `build`, `send_chain`) checks this first and sends the
+    /// (`submit_batch`, `build`) checks this first and sends the
     /// bytes as a copy instead. False on a TLS connection, whose guarded sends
     /// are copied and are not refused at the cap, on a closed connection, and
     /// on mio, which has no send slab.
@@ -3726,8 +3666,7 @@ impl SendHalf {
     /// Any `send_backpressured` still waiting for pool capacity on this
     /// connection fails with [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather
     /// than waiting for a turn it could no longer use. Already-submitted
-    /// sends, and the parts of an active `send_chain`, are left alone: their
-    /// bytes may already be on the way, and the FIN is ordered behind them.
+    /// sends are left alone: their bytes may already be on the way, and the FIN is ordered behind them.
     /// Plain `send` is unaffected either way.
     ///
     /// On io_uring the shutdown runs on the worker's io-wq pool, and a close
@@ -3745,52 +3684,6 @@ impl SendHalf {
     /// See [`Connection::tls_info`].
     pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         self.conn.tls_info()
-    }
-
-    /// Build an IO_LINK chained send, with a future for its completion.
-    ///
-    /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder)
-    /// for constructing linked SQEs. Call `.copy()`, `.parts()...add()` to build
-    /// the chain, then `.finish()` to submit it. Returns a [`SendCompletion`] that
-    /// resolves with the bytes the chain sent, or `Ok(0)` when the closure
-    /// submitted nothing.
-    ///
-    /// On a plaintext connection, `finish` returns `WouldBlock` while a send on
-    /// the connection is in flight or queued, or another chain is active, since
-    /// a linked chain would overtake them; retry once they complete. On a TLS
-    /// connection the parts are not linked SQEs: `copy` and `add` gather them,
-    /// guard parts included, and `finish` encrypts them as one send and queues
-    /// it behind the connection's other sends, so it does not refuse while
-    /// earlier sends are in flight.
-    ///
-    /// On a plaintext connection each `copy` and each part's copy data
-    /// together must fit one send-pool slot (the `slot_size` given to
-    /// [`ConfigBuilder::send_pool`](crate::ConfigBuilder::send_pool));
-    /// `finish` rejects a wider one with `InvalidInput` and submits nothing.
-    ///
-    /// A chain that fails closes the connection, because an unknown part of it
-    /// was sent and the sends queued behind it are lost, so later bytes would
-    /// reach the peer after a gap. That includes a zero-copy part that fails
-    /// with `ENOMEM`, or with `EAGAIN` because the peer has half-closed, which
-    /// an ordinary send recovers from with plain sends. So a chain part larger
-    /// than the send buffer's room cannot reach a half-closed peer, even one
-    /// that is reading: use [`send_parts`](Self::send_parts) for that.
-    ///
-    /// If a part sends some of its bytes and then fails, the error is
-    /// [`WriteZero`](io::ErrorKind::WriteZero), whatever the cause, including a
-    /// reset by the peer.
-    ///
-    /// [`close`](Self::close) waits for a running chain, and a chain waits for
-    /// the peer to read.
-    ///
-    /// Dropping the [`SendCompletion`] does not cancel the chain, as for
-    /// [`send`](Self::send).
-    #[cfg(has_io_uring)]
-    pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendCompletion>
-    where
-        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
-    {
-        self.conn.send_chain(f)
     }
 
     /// Offer this connection for rebalancing. See
@@ -5660,10 +5553,7 @@ impl SendCompletion {
     /// The flag is per connection at the moment of the write: every awaited
     /// send then in flight on the connection is marked, the one whose bytes
     /// met the full socket and the ones queued behind it. With one send in
-    /// flight per connection, it is whether that send's own bytes waited. A
-    /// plaintext `send_chain`, whose parts never wait for room this way,
-    /// reads false; a TLS one, whose records go through the connection's
-    /// queue, can read true.
+    /// flight per connection, it is whether that send's own bytes waited.
     ///
     /// Read outside a task on the send's worker, it returns false until the
     /// future has resolved, and then the value taken with the result.
