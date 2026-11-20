@@ -270,13 +270,9 @@ pub fn run_acceptor(config: AcceptorConfig) {
                 }
                 AcceptErrorAction::Stop => {
                     crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPTOR_STOPPED);
-                    // Not `eprintln!`, which panics if stderr fails.
-                    let _ = std::io::Write::write_fmt(
-                        &mut std::io::stderr(),
-                        format_args!(
-                            "ringline: acceptor for listener {} stopped: {err}\n",
-                            config.listener.index()
-                        ),
+                    log::error!(
+                        "acceptor for listener {} stopped: {err}",
+                        config.listener.index()
                     );
                     return;
                 }

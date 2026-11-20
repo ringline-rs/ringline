@@ -1,7 +1,5 @@
 use std::any::Any;
 use std::io;
-#[cfg(target_os = "linux")]
-use std::io::Write as _;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -579,8 +577,8 @@ impl Runtime {
     /// has started, is still running when the 10 s run out, or an
     /// io_uring worker's ring fails during that wait, the worker does not drop
     /// its tasks or its event loop: it leaks them, since the operation can
-    /// still use their memory, closes its sockets, and writes a line to
-    /// stderr. Its join result is the same as without the leak.
+    /// still use their memory, closes its sockets, and logs a line at `warn`.
+    /// Its join result is the same as without the leak.
     ///
     /// A task woken after the worker's last poll pass is dropped even when
     /// what it awaited is ready. On both backends a task can be woken after the
@@ -985,10 +983,11 @@ impl RuntimeShutdown {
             .filter(|i| accepting[*i as usize].load(Ordering::Acquire))
             .collect();
         if live.is_empty() && !alive.is_empty() {
-            let _ = writeln!(
-                io::stderr(),
-                "ringline: worker {worker} exited; returning {alive:?} to the accept rotation"
-            );
+            // On the worker's exit path (`report_worker_exit`), ahead of its
+            // drain.
+            crate::task_panic::log_guarded(|| {
+                log::warn!("worker {worker} exited; returning {alive:?} to the accept rotation")
+            });
             for i in &alive {
                 accepting[*i as usize].store(true, Ordering::Release);
             }
@@ -1003,10 +1002,9 @@ impl RuntimeShutdown {
             if let Some(fd) = sockets.fds().next()
                 && let Err(e) = crate::reuseport_bpf::attach_live_set(fd, &live)
             {
-                let _ = writeln!(
-                    io::stderr(),
-                    "ringline: steering around worker {worker} failed: {e}"
-                );
+                crate::task_panic::log_guarded(|| {
+                    log::warn!("steering around worker {worker} failed: {e}")
+                });
             }
             close_queued(sockets.fd(worker));
         }
@@ -1749,14 +1747,12 @@ impl RinglineBuilder {
                 // buffer (#824, #856).
                 let memory_in_use = !drain_panicked && event_loop.memory_in_use_at_exit();
                 if memory_in_use {
-                    // Not `eprintln!`, which panics if stderr fails.
-                    let _ = std::io::Write::write_fmt(
-                        &mut std::io::stderr(),
-                        format_args!(
-                            "ringline: worker {worker_id} exited with a disk operation still \
-                             in flight; leaking its tasks and event loop\n"
-                        ),
-                    );
+                    crate::task_panic::log_guarded(|| {
+                        log::warn!(
+                            "worker {worker_id} exited with a disk operation still in \
+                             flight; leaking its tasks and event loop"
+                        )
+                    });
                 }
                 if drain_panicked || memory_in_use {
                     let task_panic = event_loop.take_task_panic();
@@ -2221,13 +2217,22 @@ impl RinglineBuilder {
                         // the launching thread waits indefinitely for
                         // a startup signal that never arrives.
                         if let Err(e) = pin_to_core(core) {
-                            // A bare EINVAL here is opaque — name the knob.
-                            eprintln!(
-                                "ringline: failed to pin worker {worker_id} to logical CPU {core} \
-                                 (core_offset {} + worker id): {e} — check Config::core_offset \
-                                 against the machine's CPU count",
-                                config.worker.core_offset
-                            );
+                            // A bare EINVAL here is opaque, so the error names
+                            // the knob.
+                            let (kind, detail) = match &e {
+                                crate::error::Error::Io(io) => (io.kind(), io.to_string()),
+                                other => (io::ErrorKind::Other, other.to_string()),
+                            };
+                            let e = crate::error::Error::Io(io::Error::new(
+                                kind,
+                                format!(
+                                    "failed to pin worker {worker_id} to logical CPU {core} \
+                                     (core_offset {} + worker id): {detail}; check \
+                                     ConfigBuilder::core_offset against the machine's CPU count",
+                                    config.worker.core_offset
+                                ),
+                            ));
+                            crate::task_panic::log_guarded(|| log::error!("{e}"));
                             let _ = startup_tx.send(Err(e));
                             return Err(startup_failure_placeholder());
                         }
@@ -2636,7 +2641,7 @@ fn check_kernel_floor(
 /// When the hard limit is too low and the CQ was left at its default, the
 /// rings are fitted to the hard limit instead (`fit_ring_sizes`), which lowers
 /// `cq_entries`, and the `sq_entries` and `max_connections` left at their
-/// defaults, in `config`, and writes one line to stderr naming the sizes.
+/// defaults, in `config`, and logs one line at `warn` naming the sizes.
 ///
 /// The kernel compares the limit with everything the same user has charged in
 /// any process, which this cannot see, so passing here does not rule out an
@@ -2719,28 +2724,24 @@ fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate
                 config.max_connections = sizes.max_connections;
                 config.sq_entries = sizes.sq_entries;
                 config.cq_entries = sizes.cq_entries;
-                // Not `eprintln!`, which panics if stderr fails.
-                let _ = std::io::Write::write_fmt(
-                    &mut std::io::stderr(),
-                    format_args!(
-                        "ringline: RLIMIT_MEMLOCK hard limit {} KiB is below the {} KiB that \
+                log::warn!(
+                    "RLIMIT_MEMLOCK hard limit {} KiB is below the {} KiB that \
                          {workers} worker(s) need at max_connections {}, sq_entries {}, \
                          cq_entries {}; using max_connections {}, sq_entries {}, cq_entries {} \
                          per worker. Raise the limit (`ulimit -l`, or `LimitMEMLOCK=`) to run \
                          at max_connections {}, sq_entries {}, cq_entries {}, or set \
-                         cq_entries on the builder to fail instead of running smaller.\n",
-                        limit.hard.div_ceil(1024),
-                        required.div_ceil(1024),
-                        current.max_connections,
-                        current.sq_entries,
-                        current.cq_entries,
-                        sizes.max_connections,
-                        sizes.sq_entries,
-                        sizes.cq_entries,
-                        current.max_connections,
-                        current.sq_entries,
-                        current.cq_entries,
-                    ),
+                         cq_entries on the builder to fail instead of running smaller.",
+                    limit.hard.div_ceil(1024),
+                    required.div_ceil(1024),
+                    current.max_connections,
+                    current.sq_entries,
+                    current.cq_entries,
+                    sizes.max_connections,
+                    sizes.sq_entries,
+                    sizes.cq_entries,
+                    current.max_connections,
+                    current.sq_entries,
+                    current.cq_entries,
                 );
                 return Ok(());
             }

@@ -440,7 +440,7 @@ pub(crate) const PUSH_RETRY_BACKOFF_MIN: std::time::Duration = std::time::Durati
 /// doubles the wait up to this.
 pub(crate) const PUSH_RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// How long pushes stay refused before the worker writes one line to stderr.
+/// How long pushes stay refused before the worker logs one line at `warn`.
 pub(crate) const PUSH_RETRY_REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The backoff between retries of the pushes the ring refused
@@ -457,7 +457,7 @@ pub(crate) struct PushRetryBackoff {
     pub(crate) delay: std::time::Duration,
     /// When retries started being refused in this run of refusals.
     pub(crate) since: Option<std::time::Instant>,
-    /// Whether this run of refusals has been written to stderr.
+    /// Whether this run of refusals has been logged.
     pub(crate) reported: bool,
     /// What this worker has added to `metrics::RING_PUSH_RETRIES_PENDING`.
     pub(crate) published: i64,
@@ -808,7 +808,7 @@ pub(crate) struct Driver {
     pub(crate) region_rx: crate::region_registry::RegionControlRx,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
-    /// Print event-loop diagnostics at shutdown (Config::loop_diag).
+    /// Log event-loop diagnostics at shutdown, at `info` (Config::loop_diag).
     pub(crate) loop_diag: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
@@ -1818,7 +1818,7 @@ impl Driver {
     /// after every wait, so a completion that frees room is followed by a
     /// retry at once. Publishes the count to
     /// `metrics::RING_PUSH_RETRIES_PENDING`, and once pushes have been
-    /// refused for `PUSH_RETRY_REPORT_AFTER`, writes one line to stderr.
+    /// refused for `PUSH_RETRY_REPORT_AFTER`, logs one line at `warn`.
     pub(crate) fn after_push_retries(&mut self, now: std::time::Instant) {
         let pending = self.push_retries_pending();
         let delta = pending as i64 - self.push_retry.published;
@@ -1841,18 +1841,14 @@ impl Driver {
         let since = *backoff.since.get_or_insert(now);
         if !backoff.reported && now.duration_since(since) >= PUSH_RETRY_REPORT_AFTER {
             backoff.reported = true;
-            // Not `eprintln!`, which panics if stderr fails.
-            let _ = std::io::Write::write_fmt(
-                &mut std::io::stderr(),
-                format_args!(
-                    "ringline: worker {}: the ring has refused submissions for {:.1} s, \
-                     {pending} still owed; retrying with waits of up to {} ms \
-                     (ringline/ring/push_retries_pending, ringline/ring \
-                     op=push_retry_waits)\n",
-                    self.worker_index,
-                    now.duration_since(since).as_secs_f64(),
-                    PUSH_RETRY_BACKOFF_MAX.as_millis(),
-                ),
+            log::warn!(
+                "worker {}: the ring has refused submissions for {:.1} s, \
+                 {pending} still owed; retrying with waits of up to {} ms \
+                 (ringline/ring/push_retries_pending, ringline/ring \
+                 op=push_retry_waits)",
+                self.worker_index,
+                now.duration_since(since).as_secs_f64(),
+                PUSH_RETRY_BACKOFF_MAX.as_millis(),
             );
         }
     }
