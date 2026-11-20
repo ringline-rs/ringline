@@ -62,10 +62,8 @@ reach most callers as a refusal, which they handle as an error:
 Two related gaps are in the TLS paths:
 
 - TLS output produced while receiving (handshake flights, session tickets,
-  alerts) is written into a heap buffer (by `unbuffered::drive`, or by
-  `write_tls` on the buffered engine) and then copied into slots by
-  `ciphertext_to_sends` (`tls/backend_uring.rs`), which reserves them first.
-  If the pool is short the connection is failed ("send pool exhausted during
+  alerts) takes its slots before it is written into them (section 4). If
+  the pool is short the connection is failed ("send pool exhausted during
   TLS output flush"; on the connect path "send pool exhausted during TLS
   flush", `backend/uring/event_loop.rs`).
 - Nothing orders TLS output produced on the receive path against the
@@ -258,10 +256,13 @@ and returns the ones it did not use. Taking is a reservation
 the free count, and the operation pops them as it fills them. The
 connection's held count rises when slots are reserved and falls when unused
 ones are returned (`release_reservation`) or filled ones are released after
-their send completes, so each slot is counted once. Every operation on
-io_uring takes its slots this way within one call (`handler.rs`,
-`tls/backend_uring.rs`, `buffer/send_copy.rs`), and a mio bounded send holds
-its reservation until its entry is written.
+their send completes, so each slot is counted once. On io_uring, every send
+that can take more than one slot (`DriverCtx::send`, TLS sends, and
+receive-path TLS output) takes its slots this way within one call
+(`handler.rs`, `tls/backend_uring.rs`, `tls/buffered.rs`); a `send_parts`
+gather (`copy_in_gather`) and a UDP datagram (`copy_in`) pop their one slot
+directly. A mio bounded send holds its reservation until its entry is
+written.
 
 - A copy send takes `ceil(len / slot_size)` slots and uses all of them.
 - TLS application data takes its ciphertext bound (`ciphertext_capacity`,
@@ -273,12 +274,14 @@ its reservation until its entry is written.
   record's. The operation cannot run out of slots after rustls has sealed a
   record because its slots are already held.
 - TLS output produced on the receive path, and a close_notify, take the
-  slots their bytes need (`ciphertext_to_sends`). The bytes are collected
-  first: the unbuffered engine's scratch bytes, or on the buffered engine
-  rustls' pending output drained with `write_tls`
-  (`buffered::drain_tls_output`), because the buffered API gives no byte
-  count for that output beforehand. A close_notify the pool cannot take
-  keeps its bytes for the retry on both engines.
+  slots their bytes need. On the unbuffered engine that is the length of
+  its scratch bytes (`ciphertext_to_sends`). On the buffered engine the
+  receive path reserves from `IoState::tls_bytes_to_write` and writes into
+  the slots through `PoolWriter`; a close_notify, a `process_new_packets`
+  error and the client's first flight have no `IoState`, so their output is
+  drained into a `Vec` first (`buffered::drain_tls_output`) and reserved
+  from its length. A close_notify the pool cannot take keeps its bytes for
+  the retry on both engines.
 
 The extra record in the TLS bound covers records rustls has queued (a TLS 1.3
 `key_update` response, an alert), which it writes into the front of the same

@@ -31,7 +31,7 @@ impl SlotOwner {
 /// Filled with [`SendCopyPool::copy_in_reserved`], or on io_uring with
 /// `SendCopyPool::alloc_raw_reserved`; the unfilled remainder must go back
 /// through [`SendCopyPool::release_reservation`]. On io_uring a reservation
-/// lives inside one synchronous call that copies or encrypts a send; on mio a
+/// lives inside one synchronous call that fills it; on mio a
 /// `send_backpressured` permit is held, unfilled, until its entry flushes or
 /// is discarded. The pool honours a reservation held across other
 /// allocations either way.
@@ -1332,6 +1332,39 @@ mod tests {
         pool.release_reservation(r);
         pool.release(a);
         assert_eq!(pool.passing_held(), 0);
+    }
+
+    /// A TLS send's shape: reserve the bound while marking, fill fewer
+    /// slots, return the rest. Afterwards the connection and the passing
+    /// count hold exactly the filled slots, and the peaks recorded the
+    /// bound.
+    #[test]
+    fn a_reservation_filled_in_part_counts_only_the_filled_slots_once_returned() {
+        let mut pool = SendCopyPool::new(8, 8);
+        pool.track_passing();
+        let a = SlotOwner::conn(2, 4);
+        pool.begin_passing();
+        let mut r = pool.reserve_slots(a, 5).unwrap();
+        let filled: Vec<u16> = (0..3)
+            .map(|_| {
+                let (slot, _, _) = pool.alloc_raw_reserved(&mut r).unwrap();
+                pool.set_filled(slot, 8);
+                slot
+            })
+            .collect();
+        pool.release_reservation(r);
+        pool.end_passing();
+        assert_eq!(pool.held_by(2, 4), 3);
+        assert_eq!(pool.passing_held(), 3);
+        assert_eq!(pool.free_count(), 5);
+        assert_eq!(pool.held_peak(), 5);
+        assert_eq!(pool.passing_peak(), 5);
+        for slot in filled {
+            pool.release(slot);
+        }
+        assert_eq!(pool.held_by(2, 4), 0);
+        assert_eq!(pool.passing_held(), 0);
+        assert_eq!(pool.free_count(), 8);
     }
 
     /// Every allocator marks while marking, nothing marks after

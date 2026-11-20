@@ -1,8 +1,9 @@
 #![allow(clippy::manual_async_fn)]
 //! A TLS send on io_uring takes the slots of its ciphertext bound before
-//! encrypting and returns the ones encryption did not use, so straight after
-//! the send the connection holds the slots its ciphertext fills, not the
-//! bound (`SendHalf::send_pool_held`).
+//! encrypting and returns the ones encryption did not use: the connection's
+//! peak held count (`conn_held_max`) reaches the bound, and straight after
+//! the send it holds the slots its ciphertext fills
+//! (`SendHalf::send_pool_held`).
 //!
 //! io_uring only: on mio a plain TLS send queues an owned buffer and holds no
 //! send-pool slots.
@@ -39,9 +40,9 @@ const USED: usize = 10;
 const USED: usize = 9;
 const _: () = assert!(USED < BOUND);
 
-/// What the handler saw: held straight after the send, and held after it
-/// completed.
-static SEEN: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+/// What the handler saw: held straight after the send, the worker's
+/// `conn_held_max` then, and held after the send completed.
+static SEEN: Mutex<Option<(usize, u64, usize)>> = Mutex::new(None);
 
 struct Sender;
 
@@ -70,9 +71,10 @@ impl AsyncEventHandler for Sender {
             // `send` encrypts in the call and the task has not yielded since,
             // so no completion has been processed.
             let held = conn.send_pool_held();
+            let max = ringline::send_admission_counters().conn_held_max;
             done.await.expect("send completed");
             let after = conn.send_pool_held();
-            *SEEN.lock().unwrap() = Some((held, after));
+            *SEEN.lock().unwrap() = Some((held, max, after));
             conn.close();
         }
     }
@@ -137,8 +139,20 @@ fn a_tls_send_holds_the_slots_its_ciphertext_fills() {
     let mut got = vec![0u8; LEN];
     stream.read_exact(&mut got).unwrap();
     assert!(got.iter().all(|&b| b == 0x5a));
+    // The handler records what it saw before it closes, so the close_notify
+    // means `SEEN` is set.
+    let mut rest = [0u8; 1];
+    assert_eq!(
+        stream.read(&mut rest).unwrap(),
+        0,
+        "close_notify after the send"
+    );
 
-    let (held, after) = SEEN.lock().unwrap().take().expect("handler finished");
+    let (held, max, after) = SEEN.lock().unwrap().take().expect("handler finished");
+    assert_eq!(
+        max, BOUND as u64,
+        "the send took its {BOUND}-slot bound before encrypting"
+    );
     assert_eq!(
         held, USED,
         "held straight after the send: the slots the ciphertext fills, not the \
