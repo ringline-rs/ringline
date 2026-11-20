@@ -147,7 +147,12 @@ jobs:
       # ring is about 2.5 MiB, so the limit is lifted; memlock_rings,
       # memlock_limit and memlock_fit set their own. Raised in the same shell
       # as the tests, because each step starts a new one.
-      - run: |
+      # RINGLINE_EXPECT_FIXED_SEND=decided fails `fixed_buffer_sends` when the
+      # fixed-buffer send probe cannot decide, so a probe that stops working
+      # does not leave the feature off unnoticed.
+      - env:
+          RINGLINE_EXPECT_FIXED_SEND: decided
+        run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo nextest run --locked --workspace --profile ci
           cargo test --locked --workspace --doc

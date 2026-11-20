@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ConfigBuilder::fixed_buffer_sends`, on by default (#841). On io_uring, a
+  send whose parts are all guards in one registered region names the
+  region's buffer with `IORING_RECVSEND_FIXED_BUF`: a send of one guard as
+  `SEND_ZC`, a send of several as `SENDMSG_ZC`. The kernel then takes the
+  pages from the registered buffer instead of looking up and pinning them on
+  each send.
+  - A probe of the running kernel decides, once per process. It runs at the
+    first launch with `registered_regions`, the first
+    `Runtime::register_region` or the first `Runtime::fixed_buffer_sends`,
+    whichever comes first. The kernel must take the flag on the send's
+    opcode (`SEND_ZC` from Linux 6.0, `SENDMSG_ZC` from 6.15). It must also
+    charge such a send to the socket's send buffer by the bytes sent:
+    from Linux 6.3, kernels without the fix to `io_sg_from_iter` charge a send
+    from a huge page by its offset in the page, which stalls the connection.
+    On those kernels the sends keep using plain iovecs.
+  - `Runtime::fixed_buffer_sends` returns the result as a `FixedBufferSends`;
+    `Enabled { multi_guard }` says whether sends of several guards use the
+    buffer too.
+    `ringline/ring` `op=send_fixed_buffer` counts the sends.
+  - The probe maps 6 MiB, collapses a 2 MiB transparent huge page inside it,
+    and registers that on a ring of its own. It gives `Inconclusive`, and
+    fixed sends stay off, when no huge page is available or `RLIMIT_MEMLOCK`
+    has no room for it.
+  - Changed for existing callers, with the default config: each launch, until
+    the probe has run, raises the process's soft `RLIMIT_MEMLOCK` when it is
+    below what the workers need plus the probe's charge (2 MiB, plus a small
+    ring on a kernel that charges rings), to that sum if the hard limit
+    allows, whether or not regions are registered.
+    A guard-only send whose guards all name one region now holds the region's
+    slot until it completes, including while it waits in the send queue.
+    `Runtime::unregister_region` called before such a send is submitted makes
+    it fail with `EFAULT` and closes the connection, so await those sends
+    first, or turn the setting off.
+
 - `Runtime::next_signal()`: waits for `SIGINT`, `SIGTERM`, a task panic or a
   worker stop, as `Runtime::wait_on_signal` does, and returns it without
   shutting the runtime down itself. The first task panic under

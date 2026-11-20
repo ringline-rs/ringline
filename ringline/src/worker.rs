@@ -134,6 +134,9 @@ pub struct Runtime {
     max_connections: u32,
     sq_entries: u32,
     cq_entries: u32,
+    /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends).
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    fixed_buffer_sends: bool,
 }
 
 impl Runtime {
@@ -342,6 +345,11 @@ impl Runtime {
     /// [`SendGuard::region`](crate::SendGuard::region) and
     /// [`IoBuf::region`](crate::buf::IoBuf::region) on any worker.
     ///
+    /// The first registration in the process runs the fixed-buffer send
+    /// probe first, when
+    /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)
+    /// is on and no earlier call ran it, and blocks while it runs.
+    ///
     /// # Errors
     ///
     /// - `io::ErrorKind::Other` "registered-region table is full" if the
@@ -370,6 +378,11 @@ impl Runtime {
     ) -> io::Result<crate::buffer::fixed::RegionId> {
         #[cfg(has_io_uring)]
         {
+            // The probe runs before the first region is registered, so a
+            // send from the region finds its result (`fixed_send::modes`).
+            if self.fixed_buffer_sends {
+                crate::backend::uring::fixed_send::probe_once();
+            }
             self.region_registrar.register(region)
         }
         #[cfg(not(has_io_uring))]
@@ -382,6 +395,30 @@ impl Runtime {
         }
     }
 
+    /// Whether a send whose parts are all guards in one registered region
+    /// names that region's buffer
+    /// ([`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)),
+    /// and if not, why. With `Enabled { multi_guard: false }`, only a send of
+    /// one guard does. The first call runs the kernel probe if no earlier
+    /// call ran it, and blocks for it. The result holds for the life of the
+    /// process. On the mio backend it is always
+    /// [`Unsupported`](crate::FixedBufferSends::Unsupported), whatever the
+    /// setting.
+    pub fn fixed_buffer_sends(&self) -> crate::FixedBufferSends {
+        #[cfg(has_io_uring)]
+        {
+            if self.fixed_buffer_sends {
+                crate::backend::uring::fixed_send::probe_once()
+            } else {
+                crate::FixedBufferSends::Disabled
+            }
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            crate::FixedBufferSends::Unsupported
+        }
+    }
+
     /// Unregister a previously registered region. Blocks until every worker
     /// has acknowledged. The slot is returned to the free list on success.
     ///
@@ -389,6 +426,15 @@ impl Runtime {
     ///
     /// No SQE referencing the slot may be in flight when this is called.
     /// After it returns, the underlying memory may be safely unmapped.
+    ///
+    /// With [`fixed_buffer_sends`](Self::fixed_buffer_sends) `Enabled`, a send
+    /// of one guard naming this region, and with `multi_guard` a send of
+    /// several guards all naming it, references the slot from
+    /// the call that submits it until its
+    /// [`SendCompletion`](crate::SendCompletion) resolves, including while it
+    /// waits in the connection's send queue. Await those sends first: one
+    /// submitted after the slot is cleared fails with `EFAULT`, and the
+    /// connection closes.
     ///
     /// On the mio backend, always returns `io::ErrorKind::Unsupported`.
     pub fn unregister_region(&self, id: crate::buffer::fixed::RegionId) -> io::Result<()> {
@@ -1817,6 +1863,14 @@ impl RinglineBuilder {
         #[cfg(has_io_uring)]
         ensure_memlock_limit(&mut self.config, num_threads)?;
         ensure_nofile_limit(self.config.max_connections, num_threads)?;
+        #[cfg(has_io_uring)]
+        if self.config.fixed_buffer_sends {
+            reserve_probe_memlock(&self.config, num_threads);
+            // Before the workers start, so they read the result.
+            if !self.config.registered_regions.is_empty() {
+                crate::backend::uring::fixed_send::probe_once();
+            }
+        }
 
         crate::metrics::init_metadata();
 
@@ -2471,6 +2525,7 @@ impl RinglineBuilder {
             max_connections: self.config.max_connections,
             sq_entries: self.config.sq_entries,
             cq_entries: self.config.cq_entries,
+            fixed_buffer_sends: self.config.fixed_buffer_sends,
         };
 
         Ok((runtime, handles))
@@ -2751,6 +2806,64 @@ fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: 
         charges_rings,
         page,
     )
+}
+
+/// Make room in `RLIMIT_MEMLOCK` for the fixed-buffer send probe
+/// (`backend/uring/fixed_send.rs`), on top of what the workers need, by
+/// raising the soft limit when the hard limit allows. When it does not, the
+/// probe is told not to run, so its charge cannot take memory the workers or
+/// the regions were given; launch does not fail for it.
+#[cfg(has_io_uring)]
+fn reserve_probe_memlock(config: &Config, workers: usize) {
+    use crate::backend::uring::fixed_send;
+    use crate::error::MemlockLimit;
+    use crate::memlock::{
+        KernelVersion, charges_rings_by_version, has_cap_ipc_lock, kernel_charges_rings,
+    };
+
+    if fixed_send::probed() || has_cap_ipc_lock() {
+        fixed_send::allow();
+        return;
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let Ok(limit) = MemlockLimit::read() else {
+        fixed_send::refuse("RLIMIT_MEMLOCK could not be read".into());
+        return;
+    };
+    let needed = |charges_rings| {
+        let workers = memlock_required(config, workers, charges_rings, page);
+        (
+            workers,
+            workers.saturating_add(fixed_send::memlock_charge(charges_rings, page)),
+        )
+    };
+    // As `ensure_memlock_limit`: the version rule first, and a measurement
+    // of the running kernel when that does not fit.
+    let mut charges_rings = charges_rings_by_version(KernelVersion::current());
+    if charges_rings && needed(true).1 > limit.hard {
+        charges_rings = kernel_charges_rings().charged;
+    }
+    let (workers_need, total) = needed(charges_rings);
+    if limit.soft >= total {
+        fixed_send::allow();
+        return;
+    }
+    if limit.hard >= total {
+        let rlim = libc::rlimit {
+            rlim_cur: total,
+            rlim_max: limit.hard,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) } == 0 {
+            fixed_send::allow();
+            return;
+        }
+    }
+    fixed_send::refuse(format!(
+        "RLIMIT_MEMLOCK (hard limit {} KiB) has no room for the probe's buffer beside the \
+         {} KiB the workers need",
+        limit.hard.div_ceil(1024),
+        workers_need.div_ceil(1024),
+    ));
 }
 
 /// [`memlock_required`] with the rings sized `sq_entries` and `cq_entries`.
