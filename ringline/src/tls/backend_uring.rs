@@ -88,7 +88,10 @@ pub(super) fn ciphertext_to_sends(
         // transmission order, so records stay in sequence. Only a slot that
         // carries a send id settles anything, so a coalesced run still wakes
         // each logical send once.
-        match pool.copy_in(chunk) {
+        match pool.copy_in(
+            crate::buffer::send_copy::SlotOwner::conn(conn_index, generation),
+            chunk,
+        ) {
             Some((slot, _, len)) => staged.push((slot, len)),
             None => {
                 release_all(pool, &staged);
@@ -387,7 +390,9 @@ pub fn encrypt_to_sends(
             // `submit_next_queued` may coalesce these chunks with other queued
             // copy sends into one `SendMsgCoalesced` (#628); the send id rides
             // on the final chunk only, so the logical send settles once.
-            let Some((slot, ptr, cap)) = send_copy_pool.alloc_raw() else {
+            let Some((slot, ptr, cap)) = send_copy_pool.alloc_raw(
+                crate::buffer::send_copy::SlotOwner::conn(conn_index, generation),
+            ) else {
                 release_all(send_copy_pool, &filled);
                 return Err(io::Error::other("send copy pool exhausted for TLS"));
             };

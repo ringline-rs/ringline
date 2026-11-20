@@ -22,7 +22,7 @@ use ringline_tls::{ClientConnection, ServerConnection};
 use crate::accumulator::AccumulatorTable;
 #[cfg(has_io_uring)]
 #[allow(unused_imports)]
-use crate::buffer::send_copy::SendCopyPool;
+use crate::buffer::send_copy::{SendCopyPool, SlotOwner};
 
 use super::*;
 
@@ -308,6 +308,8 @@ pub(super) fn flush_tls_output_buffered(
 #[cfg(has_io_uring)]
 struct PoolWriter<'a> {
     pool: &'a mut SendCopyPool,
+    /// The connection the slots are charged to.
+    owner: SlotOwner,
     /// Slot currently being filled: (slot, base, capacity, used).
     current: Option<(u16, *mut u8, usize, usize)>,
     /// Sealed slots in fill order: (slot, len).
@@ -317,9 +319,10 @@ struct PoolWriter<'a> {
 
 #[cfg(has_io_uring)]
 impl<'a> PoolWriter<'a> {
-    fn new(pool: &'a mut SendCopyPool) -> Self {
+    fn new(pool: &'a mut SendCopyPool, owner: SlotOwner) -> Self {
         PoolWriter {
             pool,
+            owner,
             current: None,
             filled: Vec::new(),
             exhausted: false,
@@ -364,7 +367,7 @@ impl io::Write for PoolWriter<'_> {
         let mut copied = 0;
         while copied < buf.len() {
             if self.current.is_none() {
-                match self.pool.alloc_raw() {
+                match self.pool.alloc_raw(self.owner) {
                     Some((slot, ptr, cap)) => {
                         self.current = Some((slot, ptr, cap as usize, 0));
                     }
@@ -419,7 +422,7 @@ pub(super) fn take_tls_output_sends(
     generation: u32,
     out: &mut Vec<crate::handler::BuiltSend>,
 ) -> bool {
-    let mut writer = PoolWriter::new(send_copy_pool);
+    let mut writer = PoolWriter::new(send_copy_pool, SlotOwner::conn(conn_index, generation));
     while tls_conn.conn.wants_write() {
         match buffered_mut(tls_conn).write_tls(&mut writer) {
             Ok(0) | Err(_) => {
@@ -462,7 +465,7 @@ pub(super) fn encrypt_to_sends_buffered(
         .as_buffered_mut()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
 
-    let mut writer = PoolWriter::new(send_copy_pool);
+    let mut writer = PoolWriter::new(send_copy_pool, SlotOwner::conn(conn_index, generation));
     let mut offset = 0;
     while offset < plaintext.len() {
         let n = match buffered.writer().write(&plaintext[offset..]) {

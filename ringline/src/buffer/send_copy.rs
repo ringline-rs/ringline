@@ -1,5 +1,32 @@
 use crate::runtime::send_completion::SendId;
 
+/// The connection a pool slot is charged to, as its index and generation.
+/// Every allocation names one, so that [`SendCopyPool::held_by`] counts the
+/// slots each connection holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotOwner {
+    conn_index: u32,
+    generation: u32,
+}
+
+impl SlotOwner {
+    /// No connection: a UDP send, or a test. These slots are counted by
+    /// [`SendCopyPool::unowned_held`].
+    pub const NONE: SlotOwner = SlotOwner {
+        conn_index: u32::MAX,
+        generation: 0,
+    };
+
+    /// The connection at `conn_index` with `generation`.
+    pub fn conn(conn_index: u32, generation: u32) -> Self {
+        debug_assert_ne!(conn_index, u32::MAX, "u32::MAX is SlotOwner::NONE");
+        SlotOwner {
+            conn_index,
+            generation,
+        }
+    }
+}
+
 /// A promise of `remaining` free slots made by [`SendCopyPool::reserve_slots`].
 /// Filled with [`SendCopyPool::copy_in_reserved`]; the unfilled remainder must
 /// go back through [`SendCopyPool::release_reservation`]. On io_uring a
@@ -15,6 +42,8 @@ pub struct SlotReservation {
     /// towards [`SendCopyPool::passing_held`], and the slots filled from it
     /// are marked as passing.
     passing: bool,
+    /// The connection the reservation's slots are charged to, filled or not.
+    owner: SlotOwner,
 }
 
 impl SlotReservation {
@@ -91,6 +120,19 @@ pub struct SendCopyPool {
     // Set between `begin_passing` and `end_passing`: every slot and
     // reservation taken meanwhile is marked as passing.
     marking: bool,
+    // Per slot: the connection it is charged to. Meaningful only while the
+    // slot is in use.
+    owner: Vec<SlotOwner>,
+    // Per connection index: the generation the count belongs to and the
+    // slots that connection holds, counting slots in use and the unfilled
+    // remainder of its reservations. Slots of an earlier occupant of the
+    // index, still in flight after it closed, do not count against the
+    // next. Grows to the highest index seen.
+    held: Vec<(u32, u32)>,
+    // Slots held by `SlotOwner::NONE`, counted the same way.
+    unowned_held: usize,
+    // The largest count any entry of `held` has reached.
+    held_peak: usize,
 }
 
 impl SendCopyPool {
@@ -121,6 +163,10 @@ impl SendCopyPool {
             passing_held: 0,
             passing_peak: 0,
             marking: false,
+            owner: vec![SlotOwner::NONE; n],
+            held: Vec::new(),
+            unowned_held: 0,
+            held_peak: 0,
         }
     }
 
@@ -211,6 +257,93 @@ impl SendCopyPool {
         }
     }
 
+    /// The slots the connection at `conn_index` with `generation` holds:
+    /// slots in use that it allocated, and the unfilled remainder of its
+    /// reservations. Zero for a connection that holds none, and for an
+    /// earlier generation of the index once a later one has allocated. A
+    /// slot allocated for an earlier generation after a later one has
+    /// allocated is not counted for either.
+    pub fn held_by(&self, conn_index: u32, generation: u32) -> usize {
+        match self.held.get(conn_index as usize) {
+            Some(&(counted, held)) if counted == generation => held as usize,
+            _ => 0,
+        }
+    }
+
+    /// The slots held by [`SlotOwner::NONE`], counted as
+    /// [`held_by`](Self::held_by) counts a connection's.
+    pub fn unowned_held(&self) -> usize {
+        self.unowned_held
+    }
+
+    /// The largest [`held_by`](Self::held_by) any connection has reached
+    /// since the pool was created.
+    pub fn held_peak(&self) -> usize {
+        self.held_peak
+    }
+
+    /// Count `n` more slots as held by `owner`. The slots are already
+    /// taken (popped or reserved).
+    fn charge(&mut self, owner: SlotOwner, n: usize) {
+        if owner == SlotOwner::NONE {
+            self.unowned_held += n;
+            return;
+        }
+        let in_use = self.slot_count() - self.free_count();
+        let index = owner.conn_index as usize;
+        if index >= self.held.len() {
+            self.held.resize(index + 1, (0, 0));
+        }
+        let (counted, held) = &mut self.held[index];
+        if *counted != owner.generation {
+            // A handle from an earlier occupant of the index can still
+            // allocate (a stale `send_chain` builds before `finish` checks
+            // the generation). Its slot is not counted, and `discharge`
+            // ignores its release for the same reason. Generations wrap, so
+            // "earlier" is a wrapping comparison.
+            if (owner.generation.wrapping_sub(*counted) as i32) < 0 {
+                return;
+            }
+            *counted = owner.generation;
+            *held = 0;
+        }
+        *held += n as u32;
+        let held = *held as usize;
+        self.held_peak = self.held_peak.max(held);
+        debug_assert!(
+            held <= in_use,
+            "connection {} holds {held} slots but only {in_use} are in use",
+            owner.conn_index,
+        );
+    }
+
+    /// Count `n` fewer slots as held by `owner`. Does nothing for an
+    /// earlier generation of the index than the one counted.
+    fn discharge(&mut self, owner: SlotOwner, n: usize) {
+        if owner == SlotOwner::NONE {
+            debug_assert!(n <= self.unowned_held);
+            self.unowned_held -= n;
+            return;
+        }
+        if let Some((counted, held)) = self.held.get_mut(owner.conn_index as usize)
+            && *counted == owner.generation
+        {
+            debug_assert!(
+                n as u32 <= *held,
+                "connection {} returns {n} slots but holds {}",
+                owner.conn_index,
+                *held
+            );
+            *held = held.saturating_sub(n as u32);
+        }
+    }
+
+    /// Record the just-popped slot `idx` as `owner`'s, and charge it.
+    fn take_for(&mut self, idx: u16, owner: SlotOwner) {
+        self.owner[idx as usize] = owner;
+        self.charge(owner, 1);
+    }
+
     /// Fault every slot in before traffic arrives. See
     /// [`crate::buffer::prefault`] for why, and why it must run on the worker
     /// thread that owns the pool.
@@ -260,12 +393,13 @@ impl SendCopyPool {
 
     /// Allocate a slot, copy `data` into it, and return (slot_index, ptr, len).
     /// Returns `None` if no unreserved slots are free or data exceeds slot size.
-    pub fn copy_in(&mut self, data: &[u8]) -> Option<(u16, *const u8, u32)> {
+    pub fn copy_in(&mut self, owner: SlotOwner, data: &[u8]) -> Option<(u16, *const u8, u32)> {
         if data.len() > self.slot_size as usize {
             return None;
         }
         let idx = self.pop_unreserved()?;
         self.mark_if_passing(idx);
+        self.take_for(idx, owner);
         Some(self.fill_slot(idx, data))
     }
 
@@ -276,6 +410,7 @@ impl SendCopyPool {
     /// Each `(ptr, len)` pair must point to valid readable memory.
     pub unsafe fn copy_in_gather(
         &mut self,
+        owner: SlotOwner,
         parts: &[(*const u8, usize)],
         total_len: usize,
     ) -> Option<(u16, *const u8, u32)> {
@@ -284,6 +419,7 @@ impl SendCopyPool {
         }
         let idx = self.pop_unreserved()?;
         self.mark_if_passing(idx);
+        self.take_for(idx, owner);
         let base = idx as usize * self.slot_size as usize;
         let mut dest_offset = 0;
         for &(ptr, len) in parts {
@@ -305,9 +441,10 @@ impl SendCopyPool {
     /// and must call [`set_filled`](Self::set_filled) with the final length
     /// before the slot is used in an SQE (until then remaining == 0).
     /// Returns `None` if no unreserved slots are free.
-    pub fn alloc_raw(&mut self) -> Option<(u16, *mut u8, u32)> {
+    pub fn alloc_raw(&mut self, owner: SlotOwner) -> Option<(u16, *mut u8, u32)> {
         let idx = self.pop_unreserved()?;
         self.mark_if_passing(idx);
+        self.take_for(idx, owner);
         let offset = idx as usize * self.slot_size as usize;
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = 0;
@@ -335,7 +472,11 @@ impl SendCopyPool {
     /// is a passing one: its `n` slots count towards
     /// [`passing_held`](Self::passing_held) until they are filled and
     /// released, or returned unfilled.
-    pub fn reserve_slots(&mut self, n: usize) -> Result<SlotReservation, ReserveError> {
+    pub fn reserve_slots(
+        &mut self,
+        owner: SlotOwner,
+        n: usize,
+    ) -> Result<SlotReservation, ReserveError> {
         let capacity = self.slot_count();
         if n > capacity {
             return Err(ReserveError::TooLarge {
@@ -352,9 +493,11 @@ impl SendCopyPool {
         if passing {
             self.take_passing(n);
         }
+        self.charge(owner, n);
         Ok(SlotReservation {
             remaining: n,
             passing,
+            owner,
         })
     }
 
@@ -384,6 +527,8 @@ impl SendCopyPool {
         if r.passing {
             self.passing[idx as usize] = true;
         }
+        // The slot was charged to the owner when it was reserved.
+        self.owner[idx as usize] = r.owner;
         self.fill_slot(idx, data)
     }
 
@@ -425,6 +570,7 @@ impl SendCopyPool {
         if r.passing {
             self.return_passing(returned);
         }
+        self.discharge(r.owner, returned);
     }
 
     /// Return the unfilled remainder of a reservation to the pool. A passing
@@ -439,6 +585,7 @@ impl SendCopyPool {
         if r.passing {
             self.return_passing(r.remaining);
         }
+        self.discharge(r.owner, r.remaining);
         r.remaining = 0; // satisfies the Drop debug_assert
     }
 
@@ -461,8 +608,9 @@ impl SendCopyPool {
     /// recycled slot that still names a dead operation.
     ///
     /// Every path that returns a slot to the free list comes through here, so
-    /// this is where a passing slot's mark is cleared and
-    /// [`passing_held`](Self::passing_held) drops: a completion, an abort's
+    /// this is where a passing slot's mark is cleared,
+    /// [`passing_held`](Self::passing_held) drops and the slot's owner's
+    /// [`held_by`](Self::held_by) count drops: a completion, an abort's
     /// `release_queued_sends`, the release of a coalesced run's slots, and
     /// worker exit alike.
     pub fn release(&mut self, idx: u16) {
@@ -481,6 +629,8 @@ impl SendCopyPool {
         if self.passing_held != 0 && std::mem::take(&mut self.passing[idx as usize]) {
             self.return_passing(1);
         }
+        let owner = std::mem::replace(&mut self.owner[idx as usize], SlotOwner::NONE);
+        self.discharge(owner, 1);
         self.in_use[idx as usize] = false;
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = 0;
@@ -623,7 +773,7 @@ mod tests {
         let mut pool = SendCopyPool::new(4, 128);
         assert_eq!(pool.free_count(), 4);
 
-        let (idx, ptr, len) = pool.copy_in(b"hello").unwrap();
+        let (idx, ptr, len) = pool.copy_in(SlotOwner::NONE, b"hello").unwrap();
         assert_eq!(len, 5);
         assert_eq!(pool.free_count(), 3);
 
@@ -638,9 +788,9 @@ mod tests {
     #[test]
     fn exhaust_pool() {
         let mut pool = SendCopyPool::new(2, 64);
-        let _ = pool.copy_in(b"a").unwrap();
-        let _ = pool.copy_in(b"b").unwrap();
-        assert!(pool.copy_in(b"c").is_none());
+        let _ = pool.copy_in(SlotOwner::NONE, b"a").unwrap();
+        let _ = pool.copy_in(SlotOwner::NONE, b"b").unwrap();
+        assert!(pool.copy_in(SlotOwner::NONE, b"c").is_none());
     }
 
     #[test]
@@ -648,9 +798,9 @@ mod tests {
         // A 1-slot pool: first alloc succeeds, second returns None (SEND_EXHAUSTED
         // metric is incremented inside; we assert the observable None behavior).
         let mut pool = SendCopyPool::new(1, 64);
-        let _ = pool.copy_in(b"first").unwrap();
+        let _ = pool.copy_in(SlotOwner::NONE, b"first").unwrap();
         assert_eq!(pool.free_count(), 0);
-        assert!(pool.copy_in(b"second").is_none());
+        assert!(pool.copy_in(SlotOwner::NONE, b"second").is_none());
     }
 
     #[test]
@@ -659,23 +809,23 @@ mod tests {
         let mut pool = SendCopyPool::new(1, 64);
         let data = b"first";
         let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
-        let _ = unsafe { pool.copy_in_gather(parts, data.len()) }.unwrap();
+        let _ = unsafe { pool.copy_in_gather(SlotOwner::NONE, parts, data.len()) }.unwrap();
         assert_eq!(pool.free_count(), 0);
         let data2 = b"second";
         let parts2: &[(*const u8, usize)] = &[(data2.as_ptr(), data2.len())];
-        assert!(unsafe { pool.copy_in_gather(parts2, data2.len()) }.is_none());
+        assert!(unsafe { pool.copy_in_gather(SlotOwner::NONE, parts2, data2.len()) }.is_none());
     }
 
     #[test]
     fn data_too_large() {
         let mut pool = SendCopyPool::new(4, 4);
-        assert!(pool.copy_in(b"toolarge").is_none());
+        assert!(pool.copy_in(SlotOwner::NONE, b"toolarge").is_none());
     }
 
     #[test]
     fn try_advance_partial() {
         let mut pool = SendCopyPool::new(4, 128);
-        let (idx, _ptr, len) = pool.copy_in(b"hello world").unwrap();
+        let (idx, _ptr, len) = pool.copy_in(SlotOwner::NONE, b"hello world").unwrap();
         assert_eq!(len, 11);
         assert_eq!(pool.original_len(idx), 11);
 
@@ -711,7 +861,7 @@ mod tests {
     #[test]
     fn try_advance_full_send() {
         let mut pool = SendCopyPool::new(4, 128);
-        let (idx, _ptr, len) = pool.copy_in(b"hello").unwrap();
+        let (idx, _ptr, len) = pool.copy_in(SlotOwner::NONE, b"hello").unwrap();
         assert_eq!(len, 5);
 
         // Full send on first attempt — returns None.
@@ -725,7 +875,7 @@ mod tests {
     #[test]
     fn release_clears_tracking() {
         let mut pool = SendCopyPool::new(4, 128);
-        let (idx, _ptr, _len) = pool.copy_in(b"test data").unwrap();
+        let (idx, _ptr, _len) = pool.copy_in(SlotOwner::NONE, b"test data").unwrap();
 
         // Partial send.
         pool.try_advance(idx, 4);
@@ -735,7 +885,7 @@ mod tests {
         pool.release(idx);
 
         // Re-allocate — LIFO free list returns the just-released slot.
-        let (idx2, _ptr2, len2) = pool.copy_in(b"new").unwrap();
+        let (idx2, _ptr2, len2) = pool.copy_in(SlotOwner::NONE, b"new").unwrap();
         assert_eq!(idx2, idx);
         assert_eq!(len2, 3);
         assert_eq!(pool.original_len(idx2), 3);
@@ -748,7 +898,7 @@ mod tests {
 
         // The TLS bounded path reserves a conservative ciphertext bound, then
         // learns the real cost once rustls has produced the records.
-        let mut r = pool.reserve_slots(3).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 3).unwrap();
         assert_eq!(pool.free_count(), 1);
 
         pool.shrink_reservation(&mut r, 1);
@@ -771,7 +921,7 @@ mod tests {
     #[cfg(not(has_io_uring))]
     fn shrink_reservation_to_zero_is_a_full_release() {
         let mut pool = SendCopyPool::new(2, 8);
-        let mut r = pool.reserve_slots(2).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 2).unwrap();
         assert_eq!(pool.free_count(), 0);
 
         pool.shrink_reservation(&mut r, 0);
@@ -790,7 +940,7 @@ mod tests {
     #[cfg(not(has_io_uring))]
     fn shrink_reservation_to_its_current_size_changes_nothing() {
         let mut pool = SendCopyPool::new(4, 8);
-        let mut r = pool.reserve_slots(2).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 2).unwrap();
 
         pool.shrink_reservation(&mut r, 2);
         assert_eq!(r.remaining(), 2);
@@ -801,11 +951,126 @@ mod tests {
     }
 
     #[test]
+    fn each_allocator_charges_its_owner_and_release_returns_the_slot() {
+        let mut pool = SendCopyPool::new(8, 8);
+        let a = SlotOwner::conn(3, 1);
+        let b = SlotOwner::conn(5, 1);
+        let (s1, _, _) = pool.copy_in(a, b"x").unwrap();
+        let (s2, _, _) = pool.alloc_raw(a).unwrap();
+        let part = b"yz";
+        // SAFETY: `part` is live for the call.
+        let (s3, _, _) = unsafe { pool.copy_in_gather(b, &[(part.as_ptr(), 2)], 2) }.unwrap();
+        assert_eq!(pool.held_by(3, 1), 2);
+        assert_eq!(pool.held_by(5, 1), 1);
+        assert_eq!(pool.held_by(4, 1), 0);
+        assert_eq!(pool.unowned_held(), 0);
+        pool.release(s1);
+        assert_eq!(pool.held_by(3, 1), 1);
+        pool.release(s2);
+        pool.release(s3);
+        assert_eq!(pool.held_by(3, 1), 0);
+        assert_eq!(pool.held_by(5, 1), 0);
+        assert_eq!(pool.held_peak(), 2);
+    }
+
+    #[test]
+    fn a_reservation_counts_as_held_until_filled_slots_are_released() {
+        let mut pool = SendCopyPool::new(8, 8);
+        let a = SlotOwner::conn(0, 7);
+        let mut r = pool.reserve_slots(a, 3).unwrap();
+        assert_eq!(pool.held_by(0, 7), 3);
+        let (s1, _, _) = pool.copy_in_reserved(&mut r, b"a");
+        // Filling moves a slot from the reservation to the slot: no change.
+        assert_eq!(pool.held_by(0, 7), 3);
+        pool.release_reservation(r);
+        // The two unfilled slots go back; the filled one stays held.
+        assert_eq!(pool.held_by(0, 7), 1);
+        pool.release(s1);
+        assert_eq!(pool.held_by(0, 7), 0);
+        assert_eq!(pool.held_peak(), 3);
+    }
+
+    #[cfg(not(has_io_uring))]
+    #[test]
+    fn shrinking_a_reservation_returns_its_slots_to_the_owner_count() {
+        let mut pool = SendCopyPool::new(8, 8);
+        let a = SlotOwner::conn(2, 1);
+        let mut r = pool.reserve_slots(a, 5).unwrap();
+        pool.shrink_reservation(&mut r, 2);
+        assert_eq!(pool.held_by(2, 1), 2);
+        pool.release_reservation(r);
+        assert_eq!(pool.held_by(2, 1), 0);
+    }
+
+    #[test]
+    fn an_index_s_next_occupant_does_not_inherit_its_slots() {
+        let mut pool = SendCopyPool::new(8, 8);
+        let (old, _, _) = pool.copy_in(SlotOwner::conn(1, 1), b"old").unwrap();
+        assert_eq!(pool.held_by(1, 1), 1);
+        // The connection closes with its send in flight, and the index's
+        // next occupant allocates.
+        let (new, _, _) = pool.copy_in(SlotOwner::conn(1, 2), b"new").unwrap();
+        assert_eq!(pool.held_by(1, 2), 1);
+        assert_eq!(pool.held_by(1, 1), 0);
+        // The old send completing does not take from the new count.
+        pool.release(old);
+        assert_eq!(pool.held_by(1, 2), 1);
+        pool.release(new);
+        assert_eq!(pool.held_by(1, 2), 0);
+    }
+
+    #[test]
+    fn a_stale_generation_s_slot_does_not_touch_the_current_count() {
+        let mut pool = SendCopyPool::new(8, 8);
+        let current = SlotOwner::conn(1, 2);
+        let (c1, _, _) = pool.copy_in(current, b"a").unwrap();
+        let (c2, _, _) = pool.copy_in(current, b"b").unwrap();
+        // A handle from the index's previous occupant allocates and releases.
+        let (stale, _, _) = pool.copy_in(SlotOwner::conn(1, 1), b"old").unwrap();
+        assert_eq!(pool.held_by(1, 2), 2);
+        assert_eq!(pool.held_by(1, 1), 0);
+        pool.release(stale);
+        assert_eq!(pool.held_by(1, 2), 2);
+        pool.release(c1);
+        pool.release(c2);
+        assert_eq!(pool.held_by(1, 2), 0);
+        // Across the wrap, u32::MAX is earlier than 0.
+        let (w, _, _) = pool.copy_in(SlotOwner::conn(4, 0), b"w").unwrap();
+        pool.copy_in(SlotOwner::conn(4, u32::MAX), b"x").unwrap();
+        assert_eq!(pool.held_by(4, 0), 1);
+        pool.release(w);
+        assert_eq!(pool.held_by(4, 0), 0);
+    }
+
+    #[test]
+    fn slots_of_no_connection_count_as_unowned() {
+        let mut pool = SendCopyPool::new(8, 8);
+        let (s, _, _) = pool.copy_in(SlotOwner::NONE, b"dgram").unwrap();
+        let r = pool.reserve_slots(SlotOwner::NONE, 2).unwrap();
+        assert_eq!(pool.unowned_held(), 3);
+        assert_eq!(pool.held_peak(), 0);
+        pool.release_reservation(r);
+        pool.release(s);
+        assert_eq!(pool.unowned_held(), 0);
+    }
+
+    #[test]
+    fn a_double_release_returns_the_slot_once() {
+        let mut pool = SendCopyPool::new(8, 8);
+        let a = SlotOwner::conn(0, 1);
+        let (s1, _, _) = pool.copy_in(a, b"a").unwrap();
+        pool.copy_in(a, b"b").unwrap();
+        pool.release(s1);
+        pool.release(s1);
+        assert_eq!(pool.held_by(0, 1), 1);
+    }
+
+    #[test]
     fn reserve_then_fill_consumes_exactly_the_reserved_slots() {
         let mut pool = SendCopyPool::new(4, 8);
         assert_eq!(pool.slot_count(), 4);
 
-        let mut r = pool.reserve_slots(3).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 3).unwrap();
         assert_eq!(r.remaining(), 3);
         // Reserved slots are still on the free list but no longer available.
         assert_eq!(pool.free_count(), 1);
@@ -840,15 +1105,18 @@ mod tests {
     #[test]
     fn reserve_fails_without_side_effects_when_short() {
         let mut pool = SendCopyPool::new(2, 8);
-        let _ = pool.copy_in(b"x").unwrap();
+        let _ = pool.copy_in(SlotOwner::NONE, b"x").unwrap();
         assert_eq!(pool.free_count(), 1);
 
-        assert_eq!(pool.reserve_slots(2).err(), Some(ReserveError::Exhausted));
+        assert_eq!(
+            pool.reserve_slots(SlotOwner::NONE, 2).err(),
+            Some(ReserveError::Exhausted)
+        );
         // Nothing was reserved: the count is unchanged and a plain allocation
         // still gets the remaining slot.
         assert_eq!(pool.reserved, 0);
         assert_eq!(pool.free_count(), 1);
-        assert!(pool.copy_in(b"y").is_some());
+        assert!(pool.copy_in(SlotOwner::NONE, b"y").is_some());
         assert_eq!(pool.free_count(), 0);
     }
 
@@ -856,7 +1124,7 @@ mod tests {
     fn reserve_rejects_more_than_the_pool_holds() {
         let mut pool = SendCopyPool::new(2, 8);
         assert_eq!(
-            pool.reserve_slots(3).err(),
+            pool.reserve_slots(SlotOwner::NONE, 3).err(),
             Some(ReserveError::TooLarge {
                 needed: 3,
                 capacity: 2
@@ -865,7 +1133,7 @@ mod tests {
         assert_eq!(pool.reserved, 0);
         assert_eq!(pool.free_count(), 2);
         // Exactly the pool's size is still a valid request.
-        let r = pool.reserve_slots(2).unwrap();
+        let r = pool.reserve_slots(SlotOwner::NONE, 2).unwrap();
         assert_eq!(pool.free_count(), 0);
         pool.release_reservation(r);
     }
@@ -873,32 +1141,32 @@ mod tests {
     #[test]
     fn reservation_blocks_plain_allocation_until_released() {
         let mut pool = SendCopyPool::new(2, 8);
-        let r = pool.reserve_slots(2).unwrap();
+        let r = pool.reserve_slots(SlotOwner::NONE, 2).unwrap();
         assert_eq!(pool.free_count(), 0);
 
         // Both slots are still on the free list, so without the reservation
         // accounting every one of these would succeed.
         assert_eq!(pool.free_list.len(), 2);
-        assert!(pool.copy_in(b"a").is_none());
-        assert!(pool.alloc_raw().is_none());
+        assert!(pool.copy_in(SlotOwner::NONE, b"a").is_none());
+        assert!(pool.alloc_raw(SlotOwner::NONE).is_none());
         let data = b"g";
         let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
-        assert!(unsafe { pool.copy_in_gather(parts, data.len()) }.is_none());
+        assert!(unsafe { pool.copy_in_gather(SlotOwner::NONE, parts, data.len()) }.is_none());
         // Refusals do not disturb the reservation.
         assert_eq!(pool.free_list.len(), 2);
         assert_eq!(pool.reserved, 2);
 
         pool.release_reservation(r);
         assert_eq!(pool.free_count(), 2);
-        assert!(pool.copy_in(b"a").is_some());
-        assert!(pool.alloc_raw().is_some());
+        assert!(pool.copy_in(SlotOwner::NONE, b"a").is_some());
+        assert!(pool.alloc_raw(SlotOwner::NONE).is_some());
         assert_eq!(pool.free_count(), 0);
     }
 
     #[test]
     fn partially_filled_reservation_releases_the_rest() {
         let mut pool = SendCopyPool::new(3, 8);
-        let mut r = pool.reserve_slots(3).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 3).unwrap();
         assert_eq!(pool.free_count(), 0);
 
         let (idx, _ptr, _len) = pool.copy_in_reserved(&mut r, b"one");
@@ -911,20 +1179,20 @@ mod tests {
         assert_eq!(pool.reserved, 0);
         assert_eq!(pool.free_count(), 2);
         assert!(pool.in_use(idx));
-        assert!(pool.copy_in(b"a").is_some());
-        assert!(pool.copy_in(b"b").is_some());
-        assert!(pool.copy_in(b"c").is_none());
+        assert!(pool.copy_in(SlotOwner::NONE, b"a").is_some());
+        assert!(pool.copy_in(SlotOwner::NONE, b"b").is_some());
+        assert!(pool.copy_in(SlotOwner::NONE, b"c").is_none());
     }
 
     #[test]
     fn zero_slot_reservation_is_a_no_op() {
         let mut pool = SendCopyPool::new(2, 8);
-        let r = pool.reserve_slots(0).unwrap();
+        let r = pool.reserve_slots(SlotOwner::NONE, 0).unwrap();
         assert_eq!(r.remaining(), 0);
         assert_eq!(pool.reserved, 0);
         assert_eq!(pool.free_count(), 2);
         // Nothing is withheld from other allocators while it is outstanding.
-        let (idx, _ptr, _len) = pool.copy_in(b"a").unwrap();
+        let (idx, _ptr, _len) = pool.copy_in(SlotOwner::NONE, b"a").unwrap();
         assert_eq!(pool.free_count(), 1);
         pool.release_reservation(r);
         assert_eq!(pool.free_count(), 1);
@@ -934,9 +1202,9 @@ mod tests {
         // An empty pool still grants an empty reservation (empty sends stay a
         // no-op even under full pressure).
         let mut full = SendCopyPool::new(1, 8);
-        let _ = full.copy_in(b"x").unwrap();
+        let _ = full.copy_in(SlotOwner::NONE, b"x").unwrap();
         assert_eq!(full.free_count(), 0);
-        let r = full.reserve_slots(0).unwrap();
+        let r = full.reserve_slots(SlotOwner::NONE, 0).unwrap();
         assert_eq!(full.free_count(), 0);
         full.release_reservation(r);
     }
@@ -945,7 +1213,7 @@ mod tests {
     fn set_then_take_returns_the_pair_once() {
         let mut pool = SendCopyPool::new(2, 32);
         let id = an_id();
-        let (idx, _ptr, _len) = pool.copy_in(b"payload").unwrap();
+        let (idx, _ptr, _len) = pool.copy_in(SlotOwner::NONE, b"payload").unwrap();
 
         // Freshly allocated slots carry nothing.
         assert_eq!(pool.take_send_id(idx), None);
@@ -958,7 +1226,7 @@ mod tests {
         assert_eq!(pool.take_send_id(idx), None);
 
         // The id is per-slot: attaching to one leaves its neighbour alone.
-        let (other, _p, _l) = pool.copy_in(b"other").unwrap();
+        let (other, _p, _l) = pool.copy_in(SlotOwner::NONE, b"other").unwrap();
         assert_ne!(other, idx);
         pool.set_send_id(idx, id, 7);
         assert_eq!(pool.take_send_id(other), None);
@@ -972,18 +1240,19 @@ mod tests {
     fn every_allocator_hands_out_a_slot_without_a_bounded_send() {
         let mut pool = SendCopyPool::new(4, 32);
 
-        let (a, _p, _l) = pool.copy_in(b"a").unwrap();
+        let (a, _p, _l) = pool.copy_in(SlotOwner::NONE, b"a").unwrap();
         assert_eq!(pool.take_send_id(a), None);
 
         let data = b"gather";
         let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
-        let (b, _p, _l) = unsafe { pool.copy_in_gather(parts, data.len()) }.unwrap();
+        let (b, _p, _l) =
+            unsafe { pool.copy_in_gather(SlotOwner::NONE, parts, data.len()) }.unwrap();
         assert_eq!(pool.take_send_id(b), None);
 
-        let (c, _p, _cap) = pool.alloc_raw().unwrap();
+        let (c, _p, _cap) = pool.alloc_raw(SlotOwner::NONE).unwrap();
         assert_eq!(pool.take_send_id(c), None);
 
-        let mut r = pool.reserve_slots(1).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 1).unwrap();
         let (d, _p, _l) = pool.copy_in_reserved(&mut r, b"reserved");
         assert_eq!(pool.take_send_id(d), None);
         pool.release_reservation(r);
@@ -995,7 +1264,7 @@ mod tests {
         pool.set_send_id(a, id, 11);
         assert_eq!(pool.take_send_id(a), Some((id, 11)));
         pool.release(a);
-        let (again, _p, _l) = pool.copy_in(b"recycled").unwrap();
+        let (again, _p, _l) = pool.copy_in(SlotOwner::NONE, b"recycled").unwrap();
         assert_eq!(again, a, "LIFO free list should hand back the same slot");
         assert_eq!(pool.take_send_id(again), None);
 
@@ -1008,7 +1277,7 @@ mod tests {
     #[test]
     fn release_of_a_slot_without_an_id_is_unaffected() {
         let mut pool = SendCopyPool::new(2, 32);
-        let (idx, _ptr, _len) = pool.copy_in(b"plain send").unwrap();
+        let (idx, _ptr, _len) = pool.copy_in(SlotOwner::NONE, b"plain send").unwrap();
         assert_eq!(pool.free_count(), 1);
 
         pool.release(idx);
@@ -1029,7 +1298,7 @@ mod tests {
     fn release_with_a_live_bounded_send_trips_debug_assert() {
         let mut pool = SendCopyPool::new(1, 32);
         let id = an_id();
-        let (idx, _ptr, _len) = pool.copy_in(b"unsettled").unwrap();
+        let (idx, _ptr, _len) = pool.copy_in(SlotOwner::NONE, b"unsettled").unwrap();
         pool.set_send_id(idx, id, 9);
         pool.release(idx);
     }
@@ -1039,8 +1308,8 @@ mod tests {
     #[test]
     fn an_untracked_pool_counts_no_passing_slots() {
         let mut pool = SendCopyPool::new(4, 8);
-        let (a, _p, _l) = pool.copy_in(b"a").unwrap();
-        let r = pool.reserve_slots(2).unwrap();
+        let (a, _p, _l) = pool.copy_in(SlotOwner::NONE, b"a").unwrap();
+        let r = pool.reserve_slots(SlotOwner::NONE, 2).unwrap();
         assert_eq!(pool.passing_held(), 0);
         pool.release_reservation(r);
         pool.release(a);
@@ -1055,13 +1324,14 @@ mod tests {
         let mut pool = SendCopyPool::new(8, 8);
         pool.track_passing();
         pool.begin_passing();
-        let (a, _p, _l) = pool.copy_in(b"a").unwrap();
+        let (a, _p, _l) = pool.copy_in(SlotOwner::NONE, b"a").unwrap();
         let data = b"g";
         let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
-        let (b, _p, _l) = unsafe { pool.copy_in_gather(parts, data.len()) }.unwrap();
-        let (c, _p, _cap) = pool.alloc_raw().unwrap();
+        let (b, _p, _l) =
+            unsafe { pool.copy_in_gather(SlotOwner::NONE, parts, data.len()) }.unwrap();
+        let (c, _p, _cap) = pool.alloc_raw(SlotOwner::NONE).unwrap();
         pool.end_passing();
-        let (plain, _p, _l) = pool.copy_in(b"p").unwrap();
+        let (plain, _p, _l) = pool.copy_in(SlotOwner::NONE, b"p").unwrap();
         assert_eq!(
             pool.passing_held(),
             3,
@@ -1079,7 +1349,7 @@ mod tests {
         assert_eq!(pool.passing_peak(), 3);
 
         // The marks were cleared: the slots come back unmarked.
-        let (again, _p, _l) = pool.copy_in(b"x").unwrap();
+        let (again, _p, _l) = pool.copy_in(SlotOwner::NONE, b"x").unwrap();
         pool.release(again);
         assert_eq!(pool.passing_held(), 0);
     }
@@ -1092,10 +1362,10 @@ mod tests {
         pool.track_passing();
         pool.begin_passing();
         let marking = pool.pause_passing();
-        pool.copy_in(b"alert").unwrap();
+        pool.copy_in(SlotOwner::NONE, b"alert").unwrap();
         assert_eq!(pool.passing_held(), 0, "taken while paused");
         pool.resume_passing(marking);
-        pool.copy_in(b"reply").unwrap();
+        pool.copy_in(SlotOwner::NONE, b"reply").unwrap();
         assert_eq!(pool.passing_held(), 1, "marking resumed");
         pool.end_passing();
         assert!(!pool.pause_passing(), "nothing to pause after end_passing");
@@ -1109,7 +1379,7 @@ mod tests {
         let mut pool = SendCopyPool::new(8, 8);
         pool.track_passing();
         pool.begin_passing();
-        let mut r = pool.reserve_slots(3).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 3).unwrap();
         pool.end_passing();
         assert_eq!(pool.passing_held(), 3);
 
@@ -1127,7 +1397,7 @@ mod tests {
         assert_eq!(pool.passing_held(), 0);
 
         // A reservation taken after marking ended is not passing.
-        let r = pool.reserve_slots(2).unwrap();
+        let r = pool.reserve_slots(SlotOwner::NONE, 2).unwrap();
         assert_eq!(pool.passing_held(), 0);
         pool.release_reservation(r);
     }
@@ -1140,7 +1410,7 @@ mod tests {
         let mut pool = SendCopyPool::new(8, 8);
         pool.track_passing();
         pool.begin_passing();
-        let mut r = pool.reserve_slots(4).unwrap();
+        let mut r = pool.reserve_slots(SlotOwner::NONE, 4).unwrap();
         pool.end_passing();
         pool.shrink_reservation(&mut r, 1);
         assert_eq!(pool.passing_held(), 1);
@@ -1157,11 +1427,11 @@ mod tests {
     fn release_clears_a_live_bounded_send_without_the_tripwire() {
         let mut pool = SendCopyPool::new(1, 32);
         let id = an_id();
-        let (idx, _ptr, _len) = pool.copy_in(b"unsettled").unwrap();
+        let (idx, _ptr, _len) = pool.copy_in(SlotOwner::NONE, b"unsettled").unwrap();
         pool.set_send_id(idx, id, 9);
         pool.release(idx);
         assert_eq!(pool.take_send_id(idx), None);
-        let (again, _p, _l) = pool.copy_in(b"next").unwrap();
+        let (again, _p, _l) = pool.copy_in(SlotOwner::NONE, b"next").unwrap();
         assert_eq!(again, idx);
         assert_eq!(pool.take_send_id(again), None);
     }
