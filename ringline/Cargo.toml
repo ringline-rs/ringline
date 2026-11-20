@@ -1,6 +1,6 @@
 [package]
 name = "ringline"
-version = "0.7.0-alpha.165"
+version = "0.7.0-alpha.166"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -42,6 +42,8 @@ futures-io = "0.3"
 bytes = { workspace = true }
 crossbeam-channel = "0.5"
 libc = "0.2"
+# Already in every build through mio.
+log = "0.4"
 mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
 metriken = "0.11.3"
 pin-project-lite = "0.2"
