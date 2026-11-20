@@ -1655,13 +1655,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   read or write when the 10 s run out leaks its event loop and tasks, as on
   io_uring, closes its sockets and accept queue, and writes a line to stderr
   (#856).
-- io_uring: a guard part of a send on a Unix-domain connection is sent with
-  a plain `sendmsg`. Before, it went out as `SENDMSG_ZC`, which the kernel
-  refuses on a Unix socket with `EOPNOTSUPP`, and the send failed and closed
-  the connection. That covered a `send_parts` part with a guard, when the send totalled at least `send_zc_threshold` bytes or a
-  smaller one could not be gathered into a pool slot. The kernel copies the
-  guard's bytes into the socket, so the guard is released when the send
-  completes, with no notification to wait for (#829).
+- io_uring: a guard part of a send on a Unix-domain connection is sent with a
+  plain `sendmsg`. Before, it went out as `SENDMSG_ZC`, which the kernel refuses
+  on a Unix socket with `EOPNOTSUPP`, and the send failed and closed the
+  connection. That covered a `send_parts` part with a guard, when the send
+  totalled at least `send_zc_threshold` bytes or a smaller one could not be
+  gathered into a pool slot. The kernel copies the guard's bytes into the
+  socket, so the guard is released when the send completes, with no notification
+  to wait for (#829).
 - The acceptor thread no longer exits on an `accept` error that ends one
   pending connection or clears when an fd or memory frees: `ENOBUFS`,
   `ENOMEM`, the errors Linux's `accept4` passes through from the new socket
@@ -1863,27 +1864,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
   F8).
 
-- Docs: `SendHalf::send` names the `NotConnected` errors and both backends'
-  pool behaviour; `send_parts` states the 32-part and 8-guard limits, the
-  small-guard fold, the send-slab error and the TLS path;
-  `ConfigBuilder::send_slab_slots` says coalesced copy runs hold an entry
-  too; `WriteHalf::Shutdown` says `send_backpressured` refuses in that state. The
-  four backpressured-sends design docs say the TLS ciphertext bound gates
-  plain TLS sends on io_uring, the series design docs carry a note pointing at
-  the renames since, and the 2026-09 journal entries list their closed
-  follow-ups as closed. The dead `ConnSendState::close_send_count` field is
-  removed. Found by the send-path audit
-  (`docs/journal/2026-11-send-path-audit.md`, F9, F12, F14).
+- Docs: `SendHalf::send` names the `NotConnected` errors and both backends' pool
+  behaviour; `send_parts` states the 32-part and 8-guard limits, the small-guard
+  fold, the send-slab error and the TLS path; `ConfigBuilder::send_slab_slots`
+  says coalesced copy runs hold an entry too; `WriteHalf::Shutdown` says
+  `send_backpressured` refuses in that state. The four backpressured-sends
+  design docs say the TLS ciphertext bound gates plain TLS sends on io_uring,
+  the series design docs carry a note pointing at the renames since, and the
+  2026-09 journal entries list their closed follow-ups as closed. The dead
+  `ConnSendState::close_send_count` field is removed. Found by the send-path
+  audit (`docs/journal/2026-11-send-path-audit.md`, F9, F12, F14).
 
-- io_uring: on a plaintext connection, a copy-only `send_parts` batch whose
-  copy data is wider than one send-pool slot is rejected with `InvalidInput`, as the same data
-  beside a guard part already was. It was reported as `Other("send copy
-  pool exhausted")`, the error a caller following the `send` contract
-  retries, for a batch that can never fit. A TLS batch is encrypted into as
-  many slots as it needs and is unaffected. `SendHalf::send_parts` and
-  `AsyncSendBuilder::submit_batch` document the one-slot limit.
-  Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
-  F13).
+- io_uring: on a plaintext connection, a copy-only `send_parts` batch whose copy
+  data is wider than one send-pool slot is rejected with `InvalidInput`, as the
+  same data beside a guard part already was. It was reported as `Other("send
+  copy pool exhausted")`, the error a caller following the `send` contract
+  retries, for a batch that can never fit. A TLS batch is encrypted into as many
+  slots as it needs and is unaffected. `SendHalf::send_parts` and
+  `AsyncSendBuilder::submit_batch` document the one-slot limit. Found by the
+  send-path audit (`docs/journal/2026-11-send-path-audit.md`, F13).
 
 - io_uring: a `send_parts` batch whose parts carry no bytes is refused with
   `InvalidInput` (see Changed). On a plaintext connection, one with at least
@@ -2217,14 +2216,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   back to the standard form (#626).
 
 - On io_uring, an awaited send could resolve with another send's result. A
-  connection had one send waiter, and any send completion on it woke the
-  waiter: a `send().await` behind a `send_nowait`, a `forward_recv_buf` or a `send_backpressured` resolved with that send's byte
-  count, and the awaited send's own completion then found no waiter. Two
-  awaited sends in flight at once on one connection could hang; on mio they
-  resolved with each other's lengths. Every send (`send`, `submit_batch`) owns
-  an entry in the worker's send completion table, and only
-  its own completion settles it, on both backends. Two awaited sends in flight
-  at once each resolve with their own result (#617).
+  connection had one send waiter, and any send completion on it woke the waiter:
+  a `send().await` behind a `send_nowait`, a `forward_recv_buf` or a
+  `send_backpressured` resolved with that send's byte count, and the awaited
+  send's own completion then found no waiter. Two awaited sends in flight at
+  once on one connection could hang; on mio they resolved with each other's
+  lengths. Every send (`send`, `submit_batch`) owns an entry in the worker's
+  send completion table, and only its own completion settles it, on both
+  backends. Two awaited sends in flight at once each resolve with their own
+  result (#617).
 
 - An awaited `send` of no bytes resolves `Ok(0)`. With no other send in
   flight on the connection it used to hang (#617).

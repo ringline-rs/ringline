@@ -64,8 +64,7 @@ ordinary fd.
 
 ## Design
 
-Stream sends carry `MSG_DONTWAIT`, and `send_chain` keeps `MSG_WAITALL`. A send that
-cannot finish waits in ringline:
+Stream sends carry `MSG_DONTWAIT`. A send that cannot finish waits in ringline:
 
 1. A short send arms `PollAdd(POLLOUT)` for the rest. It does not resubmit first,
    because the resubmit would return `-EAGAIN`.
@@ -105,8 +104,7 @@ worker exit `run_shutdown` releases it directly, and the `Close` CQE fails one t
 forced close left waiting.
 
 The peer's FIN needs no tracking, because step 4 detects it from the poll's result.
-Nothing installs an fd. `send_chain` still takes a thread in this state, because its
-parts are linked and a short part would break their order (#734).
+Nothing installs an fd.
 
 ### Poll results
 

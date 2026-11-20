@@ -581,16 +581,20 @@ fn a_waitall_send_on_a_half_closed_peer_holds_a_thread() {
     .flags(libc::MSG_WAITALL)
     .build()
     .user_data(1);
+    // SAFETY: `data` and `ours` outlive the request: the test waits for its
+    // CQE before dropping either.
     unsafe { ring.submission().push(&send) }.expect("push");
     ring.submit().expect("submit");
     std::thread::sleep(Duration::from_millis(500));
+    let before = iou_threads();
     peer.shutdown(Shutdown::Write).unwrap();
     std::thread::sleep(Duration::from_millis(500));
-    let threads = iou_threads();
+    let after = iou_threads();
     // Closing the peer with unread bytes resets the connection, so the send
     // fails. Wait for its completion before `data` and the ring go.
     drop(peer);
     ring.submit_and_wait(1).expect("wait");
     drop(ours);
-    assert!(threads >= 1, "the send should hold a worker thread");
+    assert_eq!(before, 0, "the send held a thread before the half-close");
+    assert!(after >= 1, "the send should hold a worker thread");
 }

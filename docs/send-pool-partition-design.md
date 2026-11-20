@@ -42,7 +42,7 @@ The runs are recorded in that server's repository, not in this one:
 
 The default send does not wait. `SendHalf::send` (`runtime/io.rs`) copies
 into the pool in the call and fails with `Other` when the pool is short, and
-`submit_batch`, `send_parts(..).build(..)` and `send_chain` do the same.
+`submit_batch` and `send_parts(..).build(..)` do the same.
 Waiting is opt-in (`send_admitted`, `send_backpressured`,
 `submit_batch_admitted`). A limit on one connection's share would therefore
 reach most callers as a refusal, which they handle as an error:
@@ -131,8 +131,8 @@ have the same split.
   chains (`chain_short_send.rs`, `zc_chain_enomem.rs` and the chain cases in
   seven other test files and in `backend/uring/event_loop.rs`). No crate in this
   workspace other than `ringline` calls it, and a waiting form would need the
-  chain's slot count before its closure builds it. IO_LINK chains for other
-  operations, such as `abort`'s linked operations and disk ordering, stay.
+  chain's slot count before its closure builds it. The hardlinked chains of a
+  close's lead and `Close`, and of `abort`, stay.
 
 Zero-copy sends still hold their guards until the kernel releases the
 pages; that release is internal and does not need a per-send result.
