@@ -496,12 +496,12 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) tcp_nodelay: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
-    /// True when
+    /// Which guard-only sends whose guards all lie in one registered region
+    /// name that region's buffer (`IORING_RECVSEND_FIXED_BUF`): those the
+    /// kernel probe passed, when
     /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)
-    /// is on and the kernel probe passed. A guard-only send whose guards all
-    /// lie in one registered region then names that region's buffer
-    /// (`SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF`).
-    pub(crate) fixed_buffer_sends: bool,
+    /// is on.
+    pub(crate) fixed_buffer_sends: crate::backend::uring::fixed_send::Modes,
     /// Send slab entries a connection may hold before its zero-copy sends are
     /// refused, once the slab is over half used
     /// (`ConfigBuilder::zero_copy_hold_cap`).
@@ -4123,8 +4123,12 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 iov_base: std::ptr::null_mut(),
                 iov_len: 0,
             }; MAX_IOVECS];
-            // The registered buffer every guard lies in, when there is one.
-            let mut buf_index = self.ctx.fixed_buffer_sends.then_some(None);
+            // The registered buffer every guard lies in, when there is one and
+            // this send's kind may name it: one guard goes out as `SEND_ZC`,
+            // several as `SENDMSG_ZC`.
+            let modes = self.ctx.fixed_buffer_sends;
+            let single = self.part_count == 1;
+            let mut buf_index = (if single { modes.single } else { modes.multi }).then_some(None);
             for i in 0..self.part_count as usize {
                 if let PartSlot::Guard { guard_idx } = self.parts[i] {
                     let g = self.guards[guard_idx as usize].as_ref().unwrap();
@@ -4184,14 +4188,26 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             } else if let Some(Some(buf_index)) = buf_index {
                 // Every iovec lies in registered buffer `buf_index` (checked
                 // above), so the kernel takes the pages from the buffer
-                // instead of looking them up and pinning them.
+                // instead of looking them up and pinning them. The completion
+                // is handled as the `SENDMSG_ZC` the entry describes, which a
+                // short send's rest is resent as.
                 crate::metrics::RING.increment(crate::metrics::ring::SEND_FIXED_BUFFER);
-                crate::backend::uring::sqe::Sqe::send_msg_zc_fixed(
-                    self.conn.index,
-                    msg_ptr,
-                    buf_index,
-                    user_data.raw(),
-                )
+                if single {
+                    crate::backend::uring::sqe::Sqe::send_zc_fixed(
+                        self.conn.index,
+                        iovecs[0].iov_base as *const u8,
+                        iovecs[0].iov_len as u32,
+                        buf_index,
+                        user_data.raw(),
+                    )
+                } else {
+                    crate::backend::uring::sqe::Sqe::send_msg_zc_fixed(
+                        self.conn.index,
+                        msg_ptr,
+                        buf_index,
+                        user_data.raw(),
+                    )
+                }
             } else {
                 crate::backend::uring::sqe::Sqe::send_msg_zc(
                     self.conn.index,

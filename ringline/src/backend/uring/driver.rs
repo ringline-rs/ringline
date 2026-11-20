@@ -814,12 +814,12 @@ pub(crate) struct Driver {
     pub(crate) send_zc_threshold: u32,
     /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends).
     /// A send uses a fixed buffer only once the kernel probe has also passed
-    /// (`fixed_send::enabled`).
+    /// (`fixed_send::modes`).
     pub(crate) fixed_buffer_sends: bool,
     /// Test-only: the probe's result as this driver reads it, in place of
-    /// `fixed_send::enabled`.
+    /// `fixed_send::modes`.
     #[cfg(test)]
-    pub(crate) probe_passed: Option<bool>,
+    pub(crate) probe_passed: Option<crate::backend::uring::fixed_send::Modes>,
     /// Per-connection send queues for serializing sends (one in-flight at a time).
     pub(crate) send_queues: Vec<ConnSendState>,
     /// Connection indices that currently have a `close_notify_deadline`
@@ -1510,14 +1510,17 @@ impl Driver {
         Ok(driver)
     }
 
-    /// Whether a guard-only send from one registered region uses its buffer:
-    /// the setting is on and the kernel probe passed.
-    fn fixed_buffer_sends_now(&self) -> bool {
+    /// Which guard-only sends from one registered region use its buffer:
+    /// none with the setting off, otherwise those the kernel probe passed.
+    fn fixed_buffer_sends_now(&self) -> crate::backend::uring::fixed_send::Modes {
+        if !self.fixed_buffer_sends {
+            return Default::default();
+        }
         #[cfg(test)]
         if let Some(passed) = self.probe_passed {
-            return self.fixed_buffer_sends && passed;
+            return passed;
         }
-        self.fixed_buffer_sends && crate::backend::uring::fixed_send::enabled()
+        crate::backend::uring::fixed_send::modes()
     }
 
     /// Construct a [`DriverCtx`] by borrowing driver fields.

@@ -58,22 +58,27 @@ impl RegionId {
     pub const UNREGISTERED: Self = RegionId(u16::MAX);
 }
 
-/// Whether a guard-only send from one registered region goes out as
-/// `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF`
+/// Whether guard-only sends from one registered region name the region's
+/// buffer (`IORING_RECVSEND_FIXED_BUF`)
 /// ([`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)),
 /// as [`Runtime::fixed_buffer_sends`](crate::Runtime::fixed_buffer_sends)
 /// reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FixedBufferSends {
-    /// A send whose parts are all guards in one registered region names
-    /// that region's buffer, and the kernel does not look up and pin its pages.
-    Enabled,
+    /// A send of one guard in a registered region names that region's
+    /// buffer (`SEND_ZC`), and the kernel does not look up and pin its pages.
+    /// With `multi_guard`, so does a send of several guards that all lie in
+    /// one region (`SENDMSG_ZC`, which takes the flag from Linux 6.15).
+    Enabled {
+        /// Sends of several guards in one region name its buffer too.
+        multi_guard: bool,
+    },
     /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)
     /// is `false`.
     Disabled,
-    /// The kernel refuses `IORING_RECVSEND_FIXED_BUF` on `SENDMSG_ZC`
-    /// (before Linux 6.15), or the backend is mio.
+    /// The backend is mio, or the kernel refuses `IORING_RECVSEND_FIXED_BUF`
+    /// on `SEND_ZC`.
     Unsupported,
     /// The kernel charges a send from a registered buffer that lies in a huge
     /// page to the socket's send buffer by the send's offset in the page, up
