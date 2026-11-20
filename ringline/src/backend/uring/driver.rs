@@ -812,6 +812,14 @@ pub(crate) struct Driver {
     pub(crate) loop_diag: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
+    /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends).
+    /// A send uses a fixed buffer only once the kernel probe has also passed
+    /// (`fixed_send::enabled`).
+    pub(crate) fixed_buffer_sends: bool,
+    /// Test-only: the probe's result as this driver reads it, in place of
+    /// `fixed_send::enabled`.
+    #[cfg(test)]
+    pub(crate) probe_passed: Option<bool>,
     /// Per-connection send queues for serializing sends (one in-flight at a time).
     pub(crate) send_queues: Vec<ConnSendState>,
     /// Connection indices that currently have a `close_notify_deadline`
@@ -1381,6 +1389,9 @@ impl Driver {
             tcp_nodelay: config.tcp_nodelay,
             loop_diag: config.loop_diag,
             send_zc_threshold: config.send_zc_threshold,
+            fixed_buffer_sends: config.fixed_buffer_sends,
+            #[cfg(test)]
+            probe_passed: None,
             send_queues,
             close_notify_armed: Vec::new(),
             tls_out_scratch: Vec::new(),
@@ -1499,6 +1510,16 @@ impl Driver {
         Ok(driver)
     }
 
+    /// Whether a guard-only send from one registered region uses its buffer:
+    /// the setting is on and the kernel probe passed.
+    fn fixed_buffer_sends_now(&self) -> bool {
+        #[cfg(test)]
+        if let Some(passed) = self.probe_passed {
+            return self.fixed_buffer_sends && passed;
+        }
+        self.fixed_buffer_sends && crate::backend::uring::fixed_send::enabled()
+    }
+
     /// Construct a [`DriverCtx`] by borrowing driver fields.
     ///
     /// Borrows `self` mutably, so callers cannot access individual driver
@@ -1506,6 +1527,7 @@ impl Driver {
     /// simultaneous access to specific fields (e.g., accumulators + ctx),
     /// construct `DriverCtx` inline with explicit field borrows.
     pub(crate) fn make_ctx(&mut self) -> DriverCtx<'_> {
+        let fixed_buffer_sends = self.fixed_buffer_sends_now();
         DriverCtx {
             ring: &mut self.ring,
             connections: &mut self.connections,
@@ -1520,6 +1542,7 @@ impl Driver {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             send_zc_threshold: self.send_zc_threshold,
+            fixed_buffer_sends,
             zero_copy_hold_cap: self.zero_copy_hold_cap,
             connect_deadlines: &mut self.connect_deadlines,
             send_queues: &mut self.send_queues,

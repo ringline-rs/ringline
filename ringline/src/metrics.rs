@@ -362,7 +362,13 @@ pub mod ring {
     /// blocks until a completion or the retry is due; the wait starts at
     /// 50 µs and doubles up to 10 ms.
     pub const PUSH_RETRY_WAITS: usize = 9;
-    pub const COUNT: usize = 10;
+    /// io_uring: sends built as `SENDMSG_ZC` from a registered buffer
+    /// (`ConfigBuilder::fixed_buffer_sends`), counted when built. A send that
+    /// waits in the send queue and is dropped when its connection closes is
+    /// counted but never submitted. A send the kernel returns short or refuses
+    /// with `EAGAIN` is resent from plain iovecs and still counted once.
+    pub const SEND_FIXED_BUFFER: usize = 10;
+    pub const COUNT: usize = 11;
 }
 
 /// Slot indices for `RECV_RING`: copies in the receive path.
@@ -655,6 +661,11 @@ pub fn init_metadata() {
         "op".into(),
         "push_retry_waits".into(),
     );
+    RING.insert_metadata(
+        ring::SEND_FIXED_BUFFER,
+        "op".into(),
+        "send_fixed_buffer".into(),
+    );
 
     POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
     POOL.insert_metadata(pool::TIMER_EXHAUSTED, "op".into(), "timer_exhausted".into());
@@ -757,6 +768,7 @@ mod tests {
             ring::CQE_UNKNOWN_TAG,
             ring::SHUTDOWN_STALE,
             ring::PUSH_RETRY_WAITS,
+            ring::SEND_FIXED_BUFFER,
         ] {
             assert!(RING.increment(idx), "RING[{idx}] out of bounds");
         }
