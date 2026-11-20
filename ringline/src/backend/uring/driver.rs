@@ -3167,7 +3167,9 @@ impl Driver {
             .pop()
             .ok_or(crate::error::UdpSendError::PoolExhausted)?;
 
-        let (pool_slot, ptr, len) = match self.send_copy_pool.copy_in(data) {
+        // A datagram belongs to no connection.
+        let owner = crate::buffer::send_copy::SlotOwner::NONE;
+        let (pool_slot, ptr, len) = match self.send_copy_pool.copy_in(owner, data) {
             Some(v) => v,
             None => {
                 // Return the send slot to the freelist before reporting exhaustion.

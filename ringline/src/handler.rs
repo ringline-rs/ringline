@@ -805,7 +805,8 @@ impl<'a> DriverCtx<'a> {
         // The reservation is a count, not popped slots, so a refusal has no
         // side effects (see `SendCopyPool::reserve_slots`).
         let needed = data.len().div_ceil(slot_size);
-        let mut reservation = match self.send_copy_pool.reserve_slots(needed) {
+        let owner = crate::buffer::send_copy::SlotOwner::conn(conn.index, conn.generation);
+        let mut reservation = match self.send_copy_pool.reserve_slots(owner, needed) {
             Ok(r) => r,
             Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
                 return Err(io::Error::other("send copy pool exhausted"));
@@ -2830,7 +2831,8 @@ impl<'a> DriverCtx<'a> {
         // construction rather than by agreement.
         let needed =
             bounded_send_slots(self.send_copy_pool, self.tls_table, conn.index, data.len())?;
-        let mut permit = match self.send_copy_pool.reserve_slots(needed) {
+        let owner = crate::buffer::send_copy::SlotOwner::conn(conn.index, conn.generation);
+        let mut permit = match self.send_copy_pool.reserve_slots(owner, needed) {
             Ok(r) => r,
             Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
                 return Err(io::Error::other("send copy pool exhausted"));
@@ -4038,6 +4040,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         }
         let (slot, ptr, len) = unsafe {
             self.ctx.send_copy_pool.copy_in_gather(
+                crate::buffer::send_copy::SlotOwner::conn(self.conn.index, self.conn.generation),
                 &self.copy_slices[..self.copy_count as usize],
                 self.total_copy_len,
             )
@@ -4077,6 +4080,10 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         if self.total_copy_len > 0 {
             let (slot, pool_ptr, _pool_len) = unsafe {
                 self.ctx.send_copy_pool.copy_in_gather(
+                    crate::buffer::send_copy::SlotOwner::conn(
+                        self.conn.index,
+                        self.conn.generation,
+                    ),
                     &self.copy_slices[..self.copy_count as usize],
                     self.total_copy_len,
                 )
@@ -4280,9 +4287,11 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         // `self.total_len` equals the sum of all gathered part lengths, so the
         // slot's `remaining` accounting matches the bytes actually copied in.
         let Some((slot, ptr, len)) = (unsafe {
-            self.ctx
-                .send_copy_pool
-                .copy_in_gather(&slices[..n], self.total_len as usize)
+            self.ctx.send_copy_pool.copy_in_gather(
+                crate::buffer::send_copy::SlotOwner::conn(self.conn.index, self.conn.generation),
+                &slices[..n],
+                self.total_len as usize,
+            )
         }) else {
             // Pool exhausted or gather exceeds slot size: keep guards, use ZC path.
             return Ok(false);
@@ -4380,7 +4389,10 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             return self;
         }
 
-        let (slot, ptr, len) = match self.ctx.send_copy_pool.copy_in(data) {
+        let (slot, ptr, len) = match self.ctx.send_copy_pool.copy_in(
+            crate::buffer::send_copy::SlotOwner::conn(self.conn.index, self.conn.generation),
+            data,
+        ) {
             Some(v) => v,
             None => {
                 self.error = Some(io::Error::other("send copy pool exhausted"));
@@ -4727,10 +4739,14 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                     }
                 }
                 let gathered = unsafe {
-                    self.chain
-                        .ctx
-                        .send_copy_pool
-                        .copy_in_gather(&all_slices[..n], self.total_len as usize)
+                    self.chain.ctx.send_copy_pool.copy_in_gather(
+                        crate::buffer::send_copy::SlotOwner::conn(
+                            self.chain.conn.index,
+                            self.chain.conn.generation,
+                        ),
+                        &all_slices[..n],
+                        self.total_len as usize,
+                    )
                 };
                 gathered.map(|(slot, ptr, len)| {
                     // Data is in the pool now — release the guards.
@@ -4782,6 +4798,10 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
             }
             let result = unsafe {
                 self.chain.ctx.send_copy_pool.copy_in_gather(
+                    crate::buffer::send_copy::SlotOwner::conn(
+                        self.chain.conn.index,
+                        self.chain.conn.generation,
+                    ),
                     &self.copy_slices[..self.copy_count as usize],
                     self.total_copy_len,
                 )
@@ -4825,6 +4845,10 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
             if self.total_copy_len > 0 {
                 let result = unsafe {
                     self.chain.ctx.send_copy_pool.copy_in_gather(
+                        crate::buffer::send_copy::SlotOwner::conn(
+                            self.chain.conn.index,
+                            self.chain.conn.generation,
+                        ),
                         &self.copy_slices[..self.copy_count as usize],
                         self.total_copy_len,
                     )

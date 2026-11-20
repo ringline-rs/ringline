@@ -1591,7 +1591,8 @@ mod tests {
                 pool.track_passing();
             }
             for _ in 0..4 {
-                pool.copy_in(b"held").unwrap();
+                pool.copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"held")
+                    .unwrap();
             }
             let a = parked_standalone(&mut exec);
             let b = parked_standalone(&mut exec);
