@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The mio backend builds for `x86_64-unknown-hermit` (Hermit unikernels), with
+  `--features force-mio`. Building it needs `[patch.crates-io]` entries for
+  `ring` and `linkme-impl` with Hermit support: stock `ring` 0.17 does not
+  build its assembly or C for Hermit, and stock `linkme` (used by
+  `metriken`) has no Hermit `distributed_slice`. `linkme` requires
+  `linkme-impl` at exactly its own version, so the locked `linkme` must
+  match the patched `linkme-impl` (for example `cargo update -p linkme
+  --precise 0.3.37`). The `libc` requirement is
+  now 0.2.190, the first release with public `iovec` fields on Hermit. TCP
+  and UDP listeners and connections work; on Hermit:
+  - Hermit has no Unix-domain sockets: binding a Unix listener fails at
+    `socket(2)`, and `connect_unix` returns `Unsupported` as on every mio
+    target. Process spawn, kill and wait return `Unsupported`.
+  - File and direct I/O work on files in Hermit's file systems. Hermit has no
+    `pread` or `pwrite`, so each positional read or write seeks and then reads
+    or writes under one process-wide lock. Positional reads and writes do
+    not run in parallel. `O_DSYNC` and `O_DIRECT` are not passed;
+    `fs::rename` returns `ENOSYS`. Hermit's RAM file system ignores
+    `O_TRUNC`, so `fs::create` on an existing file keeps its old bytes.
+  - `SO_REUSEPORT` is not set, so a UDP address serves one worker. TCP
+    listeners, accepted on one thread by the mio backend, take any worker
+    count. `RLIMIT_NOFILE` is not checked or raised.
+  - There are no signals: `signal::wait()` blocks forever, and
+    `Runtime::wait_on_signal()` and `Runtime::next_signal()` return only for
+    a task panic or a worker exit.
+  - A stream registers `WRITABLE` only while a write waits for room, since
+    mio's poll selector, which Hermit uses, reports a stream registered
+    `WRITABLE` as writable after every read.
+  - `RinglineBuilder::bind_fd` cannot check that the socket is a stream
+    socket (Hermit has no `SO_TYPE`), so a datagram socket fails later.
 - `ConfigBuilder::fixed_buffer_sends`, on by default (#841). On io_uring, a
   send whose parts are all guards in one registered region names the
   region's buffer with `IORING_RECVSEND_FIXED_BUF`: a send of one guard as

@@ -228,7 +228,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
     // is on the open file description, so every holder of the socket sees it.
     unsafe {
         let listen_fd = config.sockets.fd(0);
-        let flags = libc::fcntl(listen_fd, libc::F_GETFL);
+        let flags = libc::fcntl(listen_fd, libc::F_GETFL, 0);
         libc::fcntl(listen_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
@@ -280,7 +280,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
             continue;
         }
 
-        let is_unix = addr_storage.ss_family == libc::AF_UNIX as libc::sa_family_t;
+        let is_unix = addr_storage.ss_family == crate::sys::AF_UNIX as libc::sa_family_t;
         apply_accepted_sockopts(fd, config.tcp_nodelay && !is_unix);
 
         // Parse peer address from the sockaddr_storage filled by accept4.
@@ -511,9 +511,9 @@ fn accept_nonblock(
             unsafe { libc::accept(listen_fd, addr as *mut _ as *mut libc::sockaddr, addr_len) };
         if fd >= 0 {
             unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
+                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
                 libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+                let fd_flags = libc::fcntl(fd, libc::F_GETFD, 0);
                 libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
             }
         }
@@ -959,7 +959,7 @@ mod tests {
         handle.join().expect("acceptor panicked");
 
         assert!(
-            unsafe { libc::fcntl(sockets.fd(0), libc::F_GETFD) } >= 0,
+            unsafe { libc::fcntl(sockets.fd(0), libc::F_GETFD, 0) } >= 0,
             "shut_down closed the socket"
         );
         assert_eq!(

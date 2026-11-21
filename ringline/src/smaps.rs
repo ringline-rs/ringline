@@ -2,6 +2,7 @@
 //! the kernel's transparent huge page settings.
 
 use std::path::Path;
+#[cfg(not(target_os = "hermit"))]
 use std::sync::OnceLock;
 
 /// The kernel's transparent huge page settings.
@@ -92,10 +93,18 @@ fn no_huge_pages(fields: &[&str], thp: bool) -> bool {
     advised
 }
 
+/// Whether the kernel has transparent huge pages. False on Hermit, which
+/// has none, and whose libc module has no `mmap` to test with.
+#[cfg(target_os = "hermit")]
+pub(crate) fn thp_configured() -> bool {
+    false
+}
+
 /// Whether the kernel has transparent huge pages: `MADV_NOHUGEPAGE` on a
 /// scratch mapping does not fail with `EINVAL`, which it does on a kernel
 /// built without them. Decided once per process. Asks the kernel, not
 /// sysfs, which a container may not mount.
+#[cfg(not(target_os = "hermit"))]
 pub(crate) fn thp_configured() -> bool {
     static THP_CONFIGURED: OnceLock<bool> = OnceLock::new();
     *THP_CONFIGURED.get_or_init(|| {

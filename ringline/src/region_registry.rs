@@ -43,6 +43,10 @@ pub(crate) enum RegionControlMsg {
 /// The bytes of base pages `region` touches, which is what the kernel charges
 /// for it unless it is on huge pages.
 pub(crate) fn page_rounded(region: &MemoryRegion) -> u64 {
+    // Hermit's libc has no sysconf; its base page is 4096.
+    #[cfg(target_os = "hermit")]
+    let page = 4096u64;
+    #[cfg(not(target_os = "hermit"))]
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
     let start = region.ptr() as u64;
     ((start + region.len() as u64).div_ceil(page) - start / page) * page

@@ -43,6 +43,7 @@
 
 use std::fmt;
 use std::sync::OnceLock;
+#[cfg(not(target_os = "hermit"))]
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Pipe file descriptors: (read_end, write_end).
@@ -50,6 +51,7 @@ static PIPE: OnceLock<(i32, i32)> = OnceLock::new();
 
 /// Write end fd, also stored in an atomic for the signal handler
 /// (OnceLock is not async-signal-safe, but AtomicI32 load is).
+#[cfg(not(target_os = "hermit"))]
 static PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// A caught signal, or the reason
@@ -105,6 +107,24 @@ pub fn install() {
 }
 
 /// Install signal handlers and create the self-pipe. Idempotent.
+///
+/// Hermit has no signals and no pipes: the read end is an eventfd that never
+/// becomes readable, so a wait returns only for the runtime's own fds.
+#[cfg(target_os = "hermit")]
+fn setup() {
+    PIPE.get_or_init(|| {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "eventfd failed: {}",
+            std::io::Error::last_os_error()
+        );
+        (fd, fd)
+    });
+}
+
+/// Install signal handlers and create the self-pipe. Idempotent.
+#[cfg(not(target_os = "hermit"))]
 fn setup() {
     PIPE.get_or_init(|| {
         let mut fds = [0i32; 2];
@@ -121,7 +141,7 @@ fn setup() {
             if r == 0 {
                 // Set close-on-exec on both ends.
                 for fd in &fds {
-                    let fd_flags = libc::fcntl(*fd, libc::F_GETFD);
+                    let fd_flags = libc::fcntl(*fd, libc::F_GETFD, 0);
                     libc::fcntl(*fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
                 }
             }
@@ -130,7 +150,7 @@ fn setup() {
         assert!(ret == 0, "pipe failed: {}", std::io::Error::last_os_error());
 
         for fd in fds {
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
             unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
         }
 
@@ -153,6 +173,7 @@ fn setup() {
 }
 
 /// Async-signal-safe handler: writes the signal number to the pipe.
+#[cfg(not(target_os = "hermit"))]
 extern "C" fn signal_handler(sig: libc::c_int) {
     let fd = PIPE_WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
@@ -201,8 +222,7 @@ pub(crate) fn next_or_ready(panic_fd: i32, exit_fd: i32) -> Signal {
 /// Read one byte from a non-blocking fd. False when there is none, because
 /// another waiter read it first.
 fn take_byte(fd: i32) -> bool {
-    let mut buf = [0u8; 1];
-    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) == 1 }
+    crate::sys::read_token(fd)
 }
 
 /// Poll the signal pipe, and the runtime's panic and worker-exit fds if given,
@@ -258,12 +278,16 @@ fn wait_inner(runtime_fds: Option<(i32, i32)>, take: bool) -> Option<Signal> {
     if fds[0].revents & libc::POLLIN != 0 {
         let mut buf = [0u8; 1];
         // Non-blocking: another waiter may have taken the byte (EAGAIN).
-        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
         if n == 1 {
+            #[cfg(not(target_os = "hermit"))]
             return Some(match buf[0] as i32 {
                 libc::SIGTERM => Signal::Terminate,
                 _ => Signal::Interrupt,
             });
+            // Hermit's eventfd is never written, so this is unreachable there.
+            #[cfg(target_os = "hermit")]
+            return Some(Signal::Interrupt);
         }
     }
     None
