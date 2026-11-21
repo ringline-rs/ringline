@@ -14,14 +14,20 @@
 //!
 //! The table is plain worker-local state owned by the [`Executor`]. Every
 //! entry holds a slot indexed by its id, and is also listed under its target
-//! connection and, when a connection task owns it, under that task; waiting
-//! bounded sends are listed in arrival order. `register`, `set_owner`,
-//! `complete`, `take_result`, `mark_submitted` and `cancel` are index
-//! lookups; `remove_connection`, `fail_waiting` and `abort_connection`
-//! visit the entries listed under their connection. An entry that leaves the
-//! waiting state leaves its id in the waiting list, and the reads of the head
-//! pop the ids at the front that no longer name a waiting entry, so each id is
-//! pushed once and leaves once, popped at the front or dropped by `compact`.
+//! connection and, when a connection task owns it, under that task. Waiting
+//! bounded sends are queued per connection in the order they were enqueued,
+//! and the worker queue holds one entry per connection with a send waiting,
+//! standing for that connection's front send
+//! (`docs/send-pool-partition-design.md`, sections 2 and 3). When the front
+//! send leaves the waiting state, the next send on its connection takes its
+//! place in the worker queue. `register`, `set_owner`, `complete`,
+//! `take_result` and `cancel` are index lookups, plus, for a waiting send, a
+//! lookup in its connection's queue; `remove_connection`, `fail_waiting` and
+//! `abort_connection` visit the entries listed under their connection. A
+//! connection whose last waiting send leaves keeps its entry in the worker
+//! queue, and the reads of the head pop the entries at the front that are no
+//! longer live, so each entry is pushed once and leaves once, popped at the
+//! front or dropped by `compact`.
 //! Design:
 //! `docs/send-completion-slots-design.md`, `docs/send-admission-design.md`
 //! (section 2).
@@ -94,12 +100,10 @@
 //! `Executor::send_scan_due`, `set_order`, `order`) test the order or a flag
 //! only `Budget` sets and take the `Strict` path; the rest of what this
 //! paragraph describes does not run under `Strict`. Under `Budget`, while
-//! the head does not fit, a waiter behind it is also admitted
-//! ([`admit`](SendCompletions::admit)). A waiter admitted that way leaves its
-//! id in `waiting`, as a cancelled waiter does, so the rule above still
-//! holds: each id is pushed once and leaves once. A waiter can become able to
+//! the head does not fit, a connection's front send behind it is also
+//! admitted ([`admit`](SendCompletions::admit)). A waiter can become able to
 //! pass without its own poll noticing: when capacity comes back, when the
-//! head changes, when an earlier waiter on its connection leaves, or when its
+//! head changes, when it becomes its connection's front, or when its
 //! connection goes idle. The first is the release hook's wake; for the
 //! others the queue sets `scan_due`, or the driver sets `capacity_released`,
 //! and the event loop's end-of-iteration capacity wake then runs
@@ -120,12 +124,14 @@ use crate::buffer::send_copy::SendCopyPool;
 /// copy pool. Set with
 /// [`ConfigBuilder::send_admission_order`](crate::ConfigBuilder::send_admission_order).
 ///
-/// Bounded sends that do not fit the pool's free slots wait in one FIFO per
-/// worker. In both orders the FIFO's head is admitted when the free slots
-/// cover its whole message, and a send is admitted only once no earlier
-/// bounded send on its own connection still waits, so the sends on one
-/// connection keep their order. The orders differ in what happens while the
-/// head does not fit.
+/// Bounded sends that do not fit the pool's free slots wait in a queue per
+/// connection, and the worker queue holds one entry per connection with a
+/// send waiting, for that connection's front send. When a connection's front
+/// send is admitted, the next send on the connection takes its place in the
+/// worker queue. In both orders the worker queue's head is admitted when the
+/// free slots cover its whole message, and only a connection's front send is
+/// admitted, so the sends on one connection keep their order. The orders
+/// differ in what happens while the head does not fit.
 ///
 /// The default is `Budget { slots: 32 }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +249,10 @@ pub struct SendAdmissionCounters {
     pub conn_held_max: u64,
     /// Copy-pool slots held now by sends that belong to no connection (UDP).
     pub unowned_held: u64,
+    /// Bounded sends that were not admitted on their first poll.
+    pub tickets_waited: u64,
+    /// The most bounded sends waiting on one connection at once.
+    pub conn_tickets_max: u64,
 }
 
 /// The admission counters of the worker this runs on: see
@@ -256,12 +266,6 @@ pub fn send_admission_counters() -> SendAdmissionCounters {
     super::io::with_state(|driver, executor| {
         executor.send_admission_counters(&driver.send_copy_pool)
     })
-}
-
-/// Whether arrival number `a` came before `b`. Arrival numbers wrap; the
-/// waiters in the FIFO at any one time span far fewer than 2^31 of them.
-fn arrived_before(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) < 0
 }
 
 /// Identity of one send operation on its worker: a slot in
@@ -293,10 +297,6 @@ enum Completion {
         /// Copy-pool slots the whole message needs; `turn` admits the head
         /// only when at least this many are free.
         required_slots: usize,
-        /// Arrival number, which orders the waiters of one connection: under
-        /// `Budget` a waiter passes only if no waiter on its connection
-        /// arrived before it. 0 under `Strict`, which never reads it.
-        seq: u32,
         /// The scan (`scan_epoch`) that last woke this waiter to pass, if it
         /// has not polled since; 0 if none. A waiter woken and not polled by
         /// the next scan loses its claim on the room it was woken for.
@@ -331,6 +331,27 @@ struct Entry {
     waited_for_room: bool,
 }
 
+/// One entry of the worker queue: connection `conn_index`'s front waiting
+/// send, whichever send that is when the entry is read. The entry is live
+/// while the connection's [`ConnTickets::entry`] is `token` and the
+/// connection has a send waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerEntry {
+    conn_index: u32,
+    token: u32,
+}
+
+/// The waiting bounded sends of one connection.
+#[derive(Default)]
+struct ConnTickets {
+    /// Waiting sends in the order they were enqueued. Only the front may be
+    /// admitted.
+    queue: VecDeque<SendId>,
+    /// The token of the connection's live entry in the worker queue, or 0
+    /// while `queue` is empty.
+    entry: u32,
+}
+
 /// One slot of the table: its current generation and, while an operation
 /// holds it, that operation.
 struct Slot {
@@ -351,16 +372,24 @@ pub(crate) struct SendCompletions {
     slots: Vec<Slot>,
     /// Indices of the slots no operation holds.
     free: Vec<u32>,
-    /// Waiting operations in arrival order. Under `Strict` only the head may
-    /// be admitted; `Budget` also admits waiters behind it. Also
-    /// holds ids that no longer name a waiting entry, which
+    /// The worker queue: one entry per connection with a send waiting, in
+    /// the order each connection's first waiting send arrived. When a
+    /// connection's front send leaves the waiting state and another waits
+    /// behind it, the next takes its place. Under `Strict` only the head may
+    /// be admitted; `Budget` also admits connections' front sends behind it.
+    /// Also holds entries that are no longer live, which
     /// [`front`](Self::front) pops when they reach the head and
     /// [`compact`](Self::compact) drops when they number more than the live
     /// ones plus 64.
-    waiting: VecDeque<SendId>,
-    /// How many ids in `waiting` name a waiting entry.
+    waiting: VecDeque<WorkerEntry>,
+    /// How many entries in `waiting` are live: the connections with a send
+    /// waiting.
     waiting_live: usize,
-    /// Ids of `waiting` examined, for the tests that bound it.
+    /// The waiting sends of each connection, indexed by connection index.
+    tickets: Vec<ConnTickets>,
+    /// The token the next worker-queue entry gets; never 0.
+    next_token: u32,
+    /// Entries of `waiting` examined, for the tests that bound it.
     #[cfg(test)]
     visited: usize,
     /// Slot indices of the live operations targeting each connection,
@@ -373,8 +402,6 @@ pub(crate) struct SendCompletions {
     by_task: Vec<VecDeque<u32>>,
     /// The worker's admission order, set when the executor is created.
     order: SendAdmissionOrder,
-    /// The arrival number the next waiter gets, under `Budget`.
-    next_seq: u32,
     /// The number of the latest scan that looked behind the head, under
     /// `Budget`; 0 until the first such scan, and never 0 after it,
     /// since `woken_in` uses 0 for none.
@@ -556,15 +583,36 @@ impl SendCompletions {
         )
     }
 
-    /// The FIFO's head: pops the ids at the front that no longer name a
-    /// waiting entry, and returns the first that does.
+    /// The front waiting send of the connection `e` names, if `e` is live.
+    fn conn_front(&self, e: WorkerEntry) -> Option<SendId> {
+        let t = self.tickets.get(e.conn_index as usize)?;
+        if t.entry != e.token {
+            return None;
+        }
+        t.queue.front().copied()
+    }
+
+    /// Whether `id` is the front waiting send of its connection.
+    fn is_conn_front(&self, id: SendId) -> bool {
+        let Some(e) = self.entry(id) else {
+            return false;
+        };
+        matches!(e.state, Completion::Waiting { .. })
+            && self
+                .tickets
+                .get(e.conn_index as usize)
+                .is_some_and(|t| t.queue.front() == Some(&id))
+    }
+
+    /// The worker queue's head: pops the entries at the front that are no
+    /// longer live, and returns the front send of the first that is.
     fn front(&mut self) -> Option<SendId> {
-        while let Some(&id) = self.waiting.front() {
+        while let Some(&e) = self.waiting.front() {
             #[cfg(test)]
             {
                 self.visited += 1;
             }
-            if self.is_waiting(id) {
+            if let Some(id) = self.conn_front(e) {
                 return Some(id);
             }
             self.waiting.pop_front();
@@ -572,15 +620,54 @@ impl SendCompletions {
         None
     }
 
-    /// An entry left the waiting state without leaving `waiting`. Drops the
-    /// stale ids once they number more than the live ones plus 64, so that a
-    /// head that waits for a long time does not leave the list growing with
-    /// every waiter behind it that times out. The `retain` visits every id;
-    /// when it runs the stale ids are more than half of them, and each went
-    /// stale after the previous `retain`, so its cost is less than two visits
-    /// per entry that left the waiting state.
-    fn left_waiting(&mut self) {
-        self.waiting_live -= 1;
+    /// Put waiting send `id` at the back of `conn_index`'s queue, and give
+    /// the connection an entry in the worker queue if it has none.
+    fn push_ticket(&mut self, conn_index: u32, id: SendId) {
+        let key = conn_index as usize;
+        if self.tickets.len() <= key {
+            self.tickets.resize_with(key + 1, ConnTickets::default);
+        }
+        let t = &mut self.tickets[key];
+        t.queue.push_back(id);
+        let waiting_here = t.queue.len() as u64;
+        if t.entry == 0 {
+            self.next_token = self.next_token.wrapping_add(1).max(1);
+            t.entry = self.next_token;
+            self.waiting.push_back(WorkerEntry {
+                conn_index,
+                token: t.entry,
+            });
+            self.waiting_live += 1;
+        }
+        self.counters.conn_tickets_max = self.counters.conn_tickets_max.max(waiting_here);
+    }
+
+    /// Waiting send `id` on `conn_index` left the waiting state. It leaves
+    /// its connection's queue; if it was the front and another send waits,
+    /// that send takes its place in the worker queue, and if none does the
+    /// connection's entry stops being live.
+    ///
+    /// Drops the entries that are no longer live once they number more than
+    /// the live ones plus 64, so that a head that waits for a long time does
+    /// not leave the list growing with every connection behind it whose
+    /// sends time out. The `retain` visits every entry; when it runs the
+    /// stale entries are more than half of them, and each went stale after
+    /// the previous `retain`, so its cost is less than two visits per entry
+    /// that went stale.
+    fn ticket_left(&mut self, conn_index: u32, id: SendId) {
+        if let Some(t) = self.tickets.get_mut(conn_index as usize) {
+            if t.queue.front() == Some(&id) {
+                t.queue.pop_front();
+            } else if t.queue.back() == Some(&id) {
+                t.queue.pop_back();
+            } else if let Some(pos) = t.queue.iter().position(|&q| q == id) {
+                t.queue.remove(pos);
+            }
+            if t.queue.is_empty() && t.entry != 0 {
+                t.entry = 0;
+                self.waiting_live -= 1;
+            }
+        }
         self.waiter_left();
         self.compact_if_mostly_stale();
     }
@@ -595,7 +682,7 @@ impl SendCompletions {
 
     /// A waiter left the waiting state. Under `Budget`
     /// that can let a waiter behind the head pass: the head may have changed,
-    /// or the waiter that left was the earliest of its connection. The scan
+    /// or the waiter that left was the front of its connection. The scan
     /// at the end of the iteration wakes whoever can.
     fn waiter_left(&mut self) {
         if self.order != SendAdmissionOrder::Strict {
@@ -603,23 +690,17 @@ impl SendCompletions {
         }
     }
 
-    /// Drop every id in `waiting` that no longer names a waiting entry.
+    /// Drop every entry in `waiting` that is no longer live.
     fn compact(&mut self) {
-        let slots = &self.slots;
+        let tickets = &self.tickets;
         #[cfg(test)]
         {
             self.visited += self.waiting.len();
         }
-        self.waiting.retain(|&id| {
-            let slot = &slots[id.index as usize];
-            slot.generation == id.generation
-                && matches!(
-                    slot.entry,
-                    Some(Entry {
-                        state: Completion::Waiting { .. },
-                        ..
-                    })
-                )
+        self.waiting.retain(|e| {
+            tickets
+                .get(e.conn_index as usize)
+                .is_some_and(|t| t.entry == e.token && !t.queue.is_empty())
         });
     }
 
@@ -629,7 +710,7 @@ impl SendCompletions {
         self.entry(id).map(|e| e.task_id)
     }
 
-    /// Append a waiter and return its id.
+    /// Append a waiter to its connection's queue and return its id.
     ///
     /// Called by `Admission` on its first poll, with the
     /// connection it targets, the number of copy-pool slots its message
@@ -641,27 +722,23 @@ impl SendCompletions {
         required_slots: usize,
         task_id: u32,
     ) -> SendId {
-        let seq = if self.order == SendAdmissionOrder::Strict {
-            0
-        } else {
-            let seq = self.next_seq;
-            self.next_seq = seq.wrapping_add(1);
-            seq
-        };
         let id = self.insert(Entry {
             conn_index,
             task_id,
             state: Completion::Waiting {
                 generation,
                 required_slots,
-                seq,
                 woken_in: 0,
             },
             waited_for_room: false,
         });
-        self.waiting.push_back(id);
-        self.waiting_live += 1;
+        self.push_ticket(conn_index, id);
         id
+    }
+
+    /// A bounded send was not admitted on its first poll.
+    pub(crate) fn count_waited(&mut self) {
+        self.counters.tickets_waited += 1;
     }
 
     /// Register an awaited send that needs no admission, already `InFlight`,
@@ -800,23 +877,11 @@ impl SendCompletions {
             return None;
         }
         let at_front = self.front() == Some(id);
-        self.entry_mut(id)?.state = Completion::InFlight;
-        if at_front {
-            self.waiting.pop_front();
-            self.waiting_live -= 1;
-            self.waiter_left();
-            // Under `Budget`, waiters behind this head can have left
-            // already, and the scan's cost rests on `waiting` holding at most
-            // twice the live ids plus 64. `Strict` never scans, and keeps the
-            // pop it always had.
-            if self.order != SendAdmissionOrder::Strict {
-                self.compact_if_mostly_stale();
-            }
-            self.head_task()
-        } else {
-            self.left_waiting();
-            None
-        }
+        let e = self.entry_mut(id)?;
+        e.state = Completion::InFlight;
+        let conn_index = e.conn_index;
+        self.ticket_left(conn_index, id);
+        if at_front { self.head_task() } else { None }
     }
 
     /// Deliver the driver's completion of `id` — the authoritative result.
@@ -893,9 +958,10 @@ impl SendCompletions {
         let e = self.entry_mut(id)?;
         match e.state {
             Completion::Waiting { .. } => {
+                let conn_index = e.conn_index;
                 let was_head = self.front() == Some(id);
                 self.remove(id);
-                self.left_waiting();
+                self.ticket_left(conn_index, id);
                 if was_head {
                     return self.head_task();
                 }
@@ -993,24 +1059,19 @@ impl SendCompletions {
         if pool.free >= head_needs {
             return if head == id { Admit::Head } else { Admit::Wait };
         }
-        if head == id {
+        if head == id || !self.is_conn_front(id) {
             return Admit::Wait;
         }
         let Some(Entry {
             conn_index,
-            state:
-                Completion::Waiting {
-                    required_slots,
-                    seq,
-                    ..
-                },
+            state: Completion::Waiting { required_slots, .. },
             ..
         }) = self.entry(id)
         else {
             return Admit::Wait;
         };
-        let (conn_index, required_slots, seq) = (*conn_index, *required_slots, *seq);
-        if !self.may_pass(head_needs, conn_index, required_slots, seq, pool) {
+        let (conn_index, required_slots) = (*conn_index, *required_slots);
+        if !self.may_pass(head_needs, required_slots, pool) {
             return Admit::Wait;
         }
         if !idle(conn_index) {
@@ -1023,7 +1084,7 @@ impl SendCompletions {
         // this waiter, the scan at the end of the iteration wakes the older
         // one.
         let left = self.left_after_older_passers(head_needs, id, pool, &idle);
-        if !self.may_pass(head_needs, conn_index, required_slots, seq, left) {
+        if !self.may_pass(head_needs, required_slots, left) {
             self.scan_due = true;
             return Admit::Wait;
         }
@@ -1032,13 +1093,12 @@ impl SendCompletions {
         }
     }
 
-    /// `pool` less what the waiters between the head and `id` that could
-    /// pass take, oldest first, each counted against the free slots and B as
-    /// [`scan`](Self::scan) counts the waiters it wakes.
+    /// `pool` less what the connections' front sends between the head and
+    /// `id` that could pass take, oldest first, each counted against the free
+    /// slots and B as [`scan`](Self::scan) counts the waiters it wakes.
     ///
-    /// Cost: one visit per id in `waiting` ahead of `id`, stale ones
-    /// included, and for each waiter that fits, the operations of its
-    /// connection. It runs only for a waiter that would pass on its own.
+    /// Cost: one visit per entry in `waiting` ahead of `id`'s, stale ones
+    /// included. It runs only for a waiter that would pass on its own.
     ///
     /// So within one iteration it is quadratic in the waiters that pass: each
     /// walks the ones ahead of it, including those that passed already and
@@ -1051,7 +1111,10 @@ impl SendCompletions {
         idle: &impl Fn(u32) -> bool,
     ) -> PoolView {
         let mut left = pool;
-        for &older in self.waiting.iter().skip(1) {
+        for &e in self.waiting.iter().skip(1) {
+            let Some(older) = self.conn_front(e) else {
+                continue;
+            };
             if older == id {
                 break;
             }
@@ -1063,10 +1126,10 @@ impl SendCompletions {
         left
     }
 
-    /// If `id` is a waiter with an owner that could pass a head of
-    /// `head_needs` with `left`, its `required_slots` and owner. The test the scan applies to
-    /// each waiter it might wake, and that an admission applies to the
-    /// waiters older than itself. A waiter with no owner ([`NO_OWNER`]) is
+    /// If `id`, a connection's front send, is a waiter with an owner that
+    /// could pass a head of `head_needs` with `left`, its `required_slots`
+    /// and owner. The test the scan applies to each waiter it might wake, and
+    /// that an admission applies to the waiters older than itself. A waiter with no owner ([`NO_OWNER`]) is
     /// left out: no task would poll it, and its holder's first poll checks
     /// it.
     ///
@@ -1091,7 +1154,6 @@ impl SendCompletions {
             state:
                 Completion::Waiting {
                     required_slots,
-                    seq,
                     woken_in,
                     ..
                 },
@@ -1103,7 +1165,7 @@ impl SendCompletions {
         let woken_earlier = *woken_in != 0 && *woken_in != self.scan_epoch;
         let passes = *task_id != NO_OWNER
             && !woken_earlier
-            && self.may_pass(head_needs, *conn_index, *required_slots, *seq, left)
+            && self.may_pass(head_needs, *required_slots, left)
             && idle(*conn_index);
         passes.then_some((*required_slots, *task_id))
     }
@@ -1117,22 +1179,13 @@ impl SendCompletions {
         }
     }
 
-    /// Whether a waiter behind the head, which needs `head_needs` slots and
-    /// does not fit, may pass it: its `required_slots` fit in `pool.free`, no
-    /// waiter on `conn_index` arrived before it (`seq`), and the order allows
-    /// it ([`order_allows`](Self::order_allows)). `pool.passing` is B as the
+    /// Whether a connection's front send behind the head, which needs
+    /// `head_needs` slots and does not fit, may pass it: its `required_slots`
+    /// fit in `pool.free` and the order allows it
+    /// ([`order_allows`](Self::order_allows)). `pool.passing` is B as the
     /// caller counts it, which a scan raises by the waiters it has woken.
-    fn may_pass(
-        &self,
-        head_needs: usize,
-        conn_index: u32,
-        required_slots: usize,
-        seq: u32,
-        pool: PoolView,
-    ) -> bool {
-        required_slots <= pool.free
-            && !self.has_earlier_waiter(conn_index, seq)
-            && self.order_allows(head_needs, required_slots, pool)
+    fn may_pass(&self, head_needs: usize, required_slots: usize, pool: PoolView) -> bool {
+        required_slots <= pool.free && self.order_allows(head_needs, required_slots, pool)
     }
 
     /// The order's own condition for a waiter of `required_slots` to pass a
@@ -1148,24 +1201,6 @@ impl SendCompletions {
         }
     }
 
-    /// Whether a waiter on `conn_index` that arrived before `seq` is still
-    /// waiting. Visits the operations indexed under the connection, which
-    /// are few.
-    fn has_earlier_waiter(&self, conn_index: u32, seq: u32) -> bool {
-        let Some(list) = self.by_conn.get(conn_index as usize) else {
-            return false;
-        };
-        list.iter().any(|&index| {
-            matches!(
-                self.slots[index as usize].entry,
-                Some(Entry {
-                    state: Completion::Waiting { seq: earlier, .. },
-                    ..
-                }) if arrived_before(earlier, seq)
-            )
-        })
-    }
-
     /// Whether a [`scan`](Self::scan) is due: the event loop runs its
     /// capacity wake at the end of the iteration when this is set, as it
     /// does when slots came back.
@@ -1175,8 +1210,8 @@ impl SendCompletions {
 
     /// The capacity wake under `Budget`, and the scan
     /// [`scan_due`](Self::scan_due) asks for: push onto `wakes` the head's
-    /// task if the head fits, and otherwise the tasks of the waiters behind
-    /// it that could pass, oldest first. Clears `scan_due`, and sets it again
+    /// task if the head fits, and otherwise the tasks of the connections'
+    /// front sends behind it that could pass, oldest first. Clears `scan_due`, and sets it again
     /// if it woke a passer, so that the next scan runs.
     ///
     /// Each waiter woken is counted against the free slots and the budget as
@@ -1187,13 +1222,13 @@ impl SendCompletions {
     /// changes before the woken tasks poll; each poll checks again
     /// ([`admit`](Self::admit)).
     ///
-    /// Cost: once the head does not fit, it visits every id in `waiting`, stale ones included (at most twice the
-    /// live ones plus 64, see [`left_waiting`](Self::left_waiting)), and for
-    /// each waiter that fits, the operations of its connection. It runs at
-    /// most once per event-loop iteration. It keeps visiting after the free
-    /// slots are used up, because a waiter that needs no slots (an empty
-    /// message) can still pass. Stale ids are skipped, not popped: only
-    /// `front` and `compact` remove ids.
+    /// Cost: once the head does not fit, it visits every entry in `waiting`,
+    /// stale ones included (at most twice the live ones plus 64, see
+    /// [`ticket_left`](Self::ticket_left)). It runs at most once per
+    /// event-loop iteration. It keeps visiting after the free slots are used
+    /// up, because a waiter that needs no slots (an empty message) can still
+    /// pass. Stale entries are skipped, not popped: only `front` and
+    /// `compact` remove entries.
     pub(crate) fn scan(
         &mut self,
         pool: PoolView,
@@ -1217,7 +1252,9 @@ impl SendCompletions {
         let mut left = pool;
         // `front` left the head at the front of `waiting`.
         for position in 1..self.waiting.len() {
-            let id = self.waiting[position];
+            let Some(id) = self.conn_front(self.waiting[position]) else {
+                continue;
+            };
             if let Some((required_slots, task_id)) = self.could_pass(id, head_needs, left, &idle) {
                 wakes.push(task_id);
                 left.free -= required_slots;
@@ -1255,8 +1292,8 @@ impl SendCompletions {
     /// backend has closed its socket and is about to free the slot.
     ///
     /// Every waiting and in-flight entry for the connection becomes
-    /// `Aborted(ConnectionAborted)` (a waiting one's id leaves the FIFO when it
-    /// reaches the head, or at the next `compact`) and its
+    /// `Aborted(ConnectionAborted)` (a waiting one leaves its connection's
+    /// queue, and the connection's worker-queue entry stops being live) and its
     /// owner's task id is in the returned list — the owner may be a
     /// standalone task, or a connection task on another index, that
     /// outlives this connection. A resolved entry keeps its result for the
@@ -1280,7 +1317,7 @@ impl SendCompletions {
     /// Visits the entries indexed under `conn_index`, and allocates the
     /// returned `Vec` and a list of those entries; this is the teardown path.
     /// An entry that leaves the waiting state can trigger a `compact`, which
-    /// visits every id in the FIFO.
+    /// visits every entry in the worker queue.
     pub(crate) fn remove_connection(&mut self, conn_index: u32) -> Vec<u32> {
         let mut wakes = Vec::new();
         let old_head = self.front();
@@ -1307,6 +1344,14 @@ impl SendCompletions {
                 continue;
             }
             let was_waiting = matches!(e.state, Completion::Waiting { .. });
+            let id = SendId {
+                index,
+                generation: self.slots[index as usize].generation,
+            };
+            let e = self.slots[index as usize]
+                .entry
+                .as_mut()
+                .expect("checked above");
             let keep = match e.state {
                 Completion::Waiting { .. } | Completion::InFlight => {
                     e.state = Completion::Aborted(connection_aborted());
@@ -1324,9 +1369,15 @@ impl SendCompletions {
                 self.free_index(index);
             }
             if was_waiting {
-                self.left_waiting();
+                self.ticket_left(conn_index, id);
             }
         }
+        debug_assert!(
+            self.tickets
+                .get(conn_index as usize)
+                .is_none_or(|t| t.queue.is_empty() && t.entry == 0),
+            "a released connection kept waiting sends"
+        );
         self.wake_new_head(old_head, &mut wakes);
         wakes
     }
@@ -1430,7 +1481,8 @@ impl SendCompletions {
             }
             e.state = Completion::Done(Err(io::Error::new(kind, msg)));
             wakes.push(e.task_id);
-            self.left_waiting();
+            let generation = self.slots[index as usize].generation;
+            self.ticket_left(conn_index, SendId { index, generation });
         }
         self.wake_new_head(old_head, &mut wakes);
         wakes
@@ -1475,16 +1527,18 @@ impl SendCompletions {
                 wakes.push(e.task_id);
             }
             if was_waiting {
-                self.left_waiting();
+                let generation = self.slots[index as usize].generation;
+                self.ticket_left(conn_index, SendId { index, generation });
             }
         }
         self.wake_new_head(old_head, &mut wakes);
         wakes
     }
 
+    /// Waiting sends, on every connection.
     #[cfg(test)]
     fn waiting_len(&self) -> usize {
-        self.waiting_live
+        self.tickets.iter().map(|t| t.queue.len()).sum()
     }
 
     /// Operations holding a slot, waiting or admitted.
@@ -1496,7 +1550,7 @@ impl SendCompletions {
     #[cfg(test)]
     fn submitted_len(&self) -> usize {
         let live = self.slots.iter().filter(|s| s.entry.is_some()).count();
-        live - self.waiting_live
+        live - self.waiting_len()
     }
 }
 
@@ -1610,6 +1664,12 @@ impl Executor {
             }
             let _ = self.wake_task(head);
         }
+    }
+
+    /// [`SendCompletions::count_waited`]. `admission_decision`, when a
+    /// bounded send's first poll is told to wait.
+    pub(crate) fn count_send_waited(&mut self) {
+        self.send_completions.count_waited();
     }
 
     /// [`SendCompletions::set_order`]. The event loops, right after
@@ -2342,15 +2402,14 @@ mod tests {
         assert_eq!(q.live(), 2);
     }
 
-    /// Cancelling waiters behind the head leaves their ids in place, and the
-    /// head's next reads pop them once each: no cancel searches the FIFO.
+    /// Cancelling the only waiters of the connections behind the head
+    /// leaves their entries in place: no cancel searches the worker queue.
     /// Cancelling from the back is the order in which a search costs most.
     #[test]
     fn cancelling_waiters_behind_the_head_does_not_search_the_fifo() {
-        const A: u32 = 4;
         let mut q = SendCompletions::new();
-        let head = q.enqueue(A, 0, 1, task(1));
-        let behind: Vec<SendId> = (0..64).map(|i| q.enqueue(A, 0, 1, task(2 + i))).collect();
+        let head = q.enqueue(0, 0, 1, task(1));
+        let behind: Vec<SendId> = (1..=64).map(|c| q.enqueue(c, 0, 1, task(1 + c))).collect();
         q.visited = 0;
         for &id in behind.iter().rev() {
             assert_eq!(q.cancel(id), None, "not the head: nobody to wake");
@@ -2358,16 +2417,34 @@ mod tests {
         assert_eq!(
             q.waiting.len(),
             65,
-            "the cancelled ids stay until they reach the head"
+            "the stale entries stay until they reach the head"
         );
         assert_eq!(q.waiting_len(), 1);
         // Each cancel reads the head once.
         assert_eq!(q.visited, 64);
 
         assert_eq!(q.mark_submitted(head), None, "no waiter left to wake");
-        assert!(q.waiting.is_empty(), "the stale ids were popped");
-        // The head read once, then the 64 stale ids popped once each.
-        assert_eq!(q.visited, 64 + 1 + 64);
+        assert!(q.waiting.is_empty(), "the stale entries were dropped");
+        // The head read once, then, with no live entry left, one compaction
+        // of the 65.
+        assert_eq!(q.visited, 64 + 1 + 65);
+    }
+
+    /// Cancelling the waiters behind a connection's front, from the back,
+    /// takes each from the back of the connection's queue without a search,
+    /// and leaves the front in its place.
+    #[test]
+    fn cancelling_a_connection_s_waiters_from_the_back_keeps_its_front() {
+        const A: u32 = 4;
+        let mut q = SendCompletions::new();
+        let head = q.enqueue(A, 0, 1, task(1));
+        let behind: Vec<SendId> = (0..64).map(|i| q.enqueue(A, 0, 1, task(2 + i))).collect();
+        assert_eq!(q.waiting.len(), 1, "one entry for the connection");
+        for &id in behind.iter().rev() {
+            assert_eq!(q.cancel(id), None, "not the head: nobody to wake");
+        }
+        assert_eq!(q.waiting_len(), 1);
+        assert!(q.turn(head, 1), "the front kept its place");
     }
 
     /// A head that waits while the waiters behind it come and go does not
@@ -2612,21 +2689,26 @@ mod tests {
         wakes
     }
 
-    /// Under `Strict` the queue keeps no arrival numbers and asks for no
-    /// scan, whatever leaves the FIFO: none of `Budget`'s work runs.
+    /// Under `Strict` the queue asks for no scan, whatever leaves the
+    /// worker queue, and counts no passing: none of `Budget`'s work runs.
     #[test]
-    fn strict_keeps_no_arrival_numbers_and_asks_for_no_scan() {
+    fn strict_asks_for_no_scan() {
         let mut q = SendCompletions::new();
         let head = q.enqueue(1, 0, 6, task(1));
         let behind = q.enqueue(2, 0, 1, task(2));
         let gone = q.enqueue(3, 0, 1, task(3));
-        assert_eq!(q.next_seq, 0);
         assert!(!q.turn(behind, 4), "nothing passes the head");
         q.cancel(gone);
         q.mark_submitted(head);
         q.remove_connection(2);
         assert!(!q.scan_due());
-        assert_eq!(q.counters, SendAdmissionCounters::default());
+        assert_eq!(
+            q.counters,
+            SendAdmissionCounters {
+                conn_tickets_max: 1,
+                ..SendAdmissionCounters::default()
+            }
+        );
     }
 
     /// A waiter that fits passes a head that does not, and once the head
@@ -2930,6 +3012,7 @@ mod tests {
                 passing_slots: 2,
                 wake_scans: 2,
                 scan_wakes: 1,
+                conn_tickets_max: 1,
                 ..SendAdmissionCounters::default()
             }
         );
@@ -3096,5 +3179,106 @@ mod tests {
         assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(2)]);
         assert!(q.scan_due(), "the next scan is due");
         assert_eq!(scanned(&mut q, pool(1, 0, 8)), vec![task(3)]);
+    }
+
+    /// When a connection's front send is admitted at the head, the next send
+    /// waiting on the same connection takes the head, ahead of a connection
+    /// whose send arrived before it.
+    #[test]
+    fn a_connections_next_waiter_takes_its_place_at_the_head() {
+        const A: u32 = 1;
+        const B: u32 = 2;
+        let mut q = SendCompletions::new();
+        let a1 = q.enqueue(A, 0, 1, task(1));
+        let b1 = q.enqueue(B, 0, 1, task(2));
+        let a2 = q.enqueue(A, 0, 1, task(3));
+        assert!(q.turn(a1, 1));
+        assert_eq!(
+            q.mark_submitted(a1),
+            Some(task(3)),
+            "A's next send is woken"
+        );
+        assert!(q.turn(a2, 1), "A's next send is the head");
+        assert!(!q.turn(b1, 1), "B waits behind it");
+    }
+
+    /// The worker queue holds one entry per connection with a send waiting,
+    /// however many sends wait on it.
+    #[test]
+    fn the_worker_queue_holds_one_entry_per_connection() {
+        let mut q = SendCompletions::new();
+        for i in 0..3 {
+            q.enqueue(1, 0, 1, task(i));
+        }
+        for i in 3..5 {
+            q.enqueue(2, 0, 1, task(i));
+        }
+        assert_eq!(q.waiting.len(), 2);
+        assert_eq!(q.waiting_live, 2);
+        assert_eq!(q.waiting_len(), 5);
+    }
+
+    /// Cancelling a connection's front send at the head hands the head to
+    /// the next send on its connection, and wakes it.
+    #[test]
+    fn cancelling_a_front_ticket_hands_its_place_to_the_next_on_its_connection() {
+        const A: u32 = 1;
+        const B: u32 = 2;
+        let mut q = SendCompletions::new();
+        let a1 = q.enqueue(A, 0, 1, task(1));
+        let b1 = q.enqueue(B, 0, 1, task(2));
+        let a2 = q.enqueue(A, 0, 1, task(3));
+        assert_eq!(q.cancel(a1), Some(task(3)));
+        assert!(q.turn(a2, 1));
+        assert!(!q.turn(b1, 1));
+    }
+
+    /// A released connection leaves no waiting send and no live entry, so
+    /// the next connection on the same index gets an entry of its own and is
+    /// admitted.
+    #[test]
+    fn a_released_connection_leaves_no_ticket_for_the_next_occupant() {
+        const A: u32 = 5;
+        let mut q = SendCompletions::new();
+        q.enqueue(A, 0, 1, task(1));
+        q.enqueue(A, 0, 1, task(2));
+        q.remove_connection(A);
+        assert_eq!(q.waiting_live, 0);
+        let next = q.enqueue(A, 1, 1, task(3));
+        assert_eq!(q.waiting_len(), 1);
+        assert!(q.turn(next, 1), "the new occupant's send is the head");
+    }
+
+    /// An entry left behind when a connection's queue emptied does not stand
+    /// for the connection's sends after it fills again: the connection's new
+    /// send waits at the back, behind a connection that arrived in between.
+    #[test]
+    fn a_stale_worker_entry_from_an_emptied_connection_is_not_its_new_entry() {
+        const H: u32 = 1;
+        const A: u32 = 2;
+        const B: u32 = 3;
+        let mut q = SendCompletions::new();
+        let head = q.enqueue(H, 0, 4, task(1));
+        let a1 = q.enqueue(A, 0, 1, task(2));
+        q.cancel(a1);
+        let b1 = q.enqueue(B, 0, 1, task(3));
+        let a2 = q.enqueue(A, 0, 1, task(4));
+        assert!(q.turn(head, 4));
+        assert_eq!(q.mark_submitted(head), Some(task(3)), "B is the next head");
+        assert!(q.turn(b1, 1));
+        assert!(!q.turn(a2, 1));
+    }
+
+    /// The counters record the most sends waiting on one connection at once.
+    #[test]
+    fn counters_record_the_most_sends_waiting_on_one_connection() {
+        let mut q = SendCompletions::new();
+        let first = q.enqueue(1, 0, 1, task(1));
+        q.enqueue(1, 0, 1, task(2));
+        q.enqueue(2, 0, 1, task(3));
+        q.cancel(first);
+        q.enqueue(1, 0, 1, task(4));
+        q.enqueue(1, 0, 1, task(5));
+        assert_eq!(q.counters.conn_tickets_max, 3);
     }
 }

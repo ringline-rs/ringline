@@ -4886,7 +4886,7 @@ fn admission_decision(
     id: SendId,
     first_poll: bool,
 ) -> Option<Option<usize>> {
-    if executor.send_admission_order() == SendAdmissionOrder::Strict {
+    let decision = if executor.send_admission_order() == SendAdmissionOrder::Strict {
         let free = driver.send_copy_pool.free_count();
         executor.send_capacity_turn(id, free).then_some(None)
     } else {
@@ -4896,7 +4896,11 @@ fn admission_decision(
             Admit::Head => Some(None),
             Admit::Pass { slots } => Some(Some(slots)),
         }
+    };
+    if first_poll && decision.is_none() {
+        executor.count_send_waited();
     }
+    decision
 }
 
 impl Drop for Admission<'_> {
