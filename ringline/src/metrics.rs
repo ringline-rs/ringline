@@ -162,11 +162,10 @@ pub mod conn {
     pub const ACCEPT_ERROR_BACKOFF: usize = 9;
     /// An acceptor thread stopped because its listening socket can no longer
     /// accept (`EBADF`, `ENOTSOCK`, `EINVAL` outside shutdown). Its listener
-    /// accepts nothing afterwards; the error is also written to stderr. In
+    /// accepts nothing afterwards; the error is also logged at `error`. In
     /// merged accept mode, a worker's multishot accept on one listener
     /// stopped outside shutdown for the same errors or `ECANCELED`; that
-    /// worker accepts nothing more on that listener, and nothing is written
-    /// to stderr.
+    /// worker accepts nothing more on that listener, and nothing is logged.
     pub const ACCEPTOR_STOPPED: usize = 10;
     /// TLS connections, inbound or outbound, closed because their handshake
     /// had not completed within `ConfigBuilder::tls_handshake_timeout`.

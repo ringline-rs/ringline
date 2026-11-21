@@ -344,7 +344,7 @@ pub struct Config {
         crate::handoff::Sender<crate::park::ParkedFd>,
         crate::wakeup::WakeFd,
     )>,
-    /// Print per-worker event-loop diagnostics to stderr at shutdown: the
+    /// Log per-worker event-loop diagnostics at shutdown, at `info`: the
     /// iteration mix (`[ringline diag]`) and wait/work stall buckets
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
     /// iteration while enabled. io_uring backend only. Default: false.
@@ -1031,12 +1031,15 @@ impl ConfigBuilder {
 
     // ── Diagnostics ──────────────────────────────────────────────────
 
-    /// Print per-worker event-loop diagnostics to stderr at shutdown.
+    /// Log per-worker event-loop diagnostics at shutdown, at `info` through
+    /// the `log` crate; nothing appears unless the application installs a
+    /// logger.
     ///
-    /// Each worker prints a `[ringline diag]` line (iteration mix: dead
+    /// Each worker logs a `[ringline diag]` line (iteration mix: dead
     /// iterations, CQEs and tasks per iteration) and a `[ringline stall]` line
     /// (wait/work stall buckets). Recording the stall buckets costs ~4 clock
-    /// reads per iteration, so this is off by default. io_uring backend only; the mio backend prints nothing.
+    /// reads per iteration, so this is off by default. io_uring backend only;
+    /// the mio backend logs nothing.
     pub fn loop_diag(mut self, enable: bool) -> Self {
         self.config.loop_diag = enable;
         self
@@ -1082,7 +1085,7 @@ impl ConfigBuilder {
     /// proportion: a CQ of `c` gives an SQ of `c / 16` and `c * 16000 / 65536`
     /// connections. An `sq_entries` or `max_connections` set on the builder
     /// that a smaller CQ cannot hold in that proportion stops the fit. A fitted
-    /// launch writes one line to stderr naming the sizes, and
+    /// launch logs one line at `warn` naming the sizes, and
     /// [`Runtime::cq_entries`](crate::Runtime::cq_entries) and the related
     /// accessors report them. When nothing fits, launch fails with
     /// [`Error::ResourceLimit`](crate::Error::ResourceLimit). To have launch

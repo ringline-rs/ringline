@@ -205,7 +205,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rings to the limit instead of failing with `Error::ResourceLimit`. It halves
   `cq_entries` until the rings fit, down to 1024, and lowers `sq_entries` and
   `max_connections` left at their defaults in proportion (`cq / 16` and
-  `cq * 16000 / 65536`), and writes one line to stderr naming the sizes. At
+  `cq * 16000 / 65536`), and logs one line at `warn` naming the sizes. At
   the 8 MiB systemd sets by default, four workers run at 32768 CQ entries,
   2048 SQ entries and 8000 connections each, where the defaults need about
   10 MiB. Sizes set on the builder are kept: a `cq_entries` set there is
@@ -507,6 +507,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   counts these receives.
 
 ### Changed
+
+- **Breaking:** ringline writes its messages through the `log` crate instead
+  of to stderr, so nothing appears unless the application installs a logger
+  (for example `env_logger`). Of the messages 0.6 printed, a worker that could
+  not be pinned to its CPU is now at `error`, and its launch error carries the
+  same text and no longer the OS error code; the `loop_diag` lines are at
+  `info`; and ringline's line for a task panic is at `error`. The panic hook
+  still prints the panic itself.
 
 - Bounded sends (`send_admitted`, `send_backpressured`) are admitted under
   `SendAdmissionOrder::Budget { slots: 32 }` by default, so one can be
@@ -1568,7 +1576,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   UDP re-arm or merged accept arm, which kept the worker from blocking at
   all. The gauge `ringline/ring/push_retries_pending` shows how many are
   owed, `ringline/ring` `op=push_retry_waits` counts the
-  waits, and after 1 s of refusals the worker writes one line to stderr.
+  waits, and after 1 s of refusals the worker logs one line at `warn`.
 - io_uring: an fs, direct I/O or NVMe call no longer fails when the ring
   refuses its submission (#877). A call that found the submission queue full
   and whose inline submit failed with `Interrupted`, `EBUSY` or `EAGAIN`
@@ -1703,7 +1711,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   had gone. At worker exit, requests the pool has not started are now answered
   `ECANCELED` without running. A worker whose pool is still running such a
   read or write when the 10 s run out leaks its event loop and tasks, as on
-  io_uring, closes its sockets and accept queue, and writes a line to stderr
+  io_uring, closes its sockets and accept queue, and logs a line at `warn`
   (#856).
 - io_uring: a guard part of a send on a Unix-domain connection is sent with a
   plain `sendmsg`. Before, it went out as `SENDMSG_ZC`, which the kernel refuses
@@ -1720,7 +1728,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ENONET`, `EOPNOTSUPP`, `ENOPROTOOPT`) and `ETIMEDOUT`.
   Before, any of these ended the thread with nothing logged, and its listener
   accepted nothing while the workers ran. It now stops only on `EBADF`,
-  `ENOTSOCK` or `EINVAL` outside shutdown, writing the error to stderr and
+  `ENOTSOCK` or `EINVAL` outside shutdown, logging the error at `error` and
   counting `acceptor_stopped`; `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and
   any errno it does not classify wait 10 ms, are counted as
   `accept_error_backoff`, and accept again (#828).
@@ -1733,7 +1741,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   freed memory to disk. An operation a cancel does not end, such as one
   already running on io-wq, is waited for; a worker with one still running
   when the bound runs out leaks its event loop and its tasks instead of
-  dropping them, and writes a line to stderr (#824). A worker that leaks its
+  dropping them, and logs a line at `warn` (#824). A worker that leaks its
   event loop, here or after a panic in its exit drain, releases its
   references to the blocking, resolver and spawner pools, so their threads
   still exit.
