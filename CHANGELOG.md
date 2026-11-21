@@ -523,6 +523,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   served per worker. Sends on one connection keep their order. Set
   `ConfigBuilder::send_admission_order(SendAdmissionOrder::Strict)` to keep
   strict order across connections.
+- Waiting bounded sends queue per connection. When one is admitted, the next
+  waiting on the same connection takes its place in the worker's admission
+  order, ahead of sends on other connections that started waiting after the
+  first.
+- A plain send (`send`, `send_parts().build`, `submit_batch`,
+  `forward_recv_buf`) made while a bounded send waits for send-pool slots on
+  the same connection is refused with `Other` ("a bounded send waits on this
+  connection"), on both backends; before, it went out ahead of the waiting
+  send. Nothing is queued, so the same buffer can be sent once the waiting
+  send is admitted. On io_uring a batch of guards only, at or above
+  `send_zc_threshold`, takes no send-pool slot and is not refused.
+- `close()` fails every bounded send still waiting for send-pool slots on the
+  connection with `NotConnected` ("connection is closing"). Before, it stayed
+  queued: it was sent ahead of the close once it won capacity, or failed when
+  the connection was released.
 - `Runtime::shutdown` (and dropping the `Runtime`) returns once every
   pool-mode acceptor thread has exited, so a pool-mode listener's port is
   free when it returns. It may block for up to 10 ms while an acceptor

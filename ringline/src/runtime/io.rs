@@ -3345,7 +3345,11 @@ impl SendHalf {
     /// record of headroom for a record rustls may have queued ahead of the
     /// data (a key update or an alert), so a message whose ciphertext alone
     /// would exactly fill the pool is refused too. On mio a plaintext send never
-    /// fails for pool reasons. Nothing was queued or transmitted on those
+    /// fails for pool reasons. On both backends, `Other` while a bounded send
+    /// ([`send_admitted`](Self::send_admitted),
+    /// [`send_backpressured`](Self::send_backpressured), a waiting batch)
+    /// waits for send-pool slots on this connection, so that this send does not
+    /// go out ahead of it. Nothing was queued or transmitted on those
     /// errors, so the same buffer may be sent again later. A TLS encryption
     /// failure (`Other`; on TLS 1.2, the traffic keys exhausted) closes the
     /// connection on both backends, because the record layer is finished: a
@@ -4664,10 +4668,11 @@ enum AdmissionState {
 /// The refusals of [`BackpressuredSend`] that come before submission:
 /// `InvalidInput` for a message that can never fit the pool, `BrokenPipe`
 /// for a write half that is shut down, `ConnectionAborted` for a connection
-/// that was aborted ([`SendHalf::abort`]) or closed while waiting,
-/// `NotConnected`, on io_uring, for a TLS connection whose close_notify is
-/// queued and for any connection whose close was committed before or while it
-/// waited, and anything the submission itself reports. Errors after
+/// that was aborted ([`SendHalf::abort`]) or released while waiting,
+/// `NotConnected` for a send waiting when [`SendHalf::close`] is called and,
+/// on io_uring, for a TLS connection whose close_notify is queued and for any
+/// connection whose close was committed before or while it waited, and
+/// anything the submission itself reports. Errors after
 /// submission come from the [`SendCompletion`].
 ///
 /// `!Send`: its connection index and its place in the admission FIFO belong
@@ -5441,7 +5446,8 @@ enum BackpressuredState<'a> {
 ///   or was shut down while this send was waiting.
 /// - [`ConnectionAborted`](io::ErrorKind::ConnectionAborted) — the connection
 ///   was aborted ([`SendHalf::abort`]), or closed while waiting or in flight.
-/// - [`NotConnected`](io::ErrorKind::NotConnected) — on io_uring, the
+/// - [`NotConnected`](io::ErrorKind::NotConnected) — `close()` was called
+///   while this send waited for capacity. On io_uring also: the
 ///   connection is TLS and its close_notify is already queued (`close()`, a
 ///   handler return or a fatal encrypt error); or the connection's close was
 ///   committed before or while this send waited for capacity. A waiter in the

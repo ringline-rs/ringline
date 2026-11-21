@@ -215,9 +215,11 @@ if timeout(settle_limit, sent).await.is_err() {
   `BackpressuredSend` in `Submitted` does (io.rs:4134-4152), and the
   bytes still go out.
 - Byte order: after admission the bytes are in the connection's queue
-  (handler.rs:970-1016 on io_uring, 2922-2947 on mio). A send made on the same
-  connection while the future waits goes out ahead of it, as with
-  `send_backpressured`.
+  (handler.rs:970-1016 on io_uring, 2922-2947 on mio). A plain send made on the
+  same connection while the future waits is refused
+  (`docs/send-pool-partition-design.md`, section 2), except, on io_uring, a
+  batch of guards only that takes no send-pool slot, which goes out ahead of
+  it.
 - `send_backpressured` becomes `send_admitted` followed by awaiting the
   `SendCompletion`, with no change in behaviour.
 - On mio, admission is the permit `send_bounded` takes, and settling is the
