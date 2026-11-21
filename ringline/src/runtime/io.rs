@@ -1564,6 +1564,16 @@ impl ConnCtx {
         if driver.connections.generation(self.conn_index) != self.generation {
             return;
         }
+        // A bounded send still waiting on the connection could only be sent
+        // ahead of the close: it fails now
+        // (`docs/send-pool-partition-design.md`, "Teardown and parking").
+        let executor = unsafe { &mut *state.executor.as_mut() };
+        executor.fail_waiting_bounded_sends(
+            self.conn_index,
+            self.generation,
+            io::ErrorKind::NotConnected,
+            "connection is closing",
+        );
         #[cfg(has_io_uring)]
         driver.close_connection_graceful(self.conn_index);
         #[cfg(not(has_io_uring))]
@@ -1574,7 +1584,6 @@ impl ConnCtx {
             .writable_task
             .take()
         {
-            let executor = unsafe { &mut *state.executor.as_mut() };
             executor.wake_task(task);
         }
     }

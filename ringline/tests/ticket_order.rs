@@ -4,7 +4,7 @@
 //! bounded sends queued behind it, and a bounded send waiting for send-pool
 //! capacity. A plain send made then is refused, and the peer reads the
 //! waiting send's bytes before those of a plain send made once it has been
-//! admitted.
+//! admitted. A close fails the waiting send.
 
 #![allow(clippy::manual_async_fn)]
 
@@ -75,6 +75,18 @@ struct Seen {
 
 static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
 
+/// The result of the bounded send that waited when its connection was
+/// closed.
+static CLOSED: Mutex<Option<String>> = Mutex::new(None);
+
+/// The tests share the statics above, and `cargo test` runs them in one
+/// process.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn kind(result: io::Result<impl Sized>) -> String {
     match result {
         Ok(_) => "Ok".to_string(),
@@ -87,9 +99,17 @@ struct Sender;
 impl AsyncEventHandler for Sender {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            // The client's go byte. `wait_for_server`'s probe closes without
-            // one.
-            if conn.with_data(|d| ParseResult::Consumed(d.len())).await == 0 {
+            // The client's first byte picks the test: `g` sends after the
+            // waiting send, `c` closes while it waits. `wait_for_server`'s
+            // probe closes without one.
+            let mut first_byte = 0;
+            let n = conn
+                .with_data(|d| {
+                    first_byte = d[0];
+                    ParseResult::Consumed(d.len())
+                })
+                .await;
+            if n == 0 {
                 return;
             }
             static QUEUED_BYTES: [u8; SLOT] = [QUEUED; SLOT];
@@ -103,6 +123,11 @@ impl AsyncEventHandler for Sender {
             let first =
                 std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx))).await;
             assert!(first.is_pending(), "the send waits for capacity");
+            if first_byte == b'c' {
+                conn.close();
+                *CLOSED.lock().unwrap() = Some(kind(waiting.await));
+                return;
+            }
             let tickets_waited = ringline::send_admission_counters().tickets_waited;
             let refused = kind(conn.send(&[PLAIN; 100]));
             *SEEN.lock().unwrap() = Some(Seen {
@@ -124,6 +149,26 @@ impl AsyncEventHandler for Sender {
     }
 }
 
+fn launch() -> (
+    ringline::Runtime,
+    Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>,
+) {
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .max_connections(16)
+        .send_pool(SLOTS, SLOT as u32)
+        .build()
+        .expect("valid config");
+    let launched = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<Sender>()
+        .expect("launch");
+    wait_for_server(launched.0.bound_addr().expect("bound"));
+    launched
+}
+
 fn wait_for_server(addr: std::net::SocketAddr) {
     for _ in 0..200 {
         if TcpStream::connect(addr).is_ok() {
@@ -140,20 +185,9 @@ fn wait_for_server(addr: std::net::SocketAddr) {
 /// then the plain send, and never the refused one.
 #[test]
 fn a_plain_send_waits_its_turn_behind_a_waiting_bounded_send() {
-    let config = ConfigBuilder::new()
-        .workers(1)
-        .pin_to_core(false)
-        .sq_entries(64)
-        .max_connections(16)
-        .send_pool(SLOTS, SLOT as u32)
-        .build()
-        .expect("valid config");
-    let (runtime, handles) = RinglineBuilder::new(config)
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<Sender>()
-        .expect("launch");
+    let _serial = serial();
+    let (runtime, handles) = launch();
     let addr = runtime.bound_addr().expect("bound");
-    wait_for_server(addr);
 
     let mut peer = TcpStream::connect(addr).expect("connect");
     peer.set_read_timeout(Some(Duration::from_secs(10)))
@@ -190,6 +224,36 @@ fn a_plain_send_waits_its_turn_behind_a_waiting_bounded_send() {
     let queued = &rest[rest.len() - 4 * SLOT..];
     assert!(queued.iter().all(|&b| b == QUEUED));
     assert!(rest[..rest.len() - 4 * SLOT].iter().all(|&b| b == FILL));
+
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
+
+/// A close fails a bounded send waiting on the connection with
+/// `NotConnected` at once, and the peer reads the sends queued before it.
+#[test]
+fn close_fails_a_bounded_send_waiting_on_the_connection() {
+    let _serial = serial();
+    *CLOSED.lock().unwrap() = None;
+    let (runtime, handles) = launch();
+    let addr = runtime.bound_addr().expect("bound");
+    let mut peer = TcpStream::connect(addr).expect("connect");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    peer.write_all(b"c").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let closed = loop {
+        if let Some(closed) = CLOSED.lock().unwrap().take() {
+            break closed;
+        }
+        assert!(Instant::now() < deadline, "the waiting send never resolved");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(closed, "NotConnected: connection is closing");
+    let mut body = Vec::new();
+    peer.read_to_end(&mut body).expect("read to the close");
+    assert!(!body.contains(&WAITING), "the failed send's bytes went out");
+    assert!(body.ends_with(&[QUEUED; 4 * SLOT]));
 
     runtime.shutdown();
     common::join_workers(&runtime, handles);

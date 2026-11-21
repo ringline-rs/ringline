@@ -155,6 +155,17 @@ fn choose_placement(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -> 
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
+    /// [`Driver::park_blocker`], plus a bounded send waiting on the
+    /// connection, which blocks a park as a queued send does
+    /// ([`ParkBlocker::Sends`]): its future lives in a task on this worker.
+    fn park_blocker(&self, conn_index: u32) -> Option<super::driver::ParkBlocker> {
+        self.driver.park_blocker(conn_index).or_else(|| {
+            self.executor
+                .send_waiting_on(conn_index)
+                .then_some(super::driver::ParkBlocker::Sends)
+        })
+    }
+
     /// Report the panics caught in the `Drop` of removed futures.
     fn report_drop_panics(&mut self) {
         for payload in self.executor.take_drop_panics() {
@@ -2057,7 +2068,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.connections.get(conn_index).is_some_and(|c| {
                     c.recv_direct_armed || c.hangup_poll_armed || c.hangup_peek_armed
                 });
-            if !armed && self.driver.park_blocker(conn_index).is_none() {
+            if !armed && self.park_blocker(conn_index).is_none() {
                 if self
                     .driver
                     .ring
@@ -2186,7 +2197,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.park_in_flight[conn_index as usize].is_some() {
             return false;
         }
-        if !self.driver.is_parkable(conn_index) {
+        if self.park_blocker(conn_index).is_some() {
             return false;
         }
         // A hangup peek completes at once and may close the connection; the
@@ -2404,7 +2415,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // closed: `park_started` minus `park_completed` is a large number under
         // load and on its own it cannot say why, which left the dominant cause
         // a matter of inference rather than measurement.
-        if let Some(blocker) = self.driver.park_blocker(conn_index) {
+        if let Some(blocker) = self.park_blocker(conn_index) {
             metrics::PARK_ABANDONED.increment(blocker.abandon_metric());
             self.rearm_direct_after_park(conn_index);
             return; // `fd` drops.
@@ -21342,6 +21353,21 @@ mod tests {
         assert!(is_ticket_refusal(&refused), "{refused:?}");
         assert_eq!(el.driver.accumulators.data(conn_index), b"message");
         assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
+    }
+
+    /// A bounded send waiting on an otherwise parkable connection blocks the
+    /// park as a queued send does; once it leaves, the connection is
+    /// parkable again.
+    #[test]
+    fn a_waiting_bounded_send_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered.insert(conn_index);
+        assert_eq!(el.park_blocker(conn_index), None, "precondition");
+        let ticket = wait_a_ticket(&mut el, conn_index);
+        assert_eq!(el.park_blocker(conn_index), Some(ParkBlocker::Sends));
+        el.executor.cancel_send(ticket);
+        assert_eq!(el.park_blocker(conn_index), None);
     }
 }
 

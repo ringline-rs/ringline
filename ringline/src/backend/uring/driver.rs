@@ -2161,8 +2161,9 @@ impl Driver {
         None
     }
 
-    /// Convenience over [`Self::park_blocker`] for call sites that do not care
+    /// Convenience over [`Self::park_blocker`] for tests that do not care
     /// which term tripped.
+    #[cfg(test)]
     pub(crate) fn is_parkable(&self, conn_index: u32) -> bool {
         self.park_blocker(conn_index).is_none()
     }
