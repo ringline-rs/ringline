@@ -8,7 +8,7 @@ of the rest of step 4, the ticket queue and the worker queue for bounded and
 non-waiting sends, are implemented. Receive-path TLS output and
 `close_notify` do not yet take tickets. A non-waiting send that would take
 slots behind a waiting ticket is refused, including `forward_to_conn`'s copy
-on io_uring, which section 2 has wait; on mio `forward_to_conn` is not yet
+on io_uring, where section 2 says it waits; on mio `forward_to_conn` is not yet
 checked against the ticket queue. The held count
 covers slots in use and reserved on io_uring, permits on mio; the mio count
 does not yet include queued entries that carry no permit (see mio).

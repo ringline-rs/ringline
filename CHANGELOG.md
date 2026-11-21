@@ -545,13 +545,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the same connection is refused with `Other` ("a bounded send waits on this
   connection"), on both backends; before, it went out ahead of the waiting
   send. Nothing is queued, so the same buffer can be sent once the waiting
-  send is admitted. On io_uring a send of guards only at or above
-  `send_zc_threshold` (a batch, or `forward_recv_buf` of the whole
-  accumulator) takes no send-pool slot and is not refused. On io_uring a
+  send is admitted. On io_uring a plaintext send of guards only at or above
+  `send_zc_threshold` (a batch, `forward_recv_buf` of the whole accumulator,
+  or a `forward_to_conn` chunk sent zero-copy) takes no send-pool slot, is
+  not refused, and goes out ahead of the waiting send. On io_uring a
   `forward_to_conn` chunk below `send_zc_threshold`, or copied at
   `zero_copy_hold_cap`, is refused the same way: the forward resolves `Other`
   and the chunk stays on the source. On mio `forward_to_conn` is not refused
-  and can still go out ahead of a waiting send.
+  and can go out ahead of a waiting send.
 - `close()` fails every bounded send still waiting for send-pool slots on the
   connection with `NotConnected` ("connection is closing"). Before, it stayed
   queued: it was sent ahead of the close once it won capacity, or failed when

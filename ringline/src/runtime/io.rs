@@ -1986,7 +1986,8 @@ impl AsyncSendBuilder {
     ///
     /// On the mio backend, guard data is copied (no kernel zero-copy). A
     /// batch that is empty or carries no bytes is rejected with
-    /// `InvalidInput`.
+    /// `InvalidInput`. A batch submitted while a bounded send waits on the
+    /// connection is refused with `Other`.
     pub fn submit_batch(
         self,
         parts: Vec<crate::handler::SendPart<'_>>,
@@ -2637,7 +2638,9 @@ impl RecvHalf {
     /// the whole pool, and the chunk stays buffered on the source. While a
     /// bounded send waits on the sink, a chunk below `send_zc_threshold`, or
     /// one copied at `zero_copy_hold_cap`, is refused: the forward resolves
-    /// `Other` and the chunk stays buffered on the source. One send is in
+    /// `Other` and the chunk stays buffered on the source. A chunk sent
+    /// zero-copy is not refused and goes out ahead of the waiting send. One
+    /// send is in
     /// flight at a time, and the source receives the next chunk
     /// while it is. Because the sends go through the sink's queue, they are
     /// ordered with other sends on the sink. A send the runtime cannot submit,
@@ -2654,6 +2657,8 @@ impl RecvHalf {
     /// The source stops reading once it holds the hold cap of entries awaiting
     /// the sink (`forward_hold_cap`), which closes the source's TCP window rather
     /// than growing the queue without bound, and resumes when the sink drains.
+    /// A forward is not checked against waiting bounded sends: its chunks can
+    /// go out ahead of one.
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
         sink: &'s mut SendHalf,
@@ -3642,8 +3647,8 @@ impl SendHalf {
     ///
     /// Queued sends drain first, then, on a TLS connection, a close_notify
     /// alert, then the FIN. A bounded send still waiting for send-pool slots
-    /// fails with `NotConnected` ("connection is closing"). The drain has no time bound: a peer that stops
-    /// reading holds the connection until it reads, resets, or the worker
+    /// fails with `NotConnected` ("connection is closing"). The drain has no
+    /// time bound: a peer that stops reading holds the connection until it reads, resets, or the worker
     /// exits. On io_uring, if a close is already pending, for example after
     /// a read error, this sends no alert; mio writes the alert at teardown
     /// regardless. No alert follows a write shutdown
@@ -3702,7 +3707,10 @@ impl SendHalf {
     /// `NotConnected` if this handle is stale: its connection closed and the
     /// slot now holds another. Otherwise the errors of
     /// [`send`](Self::send), and, when `data` is the whole
-    /// accumulator, `Other` if the zero-copy send slab is full. Nothing is
+    /// accumulator, `Other` if the zero-copy send slab is full. On a plaintext
+    /// io_uring connection a forward of the whole accumulator at or above
+    /// `send_zc_threshold` takes no send-pool slot and is not refused while a
+    /// bounded send waits. Nothing is
     /// sent or consumed on `Err`.
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.conn.forward_recv_buf(data)
