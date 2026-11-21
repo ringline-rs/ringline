@@ -97,8 +97,8 @@ pub(crate) struct ConnSendState {
     #[cfg(has_io_uring)]
     pub on_send_backstop: bool,
     /// A close_notify the send pool had no slot for when the close was
-    /// requested: its ciphertext (unbuffered engine), or empty when rustls
-    /// still holds it (buffered engine). `try_finalize_close` places it once
+    /// requested: its ciphertext, and anything rustls had queued ahead of
+    /// it. `try_finalize_close` places it once
     /// the connection's own sends have drained, or drops it and clears the
     /// connection's `close_notify_sent`.
     #[cfg(has_io_uring)]
@@ -410,8 +410,7 @@ impl std::fmt::Display for ListenerId {
 ///
 /// - `send_backpressured`'s future passes it to `SendCompletions::enqueue`,
 ///   which will not release the future until the pool's free count covers it;
-/// - `DriverCtx::send_bounded` then reserves (mio) or capacity-checks
-///   (io_uring) against it.
+/// - `DriverCtx::send_bounded` then reserves against it.
 ///
 /// If the future's number were the smaller of the two, the FIFO would admit a
 /// message the backend immediately refuses. On the TLS path that refusal
@@ -617,27 +616,27 @@ impl<'a> DriverCtx<'a> {
         tls_table.get_info(conn.index)
     }
 
-    /// Encrypt a plain (not bounded) TLS send into pool-backed sends, admitting
-    /// it against the ciphertext bound first.
+    /// Encrypt a TLS send into pool-backed sends, taking the slots its
+    /// ciphertext can need before rustls mutates.
     ///
-    /// The admission is the point. `encrypt_to_sends` allocates as it seals
-    /// records, so running out of pool partway left the sealed records'
-    /// sequence numbers spent with no ciphertext on the wire, and every later
-    /// record failed `bad_record_mac` at the peer. Checking the bound
-    /// `send_backpressured` uses (`TlsTable::ciphertext_capacity`) before
-    /// rustls mutates turns that into the same refusal the plaintext path
-    /// gives: `Other` while the pool is short, `InvalidInput` when it never
-    /// could hold the message, nothing committed either way. A plain capacity
-    /// check is enough: the worker is single-threaded and nothing allocates
-    /// between the check and the call.
+    /// The slots are reserved against the bound `send_backpressured` uses
+    /// (`TlsTable::ciphertext_capacity`), encryption writes into them
+    /// (`SendCopyPool::alloc_raw_reserved`), and the ones it did not use are
+    /// returned. Encryption therefore cannot run out of pool after rustls has
+    /// sealed a record, which would leave the sealed records' sequence
+    /// numbers spent with no ciphertext on the wire and fail every later
+    /// record with `bad_record_mac` at the peer. A send the pool cannot cover
+    /// gets the refusal the plaintext path gives: `Other` while the pool is
+    /// short, `InvalidInput` when it never could hold the message, nothing
+    /// committed either way.
     ///
-    /// No bound is expressible for the unbuffered engine with a slot too small
-    /// for one whole record. `Config::validate` rejects such a slot for every
-    /// configured rustls config, so a runtime does not reach that case; if it
-    /// did, the send would be attempted without a bound. If encryption fails
-    /// after rustls has sealed anything, the connection is closed: by
-    /// departure 1 a record gap is fatal, and leaving the connection open only
-    /// lets it emit records the peer will reject.
+    /// No bound is expressible for the unbuffered engine with a slot too
+    /// small for one whole record, and the send is refused with
+    /// `InvalidInput`. `Config::validate` rejects such a slot for every
+    /// configured rustls config, so a runtime does not reach that case. If
+    /// encryption fails after rustls has sealed anything, the connection is
+    /// closed: by departure 1 a record gap is fatal, and leaving the
+    /// connection open only lets it emit records the peer will reject.
     ///
     /// The caller has checked that `conn` is current and has TLS state.
     fn encrypt_tls_send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<Vec<BuiltSend>> {
@@ -650,12 +649,26 @@ impl<'a> DriverCtx<'a> {
         // other `tls_table` use in this module; no other reference to the
         // table is live across this function.
         let tls_table = unsafe { &mut *self.tls_table };
-        let needed = tls_table
+        let bound = tls_table
             .ciphertext_capacity(conn.index, data.len())
-            .and_then(|bound| bound.slots(slot_size));
-        if let Some(needed) = needed {
-            let capacity = self.send_copy_pool.slot_count();
-            if needed > capacity {
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no TLS state"))?;
+        let Some(needed) = bound.slots(slot_size) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a TLS send needs a send-pool slot of at least {} bytes to hold one whole \
+                     record, but Config::send_copy_slot_size is {slot_size}",
+                    bound.min_slot_size()
+                ),
+            ));
+        };
+        let owner = crate::buffer::send_copy::SlotOwner::conn(conn.index, conn.generation);
+        let mut permit = match self.send_copy_pool.reserve_slots(owner, needed) {
+            Ok(r) => r,
+            Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
+                return Err(io::Error::other("send copy pool exhausted"));
+            }
+            Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -665,33 +678,20 @@ impl<'a> DriverCtx<'a> {
                     ),
                 ));
             }
-            if self.send_copy_pool.free_count() < needed {
-                crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
-                return Err(io::Error::other("send copy pool exhausted"));
-            }
-        }
-        let free_before = self.send_copy_pool.free_count();
-        match crate::tls::encrypt_to_sends(
+        };
+        let result = crate::tls::encrypt_to_sends(
             tls_table,
             self.send_copy_pool,
             conn.index,
             conn.generation,
             data,
-        ) {
-            Ok(sends) => {
-                // If encryption took more slots than the bound, the bound is
-                // wrong, and a later send it admits can run out of pool
-                // mid-encryption and close the connection.
-                if let Some(needed) = needed {
-                    debug_assert!(
-                        free_before.saturating_sub(self.send_copy_pool.free_count()) <= needed,
-                        "TLS ciphertext bound beaten: admitted against {needed} slots, \
-                         encryption took {}",
-                        free_before.saturating_sub(self.send_copy_pool.free_count()),
-                    );
-                }
-                Ok(sends)
-            }
+            &mut permit,
+        );
+        // The slots encryption did not use go back before anything else
+        // allocates, the close's close_notify included.
+        self.send_copy_pool.release_reservation(permit);
+        match result {
+            Ok(sends) => Ok(sends),
             Err(e) => {
                 // `encrypt_to_sends` released every slot it took, but any
                 // record it sealed first spent a sequence number.
@@ -889,16 +889,11 @@ impl<'a> DriverCtx<'a> {
     ///
     /// Admission is the caller's: the send-capacity FIFO admits this id only
     /// when `free_count()` covers `bounded_send_slots`, and this function
-    /// checks the same number again before encrypting. For a TLS connection
-    /// that number is the ciphertext bound (`TlsTable::ciphertext_capacity`),
-    /// not the plaintext length.
-    ///
-    /// Unlike mio, the reservation is *not* the permit and is not held
-    /// across the TLS branch. It cannot be: on io_uring `encrypt_to_sends`
-    /// allocates the ciphertext's slots out of this same pool, and an
-    /// outstanding reservation hides them from `alloc_raw` (see
-    /// `SendCopyPool::reserve_slots`). So the TLS branch returns before the
-    /// reservation, exactly as `send` does.
+    /// reserves the same number before copying or encrypting. For a TLS
+    /// connection that number is the ciphertext bound
+    /// (`TlsTable::ciphertext_capacity`), not the plaintext length;
+    /// `encrypt_tls_send` encrypts into the reserved slots and returns the
+    /// ones it did not use.
     ///
     /// On `Ok` exactly one completion for `id` is coming: from a send CQE,
     /// from a teardown that destroys the queued entry

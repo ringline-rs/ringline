@@ -22,7 +22,7 @@ use ringline_tls::{ClientConnection, ServerConnection};
 use crate::accumulator::AccumulatorTable;
 #[cfg(has_io_uring)]
 #[allow(unused_imports)]
-use crate::buffer::send_copy::{SendCopyPool, SlotOwner};
+use crate::buffer::send_copy::{SendCopyPool, SlotOwner, SlotReservation};
 
 use super::*;
 
@@ -249,9 +249,18 @@ pub(super) fn feed_tls_recv_buffered(
         return TlsRecvResult::Error(crate::accumulator::recv_cap_exceeded());
     }
 
-    // Collect any TLS output (handshake messages, alerts, etc.).
+    // Collect any TLS output (handshake messages, alerts, etc.). The count
+    // from the last `process_new_packets` is exact here because nothing
+    // since has queued TLS output: draining plaintext only reads.
     if tls_conn.conn.wants_write()
-        && !take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out_sends)
+        && !take_counted_tls_output_sends(
+            tls_conn,
+            send_copy_pool,
+            conn_index,
+            generation,
+            state.tls_bytes_to_write(),
+            out_sends,
+        )
     {
         return TlsRecvResult::Error(io::Error::other(
             "send pool exhausted during TLS output flush",
@@ -295,21 +304,23 @@ pub(super) fn flush_tls_output_buffered(
     }
 }
 
-/// `io::Write` adapter that lands `write_tls` output directly in
+/// `io::Write` adapter that lands `write_tls` output (application data, and
+/// receive-path output whose size `IoState` reported) directly in
 /// `SendCopyPool` slots, eliminating the ciphertext bounce through a scratch
 /// `Vec` (rustls buffer → scratch → pool becomes rustls buffer → pool).
 ///
-/// Slots are filled front-to-back and sealed when full; the partially
-/// filled tail slot is sealed by [`into_filled`](Self::into_filled). On pool
-/// exhaustion `write` reports whatever it copied (rustls keeps the rest
-/// buffered) and errors on the next call — callers treat exhaustion as a
-/// broken connection either way, and [`release_all`](Self::release_all)
-/// returns every slot on the error path.
+/// Slots come from a reservation the caller took against the output's size
+/// or bound, and are filled front-to-back and sealed when full; the partially
+/// filled tail slot is sealed by [`into_filled`](Self::into_filled). When the
+/// reservation runs out (the bound or the reported count was short) `write` reports whatever it
+/// copied (rustls keeps the rest buffered) and errors on the next call; the
+/// caller treats that as a broken connection, and
+/// [`release_all`](Self::release_all) returns every slot on the error path.
 #[cfg(has_io_uring)]
 struct PoolWriter<'a> {
     pool: &'a mut SendCopyPool,
-    /// The connection the slots are charged to.
-    owner: SlotOwner,
+    /// The reservation the slots are taken from.
+    permit: &'a mut SlotReservation,
     /// Slot currently being filled: (slot, base, capacity, used).
     current: Option<(u16, *mut u8, usize, usize)>,
     /// Sealed slots in fill order: (slot, len).
@@ -319,10 +330,10 @@ struct PoolWriter<'a> {
 
 #[cfg(has_io_uring)]
 impl<'a> PoolWriter<'a> {
-    fn new(pool: &'a mut SendCopyPool, owner: SlotOwner) -> Self {
+    fn new(pool: &'a mut SendCopyPool, permit: &'a mut SlotReservation) -> Self {
         PoolWriter {
             pool,
-            owner,
+            permit,
             current: None,
             filled: Vec::new(),
             exhausted: false,
@@ -362,23 +373,24 @@ impl<'a> PoolWriter<'a> {
 impl io::Write for PoolWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.exhausted {
-            return Err(io::Error::other("send copy pool exhausted for TLS"));
+            return Err(io::Error::other("TLS ciphertext bound beaten"));
         }
         let mut copied = 0;
         while copied < buf.len() {
             if self.current.is_none() {
-                match self.pool.alloc_raw(self.owner) {
+                match self.pool.alloc_raw_reserved(self.permit) {
                     Some((slot, ptr, cap)) => {
                         self.current = Some((slot, ptr, cap as usize, 0));
                     }
                     None => {
+                        debug_assert!(false, "TLS ciphertext bound beaten");
                         self.exhausted = true;
                         if copied > 0 {
                             // Short write: rustls keeps the remainder
                             // buffered; the next call errors.
                             return Ok(copied);
                         }
-                        return Err(io::Error::other("send copy pool exhausted for TLS"));
+                        return Err(io::Error::other("TLS ciphertext bound beaten"));
                     }
                 }
             }
@@ -403,17 +415,33 @@ impl io::Write for PoolWriter<'_> {
     }
 }
 
-/// Drain rustls' pending TLS output (handshake messages, alerts) into
-/// pool-backed sends appended to `out`, tagged `TlsSend`.
+/// Drain rustls' pending TLS output (handshake messages, session tickets,
+/// alerts) into a `Vec`, for the paths that hold no `IoState` to size it
+/// from: a close_notify, a `process_new_packets` error, and the client's
+/// first flight. Their slots are then reserved from the `Vec`'s length
+/// ([`super::backend_uring::ciphertext_to_sends`]). Writing into a `Vec`
+/// cannot fall short, so an error here is rustls'.
+#[cfg(has_io_uring)]
+pub(super) fn drain_tls_output(tls_conn: &mut TlsConn) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    while tls_conn.conn.wants_write() {
+        if buffered_mut(tls_conn).write_tls(&mut out)? == 0 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Drain rustls' pending TLS output into pool-backed sends appended to
+/// `out`, tagged `TlsSend`, all of it or none, through a `Vec`
+/// ([`drain_tls_output`]). The receive path, which knows the byte count,
+/// uses [`take_counted_tls_output_sends`] instead.
 ///
 /// Returns `false` on pool exhaustion or a `write_tls` error — the
 /// connection should be considered broken. Sends already appended to `out`
-/// must still be queued by the caller (their pool slots are otherwise
-/// leaked); queueing a prefix of the output ahead of a close is safe.
-// `pub(super)` rather than private: `TlsTable::send_close_notify_queued` in the
-// parent module calls this. A child can see an ancestor's privates but not the
-// reverse, so the single-file version's module-private visibility has to be
-// spelled out now that the file is split. This is no wider than it was.
+/// by earlier calls must still be queued by the caller (their pool slots are
+/// otherwise leaked); queueing a prefix of the output ahead of a close is
+/// safe.
 #[cfg(has_io_uring)]
 pub(super) fn take_tls_output_sends(
     tls_conn: &mut TlsConn,
@@ -422,20 +450,57 @@ pub(super) fn take_tls_output_sends(
     generation: u32,
     out: &mut Vec<crate::handler::BuiltSend>,
 ) -> bool {
-    let mut writer = PoolWriter::new(send_copy_pool, SlotOwner::conn(conn_index, generation));
+    match drain_tls_output(tls_conn) {
+        Ok(bytes) => super::backend_uring::ciphertext_to_sends(
+            send_copy_pool,
+            conn_index,
+            generation,
+            &bytes,
+            out,
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Drain `pending` bytes of rustls' TLS output, the count
+/// `IoState::tls_bytes_to_write` reported, into pool-backed sends appended
+/// to `out`, tagged `TlsSend`, all of it or none. The slots are reserved from
+/// `pending` before `write_tls` runs, and `PoolWriter` writes into them
+/// directly. `PoolWriter` packs slots back to back, so `ceil(pending /
+/// slot_size)` slots hold the output exactly.
+///
+/// Returns `false` when the pool cannot cover `pending`, on a `write_tls`
+/// error, and when rustls produced more than `pending` (a debug build
+/// panics); the connection should be considered broken. Sends appended to
+/// `out` by earlier calls are untouched.
+#[cfg(has_io_uring)]
+fn take_counted_tls_output_sends(
+    tls_conn: &mut TlsConn,
+    send_copy_pool: &mut SendCopyPool,
+    conn_index: u32,
+    generation: u32,
+    pending: usize,
+    out: &mut Vec<crate::handler::BuiltSend>,
+) -> bool {
+    let slots = pending.div_ceil(send_copy_pool.slot_size() as usize);
+    let owner = SlotOwner::conn(conn_index, generation);
+    let Ok(mut permit) = send_copy_pool.reserve_slots(owner, slots) else {
+        return false;
+    };
+    let mut writer = PoolWriter::new(send_copy_pool, &mut permit);
     while tls_conn.conn.wants_write() {
         match buffered_mut(tls_conn).write_tls(&mut writer) {
             Ok(0) | Err(_) => {
-                // Pool exhaustion or writer error: release what this call
-                // allocated. Sends appended to `out` by *earlier* calls are
-                // untouched, preserving the caller contract.
                 writer.release_all();
+                send_copy_pool.release_reservation(permit);
                 return false;
             }
             Ok(_) => {}
         }
     }
-    for (slot, len) in writer.into_filled() {
+    let filled = writer.into_filled();
+    send_copy_pool.release_reservation(permit);
+    for (slot, len) in filled {
         let (ptr, _) = send_copy_pool.current_ptr_remaining(slot);
         out.push(build_pool_send(
             conn_index,
@@ -456,6 +521,7 @@ pub(super) fn encrypt_to_sends_buffered(
     conn_index: u32,
     generation: u32,
     plaintext: &[u8],
+    permit: &mut SlotReservation,
 ) -> io::Result<Vec<crate::handler::BuiltSend>> {
     let tls_conn = tls_table.get_mut(conn_index).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotConnected, "no TLS state for connection")
@@ -465,7 +531,7 @@ pub(super) fn encrypt_to_sends_buffered(
         .as_buffered_mut()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
 
-    let mut writer = PoolWriter::new(send_copy_pool, SlotOwner::conn(conn_index, generation));
+    let mut writer = PoolWriter::new(send_copy_pool, permit);
     let mut offset = 0;
     while offset < plaintext.len() {
         let n = match buffered.writer().write(&plaintext[offset..]) {

@@ -2734,13 +2734,12 @@ impl Driver {
             None => false,
         };
         if placed {
-            if sends.is_empty() {
-                // Nothing left to place: on the buffered engine a receive's
-                // feed can drain rustls' output, the alert with it, between
-                // the close and this drain. The alert is not dropped, so it
-                // is not counted, and the Close goes ahead.
-                return false;
-            }
+            // `retained` is never empty, and non-empty bytes that are placed
+            // produce at least one send.
+            debug_assert!(
+                !sends.is_empty(),
+                "retained close_notify bytes produced no sends"
+            );
             self.queue_built_sends(conn_index, &mut sends);
             return true;
         }

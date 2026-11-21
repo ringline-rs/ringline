@@ -611,8 +611,8 @@ impl Config {
     /// split one across two. Below one whole worst-case record (`F + 29`,
     /// where `F` is the plaintext per record from the TLS config's
     /// `max_fragment_size`) a bounded send has no admission bound and is
-    /// refused, on both backends, and on io_uring a plain send that finds the
-    /// pool short part-way through encryption closes the connection. So the
+    /// refused, on both backends, and on io_uring a plain send is refused with
+    /// `InvalidInput` for the same reason. So the
     /// slot must hold one whole record for every TLS config this runtime
     /// uses: the server config, the client config and each `bind_tls`
     /// listener's. `MIN_ENCRYPT_DST` is a floor for configs whose fragment

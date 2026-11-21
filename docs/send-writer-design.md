@@ -241,9 +241,8 @@ against the pool from the moment they are taken.
   `CURRENT_DRIVER` is set. Without this each panic would shrink the worker's
   pool for good. The implementation tests it: panic inside `send_with` under
   `Contain`, then check `free_count`.
-- `SendCopyPool` gains `alloc_raw_reserved(&mut SlotReservation)`, the
-  `alloc_raw` counterpart of `copy_in_reserved`: it pops a promised slot
-  for incremental filling.
+- `SendCopyPool::alloc_raw_reserved(&mut SlotReservation)` (implemented
+  for TLS encryption) pops a promised slot for incremental filling.
 
 ### Id lifecycle per form
 
@@ -338,11 +337,11 @@ allocate. When the closure returns, the buffer goes to
 admission and copy count are what `send` has today on each backend:
 admission against the ciphertext bound on io_uring, and none on mio.
 
-The writer holds no pool reservation on TLS. `encrypt_to_sends` allocates
-ciphertext slots with `alloc_raw`, which cannot take reserved slots, and
-`encrypt_tls_send` checks `free_count()`, which subtracts reservations. A
-reservation held by the writer would therefore count against its own
-encryption. On TLS:
+The writer holds no pool reservation on TLS. `encrypt_tls_send` takes its
+own reservation of the ciphertext bound and encrypts into it
+(`alloc_raw_reserved`), so a reservation held by the writer as well would
+count the same slots twice. `encrypt_tls_send` could take the writer's
+reservation instead, since encryption fills a reservation. On TLS:
 
 - `reserve` and `reserve_slots` succeed without reserving, and guarantee
   nothing. Pool exhaustion and `InvalidInput` are reported after the
