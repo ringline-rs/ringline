@@ -1564,9 +1564,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   same regions on the other workers' rings). An `ENOMEM` from
   `Runtime::register_region` also gives the regions already registered and
   the total the rings need with the new one, and names what that total
-  leaves out, including the fixed-buffer send probe's buffers and ring. 0.6.3 to 0.6.12 gave advice sized to that memory alone:
-  registering a 32 GiB arena in 1 GiB regions with 8 workers under a 31 GiB
-  limit failed at the fourth region with "Raise it with `ulimit -l 1048576`".
+  leaves out, including the fixed-buffer send probe's buffers and ring.
+  0.6.3 to 0.6.12 gave advice sized to that memory alone: registering a
+  32 GiB arena in 1 GiB regions with 8 workers under a 31 GiB limit failed
+  at the fourth region with "Raise it with `ulimit -l 1048576`".
 - io_uring: the `ringline/bytes` counter with `op=sent` now counts every
   TLS record a connection sends, handshake and alert records and every
   ciphertext chunk of an application send (#846). Every 0.6 release counted

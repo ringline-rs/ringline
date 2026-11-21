@@ -643,10 +643,11 @@ pub(crate) fn describe_region_charge(
          so they were charged {} KiB; with this region of {} KiB the rings need {} KiB \
          (soft limit {}). These figures count each region in base pages. The kernel \
          charges a region on huge pages in whole huge pages, and also charges the rings' \
-         own memory (on kernels that charge rings), the fixed-buffer send probe's \
-         buffers (and its ring, on those kernels) while it runs, its ring until shortly \
-         after, and all of it for the life of the process if the kernel did not finish \
-         with one of its sends, and memory the same user has pinned in other processes.",
+         own memory (on kernels that charge rings) and memory the same user has pinned \
+         in other processes. While the fixed-buffer send probe runs it also holds its \
+         buffers and, on those kernels, its ring, which is released shortly after the \
+         probe ends; if the kernel did not finish with one of its sends, it holds all of \
+         this for the life of the process.",
         kib_ceil(held),
         kib_ceil(held.saturating_mul(rings_u64)),
         kib_ceil(adding),
@@ -1264,7 +1265,7 @@ mod tests {
         assert!(text.contains("the rings need 268435456 KiB"), "{text}");
         assert!(text.contains("soft limit 32505856 KiB"), "{text}");
         assert!(
-            text.contains("the fixed-buffer send probe's buffers"),
+            text.contains("While the fixed-buffer send probe runs it also holds its buffers"),
             "{text}"
         );
     }
@@ -1285,7 +1286,10 @@ mod tests {
         assert!(!text.contains("This buffer"), "{text}");
         assert!(!text.contains("earlier on this ring"), "{text}");
         assert!(
-            text.contains("regions registered on the process's other rings, which for a worker's"),
+            text.contains(
+                "regions registered on the process's other rings, which for a worker's ring at \
+                 setup include the same regions on the other workers' rings"
+            ),
             "{text}"
         );
     }
