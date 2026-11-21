@@ -689,6 +689,7 @@ impl Driver {
             pending_fs_opens: &mut self.pending_fs_opens,
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,
+            ticket_waiting: false,
         }
     }
 

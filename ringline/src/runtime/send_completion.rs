@@ -736,6 +736,13 @@ impl SendCompletions {
         id
     }
 
+    /// Whether a bounded send waits on `conn_index`.
+    pub(crate) fn has_waiting(&self, conn_index: u32) -> bool {
+        self.tickets
+            .get(conn_index as usize)
+            .is_some_and(|t| t.entry != 0)
+    }
+
     /// A bounded send was not admitted on its first poll.
     pub(crate) fn count_waited(&mut self) {
         self.counters.tickets_waited += 1;
@@ -1664,6 +1671,12 @@ impl Executor {
             }
             let _ = self.wake_task(head);
         }
+    }
+
+    /// [`SendCompletions::has_waiting`]. The non-waiting sends' entry
+    /// points, through `send_ctx`.
+    pub(crate) fn send_waiting_on(&self, conn_index: u32) -> bool {
+        self.send_completions.has_waiting(conn_index)
     }
 
     /// [`SendCompletions::count_waited`]. `admission_decision`, when a

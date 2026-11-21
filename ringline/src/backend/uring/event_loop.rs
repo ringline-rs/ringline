@@ -21216,6 +21216,133 @@ mod tests {
             libc::close(handled);
         }
     }
+
+    // ── Non-waiting sends behind a waiting bounded send ──────────────
+
+    /// Put a bounded send on `conn_index`'s ticket queue that waits, owned
+    /// by a parked standalone task.
+    fn wait_a_ticket(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) -> SendId {
+        let task_id = parked_standalone(&mut el.executor);
+        let generation = el.driver.connections.generation(conn_index);
+        el.executor
+            .enqueue_send_capacity(conn_index, generation, 1, task_id)
+    }
+
+    /// A guard of `len` bytes in no registered region.
+    struct PlainGuard(Vec<u8>);
+
+    impl crate::SendGuard for PlainGuard {
+        fn as_ptr_len(&self) -> (*const u8, u32) {
+            (self.0.as_ptr(), self.0.len() as u32)
+        }
+        fn region(&self) -> crate::RegionId {
+            crate::RegionId::UNREGISTERED
+        }
+    }
+
+    fn is_ticket_refusal(r: &io::Result<impl Sized>) -> bool {
+        matches!(r, Err(e) if e.kind() == io::ErrorKind::Other
+            && e.to_string() == crate::handler::TICKET_WAITING_REFUSAL)
+    }
+
+    /// A plain send on a connection with a bounded send waiting is refused
+    /// with `Other` and takes no slot; once the waiting send leaves, the
+    /// plain send is accepted.
+    #[test]
+    fn a_plain_send_behind_a_waiting_bounded_send_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let ticket = wait_a_ticket(&mut el, conn_index);
+        let free = el.driver.send_copy_pool.free_count();
+        let refused = with_driver_state(&mut el, || conn.send(b"x"));
+        assert!(is_ticket_refusal(&refused), "{refused:?}");
+        assert_eq!(el.driver.send_copy_pool.free_count(), free);
+        assert_eq!(el.executor.send_completions.live(), 1, "no id left behind");
+        el.executor.cancel_send(ticket);
+        let sent = with_driver_state(&mut el, || conn.send(b"x"));
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// A bounded send waiting on one connection refuses no send on another.
+    #[test]
+    fn a_waiting_ticket_refuses_no_send_on_another_connection() {
+        let mut el = make_test_loop();
+        let waiting_on = accept_connection(&mut el);
+        let other = accept_connection(&mut el);
+        let conn = ConnCtx::new(other, el.driver.connections.generation(other));
+        wait_a_ticket(&mut el, waiting_on);
+        let sent = with_driver_state(&mut el, || conn.send(b"x"));
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// A batch of guards only, at or above `send_zc_threshold`, takes a send
+    /// slab entry and no slot, so a waiting bounded send does not refuse it.
+    #[test]
+    fn a_guarded_batch_that_takes_no_slot_is_not_refused_behind_a_ticket() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        let len = el.driver.send_zc_threshold as usize;
+        let sent = with_driver_state(&mut el, || {
+            let guard = crate::GuardBox::new(PlainGuard(vec![7; len]));
+            conn.send_parts()
+                .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+        });
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// A batch of guards below `send_zc_threshold` would be gathered into a
+    /// slot, so behind a waiting bounded send it is refused, and does not go
+    /// out zero-copy instead.
+    #[test]
+    fn a_small_guarded_batch_behind_a_ticket_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        let slab_free = el.driver.send_slab.free_count();
+        let refused = with_driver_state(&mut el, || {
+            let guard = crate::GuardBox::new(PlainGuard(vec![7; 100]));
+            conn.send_parts()
+                .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+        });
+        assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+        assert_eq!(el.driver.send_slab.free_count(), slab_free);
+    }
+
+    /// A `build` with a copy part behind a waiting bounded send is refused.
+    #[test]
+    fn a_built_copy_send_behind_a_ticket_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        let refused = with_driver_state(&mut el, || {
+            conn.send_parts().build(|b| b.copy(b"x").submit())
+        });
+        assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+    }
+
+    /// `forward_recv_buf` of the whole accumulator behind a waiting bounded
+    /// send is refused, and the accumulator keeps its bytes.
+    #[test]
+    fn forward_recv_buf_behind_a_ticket_is_refused_with_the_bytes_kept() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        assert!(el.driver.accumulators.append(conn_index, b"message"));
+        let data = el.driver.accumulators.data(conn_index);
+        // SAFETY: the accumulator is not touched before the call below
+        // returns, except by the refused forward, which puts it back.
+        let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+        let refused = with_driver_state(&mut el, || conn.forward_recv_buf(view).map(drop));
+        assert!(is_ticket_refusal(&refused), "{refused:?}");
+        assert_eq!(el.driver.accumulators.data(conn_index), b"message");
+        assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
+    }
 }
 
 #[cfg(test)]

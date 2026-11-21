@@ -1255,8 +1255,7 @@ impl ConnCtx {
                     // it still folds into a copy exactly as before. The id
                     // settles when the guarded (or folded) send completes.
                     let id = executor.register_send(conn_index);
-                    let result = driver
-                        .make_ctx()
+                    let result = send_ctx(driver, executor, conn_index)
                         .send_parts(token)
                         .without_zero_copy_cap()
                         .guard(crate::guard::GuardBox::new(AccumulatorGuard(frozen)))
@@ -1275,7 +1274,7 @@ impl ConnCtx {
 
             // Not the whole accumulator, or mio: copy send, as `send`.
             let id = executor.register_send(conn_index);
-            let mut ctx = driver.make_ctx();
+            let mut ctx = send_ctx(driver, executor, conn_index);
             if let Err(e) = ctx.send_awaited(self.id(), data, id) {
                 executor.withdraw_send(id);
                 return Err(e);
@@ -1435,7 +1434,7 @@ impl ConnCtx {
     pub(crate) fn send(&self, data: &[u8]) -> io::Result<SendCompletion> {
         with_state(|driver, executor| {
             let id = executor.register_send(self.conn_index);
-            let mut ctx = driver.make_ctx();
+            let mut ctx = send_ctx(driver, executor, self.conn_index);
             if let Err(e) = ctx.send_awaited(self.id(), data, id) {
                 executor.withdraw_send(id);
                 return Err(e);
@@ -1740,7 +1739,7 @@ impl AsyncSendBuilder {
             let conn_index = self.token.index;
             let id = executor.register_send(conn_index);
             let unwinding = WithdrawUnlessDisarmed(Some(id));
-            let mut ctx = driver.make_ctx();
+            let mut ctx = send_ctx(driver, executor, conn_index);
             let builder = ctx.send_parts_awaited(self.token, id);
             let built = f(builder);
             unwinding.disarm();
@@ -1803,7 +1802,7 @@ impl AsyncSendBuilder {
             // `submit` runs the guards' code: `SendGuard::region`, and each
             // guard's `Drop` when the batch is refused.
             let unwinding = WithdrawUnlessDisarmed(Some(id));
-            let mut ctx = driver.make_ctx();
+            let mut ctx = send_ctx(driver, executor, conn_index);
             let mut builder = ctx.send_parts(self.token);
             let mut consumed = 0usize;
             for part in parts {
@@ -1953,7 +1952,7 @@ impl AsyncSendBuilder {
             }
             let conn_index = self.token.index;
             let id = executor.register_send(conn_index);
-            let mut ctx = driver.make_ctx();
+            let mut ctx = send_ctx(driver, executor, conn_index);
             if let Err(e) = ctx.send_awaited(self.token, &buf, id) {
                 executor.withdraw_send(id);
                 return Err(e);
@@ -2000,7 +1999,7 @@ impl AsyncSendBuilder {
             }
             let conn_index = self.token.index;
             let id = executor.register_send(conn_index);
-            let mut ctx = driver.make_ctx();
+            let mut ctx = send_ctx(driver, executor, conn_index);
             if let Err(e) = ctx.send_awaited(self.token, &buf, id) {
                 executor.withdraw_send(id);
                 return Err(e);
@@ -4078,7 +4077,7 @@ impl DirectForward {
                 let id = executor.register_send(self.sink_index);
                 let token = ConnId::new(self.sink_index, self.sink_generation);
                 let submitted = {
-                    let mut ctx = driver.make_ctx();
+                    let mut ctx = send_ctx(driver, executor, self.sink_index);
                     // At `zero_copy_hold_cap` a guarded send is refused, so the
                     // chunk is copied into the send pool instead.
                     if ctx.zero_copy_over_cap(token) {
@@ -4701,6 +4700,18 @@ impl Admission<'_> {
             "connection closed",
         )))
     }
+}
+
+/// `driver.make_ctx()` for a non-waiting send on `conn_index`, marked when a
+/// bounded send waits on the connection (`DriverCtx::ticket_waiting`).
+fn send_ctx<'d>(
+    driver: &'d mut Driver,
+    executor: &Executor,
+    conn_index: u32,
+) -> crate::handler::DriverCtx<'d> {
+    let mut ctx = driver.make_ctx();
+    ctx.ticket_waiting = executor.send_waiting_on(conn_index);
+    ctx
 }
 
 impl Future for Admission<'_> {

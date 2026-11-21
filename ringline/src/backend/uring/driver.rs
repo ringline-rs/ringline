@@ -1567,6 +1567,7 @@ impl Driver {
             next_disk_io_seq: &mut self.next_disk_io_seq,
             write_orders: &mut self.write_orders,
             parts_id_carried: false,
+            ticket_waiting: false,
         }
     }
 

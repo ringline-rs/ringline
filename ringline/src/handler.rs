@@ -341,6 +341,17 @@ impl ConnId {
     }
 }
 
+/// The message of a non-waiting send refused because a bounded send waits on
+/// its connection.
+pub(crate) const TICKET_WAITING_REFUSAL: &str = "a bounded send waits on this connection";
+
+/// The refusal of a non-waiting send that would take send-pool slots while a
+/// bounded send waits on its connection: kind `Other`, the kind of pool
+/// exhaustion.
+pub(crate) fn ticket_waiting_error() -> io::Error {
+    io::Error::other(TICKET_WAITING_REFUSAL)
+}
+
 /// The message of a guarded send refused because its connection holds
 /// `zero_copy_hold_cap` send slab entries while the slab is over half used.
 #[cfg(has_io_uring)]
@@ -572,6 +583,13 @@ pub(crate) struct DriverCtx<'a> {
     /// closure returns: a closure that returned `Ok` without a successful
     /// `submit` left the id with nothing to settle it.
     pub(crate) parts_id_carried: bool,
+    /// A bounded send waits on the connection this context is made for
+    /// (`docs/send-pool-partition-design.md`, section 2). A non-waiting send
+    /// that would take send-pool slots is then refused with
+    /// [`ticket_waiting_error`], so it does not go out ahead of the waiting
+    /// send. Set by the entry points of the non-waiting sends; false
+    /// elsewhere.
+    pub(crate) ticket_waiting: bool,
 }
 
 /// The refusal of a TLS send made after this side's close_notify was queued:
@@ -767,6 +785,9 @@ impl<'a> DriverCtx<'a> {
         // `send_parts`.
         if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
             return Err(e);
+        }
+        if !bounded && self.ticket_waiting {
+            return Err(ticket_waiting_error());
         }
 
         // SAFETY: read-only probe; see the `tls_table` field's contract.
@@ -2613,6 +2634,13 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) direct_io_files: &'a mut Option<crate::fs::FsFileTable>,
     /// Direct I/O fds, indexed by file slot.
     pub(crate) direct_io_fds: &'a mut Vec<Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
+    /// A bounded send waits on the connection this context is made for
+    /// (`docs/send-pool-partition-design.md`, section 2). A non-waiting send
+    /// that would take send-pool slots is then refused with
+    /// [`ticket_waiting_error`], so it does not go out ahead of the waiting
+    /// send. Set by the entry points of the non-waiting sends; false
+    /// elsewhere.
+    pub(crate) ticket_waiting: bool,
 }
 
 #[cfg(not(has_io_uring))]
@@ -2668,6 +2696,11 @@ impl<'a> DriverCtx<'a> {
         // mio sets only `aborted`.
         if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
             return Err(e);
+        }
+        // Every mio send is queued in order on the connection, so every
+        // non-waiting send is refused behind a waiting one, guards included.
+        if self.ticket_waiting {
+            return Err(ticket_waiting_error());
         }
 
         // TLS path: encrypt and push ciphertext into the pending send queue.
@@ -3903,6 +3936,10 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             return Ok(());
         }
 
+        if self.ctx.ticket_waiting && self.takes_pool_slot() {
+            return Err(ticket_waiting_error());
+        }
+
         // TLS path: gather all data, encrypt, copy-send. Drop guards immediately.
         if !self.ctx.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.ctx.tls_table };
@@ -3932,6 +3969,18 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             return Err(io::Error::other(ZERO_COPY_CAP_REFUSAL));
         }
         self.submit_with_guards()
+    }
+
+    /// Whether [`submit`](Self::submit) would take a send-pool slot: on a TLS
+    /// connection, for copy parts, or for a batch below `send_zc_threshold`,
+    /// which is gathered into one slot. A batch of guards only, at or above
+    /// the threshold, takes a send slab entry and no slot.
+    fn takes_pool_slot(&self) -> bool {
+        // SAFETY: read-only probe; see the `tls_table` field's contract.
+        let tls =
+            !self.ctx.tls_table.is_null() && unsafe { (*self.ctx.tls_table).has(self.conn.index) };
+        let threshold = self.ctx.send_zc_threshold;
+        tls || self.copy_count > 0 || (threshold > 0 && self.total_len < threshold)
     }
 
     /// TLS fallback: gather all data into a contiguous buffer, encrypt, copy-send.
