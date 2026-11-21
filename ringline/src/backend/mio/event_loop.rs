@@ -209,7 +209,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     pub(crate) fn prepare_run(&mut self) -> Result<(), crate::error::Error> {
         // Register the wake pipe read-end with mio Poll.
         self.driver.poll.registry().register(
-            &mut mio::unix::SourceFd(&self.driver.wake_pipe_fd),
+            &mut super::SourceFd(&self.driver.wake_pipe_fd),
             WAKE_TOKEN,
             mio::Interest::READABLE,
         )?;
@@ -508,7 +508,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let result = unsafe {
                 libc::read(
                     self.driver.wake_pipe_fd,
-                    drain_buf.as_mut_ptr() as *mut libc::c_void,
+                    drain_buf.as_mut_ptr().cast(),
                     drain_buf.len(),
                 )
             };
@@ -518,7 +518,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         // Re-register so we get notified again (kqueue consumes the registration).
         let _ = self.driver.poll.registry().reregister(
-            &mut mio::unix::SourceFd(&self.driver.wake_pipe_fd),
+            &mut super::SourceFd(&self.driver.wake_pipe_fd),
             WAKE_TOKEN,
             mio::Interest::READABLE,
         );
@@ -591,7 +591,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let mut mio_stream = mio::net::TcpStream::from_std(std_stream);
 
         // READABLE *and* WRITABLE, registered once and never modified
-        // afterwards. mio's epoll is edge-triggered, so a socket that is
+        // afterwards, except on Hermit (`WRITABLE_ON_DEMAND`), where WRITABLE
+        // is added at `WouldBlock` and removed in `handle_writable` once the
+        // queue is written. mio's epoll is edge-triggered, so a socket that is
         // already writable fires one edge and then stays quiet — it does
         // not spin. The outbound path (`handler.rs`) has always registered
         // both; matching it here is what lets the per-send `epoll_ctl`
@@ -626,7 +628,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 "connection slot reused by a new accept",
             )
         });
-        self.driver.writable[idx] = false;
+        self.driver.writable[idx] = crate::backend::mio::driver::WRITABLE_ON_DEMAND;
 
         // TLS path: defer accept until handshake completes in handle_readable.
         if let Some(ref mut tls_table) = self.driver.tls_table
@@ -1305,6 +1307,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         crate::backend::mio::driver::STREAM_INTEREST,
                     );
                 }
+                if crate::backend::mio::driver::WRITABLE_ON_DEMAND {
+                    self.driver.writable[idx] = true;
+                }
 
                 // Set TCP_NODELAY if configured.
                 if self.driver.tcp_nodelay
@@ -1358,6 +1363,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.writable[idx] = true;
         if let Err(e) = self.driver.flush_sends(conn_index) {
             self.fail_connection_on_send_error(conn_index, e);
+            return;
+        }
+        // The queue is written: stop waiting for room.
+        if crate::backend::mio::driver::WRITABLE_ON_DEMAND
+            && self.driver.writable[idx]
+            && let Some(stream) = self.driver.tcp_streams[idx].as_mut()
+        {
+            let _ = self.driver.poll.registry().reregister(
+                stream,
+                mio::Token(idx + 1),
+                crate::backend::mio::driver::STREAM_INTEREST,
+            );
         }
     }
 
@@ -1531,8 +1548,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             // Interest is registered once at accept/connect as
-            // READABLE|WRITABLE and never modified, so there is nothing to arm
-            // here. If we already know the socket is writable, flush now.
+            // READABLE|WRITABLE and never modified (on Hermit, WRITABLE is
+            // added by `flush_sends` at `WouldBlock`), so there is nothing to
+            // arm here. If we already know the socket is writable, flush now.
             if self.driver.writable[idx]
                 && let Err(e) = self.driver.flush_sends(conn_index)
             {
@@ -2421,7 +2439,7 @@ mod tests {
             .join(format!(".ringline-mio-open-flags-{}", std::process::id()));
         std::fs::write(&path, [0u8; 4096]).unwrap();
         let getfl = |fd: &std::os::fd::OwnedFd| unsafe {
-            libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(fd), libc::F_GETFL)
+            libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(fd), libc::F_GETFL, 0)
         };
         let seq = el.executor.begin_disk_io(0);
         let (index, _) = el

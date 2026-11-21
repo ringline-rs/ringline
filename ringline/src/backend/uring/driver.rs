@@ -2909,7 +2909,7 @@ impl Driver {
             Some(fd) => {
                 use std::os::fd::IntoRawFd;
                 let fd = fd.into_raw_fd();
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
                 if flags < 0
                     || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
                 {

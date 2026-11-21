@@ -286,27 +286,37 @@ struct NvmePassthruCmd {
 /// without (`nvme_cmd_allowed`).
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) fn identify_lba_size(fd: libc::c_int, nsid: u32) -> std::io::Result<u32> {
-    let mut data = vec![0u8; 4096];
-    let mut cmd = NvmePassthruCmd {
-        opcode: NVME_ADMIN_IDENTIFY,
-        nsid,
-        addr: data.as_mut_ptr() as u64,
-        data_len: data.len() as u32,
-        // CNS 0: Identify Namespace.
-        cdw10: 0,
-        ..Default::default()
-    };
-    // Safety: `cmd` is a valid `nvme_passthru_cmd` whose `addr` points to
-    // `data_len` writable bytes that outlive the synchronous ioctl.
-    let ret = unsafe { libc::ioctl(fd, NVME_IOCTL_ADMIN_CMD as _, &mut cmd) };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
+    // NVMe passthrough is a Linux ioctl; the mio backends, Hermit's among
+    // them, do not support NVMe.
+    #[cfg(target_os = "hermit")]
+    {
+        let _ = (fd, nsid);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
-    if ret > 0 {
-        // The device failed the command: the ioctl returns its status field.
-        return Err(std::io::Error::other(NvmeStatus((ret & 0x7FFF) as u16)));
+    #[cfg(not(target_os = "hermit"))]
+    {
+        let mut data = vec![0u8; 4096];
+        let mut cmd = NvmePassthruCmd {
+            opcode: NVME_ADMIN_IDENTIFY,
+            nsid,
+            addr: data.as_mut_ptr() as u64,
+            data_len: data.len() as u32,
+            // CNS 0: Identify Namespace.
+            cdw10: 0,
+            ..Default::default()
+        };
+        // Safety: `cmd` is a valid `nvme_passthru_cmd` whose `addr` points to
+        // `data_len` writable bytes that outlive the synchronous ioctl.
+        let ret = unsafe { libc::ioctl(fd, NVME_IOCTL_ADMIN_CMD as _, &mut cmd) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if ret > 0 {
+            // The device failed the command: the ioctl returns its status field.
+            return Err(std::io::Error::other(NvmeStatus((ret & 0x7FFF) as u16)));
+        }
+        lba_size_from_identify(&data)
     }
-    lba_size_from_identify(&data)
 }
 
 /// The logical block size an Identify Namespace data structure gives for its

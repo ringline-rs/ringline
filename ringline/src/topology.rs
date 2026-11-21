@@ -31,8 +31,14 @@ pub fn physical_core_count() -> usize {
         return n;
     }
     // Fallback: logical CPU count (sysconf).
-    let ret = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if ret < 1 { 1 } else { ret as usize }
+    #[cfg(not(target_os = "hermit"))]
+    {
+        let ret = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        if ret < 1 { 1 } else { ret as usize }
+    }
+    // Hermit's libc has no sysconf; std asks the kernel for its CPU count.
+    #[cfg(target_os = "hermit")]
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 /// Logical CPU ids of the first SMT sibling of each physical core, in

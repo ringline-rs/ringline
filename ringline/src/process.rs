@@ -108,11 +108,17 @@ impl Child {
 
     /// Send `SIGKILL` to the child.
     pub fn kill(&self) -> io::Result<()> {
-        let ret = unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
-        if ret < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+        // Hermit runs one process and cannot have a child.
+        #[cfg(target_os = "hermit")]
+        return Err(io::ErrorKind::Unsupported.into());
+        #[cfg(not(target_os = "hermit"))]
+        {
+            let ret = unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
+            if ret < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -123,6 +129,8 @@ impl Child {
 /// drives it.
 pub struct WaitFuture {
     seq: u32,
+    /// Read by `waitid`, which Hermit lacks.
+    #[cfg_attr(target_os = "hermit", allow(dead_code))]
     pid: u32,
     /// The worker whose executor holds `seq`.
     owner: u32,
@@ -164,23 +172,29 @@ impl Future for WaitFuture {
                 if result < 0 {
                     return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
                 }
+                // Hermit cannot spawn a child, so no wait reaches here.
+                #[cfg(target_os = "hermit")]
+                return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
                 // Call waitid to collect exit status. This returns immediately
                 // because the pidfd poll already confirmed the child exited.
-                let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                let ret = unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        self.pid as libc::id_t,
-                        &mut siginfo,
-                        libc::WEXITED,
-                    )
-                };
-                if ret < 0 {
-                    return Poll::Ready(Err(io::Error::last_os_error()));
+                #[cfg(not(target_os = "hermit"))]
+                {
+                    let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let ret = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            self.pid as libc::id_t,
+                            &mut siginfo,
+                            libc::WEXITED,
+                        )
+                    };
+                    if ret < 0 {
+                        return Poll::Ready(Err(io::Error::last_os_error()));
+                    }
+                    // Extract exit code from siginfo.
+                    let code = unsafe { siginfo.si_status() };
+                    Poll::Ready(Ok(ExitStatus { code }))
                 }
-                // Extract exit code from siginfo.
-                let code = unsafe { siginfo.si_status() };
-                Poll::Ready(Ok(ExitStatus { code }))
             } else {
                 // Not yet ready -- re-register waiter.
                 let task_id = CURRENT_TASK_ID.with(|c| c.get());

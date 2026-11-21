@@ -9285,7 +9285,7 @@ mod tests {
             let mut fds = [0i32; 2];
             assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
             unsafe {
-                let fl = libc::fcntl(fds[0], libc::F_GETFL);
+                let fl = libc::fcntl(fds[0], libc::F_GETFL, 0);
                 libc::fcntl(fds[0], libc::F_SETFL, fl | libc::O_NONBLOCK);
             }
             FdProbe {
