@@ -603,7 +603,7 @@ fn describe_memlock_already_charged(bytes: u64, limit: &MemlockLimit, pinned: Pi
         Pinned::RingRegions => (
             format!("The regions registered on this ring, {kib} KiB in all, are"),
             "regions registered on the process's other rings, which for a worker's ring at \
-             setup are the same regions on every other worker",
+             setup include the same regions on the other workers' rings",
         ),
     };
     format!(
@@ -644,9 +644,9 @@ pub(crate) fn describe_region_charge(
          (soft limit {}). These figures count each region in base pages. The kernel \
          charges a region on huge pages in whole huge pages, and also charges the rings' \
          own memory (on kernels that charge rings), the fixed-buffer send probe's \
-         buffers and ring while it runs (or for the life of the process if one of its \
-         sends never completed), and memory the same user has pinned in other \
-         processes.",
+         buffers (and its ring, on those kernels) while it runs, its ring until shortly \
+         after, and all of it for the life of the process if the kernel did not finish \
+         with one of its sends, and memory the same user has pinned in other processes.",
         kib_ceil(held),
         kib_ceil(held.saturating_mul(rings_u64)),
         kib_ceil(adding),
