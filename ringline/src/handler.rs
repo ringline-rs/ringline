@@ -2697,8 +2697,11 @@ impl<'a> DriverCtx<'a> {
         if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
             return Err(e);
         }
-        // Every mio send is queued in order on the connection, so every
-        // non-waiting send is refused behind a waiting one, guards included.
+        // Every mio send made through a send entry point is queued in order
+        // on the connection, so each is refused behind a waiting one, guards
+        // included. `forward_to_conn` queues its chunks from the event loop
+        // (`Driver::forward_push`) and is not refused: it can go out ahead of
+        // a waiting send.
         if self.ticket_waiting {
             return Err(ticket_waiting_error());
         }

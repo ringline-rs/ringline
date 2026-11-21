@@ -251,7 +251,8 @@ pub struct SendAdmissionCounters {
     pub unowned_held: u64,
     /// Bounded sends that were not admitted on their first poll.
     pub tickets_waited: u64,
-    /// The most bounded sends waiting on one connection at once.
+    /// The most bounded sends queued on one connection at once, counting a
+    /// send admitted on its first poll, which is queued for that poll.
     pub conn_tickets_max: u64,
 }
 
@@ -1674,7 +1675,8 @@ impl Executor {
     }
 
     /// [`SendCompletions::has_waiting`]. The non-waiting sends' entry
-    /// points, through `send_ctx`.
+    /// points, through `send_ctx`, and the io_uring event loop's
+    /// `park_blocker`.
     pub(crate) fn send_waiting_on(&self, conn_index: u32) -> bool {
         self.send_completions.has_waiting(conn_index)
     }

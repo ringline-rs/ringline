@@ -1726,7 +1726,9 @@ impl AsyncSendBuilder {
     ///
     /// The closure chains `.copy()` / `.guard()` calls and ends with
     /// `.submit()`. `submit` refuses a batch that carries no bytes with
-    /// `InvalidInput`. A `build` that submits nothing is refused with
+    /// `InvalidInput`, and refuses with `Other` one that would take a
+    /// send-pool slot while a bounded send waits on the connection. A `build`
+    /// that submits nothing is refused with
     /// `InvalidInput`: a closure that returns `Ok` without a successful
     /// `submit`, including one that discards `submit`'s error, sent nothing.
     ///
@@ -1788,7 +1790,10 @@ impl AsyncSendBuilder {
     /// A batch that needs a send slab entry is rejected with `Other` when the
     /// slab is full, or when the connection holds
     /// [`zero_copy_hold_cap`](crate::ConfigBuilder::zero_copy_hold_cap)
-    /// entries while the slab is over half used.
+    /// entries while the slab is over half used. A batch that would take a
+    /// send-pool slot (copy parts, any batch on TLS, or one below
+    /// `send_zc_threshold`) is rejected with `Other` while a bounded send
+    /// waits on the connection.
     ///
     /// Awaiting the future parks the task until the kernel signals the send,
     /// which returns control to the event loop so completions are reaped and
@@ -1941,7 +1946,8 @@ impl AsyncSendBuilder {
     /// The closure chains `.copy()` / `.guard()` calls and ends with
     /// `.submit()`. `submit` refuses a batch that carries no bytes with
     /// `InvalidInput`, and a closure that returns `Ok` without a successful
-    /// `submit` sends nothing: `build` returns `InvalidInput`.
+    /// `submit` sends nothing: `build` returns `InvalidInput`. A `build` made
+    /// while a bounded send waits on the connection is refused with `Other`.
     pub fn build<F>(self, f: F) -> io::Result<SendCompletion>
     where
         F: FnOnce(MioSendBuilder<'_>) -> io::Result<()>,
@@ -2628,7 +2634,10 @@ impl RecvHalf {
     /// slab entries and the slab is over half used, the chunk is copied into
     /// the send pool instead: the forward resolves `Other` when the pool has
     /// no free slots for it now, or `InvalidInput` when the chunk is wider than
-    /// the whole pool, and the chunk stays buffered on the source. One send is in
+    /// the whole pool, and the chunk stays buffered on the source. While a
+    /// bounded send waits on the sink, a chunk below `send_zc_threshold`, or
+    /// one copied at `zero_copy_hold_cap`, is refused: the forward resolves
+    /// `Other` and the chunk stays buffered on the source. One send is in
     /// flight at a time, and the source receives the next chunk
     /// while it is. Because the sends go through the sink's queue, they are
     /// ordered with other sends on the sink. A send the runtime cannot submit,
@@ -3632,7 +3641,8 @@ impl SendHalf {
     /// Close this connection.
     ///
     /// Queued sends drain first, then, on a TLS connection, a close_notify
-    /// alert, then the FIN. The drain has no time bound: a peer that stops
+    /// alert, then the FIN. A bounded send still waiting for send-pool slots
+    /// fails with `NotConnected` ("connection is closing"). The drain has no time bound: a peer that stops
     /// reading holds the connection until it reads, resets, or the worker
     /// exits. On io_uring, if a close is already pending, for example after
     /// a read error, this sends no alert; mio writes the alert at teardown
@@ -5445,7 +5455,7 @@ enum BackpressuredState<'a> {
 /// - [`BrokenPipe`](io::ErrorKind::BrokenPipe) — the write half is shut down,
 ///   or was shut down while this send was waiting.
 /// - [`ConnectionAborted`](io::ErrorKind::ConnectionAborted) — the connection
-///   was aborted ([`SendHalf::abort`]), or closed while waiting or in flight.
+///   was aborted ([`SendHalf::abort`]), or released while waiting or in flight.
 /// - [`NotConnected`](io::ErrorKind::NotConnected) — `close()` was called
 ///   while this send waited for capacity. On io_uring also: the
 ///   connection is TLS and its close_notify is already queued (`close()`, a
