@@ -1559,8 +1559,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Runtime::register_region` or a ring's regions at setup, no longer says the
   limit is too low for that memory and suggests `ulimit -l` with its size, a
   limit the process already has. It now says that if the limit is the cause,
-  memory already charged used the rest of it, including the same regions on
-  every other worker's ring. An `ENOMEM` from `Runtime::register_region`
+  memory already charged used the rest of it, including the regions
+  registered on the process's other rings (for a worker's ring at setup, the
+  same regions on every other worker), and the fixed-buffer send probe's
+  buffers and ring while it runs. An `ENOMEM` from `Runtime::register_region`
   also gives the regions already registered and the total the rings need
   with the new one. 0.6.3 to 0.6.12 gave advice sized to that memory alone:
   registering a 32 GiB arena in 1 GiB regions with 8 workers under a 31 GiB

@@ -602,7 +602,8 @@ fn describe_memlock_already_charged(bytes: u64, limit: &MemlockLimit, pinned: Pi
         ),
         Pinned::RingRegions => (
             format!("The regions registered on this ring, {kib} KiB in all, are"),
-            "the same regions on the process's other rings",
+            "regions registered on the process's other rings, which for a worker's ring at \
+             setup are the same regions on every other worker",
         ),
     };
     format!(
@@ -642,8 +643,10 @@ pub(crate) fn describe_region_charge(
          so they were charged {} KiB; with this region of {} KiB the rings need {} KiB \
          (soft limit {}). These figures count each region in base pages. The kernel \
          charges a region on huge pages in whole huge pages, and also charges the rings' \
-         own memory (on kernels that charge rings) and memory the same user has pinned \
-         in other processes.",
+         own memory (on kernels that charge rings), the fixed-buffer send probe's \
+         buffers and ring while it runs (or for the life of the process if one of its \
+         sends never completed), and memory the same user has pinned in other \
+         processes.",
         kib_ceil(held),
         kib_ceil(held.saturating_mul(rings_u64)),
         kib_ceil(adding),
@@ -1260,6 +1263,10 @@ mod tests {
         assert!(text.contains("charged 260046848 KiB"), "{text}");
         assert!(text.contains("the rings need 268435456 KiB"), "{text}");
         assert!(text.contains("soft limit 32505856 KiB"), "{text}");
+        assert!(
+            text.contains("the fixed-buffer send probe's buffers"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1278,7 +1285,7 @@ mod tests {
         assert!(!text.contains("This buffer"), "{text}");
         assert!(!text.contains("earlier on this ring"), "{text}");
         assert!(
-            text.contains("the same regions on the process's other rings"),
+            text.contains("regions registered on the process's other rings, which for a worker's"),
             "{text}"
         );
     }
