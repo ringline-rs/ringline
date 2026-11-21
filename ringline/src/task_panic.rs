@@ -25,7 +25,6 @@
 
 use std::any::Any;
 use std::fmt;
-use std::io::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -36,7 +35,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub enum TaskPanicPolicy {
     /// Catch the panic and keep running. The task is dropped, a connection
     /// task's connection is closed, and a handle awaiting the task resolves to
-    /// a [`JoinError`]. The panic message is printed to stderr.
+    /// a [`JoinError`]. Rust's panic hook prints the panic, and ringline logs
+    /// it at `error`.
     #[default]
     Contain,
     /// Catch the panic, then shut the runtime down as
@@ -249,10 +249,10 @@ impl PanicReporter {
         let shown = message.as_deref().unwrap_or(NON_STRING_PAYLOAD);
         match self.policy {
             TaskPanicPolicy::Contain => {
-                eprintln!("ringline: {site} panicked: {shown}; continuing");
+                log_guarded(|| log::error!("{site} panicked: {shown}; continuing"));
             }
             TaskPanicPolicy::Shutdown => {
-                eprintln!("ringline: {site} panicked: {shown}; shutting down");
+                log_guarded(|| log::error!("{site} panicked: {shown}; shutting down"));
                 if self.first.is_none() {
                     self.first = Some(JoinError::panicked_with_message(message));
                 }
@@ -276,12 +276,9 @@ impl PanicReporter {
         } else {
             "other workers continue until shutdown"
         };
-        // Not `eprintln!`, which panics if stderr fails, and the worker's drain
-        // comes next.
-        let _ = writeln!(
-            std::io::stderr(),
-            "ringline: worker {worker} exited: {cause}; {outcome}"
-        );
+        // The worker's drain comes next, so a panic in the logger must not
+        // unwind past it.
+        log_guarded(|| log::error!("worker {worker} exited: {cause}; {outcome}"));
         match &self.runtime_shutdown {
             Some(runtime) => runtime.worker_exited(worker, shutdown),
             None if shutdown => self.shutdown_flag.store(true, Ordering::Release),
@@ -300,4 +297,12 @@ impl PanicReporter {
     pub(crate) fn take(&mut self) -> Option<JoinError> {
         self.first.take()
     }
+}
+
+/// Run `log`, a call into the application's logger, and discard a panic from
+/// it. Used where the caller is reporting a panic or a worker's exit, and an
+/// unwind would skip the cleanup that follows (a worker's drain, or the leak
+/// of an event loop whose memory a disk operation can still use).
+pub(crate) fn log_guarded(log: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(log));
 }

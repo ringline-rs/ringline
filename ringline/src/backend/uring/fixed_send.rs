@@ -4,6 +4,9 @@
 //! is Linux 6.0), and a send of several as `SENDMSG_ZC` (the flag is Linux
 //! 6.15).
 //!
+//! `docs/fixed-buffer-sends.md` describes the kernel behaviour this decides
+//! on, the settings involved, and the send shapes that benefit.
+//!
 //! The kernel must accept the flag, and must charge a send from a registered
 //! buffer to the socket's send buffer the same as a send of the same bytes
 //! from plain iovecs. From Linux 6.3, a
@@ -20,19 +23,23 @@
 //! the probe measures the charge instead of reading the version.
 //!
 //! The probe sends 4 KiB from the last page of a registered 2 MiB transparent
-//! huge page up to three times: from plain iovecs, as a fixed `SEND_ZC`, and,
-//! when that passes, as a fixed `SENDMSG_ZC`. Each send is on a fresh loopback connection whose
+//! huge page: from plain iovecs, as a fixed `SEND_ZC`, and, when that passes,
+//! as a fixed `SENDMSG_ZC`. Each send is on a fresh loopback connection whose
 //! receiver does not read, and the probe compares the change in
 //! `SK_MEMINFO_WMEM_QUEUED` across each fixed send with the plain one's. The
 //! kernel's fault in the charge raises a fixed send's charge by about 2 MiB.
 //!
-//! The probe usually takes a few milliseconds. Its waits on the sockets and
+//! The probe's duration has not been measured. Its waits on the sockets and
 //! the ring are bounded: 1 s for each connection's setup and prefill, and 5 s
-//! for each completion, about 33 s for one measurement and 99 s for the three
-//! it makes at most. Two steps are not bounded: the huge
-//! page is allocated with `MADV_HUGEPAGE` and `MADV_COLLAPSE`, which can wait
-//! for memory compaction, and the check that it is one huge page reads
-//! `/proc/self/smaps`, which takes longer the more the process has mapped.
+//! for each completion, about 11 s per send. It makes at most three
+//! measurements. A measurement that reaches the multi-guard send is the last,
+//! and it tries that send up to three times, so at most nine sends
+//! (2 + 2 + 5) and about 99 s in all.
+//!
+//! Two steps are not bounded. The huge page is allocated with `MADV_HUGEPAGE`
+//! and `MADV_COLLAPSE`, which can wait for memory compaction, and the check
+//! that it is one huge page reads `/proc/self/smaps`, which takes longer the
+//! more the process has mapped.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -132,18 +139,61 @@ pub(crate) fn probed() -> bool {
 }
 
 /// The probe's result, running it on the first call. The calling thread
-/// blocks while the probe runs.
+/// blocks while the probe runs. The result is logged once, at `debug` when
+/// fixed sends are on and at `warn` when they are off, and set in the
+/// `ringline/ring/fixed_buffer_sends` gauge, so a kernel upgrade that turns
+/// fixed-buffer sends on or off shows in the application's log and metrics.
 pub(crate) fn probe_once() -> FixedBufferSends {
     RESULT
         .get_or_init(|| {
             let result = probe();
+            let mut level = 0;
             if let FixedBufferSends::Enabled { multi_guard } = result {
                 MULTI.store(multi_guard, Ordering::Relaxed);
                 ENABLED.store(true, Ordering::Relaxed);
+                level = if multi_guard { 2 } else { 1 };
+            }
+            crate::metrics::FIXED_BUFFER_SENDS.set(level);
+            if level > 0 {
+                log::debug!("{}", describe(&result));
+            } else {
+                log::warn!("{}", describe(&result));
             }
             result
         })
         .clone()
+}
+
+/// The probe's result in words, for the line `probe_once` logs.
+fn describe(result: &FixedBufferSends) -> String {
+    const DOC: &str =
+        "https://github.com/ringline-rs/ringline/blob/main/docs/fixed-buffer-sends.md";
+    const SAME: &str = "sends use plain iovecs as before";
+    match result {
+        FixedBufferSends::Enabled { multi_guard: true } => {
+            "fixed-buffer sends on, for sends of one guard and of several".into()
+        }
+        FixedBufferSends::Enabled { multi_guard: false } => format!(
+            "fixed-buffer sends on for sends of one guard, not of several: the \
+             kernel refused them (it does before Linux 6.15) or the probe could not \
+             measure them; those {SAME}. See {DOC}"
+        ),
+        FixedBufferSends::Overcharged => format!(
+            "fixed-buffer sends off: this kernel does not have the fix to how they \
+             are charged to the socket (Overcharged); {SAME}. See {DOC}"
+        ),
+        FixedBufferSends::Unsupported => {
+            format!(
+                "fixed-buffer sends off: the kernel refuses them (Unsupported); {SAME}. See {DOC}"
+            )
+        }
+        FixedBufferSends::Inconclusive(why) => {
+            format!("fixed-buffer sends off: the probe could not decide ({why}); {SAME}. See {DOC}")
+        }
+        FixedBufferSends::Disabled => {
+            "fixed-buffer sends off: ConfigBuilder::fixed_buffer_sends is false".into()
+        }
+    }
 }
 
 fn probe() -> FixedBufferSends {
@@ -235,15 +285,24 @@ fn measure(engine: &mut ActiveEngine, buf: &HugeBuffer) -> Result<FixedBufferSen
         Verdict::Overcharged => return Ok(FixedBufferSends::Overcharged),
         Verdict::Unclear(why) => return Err(Failure::Transient(why)),
     }
-    // The single send passed. A multi-guard send that does not pass, or that
-    // cannot be measured, leaves sends of several guards on plain iovecs;
-    // only a `Leak` discards the single send's result.
-    let multi_guard = match charge(engine, &mut ready, at, Kind::Multi) {
-        Ok(Charge::Sent(bytes)) => verdict(bytes, plain) == Verdict::Pass,
-        Ok(Charge::Refused) | Err(Failure::Transient(_) | Failure::Fixed(_)) => false,
-        Err(leak @ Failure::Leak(_)) => return Err(leak),
-    };
-    Ok(FixedBufferSends::Enabled { multi_guard })
+    // The single send passed, and its result stands: the multi-guard send is
+    // measured up to `ATTEMPTS` times on its own. One that is refused or
+    // overcharged, or that fails transiently or measures unclear on every
+    // try, leaves sends of several guards on plain iovecs. Only a `Leak` ends
+    // the probe.
+    for _ in 0..ATTEMPTS {
+        match charge(engine, &mut ready, at, Kind::Multi) {
+            Ok(Charge::Sent(bytes)) => match verdict(bytes, plain) {
+                Verdict::Pass => return Ok(FixedBufferSends::Enabled { multi_guard: true }),
+                Verdict::Overcharged => break,
+                Verdict::Unclear(_) => {}
+            },
+            Ok(Charge::Refused) | Err(Failure::Fixed(_)) => break,
+            Err(Failure::Transient(_)) => {}
+            Err(leak @ Failure::Leak(_)) => return Err(leak),
+        }
+    }
+    Ok(FixedBufferSends::Enabled { multi_guard: false })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -284,8 +343,9 @@ enum Kind {
 enum Charge {
     /// The send was taken; the change in the write queue's charge, in bytes.
     Sent(i64),
-    /// `EINVAL`: on a fixed send, the kernel does not take
-    /// `IORING_RECVSEND_FIXED_BUF` on its opcode.
+    /// `EINVAL`. On a fixed send, the kernel does not take
+    /// `IORING_RECVSEND_FIXED_BUF` on its opcode; on a plain send, `measure`
+    /// treats it as a failure that measuring again would repeat.
     Refused,
 }
 
@@ -360,6 +420,14 @@ fn charge(
     unsafe { engine.push(&Sqe::new(op, 1)) }.map_err(|e| format!("pushing the send: {e}"))?;
     // From here every failure is `Leak` until the notification is reaped.
     let (result, cqe_flags) = next_completion(engine, ready).map_err(Failure::Leak)?;
+    // A notification here would be an earlier send's, posted without
+    // `F_MORE` on its completion; this send's completion is then still to
+    // come, and the completions after it would be misattributed.
+    if cqueue::notif(cqe_flags) {
+        return Err(Failure::Leak(
+            "the probe's send was answered by a zero-copy notification".into(),
+        ));
+    }
     let more = cqueue::more(cqe_flags);
 
     let outcome = if result == -libc::EINVAL {
@@ -731,6 +799,24 @@ impl Drop for HugeBuffer {
 mod tests {
     use super::*;
 
+    /// The line names the outcome in words and ends with the result's name
+    /// where fixed sends are off.
+    #[test]
+    fn the_probe_line_says_on_or_off() {
+        assert!(describe(&FixedBufferSends::Enabled { multi_guard: true }).contains("sends on"));
+        let single = describe(&FixedBufferSends::Enabled { multi_guard: false });
+        assert!(single.contains("one guard, not of several"), "{single}");
+        let over = describe(&FixedBufferSends::Overcharged);
+        assert!(
+            over.contains("sends off") && over.contains("(Overcharged)"),
+            "{over}"
+        );
+        assert!(over.contains("https://"), "{over}");
+        let why = describe(&FixedBufferSends::Inconclusive("no huge page".into()));
+        assert!(why.contains("could not decide (no huge page)"), "{why}");
+        assert!(why.contains("as before"), "{why}");
+    }
+
     #[test]
     fn verdict_passes_equal_charges_and_names_the_fault() {
         assert_eq!(verdict(4352, 4352), Verdict::Pass);
@@ -742,12 +828,11 @@ mod tests {
     /// The probe's result agrees with the running kernel's version where the
     /// version decides it: before 6.15 the kernel refuses the flag on
     /// `SENDMSG_ZC`, so several guards never name a buffer. Whether a kernel
-    /// carries the charge fix its version does not say; the test prints the
-    /// result. `modes` reports what the result says.
+    /// carries the charge fix its version does not say; `probe_once` logs
+    /// the result, which shows only under a logger. `modes` reports what the result says.
     #[test]
     fn the_probe_agrees_with_the_kernel_version() {
         let result = probe_once();
-        eprintln!("fixed-buffer send probe: {result:?}");
         let kernel = crate::memlock::KernelVersion::current().expect("kernel version");
         if (kernel.major, kernel.minor) < (6, 15) {
             assert!(
@@ -763,5 +848,7 @@ mod tests {
             _ => Modes::default(),
         };
         assert_eq!(modes(), want);
+        let level = i64::from(want.single) + i64::from(want.multi);
+        assert_eq!(crate::metrics::FIXED_BUFFER_SENDS.value(), level);
     }
 }

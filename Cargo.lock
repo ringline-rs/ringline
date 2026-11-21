@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.7.0-alpha.162"
+version = "0.7.0-alpha.168"
 dependencies = [
  "bytes",
  "criterion",
@@ -1651,6 +1651,7 @@ dependencies = [
  "futures-util",
  "io-uring 0.7.12",
  "libc",
+ "log",
  "metriken",
  "mio",
  "pin-project-lite",

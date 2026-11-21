@@ -344,7 +344,7 @@ pub struct Config {
         crate::handoff::Sender<crate::park::ParkedFd>,
         crate::wakeup::WakeFd,
     )>,
-    /// Print per-worker event-loop diagnostics to stderr at shutdown: the
+    /// Log per-worker event-loop diagnostics at shutdown, at `info`: the
     /// iteration mix (`[ringline diag]`) and wait/work stall buckets
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
     /// iteration while enabled. io_uring backend only. Default: false.
@@ -1031,12 +1031,15 @@ impl ConfigBuilder {
 
     // ── Diagnostics ──────────────────────────────────────────────────
 
-    /// Print per-worker event-loop diagnostics to stderr at shutdown.
+    /// Log per-worker event-loop diagnostics at shutdown, at `info` through
+    /// the `log` crate; nothing appears unless the application installs a
+    /// logger.
     ///
-    /// Each worker prints a `[ringline diag]` line (iteration mix: dead
+    /// Each worker logs a `[ringline diag]` line (iteration mix: dead
     /// iterations, CQEs and tasks per iteration) and a `[ringline stall]` line
     /// (wait/work stall buckets). Recording the stall buckets costs ~4 clock
-    /// reads per iteration, so this is off by default. io_uring backend only; the mio backend prints nothing.
+    /// reads per iteration, so this is off by default. io_uring backend only;
+    /// the mio backend logs nothing.
     pub fn loop_diag(mut self, enable: bool) -> Self {
         self.config.loop_diag = enable;
         self
@@ -1082,7 +1085,7 @@ impl ConfigBuilder {
     /// proportion: a CQ of `c` gives an SQ of `c / 16` and `c * 16000 / 65536`
     /// connections. An `sq_entries` or `max_connections` set on the builder
     /// that a smaller CQ cannot hold in that proportion stops the fit. A fitted
-    /// launch writes one line to stderr naming the sizes, and
+    /// launch logs one line at `warn` naming the sizes, and
     /// [`Runtime::cq_entries`](crate::Runtime::cq_entries) and the related
     /// accessors report them. When nothing fits, launch fails with
     /// [`Error::ResourceLimit`](crate::Error::ResourceLimit). To have launch
@@ -1400,14 +1403,13 @@ impl ConfigBuilder {
     /// it to the socket's send buffer the same as the send from plain iovecs.
     /// `Runtime::fixed_buffer_sends` reports the result.
     ///
-    /// The probe usually takes a few milliseconds. Its waits on the sockets
-    /// and the ring are bounded at about 33 s per measurement, and it makes at
-    /// most three. Allocating the huge page can wait for memory compaction,
-    /// and the check that it is a huge page reads `/proc/self/smaps`; neither
-    /// is bounded. It maps 6 MiB, collapses a 2 MiB transparent huge
-    /// page inside it, registers that on a ring of its own, and unmaps it when
-    /// done; if a send's completion does not arrive, the mapping and the ring
-    /// are kept for the life of the process.
+    /// The probe's duration has not been measured. Its waits on the sockets
+    /// and the ring are bounded at about 99 s in all. Allocating the huge page
+    /// can wait for memory compaction, and the check that it is a huge page
+    /// reads `/proc/self/smaps`; neither is bounded. It maps 6 MiB, collapses
+    /// a 2 MiB transparent huge page inside it, registers that on a ring of
+    /// its own, and unmaps it when done; if a send's completion does not
+    /// arrive, the mapping and the ring are kept for the life of the process.
     ///
     /// Each launch with this on, until the probe has run, raises the soft
     /// `RLIMIT_MEMLOCK` when it is below what the workers need plus the

@@ -1215,8 +1215,8 @@ impl AsyncEventHandler for ConnectRefusedHandler {
 
 #[test]
 fn async_outbound_connect_refused() {
-    // A port held by a socket that never listens, so a connect is refused and
-    // nothing else can take the port while the test runs.
+    // A port held by a connected client socket, so nothing listens on it and
+    // nothing else can take it while the test runs.
     let (_dead_guard, dead_port) = common::refusing_port();
 
     CONNECT_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
@@ -4460,8 +4460,8 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
 
 #[test]
 fn async_standalone_connect_refused() {
-    // A port held by a socket that never listens, so a connect is refused and
-    // nothing else can take the port while the test runs.
+    // A port held by a connected client socket, so nothing listens on it and
+    // nothing else can take it while the test runs.
     let (_dead_guard, dead_port) = common::refusing_port();
 
     STANDALONE_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);

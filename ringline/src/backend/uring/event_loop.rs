@@ -397,7 +397,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // clock reads and the output are gated.
         let loop_diag = self.driver.loop_diag;
 
-        // ── Diagnostic counters (printed to stderr at shutdown) ────────────────
+        // ── Diagnostic counters (logged at shutdown) ───────────────────────────
         // These measure the event-loop iteration mix to help diagnose client
         // throughput deficits.
         let mut diag_iters: u64 = 0;
@@ -560,14 +560,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // Check for shutdown after processing completions.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
-                // Print per-worker diagnostics before exiting.
+                // Log per-worker diagnostics before exiting.
                 if loop_diag {
                     let dead_pct = if diag_iters > 0 {
                         100.0 * diag_dead_iters as f64 / diag_iters as f64
                     } else {
                         0.0
                     };
-                    eprintln!(
+                    log::info!(
                         "[ringline diag] iters={diag_iters} dead={diag_dead_iters} ({dead_pct:.1}%) \
                          cqes_1st_avg={:.2} cqes_2nd_avg={:.2} \
                          tasks_1st_avg={:.2} tasks_fp_avg={:.2}",
@@ -576,7 +576,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         diag_tasks_1st as f64 / diag_iters.max(1) as f64,
                         diag_tasks_fp as f64 / diag_iters.max(1) as f64,
                     );
-                    eprintln!(
+                    log::info!(
                         "[ringline stall] \
                          wait_ge_1ms={diag_wait_ge_1ms} wait_ge_5ms={diag_wait_ge_5ms} \
                          wait_ge_10ms={diag_wait_ge_10ms} wait_max={:.1}ms | \

@@ -91,6 +91,16 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 )]
 pub static RING_PUSH_RETRIES_PENDING: Gauge = Gauge::new();
 
+/// io_uring: which guard-only sends from one registered region name the
+/// region's buffer, set when the fixed-buffer send probe runs
+/// (`docs/fixed-buffer-sends.md`): 0 none (the probe has not run, or did
+/// not pass), 1 a send of one guard, 2 sends of one guard and of several.
+#[metric(
+    name = "ringline/ring/fixed_buffer_sends",
+    description = "Guard-only sends that name a registered buffer: 0 none, 1 one guard, 2 one or several"
+)]
+pub static FIXED_BUFFER_SENDS: Gauge = Gauge::new();
+
 // ── Index constants ─────────────────────────────────────────────
 
 /// Counter slot indices for connection metrics.
@@ -152,11 +162,10 @@ pub mod conn {
     pub const ACCEPT_ERROR_BACKOFF: usize = 9;
     /// An acceptor thread stopped because its listening socket can no longer
     /// accept (`EBADF`, `ENOTSOCK`, `EINVAL` outside shutdown). Its listener
-    /// accepts nothing afterwards; the error is also written to stderr. In
+    /// accepts nothing afterwards; the error is also logged at `error`. In
     /// merged accept mode, a worker's multishot accept on one listener
     /// stopped outside shutdown for the same errors or `ECANCELED`; that
-    /// worker accepts nothing more on that listener, and nothing is written
-    /// to stderr.
+    /// worker accepts nothing more on that listener, and nothing is logged.
     pub const ACCEPTOR_STOPPED: usize = 10;
     /// TLS connections, inbound or outbound, closed because their handshake
     /// had not completed within `ConfigBuilder::tls_handshake_timeout`.
