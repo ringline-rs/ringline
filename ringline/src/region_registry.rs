@@ -67,6 +67,9 @@ struct RegistrarInner {
     /// which io_uring has charged once for each worker's ring. A region whose
     /// registration is still in progress on another thread is not in it.
     bytes: Vec<u64>,
+    /// `MemoryRegion::base_pages` of the region in each slot, `false` for a
+    /// free slot.
+    base_pages: Vec<bool>,
 }
 
 impl RegionRegistrar {
@@ -75,7 +78,7 @@ impl RegionRegistrar {
     /// `Config::registered_regions`, whose lengths `reserved` holds.
     pub(crate) fn new(
         max_slots: u16,
-        reserved: &[u64],
+        reserved: &[(u64, bool)],
         workers: Vec<Sender<RegionControlMsg>>,
         wake_handles: Vec<WakeHandle>,
     ) -> Self {
@@ -84,9 +87,17 @@ impl RegionRegistrar {
         // Free list ordered so smaller slots come out first.
         let free_slots: Vec<u16> = (reserved.len() as u16..max_slots).rev().collect();
         let mut bytes = vec![0; max_slots as usize];
-        bytes[..reserved.len()].copy_from_slice(reserved);
+        let mut base_pages = vec![false; max_slots as usize];
+        for (slot, &(len, base)) in reserved.iter().enumerate() {
+            bytes[slot] = len;
+            base_pages[slot] = base;
+        }
         RegionRegistrar {
-            inner: Mutex::new(RegistrarInner { free_slots, bytes }),
+            inner: Mutex::new(RegistrarInner {
+                free_slots,
+                bytes,
+                base_pages,
+            }),
             workers,
             wake_handles,
         }
@@ -115,6 +126,7 @@ impl RegionRegistrar {
             Ok(()) => {
                 let mut inner = self.inner.lock().expect("registrar mutex poisoned");
                 inner.bytes[slot as usize] = page_rounded(&region);
+                inner.base_pages[slot as usize] = region.base_pages;
                 Ok(RegionId(slot))
             }
             Err(e) => {
@@ -128,6 +140,18 @@ impl RegionRegistrar {
                 Err(e)
             }
         }
+    }
+
+    /// Whether the region registered as `id` was shown to be in base pages
+    /// only; `None` when `id` names no registered region.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn base_pages(&self, id: RegionId) -> Option<bool> {
+        let inner = self.inner.lock().expect("registrar mutex poisoned");
+        let slot = id.0 as usize;
+        if slot >= inner.bytes.len() || inner.bytes[slot] == 0 {
+            return None;
+        }
+        Some(inner.base_pages[slot])
     }
 
     /// Add the regions already registered to an `ENOMEM` from a register of
@@ -178,7 +202,10 @@ impl RegionRegistrar {
         }
         let slot = id.0;
         self.broadcast(|ack| RegionControlMsg::Unregister { slot, ack })?;
-        self.inner.lock().expect("registrar mutex poisoned").bytes[slot as usize] = 0;
+        let mut inner = self.inner.lock().expect("registrar mutex poisoned");
+        inner.bytes[slot as usize] = 0;
+        inner.base_pages[slot as usize] = false;
+        drop(inner);
         self.return_slot(slot);
         Ok(())
     }
@@ -301,7 +328,7 @@ mod tests {
         let wakes = (0..2)
             .map(|_| crate::wakeup::create_wake_fd().unwrap().1)
             .collect();
-        let registrar = RegionRegistrar::new(4, &[4096], txs, wakes);
+        let registrar = RegionRegistrar::new(4, &[(4096, false)], txs, wakes);
         let workers: Vec<_> = rxs.into_iter().map(|rx| fake_worker(rx, 0)).collect();
 
         let mut backing = [0u8; 8192];

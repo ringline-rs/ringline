@@ -346,7 +346,17 @@ impl Runtime {
     /// The first registration in the process runs the fixed-buffer send
     /// probe first, when
     /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)
-    /// is on and no earlier call ran it, and blocks while it runs.
+    /// is on and no earlier call ran it, and blocks while it runs. With the
+    /// setting on, the registration also reads `/proc/self/smaps` to find
+    /// whether the region is in base pages only, which decides which of the
+    /// probe's results applies to it
+    /// ([`region_fixed_buffer_sends`](Self::region_fixed_buffer_sends)), and
+    /// logs the result for the region: at `debug` when its sends use its
+    /// buffer, and when they do not at `warn` for the first region of its
+    /// kind in the process and at `debug` after that. The kernel builds
+    /// `/proc/self/smaps` by walking every mapping's page tables, so the read
+    /// takes longer the more memory the process has mapped; its cost has not
+    /// been measured.
     ///
     /// # Errors
     ///
@@ -376,12 +386,23 @@ impl Runtime {
     ) -> io::Result<crate::buffer::fixed::RegionId> {
         #[cfg(has_io_uring)]
         {
+            let mut region = region;
             // The probe runs before the first region is registered, so a
-            // send from the region finds its result (`fixed_send::modes`).
-            if self.fixed_buffer_sends {
-                crate::backend::uring::fixed_send::probe_once();
+            // send from the region finds its result (`fixed_send::allowed`).
+            if !self.fixed_buffer_sends {
+                return self.region_registrar.register(region);
             }
-            self.region_registrar.register(region)
+            let results = crate::backend::uring::fixed_send::probe_once();
+            region.base_pages = crate::backend::uring::fixed_send::in_base_pages(&region);
+            let (len, base_pages) = (region.len(), region.base_pages);
+            let id = self.region_registrar.register(region)?;
+            crate::backend::uring::fixed_send::log_region(
+                id,
+                len,
+                base_pages,
+                &results.for_region(base_pages),
+            );
+            Ok(id)
         }
         #[cfg(not(has_io_uring))]
         {
@@ -396,17 +417,20 @@ impl Runtime {
     /// Whether a send whose parts are all guards in one registered region
     /// names that region's buffer
     /// ([`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)),
-    /// and if not, why. With `Enabled { multi_guard: false }`, only a send of
-    /// one guard does. The first call runs the kernel probe if no earlier
-    /// call ran it, and blocks for it. The result holds for the life of the
-    /// process. On the mio backend it is always
+    /// and if not, why, for a region not shown to be in base pages only: one
+    /// that may lie in huge pages. With `Enabled { multi_guard: false }`, only
+    /// a send of one guard does. A region in base pages only can have a
+    /// different result ([`region_fixed_buffer_sends`](Self::region_fixed_buffer_sends)).
+    /// The first call runs the kernel probe if no earlier call ran it, and
+    /// blocks for it. The result holds for the life of the process. On the
+    /// mio backend it is always
     /// [`Unsupported`](crate::FixedBufferSends::Unsupported), whatever the
     /// setting.
     pub fn fixed_buffer_sends(&self) -> crate::FixedBufferSends {
         #[cfg(has_io_uring)]
         {
             if self.fixed_buffer_sends {
-                crate::backend::uring::fixed_send::probe_once()
+                crate::backend::uring::fixed_send::probe_once().huge
             } else {
                 crate::FixedBufferSends::Disabled
             }
@@ -414,6 +438,36 @@ impl Runtime {
         #[cfg(not(has_io_uring))]
         {
             crate::FixedBufferSends::Unsupported
+        }
+    }
+
+    /// As [`fixed_buffer_sends`](Self::fixed_buffer_sends), for the registered
+    /// region `id`. A region whose registration found it in base pages only
+    /// (private anonymous memory advised `MADV_NOHUGEPAGE` before it was
+    /// first touched, with no huge page in it, while no multi-page folio size
+    /// below a PMD is set to `always`) takes the probe's result for
+    /// base pages, which the kernel charges correctly whether or not it
+    /// carries the fix to how sends from huge pages are charged; any other
+    /// region takes `fixed_buffer_sends`. `None` when `id` names no
+    /// registered region, which on the mio backend, where registration
+    /// fails, is always.
+    pub fn region_fixed_buffer_sends(
+        &self,
+        id: crate::buffer::fixed::RegionId,
+    ) -> Option<crate::FixedBufferSends> {
+        #[cfg(has_io_uring)]
+        {
+            let base_pages = self.region_registrar.base_pages(id)?;
+            Some(if self.fixed_buffer_sends {
+                crate::backend::uring::fixed_send::probe_once().for_region(base_pages)
+            } else {
+                crate::FixedBufferSends::Disabled
+            })
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            let _ = id;
+            None
         }
     }
 
@@ -425,9 +479,10 @@ impl Runtime {
     /// No SQE referencing the slot may be in flight when this is called.
     /// After it returns, the underlying memory may be safely unmapped.
     ///
-    /// With [`fixed_buffer_sends`](Self::fixed_buffer_sends) `Enabled`, a send
-    /// of one guard naming this region, and with `multi_guard` a send of
-    /// several guards all naming it, references the slot from
+    /// With [`region_fixed_buffer_sends(id)`](Self::region_fixed_buffer_sends)
+    /// `Some(Enabled { .. })`, a send of one guard naming this region, and
+    /// with `multi_guard` a send of several guards all naming it, references
+    /// the slot from
     /// the call that submits it until its
     /// [`SendCompletion`](crate::SendCompletion) resolves, including while it
     /// waits in the connection's send queue. Await those sends first: one
@@ -1864,7 +1919,18 @@ impl RinglineBuilder {
             reserve_probe_memlock(&self.config, num_threads);
             // Before the workers start, so they read the result.
             if !self.config.registered_regions.is_empty() {
-                crate::backend::uring::fixed_send::probe_once();
+                let results = crate::backend::uring::fixed_send::probe_once();
+                let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap_or_default();
+                for (slot, region) in self.config.registered_regions.iter_mut().enumerate() {
+                    region.base_pages =
+                        crate::backend::uring::fixed_send::in_base_pages_by(&smaps, region);
+                    crate::backend::uring::fixed_send::log_region(
+                        crate::buffer::fixed::RegionId(slot as u16),
+                        region.len(),
+                        region.base_pages,
+                        &results.for_region(region.base_pages),
+                    );
+                }
             }
         }
 
@@ -2513,7 +2579,7 @@ impl RinglineBuilder {
                 .config
                 .registered_regions
                 .iter()
-                .map(crate::region_registry::page_rounded)
+                .map(|r| (crate::region_registry::page_rounded(r), r.base_pages))
                 .collect::<Vec<_>>(),
             region_txs,
             worker_wake_handles.clone(),

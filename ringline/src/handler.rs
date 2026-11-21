@@ -511,7 +511,7 @@ pub(crate) struct DriverCtx<'a> {
     /// kernel probe passed, when
     /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)
     /// is on.
-    pub(crate) fixed_buffer_sends: crate::backend::uring::fixed_send::Modes,
+    pub(crate) fixed_buffer_sends: crate::backend::uring::fixed_send::Allowed,
     /// Send slab entries a connection may hold before its zero-copy sends are
     /// refused, once the slab is over half used
     /// (`ConfigBuilder::zero_copy_hold_cap`).
@@ -4170,9 +4170,12 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             // The registered buffer every guard lies in, when there is one and
             // this send's kind may name it: one guard goes out as `SEND_ZC`,
             // several as `SENDMSG_ZC`.
-            let modes = self.ctx.fixed_buffer_sends;
+            let allowed = self.ctx.fixed_buffer_sends;
             let single = self.part_count == 1;
-            let mut buf_index = (if single { modes.single } else { modes.multi }).then_some(None);
+            let kind = |m: crate::backend::uring::fixed_send::Modes| {
+                if single { m.single } else { m.multi }
+            };
+            let mut buf_index = (kind(allowed.huge) || kind(allowed.base)).then_some(None);
             for i in 0..self.part_count as usize {
                 if let PartSlot::Guard { guard_idx } = self.parts[i] {
                     let g = self.guards[guard_idx as usize].as_ref().unwrap();
@@ -4200,6 +4203,13 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 }
             }
 
+            // Whether this kind of send may name the buffer depends on whether
+            // the region is in base pages only.
+            if let Some(Some(index)) = buf_index
+                && !kind(allowed.for_region(self.ctx.fixed_buffers.base_pages(index)))
+            {
+                buf_index = None;
+            }
             let guards = std::mem::take(&mut self.guards);
             let iov_slice = &iovecs[..self.part_count as usize];
             let total_len = self.total_len;

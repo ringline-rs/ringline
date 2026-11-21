@@ -1,8 +1,8 @@
-//! Whether guard-only sends from a registered region name the region's
-//! buffer (`IORING_RECVSEND_FIXED_BUF`), decided once per process by a probe
-//! of the running kernel. A send of one guard goes out as `SEND_ZC` (the flag
-//! is Linux 6.0), and a send of several as `SENDMSG_ZC` (the flag is Linux
-//! 6.15).
+//! Whether guard-only sends from a registered region name the region's buffer
+//! (`IORING_RECVSEND_FIXED_BUF`), decided once per process by a probe of the
+//! running kernel, for a region in base pages only and for any other. A send
+//! of one guard goes out as `SEND_ZC` (the flag is Linux 6.0), and a send of
+//! several as `SENDMSG_ZC` (the flag is Linux 6.15).
 //!
 //! `docs/fixed-buffer-sends.md` describes the kernel behaviour this decides
 //! on, the settings involved, and the send shapes that benefit.
@@ -22,19 +22,25 @@
 //! Distribution kernels can carry it, or not, under any version number, so
 //! the probe measures the charge instead of reading the version.
 //!
-//! The probe sends 4 KiB from the last page of a registered 2 MiB transparent
-//! huge page: from plain iovecs, as a fixed `SEND_ZC`, and, when that passes,
+//! The fault comes from coalescing, which base pages do not get, so a send
+//! from a region in base pages only is charged correctly on every kernel
+//! that takes the flag. The probe has a result for each kind.
+//!
+//! The probe sends 4 KiB from plain iovecs, then from the last page of each
+//! of two registered buffers, four base pages advised `MADV_NOHUGEPAGE` and a
+//! 2 MiB transparent huge page: as a fixed `SEND_ZC`, and, when that passes,
 //! as a fixed `SENDMSG_ZC`. Each send is on a fresh loopback connection whose
 //! receiver does not read, and the probe compares the change in
 //! `SK_MEMINFO_WMEM_QUEUED` across each fixed send with the plain one's. The
-//! kernel's fault in the charge raises a fixed send's charge by about 2 MiB.
+//! kernel's fault in the charge raises a fixed send from the huge page by
+//! about 2 MiB.
 //!
 //! The probe's duration has not been measured. Its waits on the sockets and
 //! the ring are bounded: 1 s for each connection's setup and prefill, and 5 s
-//! for each completion, about 11 s per send. It makes at most three
-//! measurements. A measurement that reaches the multi-guard send is the last,
-//! and it tries that send up to three times, so at most nine sends
-//! (2 + 2 + 5) and about 99 s in all.
+//! for each completion, about 11 s per send. It makes at most fifteen sends
+//! (up to three tries at the plain one, and for each buffer up to three at
+//! the `SEND_ZC` and three at the `SENDMSG_ZC`), so its waits are bounded at
+//! about 165 s.
 //!
 //! Two steps are not bounded. The huge page is allocated with `MADV_HUGEPAGE`
 //! and `MADV_COLLAPSE`, which can wait for memory compaction, and the check
@@ -50,12 +56,15 @@ use super::abi::cqueue;
 use super::engine::{ActiveEngine, Engine};
 use super::sqe::{Fd, Op, Sqe};
 use crate::buffer::fixed::{FixedBufferRegistry, FixedBufferSends, MemoryRegion};
+use crate::smaps;
 
 /// The size of a PMD-mapped transparent huge page on x86-64 and on arm64
 /// with 4 KiB pages.
 const HUGE: usize = 2 << 20;
 /// The probe's send: one page, page-aligned.
 const LEN: usize = 4096;
+/// The base-page probe buffer's length, in base pages.
+const BASE_PAGES: usize = 4;
 /// Bytes the fixed send's charge may exceed the plain send's and still pass.
 /// A kernel with the fault charges the probe's send about `HUGE` more.
 const TOLERANCE: i64 = LEN as i64;
@@ -65,7 +74,9 @@ const OVERCHARGE: i64 = (HUGE / 2) as i64;
 const WAIT: Duration = Duration::from_secs(5);
 /// How long the probe waits for each connection's setup and prefill.
 const SETUP: Duration = Duration::from_secs(1);
-/// How many times the probe measures before it reports `Inconclusive`.
+/// How many times the probe tries each send (the plain one, and each
+/// buffer's `SEND_ZC` and `SENDMSG_ZC`) while it fails transiently or
+/// measures unclear.
 const ATTEMPTS: usize = 3;
 /// The probe ring's sizes.
 const PROBE_SQ: u32 = 8;
@@ -78,9 +89,11 @@ const SK_MEMINFO_VARS: usize = 9;
 /// `SIOCOUTQNSD`: bytes in a TCP socket's write queue not yet sent.
 const SIOCOUTQNSD: libc::c_ulong = 0x894B;
 
-static RESULT: OnceLock<FixedBufferSends> = OnceLock::new();
-static ENABLED: AtomicBool = AtomicBool::new(false);
-static MULTI: AtomicBool = AtomicBool::new(false);
+static RESULT: OnceLock<Results> = OnceLock::new();
+static HUGE_SINGLE: AtomicBool = AtomicBool::new(false);
+static HUGE_MULTI: AtomicBool = AtomicBool::new(false);
+static BASE_SINGLE: AtomicBool = AtomicBool::new(false);
+static BASE_MULTI: AtomicBool = AtomicBool::new(false);
 
 /// Which guard-only sends name their region's buffer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +103,43 @@ pub(crate) struct Modes {
     /// A send of several guards, as `SENDMSG_ZC`.
     pub(crate) multi: bool,
 }
+
+/// Which guard-only sends name their region's buffer, for each kind of
+/// region.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Allowed {
+    /// A region whose registration did not show it to be in base pages.
+    pub(crate) huge: Modes,
+    /// A region in base pages only (`MemoryRegion::base_pages`).
+    pub(crate) base: Modes,
+}
+
+impl Allowed {
+    /// The modes for a region, by whether it is in base pages only.
+    pub(crate) fn for_region(&self, base_pages: bool) -> Modes {
+        if base_pages { self.base } else { self.huge }
+    }
+}
+
+/// The probe's results: for a region that may lie in huge pages, and for one
+/// in base pages only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Results {
+    pub(crate) huge: FixedBufferSends,
+    pub(crate) base: FixedBufferSends,
+}
+
+impl Results {
+    /// The result for a region, by whether it is in base pages only.
+    pub(crate) fn for_region(&self, base_pages: bool) -> FixedBufferSends {
+        if base_pages {
+            self.base.clone()
+        } else {
+            self.huge.clone()
+        }
+    }
+}
+
 /// Why the probe must not run, set at launch when `RLIMIT_MEMLOCK` has no room
 /// for its charge ([`refuse`]) and cleared by a later launch that made room
 /// ([`allow`]).
@@ -102,22 +152,28 @@ static REFUSED: Mutex<Option<String>> = Mutex::new(None);
 /// sends a worker the message that registers a region. A worker checks a
 /// guard's region against its own table, which it updates on that message,
 /// so a worker that can find the region loads after the stores.
-pub(crate) fn modes() -> Modes {
-    Modes {
-        single: ENABLED.load(Ordering::Relaxed),
-        multi: MULTI.load(Ordering::Relaxed),
+pub(crate) fn allowed() -> Allowed {
+    Allowed {
+        huge: Modes {
+            single: HUGE_SINGLE.load(Ordering::Relaxed),
+            multi: HUGE_MULTI.load(Ordering::Relaxed),
+        },
+        base: Modes {
+            single: BASE_SINGLE.load(Ordering::Relaxed),
+            multi: BASE_MULTI.load(Ordering::Relaxed),
+        },
     }
 }
 
-/// The `RLIMIT_MEMLOCK` charge the probe makes while it runs: its buffer, and
-/// its ring on a kernel that charges rings.
+/// The `RLIMIT_MEMLOCK` charge the probe makes while it runs: its two
+/// buffers, and its ring on a kernel that charges rings.
 pub(crate) fn memlock_charge(charges_rings: bool, page: u64) -> u64 {
     let ring = if charges_rings {
         crate::memlock::ring_bytes(PROBE_SQ, PROBE_CQ, page)
     } else {
         0
     };
-    HUGE as u64 + ring
+    HUGE as u64 + BASE_PAGES as u64 * page + ring
 }
 
 /// Keep the probe from running until a later [`allow`]: if it runs
@@ -138,30 +194,91 @@ pub(crate) fn probed() -> bool {
     RESULT.get().is_some()
 }
 
-/// The probe's result, running it on the first call. The calling thread
-/// blocks while the probe runs. The result is logged once, at `debug` when
-/// fixed sends are on and at `warn` when they are off, and set in the
-/// `ringline/ring/fixed_buffer_sends` gauge, so a kernel upgrade that turns
-/// fixed-buffer sends on or off shows in the application's log and metrics.
-pub(crate) fn probe_once() -> FixedBufferSends {
+/// The probe's results, running it on the first call. The calling thread
+/// blocks while the probe runs. The results are logged once at `debug`, and
+/// set in the `ringline/ring/fixed_buffer_sends` and
+/// `ringline/ring/fixed_buffer_sends_base_pages` gauges, so a kernel upgrade
+/// that turns fixed-buffer sends on or off shows in the application's metrics.
+/// `Runtime::register_region` logs, for each region, whether its sends use
+/// its buffer.
+pub(crate) fn probe_once() -> Results {
     RESULT
         .get_or_init(|| {
-            let result = probe();
-            let mut level = 0;
-            if let FixedBufferSends::Enabled { multi_guard } = result {
-                MULTI.store(multi_guard, Ordering::Relaxed);
-                ENABLED.store(true, Ordering::Relaxed);
-                level = if multi_guard { 2 } else { 1 };
-            }
-            crate::metrics::FIXED_BUFFER_SENDS.set(level);
-            if level > 0 {
-                log::debug!("{}", describe(&result));
-            } else {
-                log::warn!("{}", describe(&result));
-            }
-            result
+            let results = probe();
+            let level = |result: &FixedBufferSends, single: &AtomicBool, multi: &AtomicBool| {
+                let FixedBufferSends::Enabled { multi_guard } = *result else {
+                    return 0;
+                };
+                multi.store(multi_guard, Ordering::Relaxed);
+                single.store(true, Ordering::Relaxed);
+                if multi_guard { 2 } else { 1 }
+            };
+            crate::metrics::FIXED_BUFFER_SENDS.set(level(&results.huge, &HUGE_SINGLE, &HUGE_MULTI));
+            crate::metrics::FIXED_BUFFER_SENDS_BASE_PAGES.set(level(
+                &results.base,
+                &BASE_SINGLE,
+                &BASE_MULTI,
+            ));
+            log::debug!(
+                "fixed-buffer send probe: regions in base pages: {}; other regions: {}",
+                describe(&results.base),
+                describe(&results.huge)
+            );
+            results
         })
         .clone()
+}
+
+/// Whether `region` is in base pages only, by `/proc/self/smaps`
+/// (`smaps::base_pages_in`); `false` when smaps cannot be read.
+pub(crate) fn in_base_pages(region: &MemoryRegion) -> bool {
+    std::fs::read_to_string("/proc/self/smaps").is_ok_and(|smaps| in_base_pages_by(&smaps, region))
+}
+
+/// As [`in_base_pages`], from `smaps` already read, for several regions at
+/// once. Also `false` while a size of multi-page folios smaller than a PMD
+/// is faulted in without `MADV_HUGEPAGE` (`smaps::small_folios_always`):
+/// memory touched before it was advised `MADV_NOHUGEPAGE` may hold such
+/// folios, and smaps does not show them.
+pub(crate) fn in_base_pages_by(smaps: &str, region: &MemoryRegion) -> bool {
+    !smaps::small_folios_always()
+        && smaps::base_pages_in(
+            smaps,
+            region.ptr() as usize,
+            region.len(),
+            smaps::thp_configured(),
+        )
+}
+
+/// Whether a region of each kind (not in base pages, in base pages) has been
+/// logged at `warn`.
+static WARNED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+
+/// Log whether sends from the region registered as `id` use its buffer: at
+/// `debug` when they do, and when they do not at `warn` for the first region
+/// of its kind in the process and at `debug` after that.
+pub(crate) fn log_region(
+    id: crate::buffer::fixed::RegionId,
+    len: usize,
+    base_pages: bool,
+    result: &FixedBufferSends,
+) {
+    let pages = if base_pages {
+        "in base pages"
+    } else {
+        "not shown to be in base pages"
+    };
+    let line = format!(
+        "region {} ({len} bytes, {pages}): {}",
+        id.0,
+        describe(result)
+    );
+    let enabled = matches!(result, FixedBufferSends::Enabled { .. });
+    if enabled || WARNED[usize::from(base_pages)].swap(true, Ordering::Relaxed) {
+        log::debug!("{line}");
+    } else {
+        log::warn!("{line}");
+    }
 }
 
 /// The probe's result in words, for the line `probe_once` logs.
@@ -196,14 +313,20 @@ fn describe(result: &FixedBufferSends) -> String {
     }
 }
 
-fn probe() -> FixedBufferSends {
-    if let Some(why) = REFUSED.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-        return FixedBufferSends::Inconclusive(why);
-    }
-    let buf = match HugeBuffer::new() {
-        Ok(buf) => buf,
-        Err(why) => return FixedBufferSends::Inconclusive(why),
+fn probe() -> Results {
+    let both = |result: FixedBufferSends| Results {
+        huge: result.clone(),
+        base: result,
     };
+    if let Some(why) = REFUSED.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return both(FixedBufferSends::Inconclusive(why));
+    }
+    let base = match BaseBuffer::new() {
+        Ok(buf) => buf,
+        Err(why) => return both(FixedBufferSends::Inconclusive(why)),
+    };
+    // Without a huge page the base-page result is still measured.
+    let huge = HugeBuffer::new();
     let config = crate::config::Config {
         sq_entries: PROBE_SQ,
         cq_entries: PROBE_CQ,
@@ -213,96 +336,179 @@ fn probe() -> FixedBufferSends {
     };
     let mut engine = match ActiveEngine::setup(&config) {
         Ok(engine) => engine,
-        Err(e) => return FixedBufferSends::Inconclusive(format!("io_uring setup: {e}")),
-    };
-    // SAFETY: `buf` is mapped for `HUGE` bytes and outlives the engine, which
-    // is dropped first (declared after it).
-    let region = unsafe { MemoryRegion::new(buf.ptr, HUGE) };
-    if let Err(e) = engine.register_buffers(&FixedBufferRegistry::new(&[region], 1)) {
-        return FixedBufferSends::Inconclusive(format!("registering the probe buffer: {e}"));
-    }
-    // Checked after registering: the registration pins the folio, so it is
-    // still one huge page when the sends run. A folio split before the pin
-    // reads as 0 here and makes the probe inconclusive, not wrong.
-    let mut result = if buf.anon_huge_kib() < HUGE / 1024 {
-        Err(Failure::Fixed(
-            "no transparent huge page for the probe buffer \
-             (/sys/kernel/mm/transparent_hugepage/enabled)"
-                .into(),
-        ))
-    } else {
-        measure(&mut engine, &buf)
-    };
-    // A measurement can fail for a transient reason (a connection slow to
-    // set up, an ACK inside the measurement), so a `Transient` failure is
-    // retried, up to `ATTEMPTS` measurements in all.
-    for _ in 1..ATTEMPTS {
-        if !matches!(result, Err(Failure::Transient(_))) {
-            break;
+        Err(e) => {
+            return both(FixedBufferSends::Inconclusive(format!(
+                "io_uring setup: {e}"
+            )));
         }
-        result = measure(&mut engine, &buf);
+    };
+    // SAFETY: both buffers are mapped for the lengths given and outlive the
+    // engine, which is dropped first (declared after them).
+    let mut regions = vec![unsafe { MemoryRegion::new(base.ptr, base.len) }];
+    if let Ok(huge) = &huge {
+        regions.push(unsafe { MemoryRegion::new(huge.ptr, HUGE) });
     }
+    if let Err(e) = engine.register_buffers(&FixedBufferRegistry::new(&regions, 2)) {
+        return both(FixedBufferSends::Inconclusive(format!(
+            "registering the probe buffers: {e}"
+        )));
+    }
+    // Checked after registering: the registration pins the folios, so they
+    // are still what was checked when the sends run. A huge page split before
+    // the pin reads as no huge page here and makes the huge-page result
+    // inconclusive, not wrong.
+    let huge_page = match &huge {
+        Ok(buf) if buf.anon_huge_kib() >= HUGE / 1024 => Ok(buf.ptr),
+        Ok(_) => Err("no transparent huge page for the probe buffer \
+                      (/sys/kernel/mm/transparent_hugepage/enabled)"
+            .to_string()),
+        Err(why) => Err(why.clone()),
+    };
+    let in_base_pages = smaps::base_pages_in(
+        &std::fs::read_to_string("/proc/self/smaps").unwrap_or_default(),
+        base.ptr as usize,
+        base.len,
+        smaps::thp_configured(),
+    );
+    let result = measure(&mut engine, &base, in_base_pages, huge_page);
     if let Err(Failure::Leak(_)) = result {
-        // The kernel may still read the buffer, so neither it nor the ring
-        // that registered it is released.
+        // The kernel may still read the buffers, so neither they nor the
+        // ring that registered them are released.
         let _ = std::mem::ManuallyDrop::new(engine);
-        let _ = std::mem::ManuallyDrop::new(buf);
+        let _ = std::mem::ManuallyDrop::new(base);
+        let _ = std::mem::ManuallyDrop::new(huge);
     } else {
-        // Clearing the slot returns the buffer's `RLIMIT_MEMLOCK` charge now;
-        // dropping the ring returns it later, from the kernel's ring exit work.
+        // Clearing the slots returns the buffers' `RLIMIT_MEMLOCK` charge
+        // now; dropping the ring returns it later, from the kernel's ring
+        // exit work.
         let empty = libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         };
-        // SAFETY: nothing using the slot is in flight: every send has
-        // completed and posted its notification.
-        let _ = unsafe { engine.register_buffers_update_one(0, empty) };
+        for slot in 0..regions.len() as u16 {
+            // SAFETY: nothing using the slot is in flight: every send has
+            // completed and posted its notification.
+            let _ = unsafe { engine.register_buffers_update_one(slot, empty) };
+        }
     }
     match result {
-        Ok(result) => result,
+        Ok(results) => results,
         Err(Failure::Leak(why) | Failure::Fixed(why) | Failure::Transient(why)) => {
-            FixedBufferSends::Inconclusive(why)
+            both(FixedBufferSends::Inconclusive(why))
         }
     }
 }
 
-/// Compare the charges of a fixed `SEND_ZC` and a fixed `SENDMSG_ZC` with a
-/// plain send's.
-fn measure(engine: &mut ActiveEngine, buf: &HugeBuffer) -> Result<FixedBufferSends, Failure> {
-    // The last page of the huge page: the fault charges it about `HUGE`.
-    let at = buf.ptr.wrapping_add(HUGE - LEN);
+/// The registered buffer index of the base-page probe buffer.
+const BASE_INDEX: u16 = 0;
+/// The registered buffer index of the huge page.
+const HUGE_INDEX: u16 = 1;
+
+/// Measure a plain send, then each probe buffer's fixed sends against it.
+/// The base buffer is measured when `in_base_pages`, and the huge page when
+/// there is one; otherwise that buffer's result is `Inconclusive`. A failure
+/// on one buffer leaves the other's result. Only a `Leak`, or a plain send
+/// that cannot be measured, ends the probe.
+fn measure(
+    engine: &mut ActiveEngine,
+    base: &BaseBuffer,
+    in_base_pages: bool,
+    huge: Result<*mut u8, String>,
+) -> Result<Results, Failure> {
+    // The last page of the base buffer, so the send's registration spans
+    // several pages, as a real region's does.
+    let base_at = base.ptr.wrapping_add(base.len - LEN);
     let mut ready = Vec::new();
-    let plain = match charge(engine, &mut ready, at, Kind::Plain)? {
-        Charge::Sent(bytes) => bytes,
-        Charge::Refused => return Err(Failure::Fixed("a plain SENDMSG_ZC was refused".into())),
-    };
-    let single = match charge(engine, &mut ready, at, Kind::Single)? {
-        Charge::Sent(bytes) => bytes,
-        Charge::Refused => return Ok(FixedBufferSends::Unsupported),
-    };
-    match verdict(single, plain) {
-        Verdict::Pass => {}
-        Verdict::Overcharged => return Ok(FixedBufferSends::Overcharged),
-        Verdict::Unclear(why) => return Err(Failure::Transient(why)),
-    }
-    // The single send passed, and its result stands: the multi-guard send is
-    // measured up to `ATTEMPTS` times on its own. One that is refused or
-    // overcharged, or that fails transiently or measures unclear on every
-    // try, leaves sends of several guards on plain iovecs. Only a `Leak` ends
-    // the probe.
+    let mut plain = Err(Failure::Transient(String::new()));
     for _ in 0..ATTEMPTS {
-        match charge(engine, &mut ready, at, Kind::Multi) {
+        plain = match charge(engine, &mut ready, base_at, Kind::Plain) {
+            Ok(Charge::Sent(bytes)) => Ok(bytes),
+            Ok(Charge::Refused) => Err(Failure::Fixed("a plain SENDMSG_ZC was refused".into())),
+            Err(failure) => Err(failure),
+        };
+        if !matches!(plain, Err(Failure::Transient(_))) {
+            break;
+        }
+    }
+    let plain = plain?;
+    let base_result = if in_base_pages {
+        buffer(engine, &mut ready, base_at, BASE_INDEX, plain)?
+    } else {
+        FixedBufferSends::Inconclusive("the base-page probe buffer is not in base pages".into())
+    };
+    let huge_result = match huge {
+        Err(why) => FixedBufferSends::Inconclusive(why),
+        // The last page of the huge page: the fault charges it about `HUGE`.
+        Ok(ptr) => buffer(
+            engine,
+            &mut ready,
+            ptr.wrapping_add(HUGE - LEN),
+            HUGE_INDEX,
+            plain,
+        )?,
+    };
+    Ok(Results {
+        huge: huge_result,
+        base: base_result,
+    })
+}
+
+/// One buffer's result: a fixed `SEND_ZC` from `at` in buffer `index`
+/// against the plain send's charge, tried up to `ATTEMPTS` times while it
+/// fails transiently or measures unclear, and when it passes, the multi-guard
+/// send. Only a `Leak` is an error.
+fn buffer(
+    engine: &mut ActiveEngine,
+    ready: &mut Vec<(u64, i32, u32)>,
+    at: *mut u8,
+    index: u16,
+    plain: i64,
+) -> Result<FixedBufferSends, Failure> {
+    let mut why = String::new();
+    for _ in 0..ATTEMPTS {
+        match charge(engine, ready, at, Kind::Single(index)) {
+            Ok(Charge::Refused) => return Ok(FixedBufferSends::Unsupported),
             Ok(Charge::Sent(bytes)) => match verdict(bytes, plain) {
-                Verdict::Pass => return Ok(FixedBufferSends::Enabled { multi_guard: true }),
-                Verdict::Overcharged => break,
-                Verdict::Unclear(_) => {}
+                Verdict::Pass => {
+                    return Ok(FixedBufferSends::Enabled {
+                        multi_guard: multi(engine, ready, at, index, plain)?,
+                    });
+                }
+                Verdict::Overcharged => return Ok(FixedBufferSends::Overcharged),
+                Verdict::Unclear(unclear) => why = unclear,
             },
-            Ok(Charge::Refused) | Err(Failure::Fixed(_)) => break,
-            Err(Failure::Transient(_)) => {}
+            Err(Failure::Transient(transient) | Failure::Fixed(transient)) => why = transient,
             Err(leak @ Failure::Leak(_)) => return Err(leak),
         }
     }
-    Ok(FixedBufferSends::Enabled { multi_guard: false })
+    Ok(FixedBufferSends::Inconclusive(why))
+}
+
+/// Whether a fixed `SENDMSG_ZC` from `at` in buffer `index` is charged as the
+/// plain send was, measured up to `ATTEMPTS` times. One that is refused or
+/// overcharged, or that fails transiently or measures unclear on every try,
+/// leaves sends of several guards on plain iovecs. Only a `Leak` ends the
+/// probe.
+fn multi(
+    engine: &mut ActiveEngine,
+    ready: &mut Vec<(u64, i32, u32)>,
+    at: *mut u8,
+    index: u16,
+    plain: i64,
+) -> Result<bool, Failure> {
+    for _ in 0..ATTEMPTS {
+        match charge(engine, ready, at, Kind::Multi(index)) {
+            Ok(Charge::Sent(bytes)) => match verdict(bytes, plain) {
+                Verdict::Pass => return Ok(true),
+                Verdict::Overcharged => break,
+                Verdict::Unclear(_) => {}
+            },
+            Ok(Charge::Refused) => break,
+            Err(Failure::Transient(_) | Failure::Fixed(_)) => {}
+            Err(leak @ Failure::Leak(_)) => return Err(leak),
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -334,10 +540,10 @@ fn verdict(fixed: i64, plain: i64) -> Verdict {
 enum Kind {
     /// `SENDMSG_ZC` from plain iovecs.
     Plain,
-    /// `SEND_ZC` from registered buffer 0.
-    Single,
-    /// `SENDMSG_ZC` from registered buffer 0.
-    Multi,
+    /// `SEND_ZC` from the registered buffer at this index.
+    Single(u16),
+    /// `SENDMSG_ZC` from the registered buffer at this index.
+    Multi(u16),
 }
 
 enum Charge {
@@ -400,18 +606,18 @@ fn charge(
             msg: &msg,
             flags,
         },
-        Kind::Single => Op::SendZcFixed {
+        Kind::Single(buf_index) => Op::SendZcFixed {
             fd: Fd::Raw(fd),
             buf: at,
             len: LEN as u32,
             flags: libc::MSG_DONTWAIT,
-            buf_index: 0,
+            buf_index,
         },
-        Kind::Multi => Op::SendMsgZcFixed {
+        Kind::Multi(buf_index) => Op::SendMsgZcFixed {
             fd: Fd::Raw(fd),
             msg: &msg,
             flags,
-            buf_index: 0,
+            buf_index,
         },
     };
     // SAFETY: `msg`, `iov` and the bytes at `at` stay valid until the send's
@@ -727,6 +933,55 @@ fn unsent(fd: RawFd) -> Result<i64, String> {
     Ok(i64::from(n))
 }
 
+/// Private anonymous memory advised `MADV_NOHUGEPAGE` before it is touched,
+/// so it is in base pages.
+struct BaseBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl BaseBuffer {
+    fn new() -> Result<Self, String> {
+        // SAFETY: `sysconf` has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let len = BASE_PAGES * page;
+        // SAFETY: a new private anonymous mapping; the result is checked.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(format!(
+                "base-page probe buffer: mmap: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let buf = BaseBuffer {
+            ptr: ptr.cast(),
+            len,
+        };
+        // SAFETY: the mapping above.
+        unsafe {
+            libc::madvise(ptr, len, libc::MADV_NOHUGEPAGE);
+            std::ptr::write_bytes(buf.ptr, 1, len);
+        }
+        Ok(buf)
+    }
+}
+
+impl Drop for BaseBuffer {
+    fn drop(&mut self) {
+        // SAFETY: the mapping this value created.
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
 /// A 2 MiB-aligned anonymous mapping of `HUGE` bytes, advised and collapsed
 /// into a transparent huge page, inside a larger mapping, so its VMA has
 /// neighbours of its own and `/proc/self/smaps` reports it alone.
@@ -825,30 +1080,56 @@ mod tests {
         assert!(matches!(verdict(64 << 10, 4352), Verdict::Unclear(_)));
     }
 
-    /// The probe's result agrees with the running kernel's version where the
-    /// version decides it: before 6.15 the kernel refuses the flag on
-    /// `SENDMSG_ZC`, so several guards never name a buffer. Whether a kernel
-    /// carries the charge fix its version does not say; `probe_once` logs
-    /// the result, which shows only under a logger. `modes` reports what the result says.
+    /// The probe's results agree with the running kernel's version where the
+    /// version decides them: before 6.15 the kernel refuses the flag on
+    /// `SENDMSG_ZC`, so several guards never name a buffer. Sends from base
+    /// pages are charged by the pages they use on every kernel, so they are
+    /// never `Overcharged`. Whether a kernel carries the charge
+    /// fix its version does not say; `probe_once` logs the results, which
+    /// show only under a logger. `allowed` and the gauges report what the
+    /// results say.
     #[test]
     fn the_probe_agrees_with_the_kernel_version() {
-        let result = probe_once();
+        let results = probe_once();
         let kernel = crate::memlock::KernelVersion::current().expect("kernel version");
-        if (kernel.major, kernel.minor) < (6, 15) {
-            assert!(
-                !matches!(result, FixedBufferSends::Enabled { multi_guard: true }),
-                "{kernel}: {result:?}"
-            );
+        for result in [&results.huge, &results.base] {
+            if (kernel.major, kernel.minor) < (6, 15) {
+                assert!(
+                    !matches!(result, FixedBufferSends::Enabled { multi_guard: true }),
+                    "{kernel}: {results:?}"
+                );
+            }
         }
-        let want = match result {
+        // `Inconclusive` is allowed: under one test process another test's
+        // launch can refuse the probe, or its registration can meet the
+        // user's `RLIMIT_MEMLOCK`. The integration test names the result it
+        // expects on a known kernel.
+        assert!(
+            !matches!(results.base, FixedBufferSends::Overcharged),
+            "{kernel}: {results:?}"
+        );
+        let want = |result: &FixedBufferSends| match result {
             FixedBufferSends::Enabled { multi_guard } => Modes {
                 single: true,
-                multi: multi_guard,
+                multi: *multi_guard,
             },
             _ => Modes::default(),
         };
-        assert_eq!(modes(), want);
-        let level = i64::from(want.single) + i64::from(want.multi);
-        assert_eq!(crate::metrics::FIXED_BUFFER_SENDS.value(), level);
+        assert_eq!(
+            allowed(),
+            Allowed {
+                huge: want(&results.huge),
+                base: want(&results.base),
+            }
+        );
+        let level = |m: Modes| i64::from(m.single) + i64::from(m.multi);
+        assert_eq!(
+            crate::metrics::FIXED_BUFFER_SENDS.value(),
+            level(want(&results.huge))
+        );
+        assert_eq!(
+            crate::metrics::FIXED_BUFFER_SENDS_BASE_PAGES.value(),
+            level(want(&results.base))
+        );
     }
 }

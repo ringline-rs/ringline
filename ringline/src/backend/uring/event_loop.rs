@@ -7316,19 +7316,23 @@ mod tests {
 
     /// A send whose parts are all guards in one registered region is pushed
     /// with that region's buffer index when the setting is on and the probe
-    /// passed that kind of send: `SEND_ZC` for one guard, `SENDMSG_ZC` for
-    /// several. Guards in two regions, guards outside any region,
-    /// a copy part, the setting off, or the probe failed each give the plain
-    /// `SENDMSG_ZC`.
+    /// passed that kind of send for the region's kind of memory (base pages
+    /// only, or not): `SEND_ZC` for one guard, `SENDMSG_ZC` for several. Guards
+    /// in two regions, guards outside any region, a copy part, the setting off,
+    /// or the probe failed each give the plain `SENDMSG_ZC`.
     #[test]
     fn a_guard_only_send_from_one_region_uses_its_buffer() {
-        use crate::backend::uring::fixed_send::Modes;
+        use crate::backend::uring::fixed_send::{Allowed, Modes};
         use crate::backend::uring::sqe::Op;
         use crate::buffer::fixed::{MemoryRegion, RegionId};
         use crate::handler::SendPart;
-        const BOTH: Modes = Modes {
+        const ALL: Modes = Modes {
             single: true,
             multi: true,
+        };
+        const BOTH: Allowed = Allowed {
+            huge: ALL,
+            base: ALL,
         };
 
         struct RegionGuard {
@@ -7350,7 +7354,9 @@ mod tests {
         let leak = || Box::leak(vec![5u8; 16384].into_boxed_slice()).as_mut_ptr();
         let (a, b, outside) = (leak(), leak(), leak());
         // Safety: leaked, so valid and unmoved for the life of the process.
-        let regions = unsafe { vec![MemoryRegion::new(a, 16384), MemoryRegion::new(b, 16384)] };
+        let mut regions = unsafe { vec![MemoryRegion::new(a, 16384), MemoryRegion::new(b, 16384)] };
+        // Region 0 as a registration that found it in base pages only.
+        regions[0].base_pages = true;
         // Each case takes a slab entry that is never released: more than the
         // default test slab's 8.
         let mut el = make_test_loop_with_config(
@@ -7410,9 +7416,13 @@ mod tests {
         );
 
         // A kernel that takes the flag on `SEND_ZC` only (before 6.15).
-        el.driver.probe_passed = Some(Modes {
+        let single_only = Modes {
             single: true,
             multi: false,
+        };
+        el.driver.probe_passed = Some(Allowed {
+            huge: single_only,
+            base: single_only,
         });
         let op = send(&mut el, vec![SendPart::Guard(guard(a, 0, 0))]);
         assert!(
@@ -7464,7 +7474,30 @@ mod tests {
             assert!(matches!(op, Op::SendMsgZc { .. }), "{case}: {op:?}");
         }
 
-        el.driver.probe_passed = Some(Modes::default());
+        // A kernel without the charge fix: only the region in base pages
+        // uses its buffer.
+        el.driver.probe_passed = Some(Allowed {
+            huge: Modes::default(),
+            base: ALL,
+        });
+        let op = send(
+            &mut el,
+            vec![
+                SendPart::Guard(guard(a, 0, 0)),
+                SendPart::Guard(guard(a, 4096, 0)),
+            ],
+        );
+        assert!(
+            matches!(op, Op::SendMsgZcFixed { buf_index: 0, .. }),
+            "base pages only, region in base pages: {op:?}"
+        );
+        let op = send(&mut el, vec![SendPart::Guard(guard(b, 0, 1))]);
+        assert!(
+            matches!(op, Op::SendMsgZc { .. }),
+            "base pages only, other region: {op:?}"
+        );
+
+        el.driver.probe_passed = Some(Allowed::default());
         let op = send(&mut el, vec![SendPart::Guard(guard(a, 0, 0))]);
         assert!(matches!(op, Op::SendMsgZc { .. }), "probe failed: {op:?}");
 
