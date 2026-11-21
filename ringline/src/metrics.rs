@@ -92,14 +92,24 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 pub static RING_PUSH_RETRIES_PENDING: Gauge = Gauge::new();
 
 /// io_uring: which guard-only sends from one registered region name the
-/// region's buffer, set when the fixed-buffer send probe runs
+/// region's buffer, for a region not shown to be in base pages only, set
+/// when the fixed-buffer send probe runs
 /// (`docs/fixed-buffer-sends.md`): 0 none (the probe has not run, or did
 /// not pass), 1 a send of one guard, 2 sends of one guard and of several.
 #[metric(
     name = "ringline/ring/fixed_buffer_sends",
-    description = "Guard-only sends that name a registered buffer: 0 none, 1 one guard, 2 one or several"
+    description = "Guard-only sends from a region not in base pages that name its buffer: 0 none, 1 one guard, 2 one or several"
 )]
 pub static FIXED_BUFFER_SENDS: Gauge = Gauge::new();
+
+/// io_uring: as `ringline/ring/fixed_buffer_sends`, for a region whose
+/// registration showed it to be in base pages only
+/// (`docs/fixed-buffer-sends.md`).
+#[metric(
+    name = "ringline/ring/fixed_buffer_sends_base_pages",
+    description = "Guard-only sends from a region in base pages that name its buffer: 0 none, 1 one guard, 2 one or several"
+)]
+pub static FIXED_BUFFER_SENDS_BASE_PAGES: Gauge = Gauge::new();
 
 // ── Index constants ─────────────────────────────────────────────
 

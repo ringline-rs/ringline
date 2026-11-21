@@ -1401,23 +1401,29 @@ impl ConfigBuilder {
     /// send names the buffer only when the kernel takes the flag on its
     /// opcode (`SEND_ZC` from Linux 6.0, `SENDMSG_ZC` from 6.15) and charges
     /// it to the socket's send buffer the same as the send from plain iovecs.
-    /// `Runtime::fixed_buffer_sends` reports the result.
+    /// The probe decides separately for a region in base pages only, which
+    /// the kernel charges correctly whether or not it carries the fix to how
+    /// sends from huge pages are charged.
+    /// [`Runtime::region_fixed_buffer_sends`](crate::Runtime::region_fixed_buffer_sends)
+    /// reports the result for a region, and `Runtime::fixed_buffer_sends` the
+    /// result for regions not in base pages only.
     ///
     /// The probe's duration has not been measured. Its waits on the sockets
-    /// and the ring are bounded at about 99 s in all. Allocating the huge page
-    /// can wait for memory compaction, and the check that it is a huge page
-    /// reads `/proc/self/smaps`; neither is bounded. It maps 6 MiB, collapses
-    /// a 2 MiB transparent huge page inside it, registers that on a ring of
-    /// its own, and unmaps it when done; if a send's completion does not
-    /// arrive, the mapping and the ring are kept for the life of the process.
+    /// and the ring are bounded at about 165 s in all. Allocating the huge
+    /// page can wait for memory compaction, and the checks of its buffers
+    /// read `/proc/self/smaps`; neither is bounded. It maps 6 MiB, collapses
+    /// a 2 MiB transparent huge page inside it, maps four base pages advised
+    /// `MADV_NOHUGEPAGE`, registers both on a ring of its own, and unmaps them
+    /// when done; if a send's completion does not arrive, the mappings and the
+    /// ring are kept for the life of the process.
     ///
     /// Each launch with this on, until the probe has run, raises the soft
-    /// `RLIMIT_MEMLOCK` when it is below what the workers need plus the
-    /// probe's charge (2 MiB, plus a small ring on a kernel that charges
-    /// rings), to that sum if the hard limit allows, whether or not regions
-    /// are registered. Processes started afterwards inherit the
-    /// raised limit. When the hard limit does not allow it, the probe does not
-    /// run and fixed sends stay off.
+    /// `RLIMIT_MEMLOCK` when it is below what the workers need plus the probe's
+    /// charge (2 MiB and four base pages, plus a small ring on a kernel that
+    /// charges rings), to that sum if the hard limit allows, whether or not
+    /// regions are registered. Processes started afterwards inherit the raised
+    /// limit. When the hard limit does not allow it, the probe does not run and
+    /// fixed sends stay off.
     ///
     /// With fixed sends on, a guard-only send from a region uses the region's
     /// slot until it completes; see

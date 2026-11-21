@@ -11,6 +11,10 @@
 pub struct MemoryRegion {
     ptr: *mut u8,
     len: usize,
+    /// Whether `/proc/self/smaps` showed the region to be in base pages only
+    /// when it was registered (`smaps::base_pages_in`). Set by the
+    /// registration, never by the caller.
+    pub(crate) base_pages: bool,
 }
 
 impl MemoryRegion {
@@ -24,7 +28,11 @@ impl MemoryRegion {
     ///   until after the runtime is dropped.
     pub unsafe fn new(ptr: *mut u8, len: usize) -> Self {
         debug_assert!(!ptr.is_null(), "MemoryRegion: ptr must not be null");
-        MemoryRegion { ptr, len }
+        MemoryRegion {
+            ptr,
+            len,
+            base_pages: false,
+        }
     }
 
     /// Get the pointer to the memory region.
@@ -61,8 +69,10 @@ impl RegionId {
 /// Whether guard-only sends from one registered region name the region's
 /// buffer (`IORING_RECVSEND_FIXED_BUF`)
 /// ([`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)),
-/// as [`Runtime::fixed_buffer_sends`](crate::Runtime::fixed_buffer_sends)
-/// reports it.
+/// as [`Runtime::region_fixed_buffer_sends`](crate::Runtime::region_fixed_buffer_sends)
+/// reports it for a region and
+/// [`Runtime::fixed_buffer_sends`](crate::Runtime::fixed_buffer_sends) for
+/// regions not in base pages only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FixedBufferSends {
@@ -101,6 +111,9 @@ pub enum FixedBufferSends {
 pub struct FixedBufferRegistry {
     /// Full-size iovec array. `iov_base == null` indicates an empty slot.
     iovecs: Vec<libc::iovec>,
+    /// `MemoryRegion::base_pages` of the region in each slot, `false` for an
+    /// empty slot.
+    base_pages: Vec<bool>,
 }
 
 impl FixedBufferRegistry {
@@ -122,13 +135,15 @@ impl FixedBufferRegistry {
             };
             max
         ];
+        let mut base_pages = vec![false; max];
         for (slot, region) in initial.iter().enumerate() {
             iovecs[slot] = libc::iovec {
                 iov_base: region.ptr() as *mut _,
                 iov_len: region.len(),
             };
+            base_pages[slot] = region.base_pages;
         }
-        FixedBufferRegistry { iovecs }
+        FixedBufferRegistry { iovecs, base_pages }
     }
 
     /// Get the full iovec slice, including empty slots. Used by the kernel
@@ -164,7 +179,15 @@ impl FixedBufferRegistry {
             iov_base: region.ptr() as *mut _,
             iov_len: region.len(),
         };
+        self.base_pages[idx] = region.base_pages;
         Ok(())
+    }
+
+    /// Whether the region in `slot` was shown to be in base pages only when
+    /// it was registered; `false` for an empty slot.
+    #[allow(dead_code)] // unused on the mio backend
+    pub(crate) fn base_pages(&self, slot: u16) -> bool {
+        self.base_pages.get(slot as usize).copied().unwrap_or(false)
     }
 
     /// Clear the given slot. Returns `Err` if out of range or already empty.
@@ -180,6 +203,7 @@ impl FixedBufferRegistry {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         };
+        self.base_pages[idx] = false;
         Ok(())
     }
 
