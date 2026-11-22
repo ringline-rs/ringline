@@ -1575,6 +1575,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Linux: `physical_core_count()`, and so the default worker count, counted
+  only the cores below the lowest-numbered offline CPU (#974). Releases from
+  0.2.0 have this. On a host booted with `nosmt` that numbers SMT siblings
+  adjacently, every odd CPU is offline and the count was 1. On such a host
+  `launch()` failed when two or more workers with `pin_to_core` on (the
+  default) pinned a worker to an offline CPU. Before 0.2.0 the default
+  worker count was the online CPU count, `launch()` succeeded, and each
+  worker pinned to an offline CPU exited, so the connections assigned to it
+  were closed. When `core_offset` plus the worker count exceeds the physical
+  cores, this can still happen, because those workers pin raw logical ids.
 - io_uring: an `ENOMEM` from registering memory that fits within the
   `RLIMIT_MEMLOCK` soft limit by itself, a buffer added through
   `Runtime::register_region` or a ring's regions at setup, no longer says the
