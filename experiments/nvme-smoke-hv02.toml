@@ -21,6 +21,8 @@
 # Result (2026-11-15, SystemsLab 01a1e109-4726-715e-de70-536a4567f949): smoke
 # PASS; 512-byte blocks, write back, FUA; counts as predicted for a FUA drive.
 # A few R/RA reads per arm were not issued by the probe (probably udev).
+# That run used an earlier form of this spec that carried the probe inline as
+# base64; the committed form has not been run.
 name = "ringline NVMe passthrough and dsync on hv02's spare NVMe"
 
 [params]

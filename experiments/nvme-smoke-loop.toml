@@ -86,6 +86,7 @@ SETUP
 } 2>&1 | tee nvme.log
 grep -q '^ALLDONE' nvme.log || exit 1
 grep -q '^NVME SMOKE: PASS' nvme.log || exit 1
+grep -q 'block_size=4096' nvme.log || exit 1
 grep -q '^lba8_restored=1' nvme.log || exit 1
 grep -q '^smoke_rc=0' nvme.log || exit 1
 grep -q 'LBA0\[0..32\] = \[52, 49, 4e, 47' nvme.log
