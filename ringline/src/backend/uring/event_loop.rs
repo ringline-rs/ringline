@@ -11186,7 +11186,7 @@ mod tests {
         let state = &el.driver.send_queues[conn_index as usize];
         assert!(state.close_pending, "the close was requested");
         assert!(!state.in_flight, "no alert was queued behind the FIN");
-        assert!(state.close_notify_pending.is_none());
+        assert!(state.sealed.is_none());
         assert!(
             state.close_notify_deadline.is_some(),
             "the drain is still bounded"

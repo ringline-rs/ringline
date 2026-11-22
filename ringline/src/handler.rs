@@ -8,6 +8,30 @@ use crate::buffer::send_slab::{InFlightSendSlab, MAX_GUARDS, MAX_IOVECS};
 use crate::fs::FileKind;
 use crate::guard::GuardBox;
 
+/// TLS output rustls has sealed that the send pool had no slots for when it
+/// was produced, kept in the order it was produced. Its records carry
+/// sequence numbers below those of any record encrypted after them, so they
+/// go on the wire first.
+#[cfg(has_io_uring)]
+#[derive(Debug)]
+pub(crate) struct SealedOutput {
+    /// The ciphertext.
+    pub bytes: Vec<u8>,
+    /// `bytes` ends with the connection's close_notify.
+    pub close_notify: bool,
+}
+
+#[cfg(has_io_uring)]
+impl SealedOutput {
+    /// A close_notify, with anything rustls had queued ahead of it.
+    pub(crate) fn close_notify(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            close_notify: true,
+        }
+    }
+}
+
 /// Per-connection send queue state.
 ///
 /// At most one stream send operation is in the kernel per connection: one SQE
@@ -96,13 +120,11 @@ pub(crate) struct ConnSendState {
     /// The connection is on `Driver::send_backstop_list`.
     #[cfg(has_io_uring)]
     pub on_send_backstop: bool,
-    /// A close_notify the send pool had no slot for when the close was
-    /// requested: its ciphertext, and anything rustls had queued ahead of
-    /// it. `try_finalize_close` places it once
-    /// the connection's own sends have drained, or drops it and clears the
-    /// connection's `close_notify_sent`.
+    /// TLS output rustls has sealed that the send pool had no slots for
+    /// when it was produced ([`SealedOutput`]). `try_finalize_close` places
+    /// it once the connection's own sends have drained, or drops it.
     #[cfg(has_io_uring)]
-    pub close_notify_pending: Option<Vec<u8>>,
+    pub sealed: Option<SealedOutput>,
     /// `abort` ran for the current occupant (`SendHalf::abort`). Every send
     /// started afterwards is refused with `ConnectionAborted`
     /// ([`closing_refusal`](Self::closing_refusal)), and on mio the close
@@ -268,7 +290,7 @@ impl ConnSendState {
             #[cfg(has_io_uring)]
             on_send_backstop: false,
             #[cfg(has_io_uring)]
-            close_notify_pending: None,
+            sealed: None,
             aborted: false,
             #[cfg(has_io_uring)]
             disconnect: Disconnect::None,
@@ -1272,7 +1294,10 @@ impl<'a> DriverCtx<'a> {
                         if !sends.is_empty() {
                             self.queue_built_sends(conn.index, sends);
                         }
-                        self.send_queues[conn.index as usize].close_notify_pending = retained;
+                        if let Some(bytes) = retained {
+                            self.send_queues[conn.index as usize].sealed =
+                                Some(SealedOutput::close_notify(bytes));
+                        }
                     }
                     // Arm the close_notify deadline so the event loop
                     // force-closes if the deferred Close never fires (peer

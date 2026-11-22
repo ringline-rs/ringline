@@ -1599,7 +1599,7 @@ impl Driver {
         // reactivated with a Shutdown still outstanding. If the gate ever leaks,
         // the next occupant must not inherit the block.
         state.shutdown_inflight = false;
-        state.close_notify_pending = None;
+        state.sealed = None;
         state.aborted = false;
         state.disconnect = Disconnect::None;
         state.waiting_send = None;
@@ -2374,7 +2374,11 @@ impl Driver {
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
         self.send_queues[ci].aborted = true;
-        if self.send_queues[ci].close_notify_pending.take().is_some() {
+        if self.send_queues[ci]
+            .sealed
+            .take()
+            .is_some_and(|s| s.close_notify)
+        {
             self.drop_retained_close_notify_flag(conn_index);
         }
         let state = &mut self.send_queues[ci];
@@ -2465,9 +2469,9 @@ impl Driver {
         // The drain is stuck, so a retained alert would stall the same way:
         // drop it with the queued sends.
         if self.send_queues[conn_index as usize]
-            .close_notify_pending
+            .sealed
             .take()
-            .is_some()
+            .is_some_and(|s| s.close_notify)
         {
             self.drop_retained_close_notify_flag(conn_index);
         }
@@ -2707,7 +2711,10 @@ impl Driver {
         }
         // No slot for the alert now: `try_finalize_close` places it once this
         // connection's own sends have drained and given their slots back.
-        self.send_queues[conn_index as usize].close_notify_pending = retained;
+        if let Some(bytes) = retained {
+            self.send_queues[conn_index as usize].sealed =
+                Some(crate::handler::SealedOutput::close_notify(bytes));
+        }
     }
 
     /// Place the close_notify a close found no pool slot for, now that the
@@ -2717,12 +2724,10 @@ impl Driver {
     /// bare FIN, `pool::CLOSE_NOTIFY_DROPPED` counts it, and the connection
     /// no longer records the alert as sent.
     fn place_retained_close_notify(&mut self, conn_index: u32) -> bool {
-        let Some(retained) = self.send_queues[conn_index as usize]
-            .close_notify_pending
-            .take()
-        else {
+        let Some(sealed) = self.send_queues[conn_index as usize].sealed.take() else {
             return false;
         };
+        let retained = sealed.bytes;
         let generation = self.connections.generation(conn_index);
         let mut sends = Vec::new();
         let placed = match self.tls_table.as_mut() {

@@ -780,7 +780,7 @@ impl TlsTable {
     /// Returns `None` when the alert was placed in `out`, or when there was
     /// nothing to queue. Returns `Some(ciphertext)`, the encrypted alert and
     /// anything rustls had queued ahead of it, when the pool had no slots for
-    /// it. The caller keeps it in `ConnSendState::close_notify_pending` and
+    /// it. The caller keeps it in `ConnSendState::sealed` and
     /// passes it to
     /// [`retry_close_notify_queued`](Self::retry_close_notify_queued).
     #[cfg(has_io_uring)]
