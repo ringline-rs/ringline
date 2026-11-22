@@ -215,7 +215,7 @@ impl OpenFlags {
     /// each write also commits the metadata needed to read it back. On macOS
     /// the write reaches the drive but the drive's own cache is not flushed,
     /// as with `fsync(2)`.
-    pub const DSYNC: Self = Self(libc::O_DSYNC);
+    pub const DSYNC: Self = Self(crate::sys::O_DSYNC);
 }
 
 impl std::ops::BitOr for OpenFlags {
@@ -332,9 +332,18 @@ impl Metadata {
             mode: st.st_mode as u32,
             uid: st.st_uid,
             gid: st.st_gid,
+            #[cfg(not(target_os = "hermit"))]
             accessed: time(st.st_atime, st.st_atime_nsec),
+            #[cfg(not(target_os = "hermit"))]
             modified: time(st.st_mtime, st.st_mtime_nsec),
+            #[cfg(not(target_os = "hermit"))]
             status_changed: time(st.st_ctime, st.st_ctime_nsec),
+            #[cfg(target_os = "hermit")]
+            accessed: time(st.st_atim.tv_sec, st.st_atim.tv_nsec),
+            #[cfg(target_os = "hermit")]
+            modified: time(st.st_mtim.tv_sec, st.st_mtim.tv_nsec),
+            #[cfg(target_os = "hermit")]
+            status_changed: time(st.st_ctim.tv_sec, st.st_ctim.tv_nsec),
             is_file: (st.st_mode & libc::S_IFMT) == libc::S_IFREG,
             is_dir: (st.st_mode & libc::S_IFMT) == libc::S_IFDIR,
             is_symlink: (st.st_mode & libc::S_IFMT) == libc::S_IFLNK,
@@ -974,17 +983,21 @@ pub(crate) fn release_orphans(
 /// with `buf` unchanged: [`io::ErrorKind::WouldBlock`] when the command slab
 /// or the in-flight bound is full, which a later retry with the same buffer
 /// can pass; [`io::ErrorKind::InvalidInput`] for a `buf` with no spare
-/// capacity or more than `u32::MAX` bytes of it; and an error of kind `Other`
-/// otherwise, for example for a stale handle. The read's length is the whole
-/// spare capacity; to read fewer bytes, pass a buffer with that much spare
-/// capacity (an `AlignedBuf`'s capacity is exact). A spare capacity above
-/// `i32::MAX` is refused by macOS with `EINVAL` and read short by Linux,
-/// which reads at most `0x7ffff000` bytes per call.
+/// capacity or more than `u32::MAX` bytes of it. On io_uring it is also
+/// `InvalidInput` for a `buf` whose range is not inside the region its
+/// [`IoBuf::region`] names. Any other refusal is an error of kind `Other`,
+/// for example for a stale handle. The
+/// read's length is the whole spare capacity; to read fewer bytes, pass a
+/// buffer with that much spare capacity (an `AlignedBuf`'s capacity is
+/// exact). A spare capacity above `i32::MAX` is refused by macOS with
+/// `EINVAL` and read short by Linux, which reads at most `0x7ffff000` bytes
+/// per call.
 ///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor, unless `buf` is
-/// refused before submission (the `InvalidInput` cases above).
+/// refused before submission (no spare capacity, or more than `u32::MAX`
+/// bytes of it).
 pub fn read_into<B: IoBufMut>(file: File, offset: u64, buf: B) -> ReadFuture<B> {
     read_into_file(FileKind::Fs, file.index, file.generation, offset, buf)
 }
@@ -1001,13 +1014,14 @@ pub(crate) fn read_into_file<B: IoBufMut>(
         Ok(region) => region,
         Err(e) => return ReadFuture::failed(e, buf),
     };
+    let region = buf.region();
     with_state(|driver, executor| {
         // Safety: the future owns `buf`, or parks it on drop until the
         // operation completes (`ReadFuture::drop`), so the memory outlives
         // the kernel's use of it.
         let mut ctx = driver.make_ctx();
         match submit_with_key(executor, |key| unsafe {
-            ctx.file_read(kind, index, generation, offset, ptr, len, key)
+            ctx.file_read(kind, index, generation, offset, ptr, len, region, key)
         }) {
             Ok((key, target)) => ReadFuture::new(key, target, initial_len, None, buf),
             Err(e) => ReadFuture::failed(e, buf),
@@ -1042,7 +1056,7 @@ pub(crate) fn read_into_file<B: IoBufMut>(
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor, unless `buf` is
-/// refused before submission (the `InvalidInput` cases above).
+/// refused before submission (an initialized length above `u32::MAX`).
 pub fn write_from<B: IoBuf>(file: File, offset: u64, buf: B) -> WriteFuture<B> {
     write_from_file(FileKind::Fs, file.index, file.generation, offset, buf)
 }
@@ -1059,12 +1073,13 @@ pub(crate) fn write_from_file<B: IoBuf>(
         Ok(region) => region,
         Err(e) => return WriteFuture::failed(e, buf),
     };
+    let region = buf.region();
     with_state(|driver, executor| {
         // Safety: the future owns `buf`, or parks it on drop until the
         // operation completes (`WriteFuture::drop`).
         let mut ctx = driver.make_ctx();
         match submit_with_key(executor, |key| unsafe {
-            ctx.file_write(kind, index, generation, offset, ptr, len, key)
+            ctx.file_write(kind, index, generation, offset, ptr, len, region, key)
         }) {
             Ok((key, target)) => WriteFuture::new(key, target, None, buf),
             Err(e) => WriteFuture::failed(e, buf),

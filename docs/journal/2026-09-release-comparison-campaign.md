@@ -54,7 +54,7 @@ before any number is trusted:
 
 | Gap | Where | Consequence |
 |---|---|---|
-| tokio server uses `read_exact(msg_size)` — one read syscall per message | `ringline-bench/src/bin/server.rs:285` | Previously manufactured a spurious ~9.6× ringline "win". Fixed on the unmerged `bench/fair-throughput`; never landed on `main`. |
+| tokio server uses `read_exact(msg_size)` — one read syscall per message | `ringline-bench/src/bin/server.rs:285` | Previously manufactured a spurious ~9.6× ringline "win". Fixed on the segcache benchmark branch, which never landed on `main`. |
 | client hardcodes `send_pool(32768, …)` | `ringline-bench/src/client.rs:578` | At 4096 connections that is 8 slots/conn; the client collapses to 33k ops/s and the arm measures a client limit, not the server. |
 | no closed-loop pipeline depth | `ringline-bench/src/bin/client.rs` | `--max-inflight` covers open loop only, so the syscall-amortization claim cannot be tested in closed loop. |
 
@@ -96,8 +96,8 @@ Phased, because each phase's output is the next phase's input.
 - **Phase 3 — worker count and pipeline depth.** Tests whether
   connections-per-worker is the real parameter, and whether syscalls/op falls
   with depth as the copy/syscall doc claims.
-- **Phase 4 (separate effort) — segcache.** Revive `bench/fair-throughput`
-  (28k lines, vendors segcache + cache-core, predates the series) so
+- **Phase 4 (separate effort) — segcache.** Revive the segcache benchmark
+  branch (28k lines, vendors segcache + cache-core, predates the series) so
   `BENCHMARKS.md`'s own workload can be refreshed. Deliberately after the echo
   campaign: echo answers the scaling questions more cheaply, and the revival is
   a substantial job that should not block them.

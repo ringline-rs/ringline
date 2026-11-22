@@ -486,8 +486,8 @@ is excluded pending investigation; ringline served ~109 k ops/s at 16 KiB.)
 The distributed runs are SystemsLab experiments against an EC2 Graviton pair
 (`aws.server` / `aws.client` tags). The `--protocol segcache` support on
 `bench-server`/`bench-client`, the vendored Segcache, and the experiment specs
-live on the **`bench/fair-throughput`** branch (not yet on `main`); these numbers
-were produced from that branch.
+were on a benchmark branch that is not on `main`; these numbers were produced
+from it.
 
 The server is `bench-server --runtime <ringline|tokio> --protocol segcache
 --cache-keys 16384 --workers <N> --msg-size <B>`. Closed-loop runs use a

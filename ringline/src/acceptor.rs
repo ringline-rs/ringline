@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::handoff::{Sender, TrySendError};
 
@@ -15,11 +15,134 @@ pub struct AcceptedConn {
     pub peer: crate::connection::PeerAddr,
 }
 
+/// The runtime's signal to its acceptors to stop: raised by shutdown and by
+/// `Runtime::stop_accepting`.
+///
+/// An fd from [`create_wake_fd`](crate::wakeup::create_wake_fd) that is
+/// written and never read, so once raised it stays readable. Every acceptor
+/// polls it beside its listening socket. Clones share the fd, which stays
+/// open while any clone is held.
+#[derive(Clone)]
+pub(crate) struct StopSignal {
+    fd: RawFd,
+    handle: crate::wakeup::WakeHandle,
+}
+
+impl StopSignal {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        let (fd, handle) = crate::wakeup::create_wake_fd()?;
+        Ok(StopSignal { fd, handle })
+    }
+
+    /// Make the fd readable. Idempotent.
+    pub(crate) fn raise(&self) {
+        self.handle.wake();
+    }
+
+    /// The fd to poll. Valid while `self` is.
+    fn fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+/// The runtime's record of accepting, for `Runtime::stop_accepting`: whether
+/// it has begun, and per worker, how many connections have been placed in the
+/// worker's accept channel and how many the worker has taken from it and
+/// installed or closed.
+///
+/// A connection is counted as placed by the thread that sends it: an acceptor,
+/// or in merged accept mode the worker that accepted it and hands it to
+/// another. The receiving worker counts it after `install_accepted` (io_uring)
+/// or after the item's turn in `drain_channels` (mio).
+pub(crate) struct AcceptState {
+    /// Set by `Runtime::stop_accepting` before it raises the stop signal.
+    /// An acceptor checks it before each `accept`.
+    stopping: AtomicBool,
+    placed: Box<[PaddedCount]>,
+    handled: Box<[PaddedCount]>,
+    /// Set when a worker thread ends, however it ends. Its accept channel is
+    /// gone, and what was left in it is closed.
+    done: Box<[AtomicBool]>,
+}
+
+/// One counter on its own cache line: `placed` is written by the senders and
+/// `handled` by the worker.
+#[repr(align(128))]
+struct PaddedCount(AtomicU64);
+
+impl AcceptState {
+    pub(crate) fn new(workers: usize) -> Self {
+        let counts = || {
+            (0..workers)
+                .map(|_| PaddedCount(AtomicU64::new(0)))
+                .collect()
+        };
+        AcceptState {
+            stopping: AtomicBool::new(false),
+            placed: counts(),
+            handled: counts(),
+            done: (0..workers).map(|_| AtomicBool::new(false)).collect(),
+        }
+    }
+
+    /// How many workers this counts for.
+    pub(crate) fn workers(&self) -> usize {
+        self.placed.len()
+    }
+
+    pub(crate) fn begin_stopping(&self) {
+        self.stopping.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Count a connection placed in `worker`'s accept channel.
+    pub(crate) fn placed(&self, worker: usize) {
+        if let Some(count) = self.placed.get(worker) {
+            count.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Count a connection `worker` took from its accept channel and installed
+    /// or closed.
+    pub(crate) fn handled(&self, worker: usize) {
+        if let Some(count) = self.handled.get(worker) {
+            count.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Record that `worker`'s thread has ended.
+    pub(crate) fn worker_done(&self, worker: usize) {
+        if let Some(done) = self.done.get(worker) {
+            done.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn is_done(&self, worker: usize) -> bool {
+        self.done
+            .get(worker)
+            .is_some_and(|done| done.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn placed_count(&self, worker: usize) -> u64 {
+        self.placed
+            .get(worker)
+            .map_or(0, |count| count.0.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn handled_count(&self, worker: usize) -> u64 {
+        self.handled
+            .get(worker)
+            .map_or(0, |count| count.0.load(Ordering::Acquire))
+    }
+}
+
 /// Configuration for one acceptor thread.
 pub struct AcceptorConfig {
     /// The listener's socket. The acceptor's hold keeps it open while the
-    /// acceptor runs. On Linux, shutdown wakes it from `accept4` with
-    /// [`ListenerSockets::shut_down`](crate::listener_sockets::ListenerSockets::shut_down).
+    /// acceptor runs.
     pub sockets: Arc<crate::listener_sockets::ListenerSockets>,
     /// Which listener this acceptor serves. Travels with every accepted fd so
     /// the handler can tell connections from different listeners apart.
@@ -32,6 +155,13 @@ pub struct AcceptorConfig {
     pub worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     /// Shared flag set by `Runtime::shutdown` to signal the acceptor to stop.
     pub shutdown_flag: Arc<AtomicBool>,
+    /// Raised by `Runtime::shutdown` after it sets `shutdown_flag`, and by
+    /// `Runtime::stop_accepting` after it sets `accept.stopping`; wakes the
+    /// acceptor from `poll`.
+    pub(crate) stop: StopSignal,
+    /// Whether `Runtime::stop_accepting` has begun, and where this acceptor
+    /// counts each connection it places.
+    pub(crate) accept: Arc<AcceptState>,
     /// The runtime's listen gates. This acceptor waits on its gate before
     /// accepting. `ListenGates::open` calls `listen(2)`; until it runs, the
     /// socket is bound and not listening.
@@ -68,13 +198,15 @@ pub(crate) fn apply_accepted_sockopts(fd: RawFd, nodelay: bool) {
     }
 }
 
-/// Run one listener's acceptor loop, until shutdown, a fatal accept error, or
-/// every worker has exited.
+/// Run one listener's acceptor loop, until shutdown, `Runtime::stop_accepting`,
+/// a fatal accept error, or every worker has exited.
 ///
-/// Accepts connections with `accept_nonblock` and distributes them to
-/// workers round-robin, waking each worker via eventfd. One of these runs
-/// per listener; they share the worker channels, so accepts from different
-/// listeners interleave and each carries its own `ListenerId`.
+/// Accepts connections with `accept_nonblock` until the listener has none,
+/// then waits in `poll` on the listener and the stop signal. Distributes the
+/// connections to workers round-robin, waking each worker through its wake
+/// fd. One of these runs per listener; they share the worker channels, so
+/// accepts from different listeners interleave and each carries its own
+/// `ListenerId`.
 pub fn run_acceptor(config: AcceptorConfig) {
     let num_workers = config.worker_channels.len();
     if num_workers == 0 {
@@ -91,13 +223,12 @@ pub fn run_acceptor(config: AcceptorConfig) {
         return;
     }
 
-    // `SHUT_RD` does not wake a blocked `accept` here, so the loop waits in
-    // `wait_for_connection`, and an `accept` that finds the connection gone
-    // must not block.
-    #[cfg(not(target_os = "linux"))]
+    // `accept` must not block: the loop waits in `wait_for_connection`, where
+    // the stop signal can wake it, and goes back there on `EAGAIN`. The flag
+    // is on the open file description, so every holder of the socket sees it.
     unsafe {
         let listen_fd = config.sockets.fd(0);
-        let flags = libc::fcntl(listen_fd, libc::F_GETFL);
+        let flags = libc::fcntl(listen_fd, libc::F_GETFL, 0);
         libc::fcntl(listen_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
@@ -107,23 +238,28 @@ pub fn run_acceptor(config: AcceptorConfig) {
     let mut alive = vec![true; num_workers];
 
     loop {
-        let mut addr_len: libc::socklen_t =
-            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-
-        #[cfg(not(target_os = "linux"))]
-        if !wait_for_connection(config.sockets.fd(0), &config.shutdown_flag) {
+        if config.shutdown_flag.load(Ordering::Acquire) || config.accept.is_stopping() {
             return;
         }
+        let mut addr_len: libc::socklen_t =
+            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
         let fd = accept_nonblock(config.sockets.fd(0), &mut addr_storage, &mut addr_len);
 
         if fd < 0 {
             let err = std::io::Error::last_os_error();
             let errno = err.raw_os_error().unwrap_or(0);
-            // Shutdown makes `accept4` fail (`EINVAL` after `SHUT_RD`), and a
-            // retry would only fail again.
-            if config.shutdown_flag.load(Ordering::Acquire) {
+            // A shutdown that began during the `accept` may have made it fail
+            // (`EINVAL` after `SHUT_RD`), and a retry would only fail again.
+            if config.shutdown_flag.load(Ordering::Acquire) || config.accept.is_stopping() {
                 return;
+            }
+            // No connection queued: wait for one, or for the stop signal.
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                if !wait_for_connection(config.sockets.fd(0), &config.stop) {
+                    return;
+                }
+                continue;
             }
             match classify_accept_error(errno) {
                 AcceptErrorAction::Retry => {}
@@ -134,13 +270,9 @@ pub fn run_acceptor(config: AcceptorConfig) {
                 }
                 AcceptErrorAction::Stop => {
                     crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPTOR_STOPPED);
-                    // Not `eprintln!`, which panics if stderr fails.
-                    let _ = std::io::Write::write_fmt(
-                        &mut std::io::stderr(),
-                        format_args!(
-                            "ringline: acceptor for listener {} stopped: {err}\n",
-                            config.listener.index()
-                        ),
+                    log::error!(
+                        "acceptor for listener {} stopped: {err}",
+                        config.listener.index()
                     );
                     return;
                 }
@@ -148,7 +280,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
             continue;
         }
 
-        let is_unix = addr_storage.ss_family == libc::AF_UNIX as libc::sa_family_t;
+        let is_unix = addr_storage.ss_family == crate::sys::AF_UNIX as libc::sa_family_t;
         apply_accepted_sockopts(fd, config.tcp_nodelay && !is_unix);
 
         // Parse peer address from the sockaddr_storage filled by accept4.
@@ -185,6 +317,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
             let accepted = pending.take().expect("connection not yet sent");
             match config.worker_channels[worker_idx].try_send(accepted) {
                 Ok(()) => {
+                    config.accept.placed(worker_idx);
                     config.worker_wake_handles[worker_idx].wake();
                     conn_count = conn_count.wrapping_add(1);
                     break;
@@ -209,7 +342,9 @@ pub fn run_acceptor(config: AcceptorConfig) {
 
         // Every live worker is backlogged. Hold this connection until one has
         // room: not calling `accept4` leaves the rest in the kernel's listen
-        // queue, whose overflow the peer's TCP retries.
+        // queue, whose overflow the peer's TCP retries. `stop_accepting` does
+        // not end the wait; it waits for this acceptor to place the
+        // connection.
         if let Some(accepted) = pending {
             crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_QUEUE_FULL);
             if !send_when_room(&config, &mut alive, accepted) {
@@ -243,14 +378,16 @@ pub(crate) fn classify_accept_error(errno: i32) -> AcceptErrorAction {
     match errno {
         // Not a socket, or not listening (also what `SHUT_RD` gives).
         libc::EBADF | libc::ENOTSOCK | libc::EINVAL => AcceptErrorAction::Stop,
-        // EINTR: a signal. EAGAIN: on a platform with a non-blocking listener,
-        // the connection `poll` saw has gone. ECONNABORTED, ECONNRESET and
-        // EPERM end one pending connection. EPROTO, ENETDOWN, ENETUNREACH,
-        // EHOSTDOWN, EHOSTUNREACH, ENONET, EOPNOTSUPP and ENOPROTOOPT are the
-        // errors accept(2) says Linux passes through from the new socket, to
-        // be retried like EAGAIN; ETIMEDOUT is one it says some kernels
-        // return. EOPNOTSUPP also means a listener that is not SOCK_STREAM,
-        // which cannot occur here: ringline creates every listener itself.
+        // EINTR: a signal. EAGAIN: `run_acceptor` handles it before calling
+        // this, by waiting in `wait_for_connection`. ECONNABORTED, ECONNRESET
+        // and EPERM end one pending connection. EPROTO, ENETDOWN,
+        // ENETUNREACH, EHOSTDOWN, EHOSTUNREACH, ENONET, EOPNOTSUPP and
+        // ENOPROTOOPT are the errors accept(2) says Linux passes through from
+        // the new socket, to be retried like EAGAIN; ETIMEDOUT is one it says
+        // some kernels return. EOPNOTSUPP also means a listener that is not
+        // SOCK_STREAM, which cannot occur here: ringline creates every other
+        // listener itself, and `validate_listeners` refuses a `bind_fd`
+        // socket that is not SOCK_STREAM.
         libc::EINTR
         | libc::EAGAIN
         | libc::ECONNABORTED
@@ -273,9 +410,8 @@ pub(crate) fn classify_accept_error(errno: i32) -> AcceptErrorAction {
     }
 }
 
-/// How often an acceptor waiting for a connection checks for shutdown, and
-/// how often one waiting for queue room counts the wait.
-const SHUTDOWN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// How often an acceptor waiting for queue room counts the wait.
+const QUEUE_FULL_COUNT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How often an acceptor holding a connection retries the full queues.
 const ROOM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
@@ -298,6 +434,7 @@ fn send_when_room(config: &AcceptorConfig, alive: &mut [bool], accepted: Accepte
             }
             match tx.try_send(accepted) {
                 Ok(()) => {
+                    config.accept.placed(worker_idx);
                     config.worker_wake_handles[worker_idx].wake();
                     return true;
                 }
@@ -312,7 +449,7 @@ fn send_when_room(config: &AcceptorConfig, alive: &mut [bool], accepted: Accepte
         if !alive.contains(&true) || config.shutdown_flag.load(Ordering::Acquire) {
             return false;
         }
-        if counted.elapsed() >= SHUTDOWN_CHECK_INTERVAL {
+        if counted.elapsed() >= QUEUE_FULL_COUNT_INTERVAL {
             crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_QUEUE_FULL);
             counted = std::time::Instant::now();
         }
@@ -320,25 +457,28 @@ fn send_when_room(config: &AcceptorConfig, alive: &mut [bool], accepted: Accepte
     }
 }
 
-/// Block until `listen_fd` has a connection to accept. Returns false when
-/// `shutdown_flag` is set.
-#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
-fn wait_for_connection(listen_fd: RawFd, shutdown_flag: &AtomicBool) -> bool {
+/// Block until `listen_fd` has a connection to accept or reports an error.
+/// Returns false once `stop` is raised.
+fn wait_for_connection(listen_fd: RawFd, stop: &StopSignal) -> bool {
     loop {
-        if shutdown_flag.load(Ordering::Acquire) {
-            return false;
-        }
-        let mut pollfd = libc::pollfd {
-            fd: listen_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let timeout = SHUTDOWN_CHECK_INTERVAL.as_millis() as libc::c_int;
-        match unsafe { libc::poll(&mut pollfd, 1, timeout) } {
-            0 => {}
+        let mut fds = [
+            libc::pollfd {
+                fd: listen_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        match unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } {
             -1 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => {}
+            _ if fds[1].revents != 0 => return false,
             // Ready, or an error `accept` reports.
-            _ => return true,
+            _ if fds[0].revents != 0 => return true,
+            _ => {}
         }
     }
 }
@@ -346,15 +486,9 @@ fn wait_for_connection(listen_fd: RawFd, shutdown_flag: &AtomicBool) -> bool {
 /// Accept a connection and set the **returned** fd to non-blocking +
 /// close-on-exec.
 ///
-/// On Linux, uses a blocking `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` for a
-/// single syscall. `shutdown(fd, SHUT_RD)` on the listen socket makes a blocked
-/// or later `accept4` fail with `EINVAL`, which ends the acceptor at shutdown.
-/// Closing the fd does not wake a blocked accept, because the syscall holds a
-/// file reference.
-///
-/// On other platforms, `SHUT_RD` does not wake a blocked `accept`, so the
-/// listener is non-blocking and the acceptor waits in
-/// [`wait_for_connection`] before calling `accept()` and `fcntl()`.
+/// The listener is non-blocking, so with no connection queued this fails with
+/// `EAGAIN`. On Linux it is one `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` call;
+/// elsewhere `accept()` and then `fcntl()`.
 fn accept_nonblock(
     listen_fd: libc::c_int,
     addr: &mut libc::sockaddr_storage,
@@ -377,9 +511,9 @@ fn accept_nonblock(
             unsafe { libc::accept(listen_fd, addr as *mut _ as *mut libc::sockaddr, addr_len) };
         if fd >= 0 {
             unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
+                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
                 libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+                let fd_flags = libc::fcntl(fd, libc::F_GETFD, 0);
                 libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
             }
         }
@@ -395,20 +529,17 @@ mod tests {
     /// An acceptor parked on a gate that never opens must still exit when the
     /// runtime shuts down.
     ///
-    /// This is the mechanism `Runtime::shutdown` relies on. It cannot
-    /// be tested through the public API: the acceptor thread is detached, so a
-    /// parked one does not hold up `join()` on the worker handles, and the
-    /// listener is shut down by `shutdown` whether the thread woke or not. The
-    /// leak is a stranded thread, which no observable API state reflects.
+    /// `Runtime::shutdown` joins the acceptor threads, so an acceptor that
+    /// stayed parked would hang it.
     #[test]
     fn a_gated_acceptor_exits_on_shutdown() {
         use std::sync::atomic::AtomicBool;
 
         let gates = crate::listen_gate::ListenGates::new(1, 128);
         // `TcpListener::bind` listens, so an acceptor that skipped the gate
-        // would block in `accept4` rather than exit. The assertions below
+        // would wait in `poll` rather than exit. The assertions below
         // separate the two: a gated acceptor exits on `gates.shutdown()`, one
-        // blocked in `accept4` does not.
+        // in `poll` does not.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let (tx, _rx) = crate::handoff::bounded::<AcceptedConn>(1);
 
@@ -421,6 +552,8 @@ mod tests {
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
+            stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
 
         let handle = std::thread::spawn(move || run_acceptor(config));
@@ -482,6 +615,8 @@ mod tests {
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
+            stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
         (addr, sockets, gates, rx, config)
     }
@@ -525,8 +660,8 @@ mod tests {
     /// An acceptor whose listener stops accepting while the runtime is not
     /// shutting down exits and counts it, instead of exiting unseen.
     ///
-    /// Linux only: `SHUT_RD` makes `accept4` fail with `EINVAL` there; other
-    /// platforms do not wake a blocked `accept` that way.
+    /// Linux only: there `SHUT_RD` makes `poll` report the listener and
+    /// `accept4` fail with `EINVAL`; on macOS it does not wake `poll`.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_acceptor_whose_listener_dies_stops_and_counts_it() {
@@ -552,6 +687,8 @@ mod tests {
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
+            stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
         let handle = std::thread::spawn(move || run_acceptor(config));
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -580,10 +717,6 @@ mod tests {
 
     /// A connection no worker has room for is held until one does, rather than
     /// closed (#658), and the worker is woken for it.
-    ///
-    /// Linux only: the test ends the acceptor by shutting its sockets down,
-    /// and other platforms see shutdown through the flag.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_connection_every_worker_is_too_busy_for_waits_for_room() {
         use std::io::{Read, Write};
@@ -592,6 +725,7 @@ mod tests {
         let (read_fd, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
         let (addr, sockets, gates, rx, config) = acceptor_with_a_full_queue(wake);
         let shutdown_flag = Arc::clone(&config.shutdown_flag);
+        let stop = config.stop.clone();
         let before = queue_full_count();
         let handle = std::thread::spawn(move || run_acceptor(config));
 
@@ -635,16 +769,16 @@ mod tests {
         served.read_exact(&mut request).expect("read the request");
         assert_eq!(&request, b"go");
 
-        // As `RuntimeShutdown::shutdown` does: the flag first, so the
-        // acceptor reads the `EINVAL` that `SHUT_RD` causes as shutdown.
+        // As `RuntimeShutdown::shutdown` does: the flag, then the stop signal.
         shutdown_flag.store(true, Ordering::Release);
         gates.shutdown();
+        stop.raise();
         sockets.shut_down();
         handle.join().expect("acceptor panicked");
     }
 
     /// An acceptor holding a connection does not wait for the workers to exit
-    /// at shutdown, as a blocked `accept4` does not.
+    /// at shutdown.
     #[test]
     fn shutdown_ends_an_acceptor_waiting_for_room() {
         use std::time::Duration;
@@ -710,24 +844,31 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("listener address");
         let _client = std::net::TcpStream::connect(addr).expect("connect");
-        let flag = AtomicBool::new(false);
+        let stop = StopSignal::new().expect("stop signal");
         assert!(wait_for_connection(
             std::os::fd::AsRawFd::as_raw_fd(&listener),
-            &flag
+            &stop
         ));
     }
 
     #[test]
-    fn wait_for_connection_returns_false_on_shutdown() {
+    fn wait_for_connection_returns_false_once_stop_is_raised() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let listen_fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
-        let flag = Arc::new(AtomicBool::new(false));
-        let setter = Arc::clone(&flag);
-        let waiter = std::thread::spawn(move || wait_for_connection(listen_fd, &setter));
+        let stop = StopSignal::new().expect("stop signal");
+        let raiser = stop.clone();
+        let waiter = std::thread::spawn(move || wait_for_connection(listen_fd, &stop));
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(!waiter.is_finished(), "returned with nothing to accept");
-        flag.store(true, Ordering::Release);
+        raiser.raise();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !waiter.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(waiter.is_finished(), "the stop signal did not end the wait");
         assert!(!waiter.join().expect("waiter panicked"));
+        // `listener` is still listening: nothing but the signal woke the wait.
+        drop(listener);
     }
 
     /// An idle acceptor exits at shutdown with no peer connecting, on every
@@ -751,14 +892,19 @@ mod tests {
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
+            stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
+        let stop = config.stop.clone();
         let handle = std::thread::spawn(move || run_acceptor(config));
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(!handle.is_finished(), "the acceptor exited before shutdown");
 
+        // No `SHUT_RD`: the socket stays listening, and the stop signal alone
+        // wakes the acceptor from `poll`.
         flag.store(true, Ordering::Release);
         gates.shutdown();
-        sockets.shut_down();
+        stop.raise();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !handle.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -767,11 +913,11 @@ mod tests {
         handle.join().expect("acceptor panicked");
     }
 
-    /// `Runtime::shutdown` wakes an acceptor blocked in `accept4` by shutting
-    /// its listener's sockets down, and leaves the fd open for the acceptor to
-    /// drop.
+    /// On Linux, `SHUT_RD` alone also ends an acceptor in `poll`: `poll`
+    /// reports the listener and `accept4` fails with `EINVAL`. `shut_down`
+    /// leaves the fd open for the acceptor to drop.
     ///
-    /// Linux only: other platforms see shutdown through the flag.
+    /// Linux only: on macOS `SHUT_RD` does not wake `poll`.
     #[cfg(target_os = "linux")]
     #[test]
     fn shutting_the_sockets_down_ends_a_blocked_acceptor() {
@@ -794,6 +940,8 @@ mod tests {
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
+            stop: StopSignal::new().expect("stop signal"),
+            accept: Arc::new(AcceptState::new(1)),
         };
         let handle = std::thread::spawn(move || run_acceptor(config));
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -811,7 +959,7 @@ mod tests {
         handle.join().expect("acceptor panicked");
 
         assert!(
-            unsafe { libc::fcntl(sockets.fd(0), libc::F_GETFD) } >= 0,
+            unsafe { libc::fcntl(sockets.fd(0), libc::F_GETFD, 0) } >= 0,
             "shut_down closed the socket"
         );
         assert_eq!(

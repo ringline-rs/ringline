@@ -288,12 +288,12 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     require_order(
         &worker,
         "startup_rx.recv()",
-        "create_listener(*addr)",
+        "create_listener(addr)",
         "every worker reports readiness before any listener is bound",
     )?;
     require_order(
         &worker,
-        "create_listener(*addr)",
+        "create_listener(addr)",
         ".name(format!(\"rl-acpt-{idx}\"))",
         "each listener is bound before its acceptor thread starts",
     )?;

@@ -1,0 +1,13 @@
+diff --git a/ringline/src/signal.rs b/ringline/src/signal.rs
+index 24b6f399..bc893c31 100644
+--- a/ringline/src/signal.rs
++++ b/ringline/src/signal.rs
+@@ -189,7 +189,7 @@ pub(crate) fn wait_or_ready(panic_fd: i32, exit_fd: i32) -> Signal {
+ /// returns for, so each byte written there is returned once.
+ pub(crate) fn next_or_ready(panic_fd: i32, exit_fd: i32) -> Signal {
+     loop {
+-        if let Some(signal) = wait_inner(Some((panic_fd, exit_fd)), true) {
++        if let Some(signal) = wait_inner(Some((panic_fd, exit_fd)), false) {
+             return signal;
+         }
+     }

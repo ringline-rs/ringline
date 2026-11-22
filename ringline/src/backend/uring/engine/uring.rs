@@ -14,7 +14,7 @@ use crate::backend::uring::ring::{CloseLead, close_lead_for};
 use crate::backend::uring::sqe::{Fd, Link, Op, Sqe};
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::config::Config;
-use crate::error::{Error, MemlockLimit, describe_buffer_registration_failure, errno_name};
+use crate::error::{Error, MemlockLimit, Pinned, describe_buffer_registration_failure, errno_name};
 use crate::memlock::KernelVersion;
 
 /// Ubuntu's 6.8 kernels (from 6.8.0-139) invert the check on the reserved
@@ -221,8 +221,8 @@ pub(crate) struct UringEngine {
     /// `EBUSY` or `EAGAIN`, or submitted only some of them
     /// (`Engine::submit_refused`).
     submit_refused: std::sync::atomic::AtomicBool,
-    /// Reusable Entry128 conversion scratch for chain pushes — avoids a
-    /// heap allocation per chained send.
+    /// Reusable Entry128 conversion scratch for chain pushes, so a push does
+    /// not allocate.
     chain_scratch: Vec<squeue::Entry128>,
     /// Whether the ring was set up with `IORING_SETUP_DEFER_TASKRUN`. When
     /// set, the kernel runs task_work — and so posts the CQEs it generates —
@@ -674,12 +674,12 @@ impl Engine for UringEngine {
         // against the total; an `EFAULT` is about the one buffer.
         let total: u64 = iovecs.iter().map(|iov| iov.iov_len as u64).sum();
         let attribute = |e: io::Error, len: usize| {
-            let bytes = if e.raw_os_error() == Some(libc::EFAULT) {
-                len as u64
+            let (bytes, pinned) = if e.raw_os_error() == Some(libc::EFAULT) {
+                (len as u64, Pinned::Buffer)
             } else {
-                total
+                (total, Pinned::RingRegions)
             };
-            Error::buffer_registration(e, bytes, MemlockLimit::read().ok().as_ref())
+            Error::buffer_registration(e, bytes, MemlockLimit::read().ok().as_ref(), pinned)
         };
         let submitter = self.ring.submitter();
         // The sparse table pins no pages and is not charged to
@@ -735,6 +735,7 @@ impl Engine for UringEngine {
                         &e,
                         iov.iov_len as u64,
                         MemlockLimit::read().ok().as_ref(),
+                        Pinned::Buffer,
                     );
                     io::Error::new(e.kind(), text)
                 })?;
@@ -1256,11 +1257,20 @@ impl Sqe {
     /// The 128-byte entry the ring's submission queue holds.
     pub(crate) fn encode(&self) -> Entry128 {
         let e: Entry128 = match self.op {
-            Op::UringCmd80 { fd, cmd_op, cmd } => {
+            Op::UringCmd80 {
+                fd,
+                cmd_op,
+                cmd,
+                buf_index,
+            } => {
                 let e = match fd {
-                    Fd::Fixed(i) => opcode::UringCmd80::new(Fixed(i), cmd_op).cmd(cmd).build(),
+                    Fd::Fixed(i) => opcode::UringCmd80::new(Fixed(i), cmd_op)
+                        .cmd(cmd)
+                        .buf_index(buf_index)
+                        .build(),
                     Fd::Raw(f) => opcode::UringCmd80::new(types::Fd(f), cmd_op)
                         .cmd(cmd)
+                        .buf_index(buf_index)
                         .build(),
                 };
                 e.user_data(self.user_data)
@@ -1269,7 +1279,6 @@ impl Sqe {
         };
         match self.link {
             Link::None => e,
-            Link::Soft => e.flags(Flags::IO_LINK),
             Link::Hard => e.flags(Flags::IO_HARDLINK),
         }
     }
@@ -1338,6 +1347,37 @@ impl Sqe {
             Op::SendMsgZc { fd, msg, flags } => {
                 on!(fd, |t| opcode::SendMsgZc::new(t, msg).flags(flags).build())
             }
+            Op::SendZcFixed {
+                fd,
+                buf,
+                len,
+                flags,
+                buf_index,
+            } => {
+                on!(fd, |t| opcode::SendZc::new(t, buf, len)
+                    .buf_index(Some(buf_index))
+                    .flags(flags)
+                    .build())
+            }
+            Op::SendMsgZcFixed {
+                fd,
+                msg,
+                flags,
+                buf_index,
+            } => {
+                // `IORING_RECVSEND_FIXED_BUF` goes in `ioprio`, which
+                // `opcode::SendMsgZc` sets. It has no `buf_index`: that is the
+                // `u16` at byte offset 40 of the `repr(C)` `io_uring_sqe`.
+                const RECVSEND_FIXED_BUF: u16 = 1 << 2;
+                let mut e = on!(fd, |t| opcode::SendMsgZc::new(t, msg)
+                    .ioprio(RECVSEND_FIXED_BUF)
+                    .flags(flags)
+                    .build());
+                let ptr = &mut e as *mut Entry as *mut u8;
+                // SAFETY: offset 40..42 lies inside the 64-byte entry.
+                unsafe { (ptr.add(40) as *mut u16).write_unaligned(buf_index) };
+                e
+            }
             Op::Read {
                 fd,
                 buf,
@@ -1355,6 +1395,28 @@ impl Sqe {
                 offset,
             } => {
                 on!(fd, |t| opcode::Write::new(t, buf, len)
+                    .offset(offset)
+                    .build())
+            }
+            Op::ReadFixed {
+                fd,
+                buf,
+                len,
+                offset,
+                buf_index,
+            } => {
+                on!(fd, |t| opcode::ReadFixed::new(t, buf, len, buf_index)
+                    .offset(offset)
+                    .build())
+            }
+            Op::WriteFixed {
+                fd,
+                buf,
+                len,
+                offset,
+                buf_index,
+            } => {
+                on!(fd, |t| opcode::WriteFixed::new(t, buf, len, buf_index)
                     .offset(offset)
                     .build())
             }
@@ -1519,12 +1581,6 @@ mod encode_tests {
                     .build()),
             ),
             (
-                Sqe::chain_send(9, p, 77, ud),
-                e(opcode::Send::new(fx, p, 77)
-                    .flags(crate::completion::CHAIN_SEND_FLAGS)
-                    .build()),
-            ),
-            (
                 Sqe::new(
                     Op::Send {
                         fd: Fd::Raw(11),
@@ -1573,18 +1629,6 @@ mod encode_tests {
                     .build()),
             ),
             (
-                Sqe::chain_send_msg(9, msg, ud),
-                e(opcode::SendMsg::new(fx, msg)
-                    .flags(crate::completion::CHAIN_SEND_FLAGS as u32)
-                    .build()),
-            ),
-            (
-                Sqe::chain_send_msg_zc(9, msg, ud),
-                e(opcode::SendMsgZc::new(fx, msg)
-                    .flags(crate::completion::CHAIN_SEND_FLAGS as u32)
-                    .build()),
-            ),
-            (
                 Sqe::new(
                     Op::Read {
                         fd: Fd::Raw(11),
@@ -1619,6 +1663,32 @@ mod encode_tests {
                     ud,
                 ),
                 e(opcode::Write::new(fx, p, 4096).offset(8192).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::ReadFixed {
+                        fd: Fd::Fixed(9),
+                        buf: p,
+                        len: 4096,
+                        offset: 8192,
+                        buf_index: 3,
+                    },
+                    ud,
+                ),
+                e(opcode::ReadFixed::new(fx, p, 4096, 3).offset(8192).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::WriteFixed {
+                        fd: Fd::Fixed(9),
+                        buf: p,
+                        len: 4096,
+                        offset: 8192,
+                        buf_index: 3,
+                    },
+                    ud,
+                ),
+                e(opcode::WriteFixed::new(fx, p, 4096, 3).offset(8192).build()),
             ),
             (
                 Sqe::new(Op::Fsync { fd: Fd::Fixed(9) }, ud),
@@ -1773,11 +1843,28 @@ mod encode_tests {
                         fd: Fd::Fixed(9),
                         cmd_op: 0x42,
                         cmd,
+                        buf_index: None,
                     },
                     ud,
                 ),
                 opcode::UringCmd80::new(fx, 0x42)
                     .cmd(cmd)
+                    .build()
+                    .user_data(ud),
+            ),
+            (
+                Sqe::new(
+                    Op::UringCmd80 {
+                        fd: Fd::Fixed(9),
+                        cmd_op: 0x42,
+                        cmd,
+                        buf_index: Some(3),
+                    },
+                    ud,
+                ),
+                opcode::UringCmd80::new(fx, 0x42)
+                    .cmd(cmd)
+                    .buf_index(Some(3))
                     .build()
                     .user_data(ud),
             ),
@@ -1813,6 +1900,40 @@ mod encode_tests {
         assert_eq!(bytes(&recv(true)), want);
     }
 
+    /// A fixed-buffer `SENDMSG_ZC` encodes as the plain one with
+    /// `IORING_RECVSEND_FIXED_BUF` (1 << 2) in `ioprio`, at byte offset 2,
+    /// and the buffer index in `buf_index`, the `u16` at byte offset 40,
+    /// where the kernel's `io_send_zc_prep` reads them.
+    #[test]
+    fn a_fixed_buffer_sendmsg_zc_sets_ioprio_and_buf_index() {
+        let msg = 0x2000 as *const libc::msghdr;
+        let plain = bytes(&Sqe::send_msg_zc(9, msg, 0x42).encode());
+        let fixed = bytes(&Sqe::send_msg_zc_fixed(9, msg, 0x0305, 0x42).encode());
+        assert_eq!(plain[0], 48, "IORING_OP_SENDMSG_ZC");
+        assert_eq!(u16::from_ne_bytes([plain[2], plain[3]]), 0, "plain ioprio");
+        assert_eq!(
+            u16::from_ne_bytes([plain[40], plain[41]]),
+            0,
+            "plain buf_index"
+        );
+        let mut want = plain.clone();
+        want[2..4].copy_from_slice(&4u16.to_ne_bytes());
+        want[40..42].copy_from_slice(&0x0305u16.to_ne_bytes());
+        assert_eq!(fixed, want);
+    }
+
+    /// A fixed-buffer `SEND_ZC` is `IORING_OP_SEND_ZC` (47) with
+    /// `IORING_RECVSEND_FIXED_BUF` (1 << 2) in `ioprio` at byte offset 2 and
+    /// the buffer index in `buf_index` at byte offset 40.
+    #[test]
+    fn a_fixed_buffer_send_zc_sets_ioprio_and_buf_index() {
+        let e = bytes(&Sqe::send_zc_fixed(9, 0x1000 as *const u8, 77, 0x0305, 0x42).encode());
+        assert_eq!(e[0], 47, "IORING_OP_SEND_ZC");
+        assert_eq!(u16::from_ne_bytes([e[2], e[3]]), 4, "ioprio");
+        assert_eq!(u16::from_ne_bytes([e[40], e[41]]), 0x0305, "buf_index");
+        assert_eq!(u32::from_ne_bytes([e[24], e[25], e[26], e[27]]), 77, "len");
+    }
+
     /// `MAX_FILE_INDEX` is the largest slot the crate's `DestinationSlot`
     /// accepts, which `encode` relies on after `submit_openat` checks it.
     #[test]
@@ -1828,7 +1949,6 @@ mod encode_tests {
         let plain: Entry128 = opcode::AsyncCancel::new(1).build().user_data(2).into();
         let cases = [
             (Link::None, plain.clone()),
-            (Link::Soft, plain.clone().flags(Flags::IO_LINK)),
             (Link::Hard, plain.flags(Flags::IO_HARDLINK)),
         ];
         for (link, want) in cases {

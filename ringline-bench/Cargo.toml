@@ -51,6 +51,12 @@ path = "src/bin/admission-server.rs"
 name = "admission-load"
 path = "src/bin/admission-load.rs"
 
+# Experiment C's stage C1: a discrete-event model of the send pool and its
+# admission orders. It does not call ringline.
+[[bin]]
+name = "admission-model"
+path = "src/bin/admission-model.rs"
+
 # Mirrors ringline's own feature so `build.rs` sees CARGO_FEATURE_FORCE_MIO.
 # Building the mio arm as `--features ringline/force-mio` alone would leave
 # this crate's has_io_uring set while the runtime dropped it, and the

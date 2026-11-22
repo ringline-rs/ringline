@@ -63,9 +63,8 @@ pub enum Lifecycle {
 pub enum WriteHalf {
     /// Sends are accepted.
     Open,
-    /// `shutdown_write` was requested while sends were queued or in flight,
-    /// or, on io_uring, while a send chain was active; the FIN goes out once
-    /// they drain.
+    /// `shutdown_write` was requested while sends were queued or in flight;
+    /// the FIN goes out once they drain.
     ShutdownPending,
     /// Our FIN has been requested (io_uring: Shutdown SQE submitted, or
     /// parked on `pending_shutdown_retries` when the submission queue refused

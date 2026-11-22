@@ -50,7 +50,7 @@
 //!                              ▼
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │        Acceptor Thread, one per listener (TCP or Unix)          │
-//! │      blocking accept4() -> round-robin to worker channels       │
+//! │  accept4() until EAGAIN, poll -> round-robin to worker channels │
 //! └─────────────────────────────────────────────────────────────────┘
 //!                              │
 //!              ┌───────────────┼───────────────┐
@@ -165,8 +165,6 @@ pub mod buf;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod buffer;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
-pub(crate) mod chain;
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod completion;
 pub(crate) mod connection;
 pub mod direct_io;
@@ -191,7 +189,13 @@ pub(crate) mod resolver;
 #[cfg(target_os = "linux")]
 pub(crate) mod reuseport_bpf;
 pub(crate) mod runtime;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+pub(crate) mod smaps;
 pub(crate) mod spawner;
+// Under io_uring the file wrappers and `linger` are unused; they serve the
+// mio backend.
+#[cfg_attr(has_io_uring, allow(dead_code, unused_imports))]
+pub(crate) mod sys;
 pub(crate) mod task_panic;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod tls;
@@ -390,6 +394,7 @@ pub use runtime::io::try_timeout;
 pub use runtime::io::try_timeout_at;
 /// Return control to the worker's event loop once.
 pub use runtime::io::yield_now;
+pub use runtime::io::{BatchAdmission, BatchAdmitted, BatchRefused};
 /// Future returned by [`join()`].
 pub use runtime::join::Join;
 /// Future returned by [`join3()`].
@@ -416,6 +421,15 @@ pub use runtime::select::Select3;
 pub use runtime::select::select;
 /// Poll three futures concurrently, returning whichever completes first.
 pub use runtime::select::select3;
+/// What admission did on a worker: sends that passed a waiting head and the
+/// slots they hold.
+#[doc(hidden)]
+pub use runtime::send_completion::SendAdmissionCounters;
+/// The order in which each worker admits bounded sends to its send copy pool.
+pub use runtime::send_completion::SendAdmissionOrder;
+/// The current worker's admission counters.
+#[doc(hidden)]
+pub use runtime::send_completion::send_admission_counters;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
 /// Why a task's handle did not produce a value: it panicked or was cancelled.
@@ -457,6 +471,9 @@ pub use runtime::stream::ConnStream;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────
 
+/// Whether guard-only sends use a registered buffer; see
+/// [`Runtime::region_fixed_buffer_sends`] and [`Runtime::fixed_buffer_sends`].
+pub use buffer::fixed::FixedBufferSends;
 /// Memory region for io_uring fixed buffer registration.
 pub use buffer::fixed::MemoryRegion;
 /// Region identifier for [`SendGuard`] implementations.

@@ -335,14 +335,13 @@ accepted connection closing first, 5 trials per row:
 The third row is the fix: `listen_all` sets the flag immediately before
 `listen(2)`. The port stays reserved while the listener is held. In the gap
 between setting the flag and `listen(2)`, a competing `SO_REUSEADDR` socket
-**can** bind. Measured in both orders: whichever socket calls `listen(2)`
-first listens, and the other's `listen` fails `EADDRINUSE`. If the competitor
-wins, `begin_listening` (or `launch()`) reports the error. The gap cannot
-produce two listeners. This entry first said
-a competitor could not bind there, reasoned from "the flag was clear until
-then", which forgets that the flag is set again one line before the listen.
-An adversarial review found it; the same wrong sentence is in the `deae091`
-commit message, which cannot be corrected in place.
+**can** bind. Measured in both orders: whichever socket calls `listen(2)` first
+listens, and the other's `listen` fails `EADDRINUSE`. If the competitor wins,
+`begin_listening` (or `launch()`) reports the error. The gap cannot produce two
+listeners. This entry first said a competitor could not bind there, reasoned
+from "the flag was clear until then", which forgets that the flag is set again
+one line before the listen. An adversarial review found it; the same wrong
+sentence is in a commit message of #537, which cannot be corrected in place.
 `a_listener_listens_over_a_time_wait_connection` and
 `a_held_listener_reserves_its_port` pin the two halves, and each fails when its
 half of the fix is removed.
@@ -353,12 +352,12 @@ the flag exists for.
 
 ## Second adversarial review: decisions
 
-Two independent reviews of `deae091` agreed on one blocking bug. A `launch()`
-that failed after a deferred listener's acceptor had started closed the
-listeners and joined the workers, but did not shut the gates. The acceptor
+Two independent reviews of a commit of #537 agreed on one blocking bug. A
+`launch()` that failed after a deferred listener's acceptor had started closed
+the listeners and joined the workers, but did not shut the gates. The acceptor
 stayed parked in `wait_open` for the life of the process, and a
-`begin_listening` during the rollback could `listen(2)` a closed fd number.
-All three failure paths now shut the gates first, as `ShutdownHandle::shutdown`
+`begin_listening` during the rollback could `listen(2)` a closed fd number. All
+three failure paths now shut the gates first, as `ShutdownHandle::shutdown`
 does. `tests/deferred_listen_rollback.rs` counts `ringline-accept` threads in
 `/proc/self/task`; it failed before the fix (one thread alive after 5 s) and
 passes after it. It is its own test binary so other tests' acceptors are not

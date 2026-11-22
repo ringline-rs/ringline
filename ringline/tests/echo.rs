@@ -1215,8 +1215,8 @@ impl AsyncEventHandler for ConnectRefusedHandler {
 
 #[test]
 fn async_outbound_connect_refused() {
-    // A port held by a socket that never listens, so a connect is refused and
-    // nothing else can take the port while the test runs.
+    // A port held by a connected client socket, so nothing listens on it and
+    // nothing else can take it while the test runs.
     let (_dead_guard, dead_port) = common::refusing_port();
 
     CONNECT_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
@@ -2380,103 +2380,6 @@ fn async_send_await_basic() {
     assert!(
         result.contains("OK:13"),
         "expected OK:13 (send_await byte count), got: {result}"
-    );
-
-    shutdown.shutdown();
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
-}
-
-#[cfg(has_io_uring)]
-/// Handler that tests send_chain_await.
-struct SendChainAwaitHandler;
-
-#[cfg(has_io_uring)]
-impl AsyncEventHandler for SendChainAwaitHandler {
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            let n = conn
-                .with_data(|data| ParseResult::Consumed(data.len()))
-                .await;
-            if n == 0 {
-                return;
-            }
-
-            // Build a chained send with two copy parts and await completion.
-            let part1 = b"HELLO";
-            let part2 = b"WORLD";
-            match conn.send_chain(|b| b.copy(part1).copy(part2).finish()) {
-                Ok(fut) => match fut.await {
-                    Ok(bytes) => {
-                        let msg = format!("OK:{bytes}");
-                        let _ = conn.send(msg.as_bytes());
-                    }
-                    Err(e) => {
-                        let _ = conn.send(format!("ERR:{e}").as_bytes());
-                    }
-                },
-                Err(e) => {
-                    let _ = conn.send(format!("SUBMIT_ERR:{e}").as_bytes());
-                }
-            }
-            ringline::sleep(Duration::from_secs(5)).await;
-        }
-    }
-    fn create_for_worker(_id: usize) -> Self {
-        SendChainAwaitHandler
-    }
-}
-
-#[test]
-#[cfg(has_io_uring)]
-fn async_send_chain_await_basic() {
-    let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<SendChainAwaitHandler>()
-        .expect("launch failed");
-    let addr = shutdown.bound_addr().expect("bound address").to_string();
-
-    wait_for_server(&addr);
-
-    let mut stream = TcpStream::connect(&addr).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream.write_all(b"x").unwrap();
-    stream.flush().unwrap();
-
-    // Read "HELLOWORLD" followed by "OK:<bytes>".
-    let mut buf = [0u8; 128];
-    let mut total = 0;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        match stream.read(&mut buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => {
-                total += n;
-                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
-                if s.contains("OK:") && s.len() >= 13 {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => panic!("read error: {e}"),
-        }
-    }
-
-    let result = std::str::from_utf8(&buf[..total]).unwrap();
-    assert!(
-        result.starts_with("HELLOWORLD"),
-        "expected HELLOWORLD prefix, got: {result}"
-    );
-    assert!(
-        result.contains("OK:10"),
-        "expected OK:10 (5+5 bytes chain send), got: {result}"
     );
 
     shutdown.shutdown();
@@ -4557,8 +4460,8 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
 
 #[test]
 fn async_standalone_connect_refused() {
-    // A port held by a socket that never listens, so a connect is refused and
-    // nothing else can take the port while the test runs.
+    // A port held by a connected client socket, so nothing listens on it and
+    // nothing else can take it while the test runs.
     let (_dead_guard, dead_port) = common::refusing_port();
 
     STANDALONE_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);

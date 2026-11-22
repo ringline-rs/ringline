@@ -115,7 +115,9 @@ impl ListenGates {
                 ));
             }
             if inner.shutdown {
-                return Err(io::Error::other("runtime is shutting down"));
+                return Err(io::Error::other(
+                    "the runtime has stopped accepting or is shutting down",
+                ));
             }
             if inner.listened[idx] {
                 return Ok(());
@@ -186,10 +188,10 @@ impl ListenGates {
 
     /// Release every waiter.
     ///
-    /// Called by `Runtime::shutdown` before it shuts the listener sockets
-    /// down. [`ListenerSockets::shut_down`] wakes a thread inside `accept4`;
-    /// it does not wake a thread waiting in `wait_open`. After this call no
-    /// gate calls `listen(2)`.
+    /// Called by `Runtime::shutdown` and `Runtime::stop_accepting` before
+    /// they shut listener sockets down. The stop signal wakes an acceptor in
+    /// `poll`; neither it nor [`ListenerSockets::shut_down`] wakes one waiting
+    /// in `wait_open`. After this call no gate calls `listen(2)`.
     pub(crate) fn shutdown(&self) {
         let released = {
             let mut inner = self.lock();
@@ -278,7 +280,8 @@ impl ListenHandle {
     /// # Errors
     ///
     /// Returns an error if `listener` names no listener, if
-    /// [`Runtime::shutdown`](crate::Runtime::shutdown) has been
+    /// [`Runtime::shutdown`](crate::Runtime::shutdown) or
+    /// [`Runtime::stop_accepting`](crate::Runtime::stop_accepting) has been
     /// called, or if `listen(2)` fails. A `listen(2)` failure leaves the
     /// listener bound and not listening, so the call can be retried.
     pub fn begin_listening(&self, listener: ListenerId) -> io::Result<()> {
@@ -309,6 +312,15 @@ pub(crate) fn install(gates: Arc<ListenGates>) {
     GATES.with(|g| *g.borrow_mut() = Some(gates));
 }
 
+/// Whether this thread is a worker of the runtime that owns `gates`.
+pub(crate) fn is_worker_of(gates: &Arc<ListenGates>) -> bool {
+    GATES.with(|g| {
+        g.borrow()
+            .as_ref()
+            .is_some_and(|installed| Arc::ptr_eq(installed, gates))
+    })
+}
+
 fn with_gates<R>(f: impl FnOnce(&ListenGates) -> R) -> Option<R> {
     GATES.with(|g| g.borrow().as_ref().map(|gates| f(gates)))
 }
@@ -332,8 +344,9 @@ fn with_gates<R>(f: impl FnOnce(&ListenGates) -> R) -> Option<R> {
 ///
 /// Returns an error if called from a thread that is not a ringline worker
 /// (use [`ListenHandle::begin_listening`] from other threads), if `listener` names no listener, if
-/// [`Runtime::shutdown`](crate::Runtime::shutdown) has been
-/// called or `launch()` has failed, or if `listen(2)` fails. A `listen(2)`
+/// [`Runtime::shutdown`](crate::Runtime::shutdown) or
+/// [`Runtime::stop_accepting`](crate::Runtime::stop_accepting) has been
+/// called, or `launch()` has failed, or if `listen(2)` fails. A `listen(2)`
 /// failure leaves the listener bound and not listening, so the call can be
 /// retried.
 ///

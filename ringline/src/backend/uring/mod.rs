@@ -5,6 +5,7 @@ pub(crate) mod connect_deadlines;
 pub(crate) mod driver;
 pub(crate) mod engine;
 pub(crate) mod event_loop;
+pub(crate) mod fixed_send;
 pub mod provided;
 pub(crate) mod ring;
 pub(crate) mod ring_memory;

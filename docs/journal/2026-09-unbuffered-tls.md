@@ -85,11 +85,11 @@ the *remaining* copy goes. Reopen it once the unbuffered engine is real.
 Design: [`docs/tls-unbuffered-design.md`](../tls-unbuffered-design.md). Split
 into three plans; **plan 1 (foundation) shipped in PR #338**, behavior-neutral:
 
-- `a2ea825` — `tls.rs` (1181 lines) split into `tls/mod.rs` + `tls/buffered.rs`,
+- `tls.rs` (1181 lines) split into `tls/mod.rs` + `tls/buffered.rs`,
   verified byte-identical by ordered reconstruction diff.
-- `32ac78b` — `CiphertextBuf`, the incoming-ciphertext buffer the engine will
+- `CiphertextBuf`, the incoming-ciphertext buffer the engine will
   drive. Not yet wired up.
-- `b1bc91f` — default-off `tls-unbuffered` cargo feature and its CI job, so the
+- A default-off `tls-unbuffered` cargo feature and its CI job, so the
   second path is linted from the start.
 
 ### Three bugs in `CiphertextBuf`, all found by adversarial review
@@ -400,7 +400,7 @@ inferring the mechanism is exactly the mistake made here.
 #### Evidence 3 — measured on Linux/io_uring
 
 hv01, kernel 6.12, rustc 1.98.1. Isolated in-process microbenchmark of the send
-path (harness on the local `bench/tls-send-microbench` branch, not merged).
+path (harness on a local branch, not merged).
 
 An allocation counter inside the measured call, 256 KiB payload: buffered
 **263,976** bytes/op, unbuffered **264,000** — 24 bytes apart. If the unbuffered

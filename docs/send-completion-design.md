@@ -165,6 +165,7 @@ again without submitting for the same bound.
 
 Consequence: on io_uring `DriverCtx::send` fails only before it has committed
 anything (stale token, or pool admission). TLS pool exhaustion during
-encryption is closed on io_uring: `encrypt_tls_send` admits against
-`TlsTable::ciphertext_capacity` before encrypting. A failure after rustls has
-sealed a record still fails the operation and closes the connection.
+encryption is closed on io_uring: `encrypt_tls_send` reserves the slots of
+`TlsTable::ciphertext_capacity` before encrypting and encrypts into them. A
+failure after rustls has sealed a record still fails the operation and closes
+the connection.

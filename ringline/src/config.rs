@@ -189,6 +189,10 @@ pub struct Config {
     /// How much a connection may have queued before a forward stops reading
     /// from it. See `ConfigBuilder::forward_hold_cap`.
     pub(crate) forward_hold_cap: usize,
+    /// How many send slab entries a connection may hold before its zero-copy
+    /// batches are refused, once the slab is over half used. See
+    /// `ConfigBuilder::zero_copy_hold_cap`.
+    pub(crate) zero_copy_hold_cap: usize,
     /// Fault the send copy pool's pages in at worker startup instead of on
     /// first use. See `ConfigBuilder::prefault_buffers`.
     pub(crate) prefault_buffers: bool,
@@ -234,6 +238,9 @@ pub struct Config {
     /// Sends at or above the threshold, or that don't fit a send pool slot,
     /// use the zero-copy path as before. Default: `4096`.
     pub(crate) send_zc_threshold: u32,
+    /// Whether a guard-only send from one registered region names that
+    /// region's buffer. See [`ConfigBuilder::fixed_buffer_sends`].
+    pub(crate) fixed_buffer_sends: bool,
     /// Number of `InFlightSendSlab` entries. A zero-copy send (`send_parts`
     /// with a guard, when the batch totals at least `send_zc_threshold`)
     /// holds one until the
@@ -242,8 +249,14 @@ pub struct Config {
     /// than one slot or a TLS send's ciphertext, is sent as one `sendmsg`
     /// and holds one until that CQE; with the slab full those slots go out
     /// one per CQE instead. Guard sends fail with `Other("send slab
-    /// exhausted")` while it is full. Default: 512.
+    /// exhausted")` while it is full, and a connection's zero-copy sends are
+    /// refused at `zero_copy_hold_cap` while it is over half used. Default:
+    /// 512.
     pub(crate) send_slab_slots: u16,
+    /// The order in which each worker's admission FIFO admits bounded sends;
+    /// see [`ConfigBuilder::send_admission_order`]. Default: `Budget` with
+    /// 32 slots.
+    pub(crate) send_admission_order: crate::SendAdmissionOrder,
     /// Deadline-based flush interval in microseconds during CQE processing.
     /// When non-SQPOLL, if this many microseconds elapse since the last submit
     /// while processing a CQE batch, pending SQEs are flushed mid-iteration.
@@ -301,6 +314,9 @@ pub struct Config {
     /// This worker's index, so it can find its own slot in `worker_loads` and
     /// avoid handing a connection back to itself.
     pub(crate) worker_index: usize,
+    /// The runtime's accept counts and `stop_accepting` flag. Set by
+    /// `launch()`; `None` in event loops built by unit tests.
+    pub(crate) accept_state: Option<std::sync::Arc<crate::acceptor::AcceptState>>,
     /// Live connection count per worker, published by each worker and read by
     /// all of them when placing a newly accepted connection. Merged accept
     /// mode only — pool mode places explicitly in the acceptor thread.
@@ -328,16 +344,11 @@ pub struct Config {
         crate::handoff::Sender<crate::park::ParkedFd>,
         crate::wakeup::WakeFd,
     )>,
-    /// Print per-worker event-loop diagnostics to stderr at shutdown: the
+    /// Log per-worker event-loop diagnostics at shutdown, at `info`: the
     /// iteration mix (`[ringline diag]`) and wait/work stall buckets
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
     /// iteration while enabled. io_uring backend only. Default: false.
     pub(crate) loop_diag: bool,
-    /// Maximum parts in one `send_chain` (`SendChainBuilder::copy` and
-    /// `ChainPartsBuilder::add` each count one). A chain that would exceed
-    /// it fails with `InvalidInput`. 0 refuses every chain. It does not
-    /// affect `send` or `send_parts`. Default: 16.
-    pub(crate) max_chain_length: u16,
     /// Maximum number of standalone async tasks (not bound to connections)
     /// per worker. Used with [`spawn()`](crate::spawn).
     /// Default: 256.
@@ -515,6 +526,7 @@ impl Default for Config {
             defer_recv_arm: false,
             recv_direct_pool_max: 16 << 20,
             forward_hold_cap: 64,
+            zero_copy_hold_cap: 16,
             // Off by default while the trade is being measured: prefaulting
             // converts a latent memory cost into an immediate one, which is
             // the intent but is also a behaviour change for anything that
@@ -525,7 +537,9 @@ impl Default for Config {
             send_copy_count: 1024,
             send_copy_slot_size: 16448,
             send_zc_threshold: 4096,
+            fixed_buffer_sends: true,
             send_slab_slots: 512,
+            send_admission_order: crate::SendAdmissionOrder::Budget { slots: 32 },
             flush_interval_us: 100,
             tick_timeout_us: 10_000,
             tls: None,
@@ -542,12 +556,12 @@ impl Default for Config {
             #[cfg(test)]
             test_fault: None,
             worker_index: 0,
+            accept_state: None,
             worker_loads: None,
             worker_accepting: None,
             peer_accept: Vec::new(),
             peer_park: Vec::new(),
             loop_diag: false,
-            max_chain_length: 16,
             standalone_task_capacity: 256,
             udp_bind: Vec::new(),
             udp_connect_peers: Vec::new(),
@@ -583,6 +597,12 @@ impl Config {
         self.send_zc_threshold
     }
 
+    /// Whether guard-only sends from one registered region may use the
+    /// region's buffer. See [`ConfigBuilder::fixed_buffer_sends`].
+    pub fn fixed_buffer_sends(&self) -> bool {
+        self.fixed_buffer_sends
+    }
+
     /// A TLS connection encrypts into the same `SendCopyPool` slots that plain
     /// sends copy into, so `send_copy_slot_size` is also the destination for
     /// TLS records.
@@ -591,8 +611,8 @@ impl Config {
     /// split one across two. Below one whole worst-case record (`F + 29`,
     /// where `F` is the plaintext per record from the TLS config's
     /// `max_fragment_size`) a bounded send has no admission bound and is
-    /// refused, on both backends, and on io_uring a plain send that finds the
-    /// pool short part-way through encryption closes the connection. So the
+    /// refused, on both backends, and on io_uring a plain send is refused with
+    /// `InvalidInput` for the same reason. So the
     /// slot must hold one whole record for every TLS config this runtime
     /// uses: the server config, the client config and each `bind_tls`
     /// listener's. `MIN_ENCRYPT_DST` is a floor for configs whose fragment
@@ -675,6 +695,11 @@ impl Config {
                 "send_copy_count must be > 0".into(),
             ));
         }
+        if let crate::SendAdmissionOrder::Budget { slots: 0 } = self.send_admission_order {
+            return Err(crate::error::Error::RingSetup(
+                "SendAdmissionOrder::Budget needs slots > 0".into(),
+            ));
+        }
         self.validate_tls_slot_size()?;
         if self.tls_handshake_timeout.is_zero()
             || self.tls_handshake_timeout > MAX_TLS_HANDSHAKE_TIMEOUT
@@ -688,6 +713,13 @@ impl Config {
         if self.forward_hold_cap == 0 {
             return Err(crate::error::Error::RingSetup(
                 "forward_hold_cap must be >= 1".into(),
+            ));
+        }
+        // A cap of 0 would refuse every zero-copy batch once the slab is over
+        // half used, including a connection's first.
+        if self.zero_copy_hold_cap == 0 {
+            return Err(crate::error::Error::RingSetup(
+                "zero_copy_hold_cap must be >= 1".into(),
             ));
         }
         // A close pushes its lead (a shutdown or a cancel) and the Close as
@@ -999,12 +1031,15 @@ impl ConfigBuilder {
 
     // ── Diagnostics ──────────────────────────────────────────────────
 
-    /// Print per-worker event-loop diagnostics to stderr at shutdown.
+    /// Log per-worker event-loop diagnostics at shutdown, at `info` through
+    /// the `log` crate; nothing appears unless the application installs a
+    /// logger.
     ///
-    /// Each worker prints a `[ringline diag]` line (iteration mix: dead
+    /// Each worker logs a `[ringline diag]` line (iteration mix: dead
     /// iterations, CQEs and tasks per iteration) and a `[ringline stall]` line
     /// (wait/work stall buckets). Recording the stall buckets costs ~4 clock
-    /// reads per iteration, so this is off by default. io_uring backend only; the mio backend prints nothing.
+    /// reads per iteration, so this is off by default. io_uring backend only;
+    /// the mio backend logs nothing.
     pub fn loop_diag(mut self, enable: bool) -> Self {
         self.config.loop_diag = enable;
         self
@@ -1050,7 +1085,7 @@ impl ConfigBuilder {
     /// proportion: a CQ of `c` gives an SQ of `c / 16` and `c * 16000 / 65536`
     /// connections. An `sq_entries` or `max_connections` set on the builder
     /// that a smaller CQ cannot hold in that proportion stops the fit. A fitted
-    /// launch writes one line to stderr naming the sizes, and
+    /// launch logs one line at `warn` naming the sizes, and
     /// [`Runtime::cq_entries`](crate::Runtime::cq_entries) and the related
     /// accessors report them. When nothing fits, launch fails with
     /// [`Error::ResourceLimit`](crate::Error::ResourceLimit). To have launch
@@ -1283,6 +1318,44 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set how many send slab entries a connection may hold before its
+    /// zero-copy sends are refused, once the slab is over half used.
+    ///
+    /// On io_uring a zero-copy send ([`send_parts`](crate::SendHalf::send_parts)
+    /// with a guard, at or above `send_zc_threshold`) holds a slab entry until
+    /// the kernel's notification arrives, which is after the peer has
+    /// acknowledged the bytes; its [`SendCompletion`](crate::SendCompletion)
+    /// settles earlier. A guarded send on a Unix-domain connection holds an
+    /// entry until its send completes. A peer that stops reading keeps every
+    /// entry its connection holds. Once more than half the slab is in use, a
+    /// guarded send on a connection that holds `cap` entries is refused:
+    /// [`submit_batch_admitted`](crate::AsyncSendBuilder::submit_batch_admitted)
+    /// returns its parts with `WouldBlock`, as for a full slab, and the caller
+    /// can send their bytes with a copy send. `submit_batch` and `build`
+    /// return `Other` and drop the guards. The check counts the
+    /// connection's own entries, so one connection alone is refused once it
+    /// holds more than half the slab. Entries of every kind count, including
+    /// those of coalesced copy sends and of
+    /// [`forward_recv_buf`](crate::SendHalf::forward_recv_buf), which is not
+    /// refused at this cap and is bounded by `forward_hold_cap` instead. A
+    /// [`forward_to_conn`](crate::RecvHalf::forward_to_conn) whose sink is at
+    /// the cap copies its chunk into the send pool. A batch below
+    /// `send_zc_threshold` that is copied into one pool slot takes no entry
+    /// and is not refused.
+    ///
+    /// The cap applies only over half used, so one connection can take half
+    /// the slab and each later one `cap` entries: as few as `1 +
+    /// (send_slab_slots / 2) / cap` connections whose peers do not read can
+    /// fill it (17 with the defaults). After that, a guarded send on any
+    /// connection is refused because the slab is full. `usize::MAX` turns the
+    /// cap off. On mio, which has no send slab, the cap has no effect.
+    ///
+    /// Default: 16.
+    pub fn zero_copy_hold_cap(mut self, cap: usize) -> Self {
+        self.config.zero_copy_hold_cap = cap;
+        self
+    }
+
     /// Set the number and size of copy-send pool slots.
     ///
     /// Default: 1024 slots of 16448 bytes. One slot is consumed per chunk of a
@@ -1313,9 +1386,89 @@ impl ConfigBuilder {
         self
     }
 
+    /// Whether a send whose parts are all guards in one registered region
+    /// names that region's buffer (`IORING_RECVSEND_FIXED_BUF`), so the kernel
+    /// does not look up and pin the pages of each send. A send of one guard
+    /// goes out as `SEND_ZC`, and a send of several as `SENDMSG_ZC`.
+    /// Default: `true`.
+    ///
+    /// When `true`, a probe of the running kernel decides, once per process.
+    /// It runs at the first launch with
+    /// [`registered_regions`](Self::registered_regions), the first
+    /// [`Runtime::register_region`](crate::Runtime::register_region), or the
+    /// first [`Runtime::fixed_buffer_sends`](crate::Runtime::fixed_buffer_sends),
+    /// whichever comes first, and that call blocks while it runs. Each kind of
+    /// send names the buffer only when the kernel takes the flag on its
+    /// opcode (`SEND_ZC` from Linux 6.0, `SENDMSG_ZC` from 6.15) and charges
+    /// it to the socket's send buffer the same as the send from plain iovecs.
+    /// The probe decides separately for a region in base pages only, which
+    /// the kernel charges correctly whether or not it carries the fix to how
+    /// sends from huge pages are charged.
+    /// [`Runtime::region_fixed_buffer_sends`](crate::Runtime::region_fixed_buffer_sends)
+    /// reports the result for a region, and `Runtime::fixed_buffer_sends` the
+    /// result for regions not in base pages only.
+    ///
+    /// The probe's duration has not been measured. Its waits on the sockets
+    /// and the ring are bounded at about 165 s in all. Allocating the huge
+    /// page can wait for memory compaction, and the checks of its buffers
+    /// read `/proc/self/smaps`; neither is bounded. It maps 6 MiB, collapses
+    /// a 2 MiB transparent huge page inside it, maps four base pages advised
+    /// `MADV_NOHUGEPAGE`, registers both on a ring of its own, and unmaps them
+    /// when done; if a send's completion does not arrive, the mappings and the
+    /// ring are kept for the life of the process.
+    ///
+    /// Each launch with this on, until the probe has run, raises the soft
+    /// `RLIMIT_MEMLOCK` when it is below what the workers need plus the probe's
+    /// charge (2 MiB and four base pages, plus a small ring on a kernel that
+    /// charges rings), to that sum if the hard limit allows, whether or not
+    /// regions are registered. Processes started afterwards inherit the raised
+    /// limit. When the hard limit does not allow it, the probe does not run and
+    /// fixed sends stay off.
+    ///
+    /// With fixed sends on, a guard-only send from a region uses the region's
+    /// slot until it completes; see
+    /// [`Runtime::unregister_region`](crate::Runtime::unregister_region).
+    ///
+    /// A send with a copy part, a guard outside a registered region, or
+    /// guards in more than one region uses plain iovecs, as does a send on a
+    /// Unix-domain connection. A fixed send that the kernel returns short or
+    /// refuses with `EAGAIN` is resent from plain iovecs.
+    /// The mio backend ignores this setting.
+    pub fn fixed_buffer_sends(mut self, enabled: bool) -> Self {
+        self.config.fixed_buffer_sends = enabled;
+        self
+    }
+
     /// Set the number of scatter-gather send slab slots.
     pub fn send_slab_slots(mut self, n: u16) -> Self {
         self.config.send_slab_slots = n;
+        self
+    }
+
+    /// Set the order in which each worker admits bounded sends
+    /// ([`send_admitted`](crate::SendHalf::send_admitted) and
+    /// [`send_backpressured`](crate::SendHalf::send_backpressured)) to its
+    /// send copy pool.
+    ///
+    /// A bounded send that does not fit the pool's free slots waits in a FIFO
+    /// shared by the worker's connections. Under
+    /// [`Strict`](crate::SendAdmissionOrder::Strict) only the oldest waiter
+    /// is admitted, so a small send waits behind a large one that does not
+    /// fit. Under [`Budget`](crate::SendAdmissionOrder::Budget) a waiter that
+    /// fits can be admitted ahead of an older waiter on another connection,
+    /// while the slots held by sends admitted that way, with its own, are at
+    /// most min(`slots`, P - H) (P the pool's slot count, H the slots the
+    /// FIFO's head needs), and only onto a connection with no send queued or
+    /// in flight whose last send did not wait for room in the socket. The
+    /// sends on one connection are admitted in the order they were made under
+    /// either order.
+    ///
+    /// [`build`](Self::build) refuses `Budget { slots: 0 }`. A `slots` larger
+    /// than the pool's slot count admits as the slot count does.
+    ///
+    /// Default: `Budget { slots: 32 }`.
+    pub fn send_admission_order(mut self, order: crate::SendAdmissionOrder) -> Self {
+        self.config.send_admission_order = order;
         self
     }
 
@@ -1360,14 +1513,6 @@ impl ConfigBuilder {
     /// Set the deadline-based flush interval in microseconds. 0 = disabled.
     pub fn flush_interval_us(mut self, us: u64) -> Self {
         self.config.flush_interval_us = us;
-        self
-    }
-
-    // ── Chain settings ───────────────────────────────────────────────
-
-    /// Set the maximum number of SQEs per IO_LINK chain. 0 disables chaining.
-    pub fn max_chain_length(mut self, n: u16) -> Self {
-        self.config.max_chain_length = n;
         self
     }
 
@@ -1731,6 +1876,15 @@ mod tests {
     }
 
     #[test]
+    fn validate_zero_copy_hold_cap_zero_rejected() {
+        assert!(
+            config_with(|c| c.zero_copy_hold_cap = 0)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn validate_accept_queue_capacity_zero_rejected() {
         // bounded(0) is a rendezvous channel, and workers only try_recv.
         assert!(
@@ -2046,6 +2200,24 @@ mod tests {
     #[test]
     fn validate_send_copy_count_zero_rejected() {
         assert!(config_with(|c| c.send_copy_count = 0).validate().is_err());
+    }
+
+    /// `Budget` needs at least one slot; any larger budget is accepted,
+    /// above the pool's slot count too, and so is `Strict`.
+    #[test]
+    fn validate_budget_needs_a_slot() {
+        let with = |order| config_with(|c| c.send_admission_order = order).validate();
+        let budget = |slots| crate::SendAdmissionOrder::Budget { slots };
+        let err = with(budget(0)).expect_err("a budget of 0");
+        assert!(err.to_string().contains("slots > 0"), "{err}");
+        assert!(with(budget(1)).is_ok());
+        assert!(with(budget(u16::MAX)).is_ok(), "above the 1024 slots");
+        assert!(with(crate::SendAdmissionOrder::Strict).is_ok());
+        assert_eq!(
+            Config::default().send_admission_order,
+            budget(32),
+            "the default"
+        );
     }
 
     #[test]

@@ -88,6 +88,9 @@ fn memlock_shortfall_is_named_at_launch_and_at_register_region() {
     assert!(text.contains("RLIMIT_MEMLOCK"), "{text}");
     assert!(text.contains("ulimit -l"), "{text}");
     assert!(text.contains("CAP_IPC_LOCK"), "{text}");
+    // The registrar adds what the worker rings already hold and need.
+    assert!(text.contains("registered region(s)"), "{text}");
+    assert!(text.contains("the rings need"), "{text}");
 
     shutdown.shutdown();
     for h in handles {

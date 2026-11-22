@@ -108,6 +108,6 @@ section: watch for environment artifacts before blaming the code.
 - **Decompose open-loop latency.** Service time vs offer lag (#206) is the
   difference between "the server is slow" and "the client fell behind schedule".
 - Open: the withdrawn protocol matrix (UDP/QUIC/HTTP/redis/memcache) was never
-  re-measured two-machine — `BENCHMARKS.md` covers segcache TCP only; the 16 KiB
-  tokio open-loop cell errored and remains excluded pending investigation; the
-  `bench/fair-throughput` segcache harness has not landed on `main`.
+  re-measured two-machine — `BENCHMARKS.md` covers segcache TCP only; the 16
+  KiB tokio open-loop cell errored and remains excluded pending investigation;
+  the segcache harness has not landed on `main`.
