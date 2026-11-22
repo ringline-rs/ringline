@@ -1567,6 +1567,7 @@ impl Driver {
             next_disk_io_seq: &mut self.next_disk_io_seq,
             write_orders: &mut self.write_orders,
             parts_id_carried: false,
+            ticket_waiting: false,
         }
     }
 
@@ -2160,8 +2161,9 @@ impl Driver {
         None
     }
 
-    /// Convenience over [`Self::park_blocker`] for call sites that do not care
+    /// Convenience over [`Self::park_blocker`] for tests that do not care
     /// which term tripped.
+    #[cfg(test)]
     pub(crate) fn is_parkable(&self, conn_index: u32) -> bool {
         self.park_blocker(conn_index).is_none()
     }

@@ -155,6 +155,17 @@ fn choose_placement(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -> 
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
+    /// [`Driver::park_blocker`], plus a bounded send waiting on the
+    /// connection, which blocks a park as a queued send does
+    /// ([`ParkBlocker::Sends`]): its future lives in a task on this worker.
+    fn park_blocker(&self, conn_index: u32) -> Option<super::driver::ParkBlocker> {
+        self.driver.park_blocker(conn_index).or_else(|| {
+            self.executor
+                .send_waiting_on(conn_index)
+                .then_some(super::driver::ParkBlocker::Sends)
+        })
+    }
+
     /// Report the panics caught in the `Drop` of removed futures.
     fn report_drop_panics(&mut self) {
         for payload in self.executor.take_drop_panics() {
@@ -2057,7 +2068,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.connections.get(conn_index).is_some_and(|c| {
                     c.recv_direct_armed || c.hangup_poll_armed || c.hangup_peek_armed
                 });
-            if !armed && self.driver.park_blocker(conn_index).is_none() {
+            if !armed && self.park_blocker(conn_index).is_none() {
                 if self
                     .driver
                     .ring
@@ -2186,7 +2197,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.park_in_flight[conn_index as usize].is_some() {
             return false;
         }
-        if !self.driver.is_parkable(conn_index) {
+        if self.park_blocker(conn_index).is_some() {
             return false;
         }
         // A hangup peek completes at once and may close the connection; the
@@ -2404,7 +2415,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // closed: `park_started` minus `park_completed` is a large number under
         // load and on its own it cannot say why, which left the dominant cause
         // a matter of inference rather than measurement.
-        if let Some(blocker) = self.driver.park_blocker(conn_index) {
+        if let Some(blocker) = self.park_blocker(conn_index) {
             metrics::PARK_ABANDONED.increment(blocker.abandon_metric());
             self.rearm_direct_after_park(conn_index);
             return; // `fd` drops.
@@ -21248,6 +21259,148 @@ mod tests {
         unsafe {
             libc::close(handled);
         }
+    }
+
+    // ── Non-waiting sends behind a waiting bounded send ──────────────
+
+    /// Put a bounded send on `conn_index`'s ticket queue that waits, owned
+    /// by a parked standalone task.
+    fn wait_a_ticket(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) -> SendId {
+        let task_id = parked_standalone(&mut el.executor);
+        let generation = el.driver.connections.generation(conn_index);
+        el.executor
+            .enqueue_send_capacity(conn_index, generation, 1, task_id)
+    }
+
+    /// A guard of `len` bytes in no registered region.
+    struct PlainGuard(Vec<u8>);
+
+    impl crate::SendGuard for PlainGuard {
+        fn as_ptr_len(&self) -> (*const u8, u32) {
+            (self.0.as_ptr(), self.0.len() as u32)
+        }
+        fn region(&self) -> crate::RegionId {
+            crate::RegionId::UNREGISTERED
+        }
+    }
+
+    fn is_ticket_refusal(r: &io::Result<impl Sized>) -> bool {
+        matches!(r, Err(e) if e.kind() == io::ErrorKind::Other
+            && e.to_string() == crate::handler::TICKET_WAITING_REFUSAL)
+    }
+
+    /// A plain send on a connection with a bounded send waiting is refused
+    /// with `Other` and takes no slot; once the waiting send leaves, the
+    /// plain send is accepted.
+    #[test]
+    fn a_plain_send_behind_a_waiting_bounded_send_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let ticket = wait_a_ticket(&mut el, conn_index);
+        let free = el.driver.send_copy_pool.free_count();
+        let refused = with_driver_state(&mut el, || conn.send(b"x"));
+        assert!(is_ticket_refusal(&refused), "{refused:?}");
+        assert_eq!(el.driver.send_copy_pool.free_count(), free);
+        assert_eq!(el.executor.send_completions.live(), 1, "no id left behind");
+        el.executor.cancel_send(ticket);
+        let sent = with_driver_state(&mut el, || conn.send(b"x"));
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// A bounded send waiting on one connection refuses no send on another.
+    #[test]
+    fn a_waiting_ticket_refuses_no_send_on_another_connection() {
+        let mut el = make_test_loop();
+        let waiting_on = accept_connection(&mut el);
+        let other = accept_connection(&mut el);
+        let conn = ConnCtx::new(other, el.driver.connections.generation(other));
+        wait_a_ticket(&mut el, waiting_on);
+        let sent = with_driver_state(&mut el, || conn.send(b"x"));
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// A batch of guards only, at or above `send_zc_threshold`, takes a send
+    /// slab entry and no slot, so a waiting bounded send does not refuse it.
+    #[test]
+    fn a_guarded_batch_that_takes_no_slot_is_not_refused_behind_a_ticket() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        let len = el.driver.send_zc_threshold as usize;
+        let sent = with_driver_state(&mut el, || {
+            let guard = crate::GuardBox::new(PlainGuard(vec![7; len]));
+            conn.send_parts()
+                .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+        });
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// A batch of guards below `send_zc_threshold` would be gathered into a
+    /// slot, so behind a waiting bounded send it is refused, and does not go
+    /// out zero-copy instead.
+    #[test]
+    fn a_small_guarded_batch_behind_a_ticket_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        let slab_free = el.driver.send_slab.free_count();
+        let refused = with_driver_state(&mut el, || {
+            let guard = crate::GuardBox::new(PlainGuard(vec![7; 100]));
+            conn.send_parts()
+                .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+        });
+        assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+        assert_eq!(el.driver.send_slab.free_count(), slab_free);
+    }
+
+    /// A `build` with a copy part behind a waiting bounded send is refused.
+    #[test]
+    fn a_built_copy_send_behind_a_ticket_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        let refused = with_driver_state(&mut el, || {
+            conn.send_parts().build(|b| b.copy(b"x").submit())
+        });
+        assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+    }
+
+    /// `forward_recv_buf` of the whole accumulator behind a waiting bounded
+    /// send is refused, and the accumulator keeps its bytes.
+    #[test]
+    fn forward_recv_buf_behind_a_ticket_is_refused_with_the_bytes_kept() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        assert!(el.driver.accumulators.append(conn_index, b"message"));
+        let data = el.driver.accumulators.data(conn_index);
+        // SAFETY: the accumulator is not touched before the call below
+        // returns, except by the refused forward, which puts it back.
+        let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+        let refused = with_driver_state(&mut el, || conn.forward_recv_buf(view).map(drop));
+        assert!(is_ticket_refusal(&refused), "{refused:?}");
+        assert_eq!(el.driver.accumulators.data(conn_index), b"message");
+        assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
+    }
+
+    /// A bounded send waiting on an otherwise parkable connection blocks the
+    /// park as a queued send does; once it leaves, the connection is
+    /// parkable again.
+    #[test]
+    fn a_waiting_bounded_send_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered.insert(conn_index);
+        assert_eq!(el.park_blocker(conn_index), None, "precondition");
+        let ticket = wait_a_ticket(&mut el, conn_index);
+        assert_eq!(el.park_blocker(conn_index), Some(ParkBlocker::Sends));
+        el.executor.cancel_send(ticket);
+        assert_eq!(el.park_blocker(conn_index), None);
     }
 }
 

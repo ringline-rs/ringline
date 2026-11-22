@@ -3,8 +3,13 @@
 Status: proposal. Experiment stage 0 has run
 (`docs/journal/2026-11-send-pool-stage0.md`). Of the runtime changes, only
 the held count per connection (order of work step 2), taking slots before
-the work and returning the excess (step 3), and the removal of `send_chain`
-(ahead of the rest of step 4) are implemented. The held count
+the work and returning the excess (step 3), the removal of `send_chain`, and,
+of the rest of step 4, the ticket queue and the worker queue for bounded and
+non-waiting sends, are implemented. Receive-path TLS output and
+`close_notify` do not yet take tickets. A non-waiting send that would take
+slots behind a waiting ticket is refused, including `forward_to_conn`'s copy
+on io_uring, where section 2 says it waits; on mio `forward_to_conn` is not yet
+checked against the ticket queue. The held count
 covers slots in use and reserved on io_uring, permits on mio; the mio count
 does not yet include queued entries that carry no permit (see mio).
 
@@ -484,7 +489,7 @@ A close request is the application's `close`; teardown is the release of
 the connection's state that follows once its sends have drained or failed.
 
 - At a close request, the connection's waiting bounded-send tickets are
-  failed, as waiting sends are today, and `close_notify` takes its ticket.
+  failed with `NotConnected`, and `close_notify` takes its ticket.
   A waiting receive-path ticket stays, so the records it holds still go
   ahead of `close_notify`.
 - `close_notify` keeps today's fallback: if it finds no slot once the
