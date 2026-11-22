@@ -254,6 +254,14 @@ pub struct SendAdmissionCounters {
     /// The most bounded sends queued on one connection at once, counting a
     /// send admitted on its first poll, which is queued for that poll.
     pub conn_tickets_max: u64,
+    /// TLS output produced on the receive path that the send pool had no
+    /// slots for, so that it waited in a sealed ticket. Output that joined
+    /// a ticket already waiting is not counted again.
+    pub tls_output_waited: u64,
+    /// io_uring: connections whose close went ahead with a bare FIN while
+    /// sealed TLS output still waited, either at the close's drain, when the
+    /// pool still had no slots for it, or at teardown.
+    pub bare_fin_closes: u64,
 }
 
 /// The admission counters of the worker this runs on: see
@@ -330,6 +338,11 @@ struct Entry {
     /// A write on the connection found the socket full while this send was
     /// in flight ([`mark_waited_for_room`](SendCompletions::mark_waited_for_room)).
     waited_for_room: bool,
+    /// A sealed ticket ([`push_sealed`](SendCompletions::push_sealed)): TLS
+    /// output the driver holds for the connection. No task polls it; the
+    /// capacity wake hands it to the driver to place
+    /// ([`take_sealed_serve`](SendCompletions::take_sealed_serve)).
+    sealed: bool,
 }
 
 /// One entry of the worker queue: connection `conn_index`'s front waiting
@@ -414,6 +427,14 @@ pub(crate) struct SendCompletions {
     /// ([`admit`](Self::admit)), and by a scan that woke passers, for the
     /// scan after it.
     scan_due: bool,
+    /// A sealed ticket may have become servable without slots coming back:
+    /// it was pushed, or it became the head. The event loop runs its
+    /// capacity wake at the end of the iteration when this is set.
+    serve_due: bool,
+    /// The sealed tickets the latest capacity wake found servable, oldest
+    /// first, for the event loop to place
+    /// ([`take_sealed_serve`](Self::take_sealed_serve)).
+    serve: Vec<SendId>,
     /// The task ids a scan wakes, kept between scans by
     /// [`Executor::wake_send_capacity_in`] so that a scan allocates only
     /// when it wakes more tasks than any scan before it.
@@ -705,10 +726,17 @@ impl SendCompletions {
         });
     }
 
-    /// The task owning the FIFO's head, if any.
+    /// The task owning the FIFO's head, if any. A sealed head has no task:
+    /// it sets `serve_due` instead, so that the capacity wake at the end of
+    /// the iteration hands it to the driver.
     fn head_task(&mut self) -> Option<u32> {
         let id = self.front()?;
-        self.entry(id).map(|e| e.task_id)
+        let e = self.entry(id)?;
+        if e.sealed {
+            self.serve_due = true;
+            return None;
+        }
+        Some(e.task_id)
     }
 
     /// Append a waiter to its connection's queue and return its id.
@@ -732,6 +760,7 @@ impl SendCompletions {
                 woken_in: 0,
             },
             waited_for_room: false,
+            sealed: false,
         });
         self.push_ticket(conn_index, id);
         id
@@ -749,6 +778,98 @@ impl SendCompletions {
         self.counters.tickets_waited += 1;
     }
 
+    /// Put a sealed ticket for `conn_index` at the front of its queue and
+    /// return its id: TLS output the driver holds, which needs
+    /// `required_slots` slots. Its records were sealed before any waiting
+    /// send's, so it goes ahead of them, and takes the connection's place in
+    /// the worker queue, or a new place at the back if the connection had
+    /// none. A send woken to pass the head stays woken; its next poll finds
+    /// it is no longer its connection's front.
+    ///
+    /// `receive` counts it in `tls_output_waited`: the output came from the
+    /// receive path, not from a close.
+    pub(crate) fn push_sealed(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        required_slots: usize,
+        receive: bool,
+    ) -> SendId {
+        let id = self.insert(Entry {
+            conn_index,
+            task_id: NO_OWNER,
+            state: Completion::Waiting {
+                generation,
+                required_slots,
+                woken_in: 0,
+            },
+            waited_for_room: false,
+            sealed: true,
+        });
+        // `conn_tickets_max` counts bounded sends only.
+        let max = self.counters.conn_tickets_max;
+        self.push_ticket(conn_index, id);
+        self.counters.conn_tickets_max = max;
+        let t = &mut self.tickets[conn_index as usize];
+        let back = t.queue.pop_back();
+        debug_assert_eq!(back, Some(id));
+        t.queue.push_front(id);
+        if receive {
+            self.counters.tls_output_waited += 1;
+        }
+        self.serve_due = true;
+        self.waiter_left();
+        id
+    }
+
+    /// The sealed ticket `id` now holds output that needs `required_slots`
+    /// slots: more output joined it.
+    pub(crate) fn set_sealed_need(&mut self, id: SendId, required_slots: usize) {
+        if let Some(Entry {
+            state: Completion::Waiting {
+                required_slots: r, ..
+            },
+            sealed: true,
+            ..
+        }) = self.entry_mut(id)
+        {
+            *r = required_slots;
+        }
+        self.serve_due = true;
+        self.waiter_left();
+    }
+
+    /// The sealed ticket `id` left: the driver placed its output or dropped
+    /// it. Returns the new head's task if the head moved, as
+    /// [`cancel`](Self::cancel) does. A stale id is ignored.
+    pub(crate) fn remove_sealed(&mut self, id: SendId) -> Option<u32> {
+        let e = self.entry(id)?;
+        if !e.sealed {
+            return None;
+        }
+        let conn_index = e.conn_index;
+        let was_head = self.front() == Some(id);
+        self.remove(id);
+        self.ticket_left(conn_index, id);
+        if was_head { self.head_task() } else { None }
+    }
+
+    /// The connection a live sealed ticket is for.
+    pub(crate) fn sealed_conn(&self, id: SendId) -> Option<u32> {
+        self.entry(id).filter(|e| e.sealed).map(|e| e.conn_index)
+    }
+
+    /// Whether `id` is the worker queue's head.
+    pub(crate) fn is_head(&mut self, id: SendId) -> bool {
+        self.front() == Some(id)
+    }
+
+    /// The sealed tickets the latest capacity wake found servable, oldest
+    /// first, leaving `serve` empty with its allocation.
+    pub(crate) fn take_sealed_serve(&mut self, out: &mut Vec<SendId>) {
+        out.append(&mut self.serve);
+    }
+
     /// Register an awaited send that needs no admission, already `InFlight`,
     /// and return its id.
     ///
@@ -762,6 +883,7 @@ impl SendCompletions {
             task_id,
             state: Completion::InFlight,
             waited_for_room: false,
+            sealed: false,
         })
     }
 
@@ -998,11 +1120,18 @@ impl SendCompletions {
     /// The driver's slot-release hook calls this through
     /// [`Executor::wake_send_capacity`] after every pool release, so the
     /// head is woken only when it can now fit rather than on every release.
+    ///
+    /// A sealed head that fits is pushed onto `serve` instead, and `None`
+    /// is returned.
     pub(crate) fn head_ready(&mut self, free_slots: usize) -> Option<u32> {
         let head = self.front()?;
         let e = self.entry(head)?;
         match e.state {
             Completion::Waiting { required_slots, .. } if free_slots >= required_slots => {
+                if e.sealed {
+                    self.serve.push(head);
+                    return None;
+                }
                 Some(e.task_id)
             }
             _ => None,
@@ -1165,13 +1294,14 @@ impl SendCompletions {
                     woken_in,
                     ..
                 },
+            sealed,
             ..
         }) = self.entry(id)
         else {
             return None;
         };
         let woken_earlier = *woken_in != 0 && *woken_in != self.scan_epoch;
-        let passes = *task_id != NO_OWNER
+        let passes = (*task_id != NO_OWNER || *sealed)
             && !woken_earlier
             && self.may_pass(head_needs, *required_slots, left)
             && idle(*conn_index);
@@ -1213,7 +1343,7 @@ impl SendCompletions {
     /// capacity wake at the end of the iteration when this is set, as it
     /// does when slots came back.
     pub(crate) fn scan_due(&self) -> bool {
-        self.scan_due
+        self.scan_due || self.serve_due
     }
 
     /// The capacity wake under `Budget`, and the scan
@@ -1250,7 +1380,11 @@ impl SendCompletions {
         };
         if pool.free >= head_needs {
             if let Some(e) = self.entry(head) {
-                wakes.push(e.task_id);
+                if e.sealed {
+                    self.serve.push(head);
+                } else {
+                    wakes.push(e.task_id);
+                }
             }
             return;
         }
@@ -1264,7 +1398,11 @@ impl SendCompletions {
                 continue;
             };
             if let Some((required_slots, task_id)) = self.could_pass(id, head_needs, left, &idle) {
-                wakes.push(task_id);
+                if self.entry(id).is_some_and(|e| e.sealed) {
+                    self.serve.push(id);
+                } else {
+                    wakes.push(task_id);
+                }
                 left.free -= required_slots;
                 left.passing += required_slots;
                 let epoch = self.scan_epoch;
@@ -1299,7 +1437,8 @@ impl SendCompletions {
     /// The connection at `conn_index` is released (any generation): the
     /// backend has closed its socket and is about to free the slot.
     ///
-    /// Every waiting and in-flight entry for the connection becomes
+    /// A sealed ticket is removed, with no wake. Every other waiting and
+    /// in-flight entry for the connection becomes
     /// `Aborted(ConnectionAborted)` (a waiting one leaves its connection's
     /// queue, and the connection's worker-queue entry stops being live) and its
     /// owner's task id is in the returned list — the owner may be a
@@ -1361,6 +1500,8 @@ impl SendCompletions {
                 .as_mut()
                 .expect("checked above");
             let keep = match e.state {
+                // The driver drops a sealed ticket's output at the release.
+                Completion::Waiting { .. } if e.sealed => false,
                 Completion::Waiting { .. } | Completion::InFlight => {
                     e.state = Completion::Aborted(connection_aborted());
                     if e.task_id != NO_OWNER {
@@ -1451,7 +1592,8 @@ impl SendCompletions {
     }
 
     /// Fail every *waiting* entry for exactly (`conn_index`, `generation`)
-    /// with `io::Error::new(kind, msg)`; in-flight entries are left alone.
+    /// with `io::Error::new(kind, msg)`; in-flight entries and the sealed
+    /// ticket are left alone.
     /// Returns the owners' task ids for waking, plus the new head's task id
     /// if the head was among the failed.
     ///
@@ -1483,6 +1625,7 @@ impl SendCompletions {
                 continue;
             };
             let matches = e.conn_index == conn_index
+                && !e.sealed
                 && matches!(e.state, Completion::Waiting { generation: g, .. } if g == generation);
             if !matches {
                 continue;
@@ -1499,7 +1642,8 @@ impl SendCompletions {
     /// `abort` on `conn_index`: every entry on it that is waiting for
     /// admission (for `generation`) or in flight records
     /// `Done(Err(ConnectionAborted))`, and its owner's task id is returned for
-    /// waking; if the FIFO head left, the new head's task id is appended.
+    /// waking; if the FIFO head left, the new head's task id is appended. A
+    /// sealed ticket is removed, with no wake.
     ///
     /// `Done`, not the provisional `Aborted`: the caller asked for these
     /// sends to fail, so a driver result that arrives later is ignored, as
@@ -1530,6 +1674,16 @@ impl SendCompletions {
                 Completion::InFlight => false,
                 _ => continue,
             };
+            if e.sealed {
+                // `abort` drops the driver's sealed output with the queue.
+                let id = SendId {
+                    index,
+                    generation: self.slots[index as usize].generation,
+                };
+                self.free_index(index);
+                self.ticket_left(conn_index, id);
+                continue;
+            }
             e.state = Completion::Done(Err(crate::handler::aborted_error()));
             if e.task_id != NO_OWNER {
                 wakes.push(e.task_id);
@@ -1687,6 +1841,56 @@ impl Executor {
         self.send_completions.count_waited();
     }
 
+    /// [`SendCompletions::push_sealed`]. The io_uring driver's sealed-output
+    /// sync, for output the pool had no slots for.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn push_sealed_ticket(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        required_slots: usize,
+        receive: bool,
+    ) -> SendId {
+        self.send_completions
+            .push_sealed(conn_index, generation, required_slots, receive)
+    }
+
+    /// [`SendCompletions::set_sealed_need`]. The sealed-output sync, when
+    /// output joined a waiting ticket.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn set_sealed_need(&mut self, id: SendId, required_slots: usize) {
+        self.send_completions.set_sealed_need(id, required_slots);
+    }
+
+    /// [`SendCompletions::remove_sealed`] plus a wake of the new head. The
+    /// event loop, once the driver placed a ticket's output, and the
+    /// sealed-output sync, for a ticket the driver dropped.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn remove_sealed_ticket(&mut self, id: SendId) {
+        if let Some(next) = self.send_completions.remove_sealed(id) {
+            let _ = self.wake_task(next);
+        }
+    }
+
+    /// [`SendCompletions::sealed_conn`].
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn sealed_ticket_conn(&self, id: SendId) -> Option<u32> {
+        self.send_completions.sealed_conn(id)
+    }
+
+    /// [`SendCompletions::is_head`].
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn is_send_head(&mut self, id: SendId) -> bool {
+        self.send_completions.is_head(id)
+    }
+
+    /// [`SendCompletions::take_sealed_serve`]. The io_uring event loop,
+    /// after each capacity wake.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn take_sealed_serve(&mut self, out: &mut Vec<SendId>) {
+        self.send_completions.take_sealed_serve(out);
+    }
+
     /// [`SendCompletions::set_order`]. The event loops, right after
     /// `Executor::new`, with `Config::send_admission_order`.
     pub(crate) fn set_send_admission_order(&mut self, order: SendAdmissionOrder) {
@@ -1752,6 +1956,7 @@ impl Executor {
         pool: &SendCopyPool,
         idle: impl Fn(u32) -> bool,
     ) {
+        self.send_completions.serve_due = false;
         if self.send_completions.order() == SendAdmissionOrder::Strict {
             self.wake_send_capacity(pool.free_count());
             return;
@@ -3295,5 +3500,125 @@ mod tests {
         q.enqueue(1, 0, 1, task(4));
         q.enqueue(1, 0, 1, task(5));
         assert_eq!(q.counters.conn_tickets_max, 3);
+    }
+
+    // ── Sealed tickets ──────────────────────────────────────────────
+
+    /// Takes the sealed tickets the latest wake found servable.
+    fn served(q: &mut SendCompletions) -> Vec<SendId> {
+        let mut out = Vec::new();
+        q.take_sealed_serve(&mut out);
+        out
+    }
+
+    /// A sealed ticket goes ahead of its connection's waiting send, takes
+    /// its place at the head, and is handed to the driver, not woken. Once
+    /// it leaves, the send is woken as the head.
+    #[test]
+    fn a_sealed_ticket_goes_ahead_of_its_connections_waiting_send() {
+        const A: u32 = 1;
+        let mut q = SendCompletions::new();
+        let a1 = q.enqueue(A, 0, 4, task(1));
+        let sealed = q.push_sealed(A, 0, 1, true);
+        assert!(q.has_waiting(A));
+        assert_eq!(q.waiting.len(), 1, "one worker-queue entry for A");
+        assert!(!q.turn(a1, 8), "the send waits behind the sealed ticket");
+        assert_eq!(q.head_ready(8), None, "no task is woken for it");
+        assert_eq!(served(&mut q), vec![sealed]);
+        assert_eq!(q.sealed_conn(sealed), Some(A));
+        assert_eq!(q.remove_sealed(sealed), Some(task(1)));
+        assert!(q.turn(a1, 8));
+        assert_eq!(q.sealed_conn(sealed), None, "the id is stale");
+    }
+
+    /// Under `Strict` a sealed ticket waits behind another connection's
+    /// head. When that head is admitted the sealed ticket becomes the head:
+    /// no task is returned to wake, and the capacity wake is asked for.
+    #[test]
+    fn a_sealed_ticket_that_becomes_the_head_asks_for_the_capacity_wake() {
+        let mut q = SendCompletions::new();
+        let b1 = q.enqueue(2, 0, 4, task(2));
+        let sealed = q.push_sealed(1, 0, 1, true);
+        q.serve_due = false;
+        assert_eq!(q.head_ready(2), None);
+        assert!(served(&mut q).is_empty(), "B's send is the head and does not fit");
+        assert!(q.turn(b1, 4));
+        assert_eq!(q.mark_submitted(b1), None);
+        assert!(q.scan_due(), "the sealed head needs the capacity wake");
+        assert_eq!(q.head_ready(1), None);
+        assert_eq!(served(&mut q), vec![sealed]);
+    }
+
+    /// Pushing a sealed ticket asks for the capacity wake, and output that
+    /// joins it raises what it needs.
+    #[test]
+    fn a_sealed_ticket_needs_what_its_output_needs() {
+        let mut q = SendCompletions::new();
+        let sealed = q.push_sealed(1, 0, 1, true);
+        assert!(q.scan_due());
+        q.set_sealed_need(sealed, 3);
+        assert_eq!(q.head_ready(2), None);
+        assert!(served(&mut q).is_empty(), "three slots are needed");
+        assert_eq!(q.head_ready(3), None);
+        assert_eq!(served(&mut q), vec![sealed]);
+    }
+
+    /// Under `Budget` a sealed ticket behind a head that does not fit is
+    /// handed to the driver as a passer would be woken, and counted against
+    /// the room the scan hands out.
+    #[test]
+    fn a_scan_serves_a_sealed_ticket_that_can_pass() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        q.enqueue(2, 0, 8, task(2));
+        let sealed = q.push_sealed(1, 0, 2, true);
+        q.enqueue(3, 0, 2, task(3));
+        let mut wakes = Vec::new();
+        q.scan(pool(3, 0, 16), idle, &mut wakes);
+        assert_eq!(served(&mut q), vec![sealed]);
+        assert!(wakes.is_empty(), "the sealed ticket took the room");
+    }
+
+    /// A close fails the waiting bounded sends and leaves the sealed ticket,
+    /// whose records go ahead of the close_notify.
+    #[test]
+    fn a_close_leaves_the_sealed_ticket() {
+        let mut q = SendCompletions::new();
+        let a1 = q.enqueue(1, 7, 1, task(1));
+        let sealed = q.push_sealed(1, 7, 1, true);
+        let wakes = q.fail_waiting(1, 7, io::ErrorKind::NotConnected, "closing");
+        assert_eq!(wakes, vec![task(1)]);
+        assert!(q.take_result(a1).is_some());
+        assert_eq!(q.sealed_conn(sealed), Some(1));
+        assert!(q.has_waiting(1));
+    }
+
+    /// `abort` and the connection's release drop the sealed ticket without
+    /// a wake or a result, and leave no ticket for the next occupant.
+    #[test]
+    fn abort_and_release_drop_the_sealed_ticket() {
+        let mut q = SendCompletions::new();
+        let sealed = q.push_sealed(1, 7, 1, true);
+        assert!(q.abort_connection(1, 7).is_empty());
+        assert_eq!(q.sealed_conn(sealed), None);
+        assert!(!q.has_waiting(1));
+        assert_eq!(q.live(), 0);
+
+        let sealed = q.push_sealed(1, 7, 1, true);
+        assert!(q.remove_connection(1).is_empty());
+        assert_eq!(q.sealed_conn(sealed), None);
+        assert!(!q.has_waiting(1));
+        assert_eq!(q.live(), 0);
+    }
+
+    /// `tls_output_waited` counts receive-path tickets only, and a sealed
+    /// ticket is not a bounded send for `conn_tickets_max`.
+    #[test]
+    fn counters_record_receive_path_output_that_waited() {
+        let mut q = SendCompletions::new();
+        let s = q.push_sealed(1, 0, 1, true);
+        q.remove_sealed(s);
+        q.push_sealed(2, 0, 1, false);
+        assert_eq!(q.counters.tls_output_waited, 1);
+        assert_eq!(q.counters.conn_tickets_max, 0);
     }
 }
