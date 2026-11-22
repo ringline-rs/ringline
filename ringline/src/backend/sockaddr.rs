@@ -39,8 +39,8 @@ pub(crate) fn sockaddr_to_peer_addr(
         libc::AF_INET | libc::AF_INET6 => {
             sockaddr_to_socket_addr(addr, len).map(crate::connection::PeerAddr::Tcp)
         }
-        libc::AF_UNIX => {
-            let sa = unsafe { &*(addr as *const _ as *const libc::sockaddr_un) };
+        crate::sys::AF_UNIX => {
+            let sa = unsafe { &*(addr as *const _ as *const crate::sys::sockaddr_un) };
             let path_offset = memoffset(sa);
             let path_len = (len as usize).saturating_sub(path_offset);
             if path_len == 0 {
@@ -62,7 +62,7 @@ pub(crate) fn sockaddr_to_peer_addr(
 }
 
 /// Offset of `sun_path` within `sockaddr_un`.
-fn memoffset(sa: &libc::sockaddr_un) -> usize {
+fn memoffset(sa: &crate::sys::sockaddr_un) -> usize {
     let base = sa as *const _ as usize;
     let path = sa.sun_path.as_ptr() as usize;
     path - base
@@ -80,9 +80,9 @@ pub(crate) fn unix_path_to_sockaddr(
             std::mem::size_of::<libc::sockaddr_storage>(),
         );
     }
-    let sa = storage as *mut _ as *mut libc::sockaddr_un;
+    let sa = storage as *mut _ as *mut crate::sys::sockaddr_un;
     unsafe {
-        (*sa).sun_family = libc::AF_UNIX as libc::sa_family_t;
+        (*sa).sun_family = crate::sys::AF_UNIX as libc::sa_family_t;
     }
     let path_bytes = path.as_os_str().as_encoded_bytes();
     let max_len = std::mem::size_of_val(unsafe { &(*sa).sun_path }) - 1;

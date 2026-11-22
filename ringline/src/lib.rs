@@ -192,6 +192,10 @@ pub(crate) mod runtime;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod smaps;
 pub(crate) mod spawner;
+// Under io_uring the file wrappers and `linger` are unused; they serve the
+// mio backend.
+#[cfg_attr(has_io_uring, allow(dead_code, unused_imports))]
+pub(crate) mod sys;
 pub(crate) mod task_panic;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod tls;

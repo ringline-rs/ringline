@@ -15,6 +15,7 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
 
+#[cfg(not(target_os = "hermit"))]
 unsafe extern "C" {
     static environ: *const *const libc::c_char;
 }
@@ -96,7 +97,15 @@ fn spawner_thread(rx: Receiver<SpawnRequest>) {
     // Channel closed -- pool is shutting down.
 }
 
+/// Hermit has no process spawning.
+#[cfg(target_os = "hermit")]
+fn do_spawn(_program: &CString, _args: &[CString]) -> io::Result<SpawnResult> {
+    // Hermit runs one process and cannot spawn another.
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 /// Perform blocking process spawn via `posix_spawnp` + `pidfd_open`.
+#[cfg(not(target_os = "hermit"))]
 fn do_spawn(program: &CString, args: &[CString]) -> io::Result<SpawnResult> {
     // Build argv array: [program, args..., null]
     let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(args.len() + 2);

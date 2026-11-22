@@ -738,12 +738,18 @@ fn close_queued(fd: RawFd) {
 
 /// A non-blocking, close-on-exec pipe: `(read end, write end)`.
 fn nonblocking_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(target_os = "hermit")]
+    let fds = {
+        let (r, w) = crate::sys::token_pair()?;
+        [r, w]
+    };
+    #[cfg(not(target_os = "hermit"))]
     let mut fds = [0 as RawFd; 2];
     #[cfg(target_os = "linux")]
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "hermit")))]
     {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
             return Err(io::Error::last_os_error());
@@ -753,7 +759,7 @@ fn nonblocking_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
                 libc::fcntl(
                     fd,
                     libc::F_SETFL,
-                    libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+                    libc::fcntl(fd, libc::F_GETFL, 0) | libc::O_NONBLOCK,
                 );
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
@@ -966,10 +972,7 @@ impl RuntimeShutdown {
     pub(crate) fn shutdown_for_panic(&self) {
         self.shutdown();
         if !self.panicked.swap(true, Ordering::AcqRel) {
-            let byte = 1u8;
-            unsafe {
-                libc::write(self.panic_write.as_raw_fd(), (&byte as *const u8).cast(), 1);
-            }
+            crate::sys::write_token(self.panic_write.as_raw_fd());
         }
     }
 
@@ -992,10 +995,7 @@ impl RuntimeShutdown {
             .push(worker);
         #[cfg(target_os = "linux")]
         self.steer_away_from(worker);
-        let byte = 1u8;
-        unsafe {
-            libc::write(self.exit_write.as_raw_fd(), (&byte as *const u8).cast(), 1);
-        }
+        crate::sys::write_token(self.exit_write.as_raw_fd());
         if shutdown {
             self.shutdown();
         }
@@ -1130,7 +1130,7 @@ impl BindAddr {
         match self {
             BindAddr::Tcp(_) => false,
             BindAddr::Unix(_) => true,
-            BindAddr::Fd(fd) => socket_family(fd.as_raw_fd()) == Some(libc::AF_UNIX),
+            BindAddr::Fd(fd) => socket_family(fd.as_raw_fd()) == Some(crate::sys::AF_UNIX),
         }
     }
 }
@@ -1165,12 +1165,13 @@ fn unix_socket_is_bound(fd: RawFd) -> bool {
     if rc != 0 {
         return false;
     }
-    let path_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    let path_offset = std::mem::offset_of!(crate::sys::sockaddr_un, sun_path);
     if (len as usize) <= path_offset {
         return false;
     }
     // SAFETY: `storage` is large enough for a `sockaddr_un`.
-    let un = unsafe { &*(&storage as *const libc::sockaddr_storage as *const libc::sockaddr_un) };
+    let un =
+        unsafe { &*(&storage as *const libc::sockaddr_storage as *const crate::sys::sockaddr_un) };
     // A leading NUL is an abstract name on Linux, and no path elsewhere.
     cfg!(target_os = "linux") || un.sun_path[0] != 0
 }
@@ -1179,7 +1180,19 @@ fn unix_socket_is_bound(fd: RawFd) -> bool {
 /// cannot: it must be a `SOCK_STREAM` socket bound in `AF_INET`, `AF_INET6`
 /// or `AF_UNIX` and not connected, and an inet socket must not be on port 0,
 /// which is what `getsockname` reports for one that was never bound.
+///
+/// Hermit has no `SO_TYPE` option, so there the socket type is not checked
+/// and a datagram socket fails later, when it is listened on or accepted
+/// from.
 fn check_listener_fd(fd: RawFd) -> Result<(), String> {
+    #[cfg(not(target_os = "hermit"))]
+    check_stream_socket(fd)?;
+    check_unconnected_and_bound(fd)
+}
+
+/// `fd` is a `SOCK_STREAM` socket (`SO_TYPE`).
+#[cfg(not(target_os = "hermit"))]
+fn check_stream_socket(fd: RawFd) -> Result<(), String> {
     let mut kind: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     let rc = unsafe {
@@ -1200,6 +1213,11 @@ fn check_listener_fd(fd: RawFd) -> Result<(), String> {
     if kind != libc::SOCK_STREAM {
         return Err(format!("bind_fd(): fd {fd} is not a SOCK_STREAM socket"));
     }
+    Ok(())
+}
+
+/// `fd` is not connected and is bound in `AF_INET`, `AF_INET6` or `AF_UNIX`.
+fn check_unconnected_and_bound(fd: RawFd) -> Result<(), String> {
     // A connected stream socket cannot listen. `getpeername` fails with
     // `ENOTCONN` on one that is not connected.
     let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -1215,8 +1233,8 @@ fn check_listener_fd(fd: RawFd) -> Result<(), String> {
         return Err(format!("bind_fd(): fd {fd} is a connected socket"));
     }
     match socket_family(fd) {
-        Some(libc::AF_UNIX) if unix_socket_is_bound(fd) => Ok(()),
-        Some(libc::AF_UNIX) => Err(format!("bind_fd(): fd {fd} is not bound to a path")),
+        Some(crate::sys::AF_UNIX) if unix_socket_is_bound(fd) => Ok(()),
+        Some(crate::sys::AF_UNIX) => Err(format!("bind_fd(): fd {fd} is not bound to a path")),
         Some(libc::AF_INET) | Some(libc::AF_INET6) => match getsockname_v4_v6(fd) {
             Some(addr) if addr.port() != 0 => Ok(()),
             _ => Err(format!("bind_fd(): fd {fd} is not bound to a port")),
@@ -2456,7 +2474,7 @@ impl RinglineBuilder {
                     // systemd may not be close-on-exec.
                     (BindAddr::Fd(fd), _) => {
                         unsafe {
-                            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+                            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD, 0);
                             libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC);
                         }
                         let bound = getsockname_v4_v6(fd.as_raw_fd());
@@ -2615,56 +2633,65 @@ fn ensure_nofile_limit(
     max_connections: u32,
     num_workers: usize,
 ) -> Result<(), crate::error::Error> {
-    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
-    if ret != 0 {
-        return Err(crate::error::Error::Io(io::Error::last_os_error()));
+    // Hermit has no resource limits.
+    #[cfg(target_os = "hermit")]
+    {
+        let _ = (max_connections, num_workers);
+        Ok(())
     }
-
-    // io_uring: register_files_sparse(max_connections) needs RLIMIT_NOFILE
-    // >= max_connections (the kernel's check is per-ring; connections live
-    // in fixed-file tables, not real fds). Add per-worker overhead (ring
-    // fd, eventfd, transient socket fds) and global overhead (listen
-    // socket, stdio, misc).
-    //
-    // mio: every connection holds a REAL fd and each worker has its own
-    // max_connections-slot table, so the worst case scales with the worker
-    // count — the io_uring formula under-provisioned and configs passed
-    // the check only to fail with EMFILE under load.
-    let per_worker_overhead: u64 = 8;
-    let global_overhead: u64 = 64;
-    #[cfg(has_io_uring)]
-    let conn_fds = max_connections as u64;
-    #[cfg(not(has_io_uring))]
-    let conn_fds = max_connections as u64 * num_workers as u64;
-    let required = conn_fds + per_worker_overhead * num_workers as u64 + global_overhead;
-
-    let soft = rlim.rlim_cur;
-    let hard = rlim.rlim_max;
-
-    if soft >= required {
-        return Ok(());
-    }
-
-    if hard >= required || hard == libc::RLIM_INFINITY {
-        // Raise soft limit to required (or hard if hard is finite and smaller)
-        let new_soft = if hard == libc::RLIM_INFINITY {
-            required
-        } else {
-            std::cmp::min(required, hard)
-        };
-        rlim.rlim_cur = new_soft;
-        let ret = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) };
+    #[cfg(not(target_os = "hermit"))]
+    {
+        let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
         if ret != 0 {
             return Err(crate::error::Error::Io(io::Error::last_os_error()));
         }
-        Ok(())
-    } else {
-        Err(crate::error::Error::ResourceLimit(format!(
-            "RLIMIT_NOFILE too low: need {} but hard limit is {} (soft: {}). \
+
+        // io_uring: register_files_sparse(max_connections) needs RLIMIT_NOFILE
+        // >= max_connections (the kernel's check is per-ring; connections live
+        // in fixed-file tables, not real fds). Add per-worker overhead (ring
+        // fd, eventfd, transient socket fds) and global overhead (listen
+        // socket, stdio, misc).
+        //
+        // mio: every connection holds a REAL fd and each worker has its own
+        // max_connections-slot table, so the worst case scales with the worker
+        // count — the io_uring formula under-provisioned and configs passed
+        // the check only to fail with EMFILE under load.
+        let per_worker_overhead: u64 = 8;
+        let global_overhead: u64 = 64;
+        #[cfg(has_io_uring)]
+        let conn_fds = max_connections as u64;
+        #[cfg(not(has_io_uring))]
+        let conn_fds = max_connections as u64 * num_workers as u64;
+        let required = conn_fds + per_worker_overhead * num_workers as u64 + global_overhead;
+
+        let soft = rlim.rlim_cur;
+        let hard = rlim.rlim_max;
+
+        if soft >= required {
+            return Ok(());
+        }
+
+        if hard >= required || hard == libc::RLIM_INFINITY {
+            // Raise soft limit to required (or hard if hard is finite and smaller)
+            let new_soft = if hard == libc::RLIM_INFINITY {
+                required
+            } else {
+                std::cmp::min(required, hard)
+            };
+            rlim.rlim_cur = new_soft;
+            let ret = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) };
+            if ret != 0 {
+                return Err(crate::error::Error::Io(io::Error::last_os_error()));
+            }
+            Ok(())
+        } else {
+            Err(crate::error::Error::ResourceLimit(format!(
+                "RLIMIT_NOFILE too low: need {} but hard limit is {} (soft: {}). \
              Raise it with: ulimit -n {}",
-            required, hard, soft, required
-        )))
+                required, hard, soft, required
+            )))
+        }
     }
 }
 
@@ -3013,7 +3040,13 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<OwnedFd, crate::error::Erro
     let owned = stream_socket(domain).map_err(crate::error::Error::Io)?;
     let fd = owned.as_raw_fd();
     let optval: libc::c_int = 1;
-    for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+    // Hermit has no SO_REUSEPORT. This path serves io_uring's merged accept
+    // mode, which Hermit never builds; the option list only has to compile.
+    #[cfg(not(target_os = "hermit"))]
+    let opts = [libc::SO_REUSEADDR, libc::SO_REUSEPORT];
+    #[cfg(target_os = "hermit")]
+    let opts = [libc::SO_REUSEADDR];
+    for opt in opts {
         let ret = unsafe {
             libc::setsockopt(
                 fd,
@@ -3054,7 +3087,7 @@ fn stream_socket(domain: libc::c_int) -> io::Result<OwnedFd> {
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     #[cfg(not(target_os = "linux"))]
     unsafe {
-        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD, 0);
         if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -3126,7 +3159,7 @@ fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, Socke
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     #[cfg(not(target_os = "linux"))]
     unsafe {
-        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD, 0);
         if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -3145,18 +3178,22 @@ fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, Socke
         return Err(io::Error::last_os_error());
     }
 
-    let optval: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
+    // Hermit has no SO_REUSEPORT, so only one worker can bind a port there.
+    #[cfg(not(target_os = "hermit"))]
+    {
+        let optval: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     let resolved = getsockname_v4_v6(fd.as_raw_fd())
         .ok_or_else(|| io::Error::other("getsockname on a bound UDP socket returned no address"))?;
@@ -3254,7 +3291,7 @@ fn create_unix_listener(path: &Path) -> Result<OwnedFd, crate::error::Error> {
     // Remove existing socket file if present (ignore errors — path may not exist).
     let _ = std::fs::remove_file(path);
 
-    let fd = stream_socket(libc::AF_UNIX).map_err(crate::error::Error::Io)?;
+    let fd = stream_socket(crate::sys::AF_UNIX).map_err(crate::error::Error::Io)?;
 
     // Bind using the driver's sockaddr helper.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };

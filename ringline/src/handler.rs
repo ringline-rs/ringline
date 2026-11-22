@@ -3020,7 +3020,7 @@ impl<'a> DriverCtx<'a> {
         if let Err(e) = self.poll.registry().register(
             &mut mio_stream,
             token,
-            crate::backend::mio::driver::STREAM_INTEREST,
+            crate::backend::mio::driver::CONNECT_INTEREST,
         ) {
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
@@ -3334,23 +3334,16 @@ impl<'a> DriverCtx<'a> {
         #[cfg(not(target_os = "macos"))]
         let _ = nocache;
         let work = Box::new(move || {
-            let fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    flags | libc::O_CLOEXEC,
-                    mode as libc::c_int,
-                )
+            let fd = match crate::sys::open(&c_path, flags, mode) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    return crate::disk_io_pool::DiskIoResult {
+                        result: -e.raw_os_error().unwrap_or(libc::EIO),
+                        metadata: None,
+                        opened: None,
+                    };
+                }
             };
-            if fd < 0 {
-                let errno = io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO);
-                return crate::disk_io_pool::DiskIoResult {
-                    result: -errno,
-                    metadata: None,
-                    opened: None,
-                };
-            }
             // macOS has no O_DIRECT; F_NOCACHE bypasses the page cache.
             #[cfg(target_os = "macos")]
             if nocache {
@@ -3399,20 +3392,14 @@ impl<'a> DriverCtx<'a> {
         let fd = self.validate_file(kind, index, generation)?;
         let buf_addr = buf as usize;
         let work = Box::new(move || {
-            let result = unsafe {
-                libc::pread(
-                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
-                    buf_addr as *mut libc::c_void,
-                    len as usize,
-                    offset as libc::off_t,
-                )
-            };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                result as i32
+            let r = match crate::sys::pread(
+                std::os::fd::AsRawFd::as_raw_fd(&*fd),
+                buf_addr as *mut u8,
+                len as usize,
+                offset,
+            ) {
+                Ok(n) => n as i32,
+                Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO)),
             };
             crate::disk_io_pool::DiskIoResult {
                 result: r,
@@ -3441,20 +3428,14 @@ impl<'a> DriverCtx<'a> {
         let fd = self.validate_file(kind, index, generation)?;
         let buf_addr = buf as usize;
         let work = Box::new(move || {
-            let result = unsafe {
-                libc::pwrite(
-                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
-                    buf_addr as *const libc::c_void,
-                    len as usize,
-                    offset as libc::off_t,
-                )
-            };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                result as i32
+            let r = match crate::sys::pwrite(
+                std::os::fd::AsRawFd::as_raw_fd(&*fd),
+                buf_addr as *const u8,
+                len as usize,
+                offset,
+            ) {
+                Ok(n) => n as i32,
+                Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO)),
             };
             crate::disk_io_pool::DiskIoResult {
                 result: r,
@@ -3482,13 +3463,9 @@ impl<'a> DriverCtx<'a> {
     ) -> io::Result<()> {
         let fd = self.validate_file(kind, index, generation)?;
         let work = Box::new(move || {
-            let result = unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&*fd)) };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                0
+            let r = match crate::sys::fsync(std::os::fd::AsRawFd::as_raw_fd(&*fd)) {
+                Ok(()) => 0,
+                Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO)),
             };
             crate::disk_io_pool::DiskIoResult {
                 result: r,
@@ -3688,13 +3665,9 @@ impl<'a> DriverCtx<'a> {
         let c_from = crate::fs::path_to_cstring(from)?;
         let c_to = crate::fs::path_to_cstring(to)?;
         let work = Box::new(move || {
-            let result = unsafe { libc::rename(c_from.as_ptr(), c_to.as_ptr()) };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                0
+            let r = match crate::sys::rename(&c_from, &c_to) {
+                Ok(()) => 0,
+                Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO)),
             };
             crate::disk_io_pool::DiskIoResult {
                 result: r,

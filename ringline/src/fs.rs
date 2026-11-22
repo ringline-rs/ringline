@@ -215,7 +215,7 @@ impl OpenFlags {
     /// each write also commits the metadata needed to read it back. On macOS
     /// the write reaches the drive but the drive's own cache is not flushed,
     /// as with `fsync(2)`.
-    pub const DSYNC: Self = Self(libc::O_DSYNC);
+    pub const DSYNC: Self = Self(crate::sys::O_DSYNC);
 }
 
 impl std::ops::BitOr for OpenFlags {
@@ -332,9 +332,18 @@ impl Metadata {
             mode: st.st_mode as u32,
             uid: st.st_uid,
             gid: st.st_gid,
+            #[cfg(not(target_os = "hermit"))]
             accessed: time(st.st_atime, st.st_atime_nsec),
+            #[cfg(not(target_os = "hermit"))]
             modified: time(st.st_mtime, st.st_mtime_nsec),
+            #[cfg(not(target_os = "hermit"))]
             status_changed: time(st.st_ctime, st.st_ctime_nsec),
+            #[cfg(target_os = "hermit")]
+            accessed: time(st.st_atim.tv_sec, st.st_atim.tv_nsec),
+            #[cfg(target_os = "hermit")]
+            modified: time(st.st_mtim.tv_sec, st.st_mtim.tv_nsec),
+            #[cfg(target_os = "hermit")]
+            status_changed: time(st.st_ctim.tv_sec, st.st_ctim.tv_nsec),
             is_file: (st.st_mode & libc::S_IFMT) == libc::S_IFREG,
             is_dir: (st.st_mode & libc::S_IFMT) == libc::S_IFDIR,
             is_symlink: (st.st_mode & libc::S_IFMT) == libc::S_IFLNK,

@@ -24,9 +24,32 @@ pub(crate) const STREAM_INTEREST: mio::Interest = mio::Interest::READABLE
     .add(mio::Interest::WRITABLE)
     .add(mio::Interest::PRIORITY);
 /// What a connection's stream is registered for.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "hermit")))]
 pub(crate) const STREAM_INTEREST: mio::Interest =
     mio::Interest::READABLE.add(mio::Interest::WRITABLE);
+/// What a connection's stream is registered for. mio's poll selector, which
+/// Hermit uses, clears an interest when it fires and restores it after an
+/// operation through mio returns `WouldBlock`; a stream registered WRITABLE
+/// therefore reports writable again after every read that drains the
+/// socket, and the loop never blocks. So a stream starts writable
+/// ([`WRITABLE_ON_DEMAND`]) and has WRITABLE added only while a write waits
+/// for room ([`WAITING_INTEREST`]).
+#[cfg(target_os = "hermit")]
+pub(crate) const STREAM_INTEREST: mio::Interest = mio::Interest::READABLE;
+
+/// What a connecting stream is registered for: WRITABLE reports the end of
+/// the connect.
+pub(crate) const CONNECT_INTEREST: mio::Interest = STREAM_INTEREST.add(mio::Interest::WRITABLE);
+
+/// What a stream is registered for while a write waits for room, where
+/// [`WRITABLE_ON_DEMAND`] holds.
+pub(crate) const WAITING_INTEREST: mio::Interest = STREAM_INTEREST.add(mio::Interest::WRITABLE);
+
+/// Whether a stream is taken as writable from the start and registers
+/// WRITABLE only while a write waits for room (Hermit; see
+/// [`STREAM_INTEREST`]). Elsewhere WRITABLE stays registered and the first
+/// writable event sets `writable`.
+pub(crate) const WRITABLE_ON_DEMAND: bool = cfg!(target_os = "hermit");
 
 /// mio token 0 is reserved for the wake pipe.
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
@@ -654,7 +677,7 @@ impl Driver {
             .tls_table
             .as_mut()
             .map(|t| t as *mut _)
-            .unwrap_or(std::ptr::null_mut());
+            .unwrap_or_default();
 
         DriverCtx {
             connections: &mut self.connections,
@@ -756,7 +779,7 @@ impl Driver {
         self.clear_pending_sends(idx, crate::handler::aborted_error);
         if let Some(stream) = &self.tcp_streams[idx] {
             use std::os::fd::AsRawFd;
-            let linger = libc::linger {
+            let linger = crate::sys::linger {
                 l_onoff: 1,
                 l_linger: 0,
             };
@@ -770,7 +793,7 @@ impl Driver {
                     libc::SOL_SOCKET,
                     libc::SO_LINGER,
                     (&raw const linger).cast(),
-                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    std::mem::size_of::<crate::sys::linger>() as libc::socklen_t,
                 );
             }
         }
@@ -1113,12 +1136,19 @@ impl Driver {
             }
 
             let fd = stream.as_raw_fd();
-            let result = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as i32) };
+            let result = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as _) };
 
             if result < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
+                    if WRITABLE_ON_DEMAND {
+                        let _ = self.poll.registry().reregister(
+                            stream,
+                            mio::Token(idx + 1),
+                            WAITING_INTEREST,
+                        );
+                    }
                     // Every awaited send queued now has bytes the full socket
                     // did not take (`SendCompletion::waited_for_room`).
                     for entry in self.pending_sends[idx].iter_mut() {
@@ -1218,7 +1248,9 @@ impl Driver {
         }
 
         // All sends flushed. Interest is registered once, as
-        // READABLE|WRITABLE, and never modified: dropping WRITABLE after each
+        // READABLE|WRITABLE, and never modified, except on Hermit
+        // (`WRITABLE_ON_DEMAND`), where `handle_writable` removes WRITABLE
+        // once the queue is written: dropping WRITABLE after each
         // drain and re-adding it on the next send cost two `epoll_ctl(MOD)`
         // per operation on an echo workload (#395), and a `reregister` here
         // re-reported EOF on a half-closed socket and spun the loop at 100%
@@ -1292,7 +1324,7 @@ fn bind_udp_with_reuseport(
     }
     #[cfg(not(target_os = "linux"))]
     unsafe {
-        let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+        let fd_flags = libc::fcntl(fd, libc::F_GETFD, 0);
         if fd_flags < 0 || libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0 {
             let err = io::Error::last_os_error();
             libc::close(fd);
@@ -1304,6 +1336,8 @@ fn bind_udp_with_reuseport(
     // a worker only when each worker should get its own port, and with the
     // option set the free-port search can return a port another
     // SO_REUSEPORT socket already holds, so it is left off then.
+    // Hermit has no SO_REUSEPORT, so only one worker can bind a port there.
+    #[cfg(not(target_os = "hermit"))]
     if addr.port() != 0 {
         let optval: libc::c_int = 1;
         let rc = unsafe {

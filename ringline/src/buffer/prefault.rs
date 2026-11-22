@@ -31,9 +31,15 @@
 /// larger one would skip pages and silently prefault nothing. 4096 is the
 /// smallest page on every platform ringline runs on, so the fallback is safe.
 fn page_size() -> usize {
+    // Hermit's libc has no sysconf; its base page is 4096.
+    #[cfg(target_os = "hermit")]
+    return 4096;
     // SAFETY: `sysconf` with a valid name has no preconditions.
-    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n > 0 { n as usize } else { 4096 }
+    #[cfg(not(target_os = "hermit"))]
+    {
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if n > 0 { n as usize } else { 4096 }
+    }
 }
 
 /// Touch every page of `buf` so its pages are resident and private.
