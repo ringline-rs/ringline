@@ -20,8 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   now 0.2.190, the first release with public `iovec` fields on Hermit. TCP
   and UDP listeners and connections work; on Hermit:
   - Hermit has no Unix-domain sockets: binding a Unix listener fails at
-    `socket(2)`, and `connect_unix` returns `Unsupported` as on every mio
-    target. Process spawn, kill and wait return `Unsupported`.
+    `socket(2)`, and `connect_unix` returns an error of kind `Other`, as on
+    every mio target. Process spawn, kill and wait return `Unsupported`.
   - File and direct I/O work on files in Hermit's file systems. Hermit has no
     `pread` or `pwrite`, so each positional read or write seeks and then reads
     or writes under one process-wide lock. Positional reads and writes do
