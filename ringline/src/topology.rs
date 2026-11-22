@@ -3,7 +3,8 @@
 /// On Linux, reads `/sys/devices/system/cpu/cpu*/topology/physical_package_id`
 /// and `core_id` for each CPU in `/sys/devices/system/cpu/online` to count
 /// unique (socket, core) pairs, counting hyperthreading siblings once.
-/// Falls back to the logical CPU count when no CPU's topology can be read,
+/// Without a readable `online` list, it counts up from cpu0 to the first CPU
+/// without topology. Falls back to the logical CPU count when no CPU's topology can be read,
 /// and on non-Linux platforms. The process's CPU affinity (`taskset`, a
 /// cpuset cgroup) and `isolcpus` are not taken into account.
 ///
