@@ -142,7 +142,7 @@ impl AsyncEventHandler for TlsEchoHandler {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -421,7 +421,7 @@ fn tls_echo_large_multichunk() {
     // synchronous client writes the whole payload before reading, so echo
     // sends queue until it turns around). The default 64-slot test pool is
     // about 1 MiB — sitting on the exhaustion cliff, and TlsEchoHandler's
-    // send_nowait errors are swallowed, which turned exhaustion into a
+    // send errors are swallowed, which turned exhaustion into a
     // silent short echo. Give this test 4× headroom.
     let config = test_config_builder()
         .send_pool(256, 16448)
@@ -646,7 +646,7 @@ impl AsyncEventHandler for TlsInfoHandler {
                             };
                             *TLS_INFO_SNAPSHOT.lock().unwrap() = Some(snapshot);
                         }
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -820,7 +820,7 @@ impl AsyncEventHandler for TlsCloseHandler {
         async move {
             let (mut tx, mut rx) = conn.split();
             rx.with_data(|data| {
-                let _ = tx.send_nowait(data);
+                let _ = tx.send(data);
                 ParseResult::Consumed(data.len())
             })
             .await;
@@ -858,7 +858,7 @@ impl AsyncEventHandler for TlsReturnHandler {
         async move {
             let (mut tx, mut rx) = conn.split();
             rx.with_data(|data| {
-                let _ = tx.send_nowait(data);
+                let _ = tx.send(data);
                 ParseResult::Consumed(data.len())
             })
             .await;
@@ -977,7 +977,7 @@ impl AsyncEventHandler for TlsBigReplyThenReturn {
             }
             let chunk = vec![0x5au8; 64 * 1024];
             for _ in 0..BIG_REPLY / chunk.len() {
-                conn.send_nowait(&chunk).expect("queue the reply");
+                conn.send(&chunk).expect("queue the reply");
             }
         }
     }
@@ -1090,7 +1090,7 @@ impl AsyncEventHandler for TlsBigReplyShutdownThenReturn {
             }
             let chunk = vec![0x5au8; 64 * 1024];
             for _ in 0..BIG_REPLY / chunk.len() {
-                conn.send_nowait(&chunk).expect("queue the reply");
+                conn.send(&chunk).expect("queue the reply");
             }
             conn.shutdown_write();
         }
@@ -1214,9 +1214,9 @@ impl AsyncEventHandler for TlsSendAfterClose {
             if n == 0 {
                 return;
             }
-            conn.send_nowait(b"early").expect("send before close");
+            conn.send(b"early").expect("send before close");
             conn.close();
-            *TLS_SEND_AFTER_CLOSE.lock().unwrap() = Some(conn.send_nowait(b"late"));
+            *TLS_SEND_AFTER_CLOSE.lock().unwrap() = Some(conn.send(b"late").map(drop));
         }
     }
 
@@ -1246,7 +1246,7 @@ impl AsyncEventHandler for TlsBackpressuredSendAfterClose {
             if n == 0 {
                 return;
             }
-            conn.send_nowait(b"early").expect("send before close");
+            conn.send(b"early").expect("send before close");
             conn.close();
             let late = conn.send_backpressured(b"late").await.map(|_| ());
             *TLS_SEND_AFTER_CLOSE.lock().unwrap() = Some(late);
@@ -1258,7 +1258,7 @@ impl AsyncEventHandler for TlsBackpressuredSendAfterClose {
     }
 }
 
-/// On io_uring a TLS `send_nowait` after `close()` is refused: its record
+/// On io_uring a TLS `send` after `close()` is refused: its record
 /// would follow the close_notify, and the peer discards records after the
 /// alert.
 #[cfg(has_io_uring)]
@@ -1311,140 +1311,6 @@ fn send_after_close_is_refused<H: AsyncEventHandler>() {
         .expect("handler ran");
     let err = late.expect_err("a send after close() was accepted");
     assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
-}
-
-/// Owns the heap bytes a chain's guard part sends.
-#[cfg(has_io_uring)]
-struct ChainGuard(Vec<u8>);
-
-#[cfg(has_io_uring)]
-impl ringline::SendGuard for ChainGuard {
-    fn as_ptr_len(&self) -> (*const u8, u32) {
-        (self.0.as_ptr(), self.0.len() as u32)
-    }
-    fn region(&self) -> ringline::RegionId {
-        ringline::RegionId::UNREGISTERED
-    }
-}
-
-/// Above `send_zc_threshold`, so on a plaintext connection the guard part
-/// would go out zero-copy.
-#[cfg(has_io_uring)]
-const CHAIN_GUARD_LEN: usize = 8192;
-
-/// The send before the chain spans several TLS records. It is in flight when
-/// the chain is submitted whatever its size: the handler submits both in one
-/// poll, and completions are processed only between polls.
-#[cfg(has_io_uring)]
-const CHAIN_BEFORE_LEN: usize = 100_000;
-
-/// The results of `TlsSendChain`'s chain and empty chain.
-#[cfg(has_io_uring)]
-#[allow(clippy::type_complexity)]
-static TLS_CHAIN_RESULTS: Mutex<Option<(std::io::Result<u32>, std::io::Result<u32>)>> =
-    Mutex::new(None);
-
-/// Read one byte, queue a large send, then without waiting send a `send_chain`
-/// of a copy part, a scatter-gather part with a guard, and another copy part;
-/// wait for it, send an empty chain, record both results, and close.
-#[cfg(has_io_uring)]
-struct TlsSendChain;
-
-#[cfg(has_io_uring)]
-impl AsyncEventHandler for TlsSendChain {
-    #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            let n = conn
-                .with_data(|d| {
-                    if d.is_empty() {
-                        ParseResult::NeedMore
-                    } else {
-                        ParseResult::Consumed(1)
-                    }
-                })
-                .await;
-            if n == 0 {
-                return;
-            }
-            // On TLS the chain queues behind this send rather than refusing,
-            // so do not wait for it.
-            let mut before = vec![b'x'; CHAIN_BEFORE_LEN];
-            before.extend_from_slice(b"before-");
-            conn.send_nowait(&before).expect("send before the chain");
-            let guard = ringline::GuardBox::new(ChainGuard(vec![b'g'; CHAIN_GUARD_LEN]));
-            let sent = conn
-                .send_chain(|chain| {
-                    chain
-                        .copy(b"chain-a")
-                        .parts()
-                        .copy(b"-")
-                        .guard(guard)
-                        .copy(b"-")
-                        .add()
-                        .copy(b"-chain-b")
-                        .finish()
-                })
-                .expect("submit the chain")
-                .await;
-            // An empty chain sends nothing and resolves to 0.
-            let empty = conn
-                .send_chain(|chain| chain.finish())
-                .expect("submit the empty chain")
-                .await;
-            *TLS_CHAIN_RESULTS.lock().unwrap() = Some((sent, empty));
-            conn.close();
-        }
-    }
-
-    fn create_for_worker(_id: usize) -> Self {
-        TlsSendChain
-    }
-}
-
-/// A `send_chain` on a TLS connection, copy and guard parts alike, is
-/// encrypted, queued behind a send still in flight rather than refused, and
-/// resolves with its plaintext length.
-#[cfg(has_io_uring)]
-#[test]
-fn a_tls_send_chain_is_encrypted() {
-    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
-    *TLS_CHAIN_RESULTS.lock().unwrap() = None;
-    let (certs, key) = generate_self_signed();
-    let config = test_config_builder()
-        .tls(ringline_server_tls(certs.clone(), key))
-        .build()
-        .expect("valid config");
-    let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<TlsSendChain>()
-        .expect("launch failed");
-    let addr = shutdown.bound_addr().expect("bound address").to_string();
-    wait_for_server(&addr);
-
-    let (plaintext, peer_closed) = read_reply_until_close(&addr, &certs, Duration::ZERO);
-
-    shutdown.shutdown();
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
-    }
-    let (sent, empty) = TLS_CHAIN_RESULTS
-        .lock()
-        .unwrap()
-        .take()
-        .expect("handler ran");
-    assert_eq!(
-        sent.expect("chain completes"),
-        (CHAIN_GUARD_LEN + 17) as u32,
-        "the chain's bytes"
-    );
-    assert_eq!(empty.expect("empty chain completes"), 0);
-    let mut expected = vec![b'x'; CHAIN_BEFORE_LEN];
-    expected.extend_from_slice(b"before-chain-a-");
-    expected.extend(std::iter::repeat_n(b'g', CHAIN_GUARD_LEN));
-    expected.extend_from_slice(b"--chain-b");
-    assert_eq!(plaintext, expected);
-    assert!(peer_closed, "no close_notify after the chain");
 }
 
 // ── A panicking handler ─────────────────────────────────────────────────
@@ -1595,7 +1461,7 @@ impl AsyncEventHandler for TlsForwardProxy {
                         return;
                     }
                 }
-                if client.send_nowait(&echo).is_err() {
+                if client.send(&echo).is_err() {
                     break;
                 }
             }
@@ -1620,7 +1486,7 @@ impl AsyncEventHandler for PlainEcho {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        let _ = tx.send_nowait(data);
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -1810,7 +1676,7 @@ impl AsyncEventHandler for TlsForwardToStuckSink {
             // The ack is queued before the forward is armed, but both happen
             // in this poll, before the ack's send is submitted, so the
             // client's flood arrives after the forward is armed.
-            let _ = client.send_nowait(b"a");
+            let _ = client.send(b"a");
             let _ = client.forward_to_conn(&mut sink_tx, 1 << 30).await;
         }
     }
@@ -1885,7 +1751,7 @@ impl AsyncEventHandler for TlsIdleReader {
             if n == 0 {
                 return;
             }
-            let _ = conn.send_nowait(b"a");
+            let _ = conn.send(b"a");
             loop {
                 ringline::sleep(Duration::from_secs(1)).await;
             }
@@ -1955,7 +1821,7 @@ impl AsyncEventHandler for TlsCloseWatcher {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let _report = ReportCloseOnDrop;
-            let _ = conn.send_nowait(b"a");
+            let _ = conn.send(b"a");
             let started = Instant::now();
             while started.elapsed() < Duration::from_secs(5) {
                 if conn.peer_closed() {

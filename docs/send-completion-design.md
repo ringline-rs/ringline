@@ -139,8 +139,9 @@ the send pool's memory are then leaked, since the kernel can still read them.
 Copied sends are admitted transactionally. On io_uring `DriverCtx::send`
 reserves every send-pool slot the buffer needs (`SendCopyPool::reserve_slots`
 — a count, not popped slots) before copying the first byte, so a pool `Err`
-from `ConnCtx::send` / `send_nowait` means nothing was queued or transmitted
-and the same buffer may be resent; a buffer wider than the whole pool is
+from `ConnCtx::send` (and from `send_nowait`, removed in 0.7.0-alpha.141)
+means nothing was queued or transmitted and the same buffer may be resent; a
+buffer wider than the whole pool is
 refused up front with `InvalidInput`. The hole this closes (a retry after a
 mid-buffer refusal duplicated the already-queued prefix) and the design are
 in [copied-send-reservation-design.md](copied-send-reservation-design.md).
@@ -164,6 +165,7 @@ again without submitting for the same bound.
 
 Consequence: on io_uring `DriverCtx::send` fails only before it has committed
 anything (stale token, or pool admission). TLS pool exhaustion during
-encryption is closed on io_uring: `encrypt_tls_send` admits against
-`TlsTable::ciphertext_capacity` before encrypting. A failure after rustls has
-sealed a record still fails the operation and closes the connection.
+encryption is closed on io_uring: `encrypt_tls_send` reserves the slots of
+`TlsTable::ciphertext_capacity` before encrypting and encrypts into them. A
+failure after rustls has sealed a record still fails the operation and closes
+the connection.

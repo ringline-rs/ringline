@@ -18,7 +18,7 @@ impl AsyncEventHandler for EchoHandler {
             loop {
                 let n = rx
                     .with_data(|data| {
-                        tx.send_nowait(data).ok();
+                        let _ = tx.send(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;

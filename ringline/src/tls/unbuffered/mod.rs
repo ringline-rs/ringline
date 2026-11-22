@@ -166,8 +166,8 @@ pub struct UnbufferedConn {
     /// One entry, keyed on that size: a connection alternating between two
     /// destination sizes never hits, and pays an `InsufficientSize` round-trip
     /// on every send. Correct, just worthless. It cannot happen today —
-    /// `SendCopyPool::alloc_raw` hands back the uniform `slot_size` for every
-    /// slot — but `docs/tls-unbuffered-design.md`'s chunk-size open question
+    /// `SendCopyPool::alloc_raw_reserved` hands back the uniform `slot_size`
+    /// for every slot — but `docs/tls-unbuffered-design.md`'s chunk-size open question
     /// floats giving TLS its own slot class, which would introduce exactly
     /// that. Widen the cache then, against the real io_uring shape, not
     /// speculatively now.

@@ -130,7 +130,7 @@ impl AsyncEventHandler for EchoOnceThenClose {
                 })
                 .await;
             if n > 0 {
-                let _ = conn.send_nowait(&request);
+                let _ = conn.send(&request);
             }
             // Returning closes the connection once the echo has been sent.
         }

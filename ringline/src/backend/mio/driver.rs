@@ -24,9 +24,32 @@ pub(crate) const STREAM_INTEREST: mio::Interest = mio::Interest::READABLE
     .add(mio::Interest::WRITABLE)
     .add(mio::Interest::PRIORITY);
 /// What a connection's stream is registered for.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "hermit")))]
 pub(crate) const STREAM_INTEREST: mio::Interest =
     mio::Interest::READABLE.add(mio::Interest::WRITABLE);
+/// What a connection's stream is registered for. mio's poll selector, which
+/// Hermit uses, clears an interest when it fires and restores it after an
+/// operation through mio returns `WouldBlock`; a stream registered WRITABLE
+/// therefore reports writable again after every read that drains the
+/// socket, and the loop never blocks. So a stream starts writable
+/// ([`WRITABLE_ON_DEMAND`]) and has WRITABLE added only while a write waits
+/// for room ([`WAITING_INTEREST`]).
+#[cfg(target_os = "hermit")]
+pub(crate) const STREAM_INTEREST: mio::Interest = mio::Interest::READABLE;
+
+/// What a connecting stream is registered for: WRITABLE reports the end of
+/// the connect.
+pub(crate) const CONNECT_INTEREST: mio::Interest = STREAM_INTEREST.add(mio::Interest::WRITABLE);
+
+/// What a stream is registered for while a write waits for room, where
+/// [`WRITABLE_ON_DEMAND`] holds.
+pub(crate) const WAITING_INTEREST: mio::Interest = STREAM_INTEREST.add(mio::Interest::WRITABLE);
+
+/// Whether a stream is taken as writable from the start and registers
+/// WRITABLE only while a write waits for room (Hermit; see
+/// [`STREAM_INTEREST`]). Elsewhere WRITABLE stays registered and the first
+/// writable event sets `writable`.
+pub(crate) const WRITABLE_ON_DEMAND: bool = cfg!(target_os = "hermit");
 
 /// mio token 0 is reserved for the wake pipe.
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
@@ -48,6 +71,9 @@ pub(crate) struct PendingSend {
     pub(crate) offset: usize,
     pub(crate) send_id: Option<(SendId, u32)>,
     pub(crate) permit: Option<SlotReservation>,
+    /// A `writev` that carried this entry returned `WouldBlock`, and its id
+    /// went on `Driver::room_waited_sends`.
+    pub(crate) waited_for_room: bool,
 }
 
 impl PendingSend {
@@ -58,6 +84,7 @@ impl PendingSend {
             offset: 0,
             send_id: None,
             permit: None,
+            waited_for_room: false,
         }
     }
 
@@ -68,6 +95,7 @@ impl PendingSend {
             offset: 0,
             send_id: Some((id, len)),
             permit: None,
+            waited_for_room: false,
         }
     }
 
@@ -82,6 +110,7 @@ impl PendingSend {
             offset: 0,
             send_id: Some((id, len)),
             permit: Some(permit),
+            waited_for_room: false,
         }
     }
 }
@@ -156,6 +185,10 @@ pub(crate) struct Driver {
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_queues: Vec<ConnSendState>,
     pub(crate) accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
+    /// Where this worker counts the connections it takes from `accept_rx`.
+    pub(crate) accept_state: Option<Arc<crate::acceptor::AcceptState>>,
+    /// This worker's index into `accept_state`.
+    pub(crate) worker_index: usize,
     pub(crate) wake_handle: crate::wakeup::WakeFd,
     /// Set by a disk-I/O pool thread that wrote the wake pipe, cleared by
     /// `drain_channels` before it reads the responses, so a burst of
@@ -256,10 +289,19 @@ pub(crate) struct Driver {
     /// `drain_send_completions`. The driver never touches the `Executor`
     /// itself.
     pub(crate) settled_sends: VecDeque<(SendId, io::Result<u32>)>,
+    /// Awaited sends whose entry a `writev` carried when it returned
+    /// `WouldBlock`, for the event loop to mark in the executor's completion
+    /// table before it next polls a task (`SendCompletion::waited_for_room`).
+    pub(crate) room_waited_sends: Vec<SendId>,
     /// Set whenever a copy-pool permit goes back to the pool, so the event
     /// loop can call `Executor::wake_send_capacity` once per iteration
     /// instead of once per released permit. The event loop clears it.
     pub(crate) capacity_released: bool,
+    /// Keep each connection's `room_waited` and `send_waited`, and set
+    /// `capacity_released` when a connection's queue drains: the worker's
+    /// order is `SendAdmissionOrder::Budget`, which reads them
+    /// (`send_idle`). Off under `Strict`.
+    pub(crate) track_room_waits: bool,
     /// Bound UDP sockets (one per `config.udp_bind` address).
     pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,
     /// The peer each UDP socket is `connect(2)`ed to, parallel to
@@ -527,10 +569,15 @@ impl Driver {
                 } else {
                     pool.no_huge_pages();
                 }
+                if config.send_admission_order.lets_pass() {
+                    pool.track_passing();
+                }
                 pool
             },
             send_queues: (0..max_conn).map(|_| ConnSendState::new()).collect(),
             accept_rx,
+            accept_state: config.accept_state.clone(),
+            worker_index: config.worker_index,
             // The pipe's WRITE end: handed to worker-pool threads (disk I/O,
             // resolver, spawner) so their completion wakes actually reach
             // this worker. `eventfd` is the READ end (polled by the loop) —
@@ -583,7 +630,9 @@ impl Driver {
             send_half_taken: vec![false; max_conn],
             forward_hold_cap: config.forward_hold_cap,
             settled_sends: VecDeque::new(),
+            room_waited_sends: Vec::new(),
             capacity_released: false,
+            track_room_waits: config.send_admission_order.lets_pass(),
             udp_sockets,
             udp_connected_peers,
             udp_gro: config.udp_gro,
@@ -628,7 +677,7 @@ impl Driver {
             .tls_table
             .as_mut()
             .map(|t| t as *mut _)
-            .unwrap_or(std::ptr::null_mut());
+            .unwrap_or_default();
 
         DriverCtx {
             connections: &mut self.connections,
@@ -663,6 +712,7 @@ impl Driver {
             pending_fs_opens: &mut self.pending_fs_opens,
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,
+            ticket_waiting: false,
         }
     }
 
@@ -729,7 +779,7 @@ impl Driver {
         self.clear_pending_sends(idx, crate::handler::aborted_error);
         if let Some(stream) = &self.tcp_streams[idx] {
             use std::os::fd::AsRawFd;
-            let linger = libc::linger {
+            let linger = crate::sys::linger {
                 l_onoff: 1,
                 l_linger: 0,
             };
@@ -743,7 +793,7 @@ impl Driver {
                     libc::SOL_SOCKET,
                     libc::SO_LINGER,
                     (&raw const linger).cast(),
-                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    std::mem::size_of::<crate::sys::linger>() as libc::socklen_t,
                 );
             }
         }
@@ -864,6 +914,13 @@ impl Driver {
         self.send_queues[idx].in_flight = false;
         self.send_queues[idx].close_pending = false;
         self.send_queues[idx].close_notify_deadline = None;
+        self.send_queues[idx].writable_task = None;
+        if self.track_room_waits {
+            let state = &mut self.send_queues[idx];
+            state.room_waited = false;
+            state.send_waited = false;
+            state.waited_entries = 0;
+        }
 
         // The future dropped at teardown may have owned a half, whose `Drop`
         // queues an orphan that finds a changed generation. Clear the flags
@@ -1003,6 +1060,17 @@ impl Driver {
         }
     }
 
+    /// Whether `conn_index` has nothing queued to write and its most recent
+    /// send did not wait for room in the socket: the condition
+    /// `SendAdmissionOrder::Budget` puts on the connection of a send that
+    /// passes a waiting head. mio keeps a connection's unwritten sends in
+    /// `pending_sends`, not in `ConnSendState`'s `queue` and `in_flight`.
+    /// Meaningful only while `track_room_waits` is set.
+    pub(crate) fn send_idle(&self, conn_index: u32) -> bool {
+        let idx = conn_index as usize;
+        self.pending_sends[idx].is_empty() && !self.send_queues[idx].room_waited
+    }
+
     /// Flush pending sends for a connection. Called by the event loop when
     /// the connection becomes writable.
     ///
@@ -1025,6 +1093,9 @@ impl Driver {
         };
 
         let mut total_written: u32 = 0;
+        // Under `SendAdmissionOrder::Budget`, whether this flush can end a
+        // busy queue.
+        let had_sends = self.track_room_waits && !self.pending_sends[idx].is_empty();
 
         // Use writev() to coalesce multiple pending sends into a single
         // syscall, reducing TCP segment count under pipelining.
@@ -1065,12 +1136,36 @@ impl Driver {
             }
 
             let fd = stream.as_raw_fd();
-            let result = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as i32) };
+            let result = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as _) };
 
             if result < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
+                    if WRITABLE_ON_DEMAND {
+                        let _ = self.poll.registry().reregister(
+                            stream,
+                            mio::Token(idx + 1),
+                            WAITING_INTEREST,
+                        );
+                    }
+                    // Every awaited send queued now has bytes the full socket
+                    // did not take (`SendCompletion::waited_for_room`).
+                    for entry in self.pending_sends[idx].iter_mut() {
+                        if let Some((id, _)) = entry.send_id
+                            && !std::mem::replace(&mut entry.waited_for_room, true)
+                        {
+                            self.room_waited_sends.push(id);
+                        }
+                    }
+                    // Under `SendAdmissionOrder::Budget` every send queued now
+                    // was in the write that found the socket full, so each
+                    // waited for room (`ConnSendState::room_waited`).
+                    if self.track_room_waits {
+                        let state = &mut self.send_queues[idx];
+                        state.waited_entries = self.pending_sends[idx].len();
+                        state.room_waited = true;
+                    }
                     // Queue survives this flush — keep the dirty invariant.
                     self.mark_send_dirty(idx);
                     return Ok((false, total_written));
@@ -1101,10 +1196,27 @@ impl Driver {
                             self.send_copy_pool.release_reservation(permit);
                             self.capacity_released = true;
                         }
-                        if let Some((id, len)) = entry.send_id.take() {
+                        let settled = entry.send_id.take();
+                        let awaited = settled.is_some();
+                        if let Some((id, len)) = settled {
                             self.settled_sends.push_back((id, Ok(len)));
                         }
                         self.pending_sends[idx].pop_front();
+                        // Under `SendAdmissionOrder::Budget`: this send's
+                        // wait joins the ones since the last awaited send,
+                        // and an awaited send leaves them as the
+                        // connection's `room_waited`, as io_uring's
+                        // `end_logical_send` does.
+                        if self.track_room_waits {
+                            let state = &mut self.send_queues[idx];
+                            if state.waited_entries > 0 {
+                                state.waited_entries -= 1;
+                                state.send_waited = true;
+                            }
+                            if awaited {
+                                state.room_waited = std::mem::take(&mut state.send_waited);
+                            }
+                        }
                     } else {
                         entry.offset += remaining;
                         remaining = 0;
@@ -1113,6 +1225,13 @@ impl Driver {
                     break;
                 }
             }
+        }
+
+        // All sends flushed. Under `SendAdmissionOrder::Budget` the
+        // connection is idle, so a waiter on it may now pass a waiting head:
+        // the end-of-iteration capacity wake looks for it.
+        if had_sends {
+            self.capacity_released = true;
         }
 
         // All sends flushed. A deferred half-close goes out only now, after
@@ -1129,7 +1248,9 @@ impl Driver {
         }
 
         // All sends flushed. Interest is registered once, as
-        // READABLE|WRITABLE, and never modified: dropping WRITABLE after each
+        // READABLE|WRITABLE, and never modified, except on Hermit
+        // (`WRITABLE_ON_DEMAND`), where `handle_writable` removes WRITABLE
+        // once the queue is written: dropping WRITABLE after each
         // drain and re-adding it on the next send cost two `epoll_ctl(MOD)`
         // per operation on an echo workload (#395), and a `reregister` here
         // re-reported EOF on a half-closed socket and spun the loop at 100%
@@ -1203,7 +1324,7 @@ fn bind_udp_with_reuseport(
     }
     #[cfg(not(target_os = "linux"))]
     unsafe {
-        let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+        let fd_flags = libc::fcntl(fd, libc::F_GETFD, 0);
         if fd_flags < 0 || libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0 {
             let err = io::Error::last_os_error();
             libc::close(fd);
@@ -1215,6 +1336,8 @@ fn bind_udp_with_reuseport(
     // a worker only when each worker should get its own port, and with the
     // option set the free-port search can return a port another
     // SO_REUSEPORT socket already holds, so it is left off then.
+    // Hermit has no SO_REUSEPORT, so only one worker can bind a port there.
+    #[cfg(not(target_os = "hermit"))]
     if addr.port() != 0 {
         let optval: libc::c_int = 1;
         let rc = unsafe {
@@ -1627,7 +1750,10 @@ pub(crate) mod tests {
         // Starve the pool down to exactly what was admitted.
         let mut held = Vec::new();
         while driver.send_copy_pool.free_count() > needed {
-            let (slot, _p, _l) = driver.send_copy_pool.copy_in(b"x").unwrap();
+            let (slot, _p, _l) = driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+                .unwrap();
             held.push(slot);
         }
         assert_eq!(driver.send_copy_pool.free_count(), needed);
@@ -1750,6 +1876,116 @@ pub(crate) mod tests {
             ),
             "expected an empty socket, got {err:?}"
         );
+    }
+
+    /// A driver under `Budget`, which keeps the room-wait flags, and a
+    /// connection to a client that is not reading yet.
+    fn idle_order_driver() -> (Driver, crate::wakeup::WakeHandle, u32, std::net::TcpStream) {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .send_admission_order(crate::SendAdmissionOrder::Budget { slots: 32 })
+            .build()
+            .expect("valid config");
+        let (mut driver, wake) = test_driver(&config);
+        let (conn_index, client) = attach_conn(&mut driver);
+        (driver, wake, conn_index, client)
+    }
+
+    /// More than a loopback socket's buffers take on either side, so the
+    /// write that carries it returns `WouldBlock`.
+    const ROOM_FILL: usize = 16 << 20;
+
+    /// Have `client` read `len` bytes while the driver flushes, until the
+    /// connection's queue is empty.
+    fn drain(driver: &mut Driver, conn_index: u32, client: &mut std::net::TcpStream, len: usize) {
+        let mut reader = client.try_clone().expect("clone the client");
+        let read = std::thread::spawn(move || {
+            let mut got = vec![0u8; len];
+            reader
+                .read_exact(&mut got)
+                .expect("the client reads it all");
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !driver.pending_sends[conn_index as usize].is_empty() {
+            driver.flush_sends(conn_index).expect("flush");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queue never drained"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        read.join().expect("the reading thread");
+    }
+
+    /// Under `Budget` mio keeps the flag by the rule io_uring keeps:
+    /// a send queued when a write finds the socket full waited, and an
+    /// awaited send leaves whether the sends since the previous one waited as
+    /// the connection's flag. Here both sends are awaited: the first fills
+    /// the socket, and the second, queued behind it at the `WouldBlock`, is
+    /// marked only by `waited_entries`, so the drained connection is still
+    /// not idle. An awaited send that completes without waiting makes it
+    /// idle.
+    #[test]
+    fn an_awaited_send_queued_at_a_full_socket_leaves_the_connection_not_idle() {
+        let (mut driver, _wake, conn_index, mut client) = idle_order_driver();
+        let conn = token(&driver, conn_index);
+        let ids = bounded_ids(3);
+        driver
+            .make_ctx()
+            .send_awaited(conn, &vec![b'f'; ROOM_FILL], ids[0])
+            .expect("queued");
+        driver
+            .make_ctx()
+            .send_awaited(conn, b"end", ids[1])
+            .expect("queued");
+        let (all_flushed, _) = driver.flush_sends(conn_index).expect("flush");
+        assert!(!all_flushed, "the socket filled");
+        assert!(driver.send_queues[conn_index as usize].room_waited);
+        drain(&mut driver, conn_index, &mut client, ROOM_FILL + 3);
+        assert!(
+            !driver.send_idle(conn_index),
+            "the last awaited send was queued at the full socket"
+        );
+
+        driver
+            .make_ctx()
+            .send_awaited(conn, b"x", ids[2])
+            .expect("queued");
+        drain(&mut driver, conn_index, &mut client, 1);
+        assert!(
+            driver.send_idle(conn_index),
+            "its most recent send did not wait"
+        );
+    }
+
+    /// A send without an id ends no wait: once it drains the connection is
+    /// still not idle, and its wait carries to the next awaited send, as on
+    /// io_uring; the awaited send after that makes it idle.
+    #[test]
+    fn a_send_without_an_id_carries_its_wait_to_the_next_awaited_send() {
+        let (mut driver, _wake, conn_index, mut client) = idle_order_driver();
+        let conn = token(&driver, conn_index);
+        let ids = bounded_ids(2);
+        driver
+            .make_ctx()
+            .send(conn, &vec![b'f'; ROOM_FILL])
+            .expect("queued");
+        let (all_flushed, _) = driver.flush_sends(conn_index).expect("flush");
+        assert!(!all_flushed, "the socket filled");
+        drain(&mut driver, conn_index, &mut client, ROOM_FILL);
+        assert!(!driver.send_idle(conn_index), "set when the send waited");
+
+        for (id, idle) in [(ids[0], false), (ids[1], true)] {
+            driver
+                .make_ctx()
+                .send_awaited(conn, b"x", id)
+                .expect("queued");
+            drain(&mut driver, conn_index, &mut client, 1);
+            assert_eq!(driver.send_idle(conn_index), idle);
+        }
     }
 
     /// The completion and the permit are produced together, by the flush
@@ -2449,7 +2685,7 @@ pub(crate) mod tests {
 
         let permit = driver
             .send_copy_pool
-            .reserve_slots(1)
+            .reserve_slots(crate::buffer::send_copy::SlotOwner::NONE, 1)
             .expect("a free slot to promise");
         driver.pending_sends[idx].push_back(PendingSend::bounded(Vec::new(), id, 0, permit));
         assert_eq!(driver.send_copy_pool.free_count(), 3);

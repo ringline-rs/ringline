@@ -66,8 +66,8 @@ The diagram above is generated from a checked-in, code-checked description; do
 not edit the SVG by hand. In text: the caller starts N independent workers,
 each containing one handler, executor, connection table, backend driver, and
 backend poll object. When a stream listener is configured, one centralized
-acceptor blocks in `accept4` on Linux, or polls a non-blocking listener and calls
-`accept` elsewhere, sends each accepted descriptor through a
+acceptor accepts from a non-blocking listener until it is empty, then waits in
+`poll` on the listener and the runtime's stop signal. It sends each accepted descriptor through a
 bounded per-worker channel, then writes that worker's eventfd or pipe. Optional
 service pools return results through per-worker channels and use the same
 cross-thread wake mechanism. A shared atomic shutdown flag and the per-worker
@@ -206,22 +206,31 @@ buffer that `read_tls` copies from) and feeds it to rustls; ringline copies the
 decrypted plaintext into the accumulator. `with_bytes` provides zero-copy
 slicing of the accumulator, not a reference to kernel-owned ring memory.
 
-`send_nowait` eagerly submits an owned copy and returns without a future.
-`send` also submits eagerly but returns `SendCompletion`, which waits for the
-logical send's completion. Neither form bypasses backend completion handling:
-the completion is required to release pool or slab resources and advance the
-queue. On io_uring, `send_parts` can retain guarded user memory for zero-copy
-sends; on Mio guards are consumed by copying.
+`send` eagerly submits an owned copy and returns `SendCompletion`, which waits
+for the logical send's completion; dropping it does not cancel the send.
+Backend completion handling runs either way: the completion is required to
+release pool or slab resources and advance the queue. The `build` and
+`submit_batch` of `send_parts`, and `forward_recv_buf`, return a
+`SendCompletion` the same way. On io_uring, `send_parts` can retain guarded
+user memory for zero-copy sends; on Mio guards are consumed by copying.
 
 `send_backpressured` differs from all of these in *when* it is admitted. The
 others decide at call time and fail if the send-copy pool is exhausted; this
 one joins a per-worker FIFO and submits at its turn, when the pool can cover
 the message's worst-case slot cost. That makes the peer, rather than the
 pool, set the pace — the shape a proxy forwarding a fast source to a slow
-sink wants. Admission is strictly first-come-first-served, so a large message
-cannot be starved by a stream of small ones, and it is the whole reason the
-cost is computed up front: the queue will not release a waiter until the pool
-can satisfy the number it was admitted with.
+sink wants. Under `SendAdmissionOrder::Strict` admission is first come first
+served, so a large message cannot be starved by a stream of small ones. Under
+`SendAdmissionOrder::Budget`, the default, a waiter that fits may be admitted
+ahead of an older one on another connection that does not fit, while the
+sends admitted that way hold at most the budget's slots. Either way the queue
+will not release a waiter until the pool can satisfy the number it was
+admitted with, which is why the cost is computed up front.
+
+`send_parts().submit_batch_admitted` waits in the same FIFO for a batch's
+own pool cost: one slot for a plaintext io_uring batch with copy parts, none
+for guards alone, the ciphertext bound of its length on TLS and its length on
+Mio. Its refusal returns every part, guards included.
 
 Two consequences follow from that ordering. Nothing is submitted until the
 future is polled, so the message is read at submission time rather than
@@ -283,8 +292,8 @@ Backpressure is bounded and explicit at each layer:
 - `ConnSendState` permits at most one in-flight send per connection and queues
   later sends in a `VecDeque`. This preserves stream and TLS order.
 - Send-copy-pool, zero-copy slab, task-slab, and timer-slot exhaustion surface
-  as errors. A caller using `send` can await completion; `send_nowait` reports
-  immediate admission failures. `send_backpressured` and `send_admitted` are
+  as errors. `send` reports an admission failure at once, and its caller can
+  await completion. `send_backpressured` and `send_admitted` are
   the exception: copy-pool exhaustion parks them in the worker's admission
   FIFO instead of failing them.
 - Short sends retain their backing and resubmit the remainder. Socket `EAGAIN`
@@ -300,18 +309,35 @@ queued and in-flight sends in order, cancels an armed receive, and only then
 finalizes close. Stale CQEs are normal during teardown and must release only
 their own backing without touching a reused connection.
 
-`Runtime::shutdown` sets a shared atomic flag, releases the listen gates, sets
-`SO_REUSEADDR` and calls `shutdown(SHUT_RD)` on each listener socket, and wakes
-every worker. On Linux `SHUT_RD` wakes an acceptor blocked in `accept4` and
-takes the socket out of the listening state. On other platforms `SHUT_RD` does
-not wake a blocked `accept`, so the acceptor polls a non-blocking listener. An
-acceptor polling or holding a connection sees the flag within about 100 ms. Each listener's sockets are owned
+`Runtime::shutdown` sets a shared atomic flag, releases the listen gates, raises
+the stop signal the acceptors poll, sets `SO_REUSEADDR` and calls
+`shutdown(SHUT_RD)` on each listener socket, wakes every worker, and joins the
+acceptor threads. On Linux `SHUT_RD` takes the socket out of the listening
+state. A listener from `RinglineBuilder::bind_fd` is left listening, since
+another process, such as systemd through its fd store, may hold it. An
+acceptor in `poll` wakes on the stop signal; one holding a connection no
+worker has room for sees the flag within about 1 ms, and one backing off after
+an accept error within 10 ms. Each listener's sockets are owned
 by a shared `ListenerSockets`. Every thread that passes their fd numbers to a
 syscall holds it, and the sockets close when the last holder drops it: after
 shutdown, when the acceptor thread or, in merged accept mode
 (`unstable-accept`), the workers exit. Dropping `Runtime` invokes the same idempotent path. io_uring workers
 observe shutdown after draining a CQE batch and run backend shutdown drainage;
 Mio workers finish the current event/task/send/close cycle before returning.
+
+`Runtime::stop_accepting(timeout)` stops accepting without setting the
+shutdown flag. It sets the `stopping` flag in the runtime's `AcceptState`,
+releases the listen gates, raises the stop signal, and calls `SHUT_RD` on the
+merged-mode listeners. Each acceptor exits at its next check of the flag,
+after placing a connection it holds, and calls `SHUT_RD` on its listener
+unless it came from `bind_fd`. `stop_accepting` waits for the acceptor threads
+to exit, then reads, for each worker, the number of connections placed in its
+accept channel, and waits until the worker's count of connections taken from
+the channel and installed or closed reaches it. The senders (an acceptor, or a
+merged-mode worker handing a connection to another) count a placement after a
+successful `try_send`; the worker counts after `install_accepted` on io_uring
+and after each item of `drain_channels` on mio. The workers keep running
+tasks and I/O; `Runtime::shutdown` afterwards closes what they hold.
 
 Startup failures are returned from `launch`: workers acknowledge backend
 preparation before the listener exists, and a failed worker, listener bind, or
@@ -330,19 +356,22 @@ it too. It leaves
 the accept rotation, closes its connections (on io_uring through
 `run_shutdown`), and wakes `Runtime::wait_on_signal` with
 `Signal::WorkerExited`, which shuts the runtime down so a supervisor can restart
-the process. Until then, and in a process that does not call `wait_on_signal`,
-the other workers keep serving. A worker is not replaced. Under
+the process. `Runtime::next_signal` returns the same events without shutting
+down; it reads the byte it was woken by from the panic or worker-exit pipe, so
+each event is returned once. Until `wait_on_signal` shuts the runtime down,
+and in a process that does not call it, the other workers keep serving. A
+worker is not replaced. Under
 `TaskPanicPolicy::Shutdown` a stopped worker shuts the runtime down. If
 `run_shutdown` panics, the worker drops its ring and leaks the heap memory its
 event loop owns, which the kernel can still be using.
 
-The acceptor stops only on `EBADF`, `ENOTSOCK` or `EINVAL` outside shutdown, writing the error to
-stderr and counting `acceptor_stopped`. Errors that end one pending connection retry at once.
+The acceptor stops only on `EBADF`, `ENOTSOCK` or `EINVAL` outside shutdown, logging the error at
+`error` and counting `acceptor_stopped`. Errors that end one pending connection retry at once.
 `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and errors it does not classify wait 10 ms and count
 `accept_error_backoff`. In merged accept mode (`unstable-accept`) a worker's multishot accept
 follows the same classification, with `ECANCELED` also terminal: an error that stops the
 acceptor, or `ECANCELED`, stops that listener's accept on that worker, counting `acceptor_stopped`
-outside shutdown but writing nothing to stderr, and an `EMFILE`-class error re-arms it after
+outside shutdown but logging nothing, and an `EMFILE`-class error re-arms it after
 10 ms and counts `accept_error_backoff`.
 
 ## Architectural invariants
@@ -361,7 +390,8 @@ facts:
 - Connection identity is `(index, generation)` and stale completions are
   expected.
 - Stream sends, partial-send retries, and TLS records are serialized per
-  connection. `send_nowait` still requires completion cleanup.
+  connection. A send whose `SendCompletion` was dropped still requires
+  completion cleanup.
 - SQE-referenced memory lives until its CQE, and zero-copy guard memory lives
   until the notification CQE.
 - Exactly one backend is compiled into a process. Mio must not be drawn with

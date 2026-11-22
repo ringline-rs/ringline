@@ -3,13 +3,21 @@
 //! Provides [`wait()`] to block the current thread until `SIGINT` or
 //! `SIGTERM` is received. Typically used with
 //! [`Runtime::wait_on_signal()`](crate::worker::Runtime::wait_on_signal)
-//! for one-line graceful shutdown.
+//! for one-line graceful shutdown, or with
+//! [`Runtime::next_signal()`](crate::worker::Runtime::next_signal) to decide
+//! what to do with each signal.
+//!
+//! The handlers are installed by the first wait, or by [`install()`]. Until
+//! then ringline leaves the disposition of `SIGINT` and `SIGTERM` alone; with
+//! the default action either signal ends the process. Call [`install()`] at
+//! start to catch a signal that arrives before the first wait. Installing
+//! replaces any handler already set for either signal.
 //!
 //! # Implementation
 //!
 //! Uses the self-pipe trick: a `pipe2` fd pair is created once, and
 //! `sigaction` handlers write the signal number to the pipe. [`wait()`]
-//! does a blocking `read()` on the pipe read end.
+//! polls the pipe's read end and reads the byte.
 //!
 //! # Example
 //!
@@ -35,6 +43,7 @@
 
 use std::fmt;
 use std::sync::OnceLock;
+#[cfg(not(target_os = "hermit"))]
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Pipe file descriptors: (read_end, write_end).
@@ -42,10 +51,12 @@ static PIPE: OnceLock<(i32, i32)> = OnceLock::new();
 
 /// Write end fd, also stored in an atomic for the signal handler
 /// (OnceLock is not async-signal-safe, but AtomicI32 load is).
+#[cfg(not(target_os = "hermit"))]
 static PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// A caught signal, or the reason [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal)
-/// returned.
+/// A caught signal, or the reason
+/// [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal) or
+/// [`Runtime::next_signal`](crate::Runtime::next_signal) returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Signal {
@@ -56,13 +67,15 @@ pub enum Signal {
     /// Not an OS signal: a task panicked under
     /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) and shut
     /// the runtime down. Returned only by
-    /// [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal).
+    /// [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal) and
+    /// [`Runtime::next_signal`](crate::Runtime::next_signal).
     TaskPanic,
     /// Not an OS signal: a worker stopped because of a panic in the runtime or
     /// an error from its ring or poll, and its connections are closing. Returned
     /// only by [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal),
     /// which then shuts the runtime down, so a supervisor can restart the
-    /// process.
+    /// process, and by [`Runtime::next_signal`](crate::Runtime::next_signal),
+    /// which does not shut the runtime down itself.
     WorkerExited,
 }
 
@@ -77,7 +90,41 @@ impl fmt::Display for Signal {
     }
 }
 
+/// Install the `SIGINT` and `SIGTERM` handlers now. Idempotent.
+///
+/// [`wait()`], [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal) and
+/// [`Runtime::next_signal`](crate::Runtime::next_signal) install them on their
+/// first call. Before then, with the default action, either signal ends the
+/// process. After, a signal that arrives while nothing waits is kept, and the
+/// next wait returns it. Installing replaces any handler already set for
+/// either signal.
+///
+/// # Panics
+///
+/// If creating the pipe the handlers write to fails.
+pub fn install() {
+    setup();
+}
+
 /// Install signal handlers and create the self-pipe. Idempotent.
+///
+/// Hermit has no signals and no pipes: the read end is an eventfd that never
+/// becomes readable, so a wait returns only for the runtime's own fds.
+#[cfg(target_os = "hermit")]
+fn setup() {
+    PIPE.get_or_init(|| {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "eventfd failed: {}",
+            std::io::Error::last_os_error()
+        );
+        (fd, fd)
+    });
+}
+
+/// Install signal handlers and create the self-pipe. Idempotent.
+#[cfg(not(target_os = "hermit"))]
 fn setup() {
     PIPE.get_or_init(|| {
         let mut fds = [0i32; 2];
@@ -94,7 +141,7 @@ fn setup() {
             if r == 0 {
                 // Set close-on-exec on both ends.
                 for fd in &fds {
-                    let fd_flags = libc::fcntl(*fd, libc::F_GETFD);
+                    let fd_flags = libc::fcntl(*fd, libc::F_GETFD, 0);
                     libc::fcntl(*fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
                 }
             }
@@ -103,7 +150,7 @@ fn setup() {
         assert!(ret == 0, "pipe failed: {}", std::io::Error::last_os_error());
 
         for fd in fds {
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
             unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
         }
 
@@ -126,6 +173,7 @@ fn setup() {
 }
 
 /// Async-signal-safe handler: writes the signal number to the pipe.
+#[cfg(not(target_os = "hermit"))]
 extern "C" fn signal_handler(sig: libc::c_int) {
     let fd = PIPE_WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
@@ -144,7 +192,7 @@ extern "C" fn signal_handler(sig: libc::c_int) {
 /// This is a blocking call intended for use on the main thread.
 pub fn wait() -> Signal {
     loop {
-        if let Some(signal) = wait_inner(None) {
+        if let Some(signal) = wait_inner(None, false) {
             return signal;
         }
     }
@@ -152,19 +200,35 @@ pub fn wait() -> Signal {
 
 /// Block until `SIGINT` or `SIGTERM` is received or one of the runtime's fds
 /// becomes readable: `panic_fd` returns [`Signal::TaskPanic`], and `exit_fd`
-/// returns [`Signal::WorkerExited`].
+/// returns [`Signal::WorkerExited`]. Leaves the runtime's fds readable.
 pub(crate) fn wait_or_ready(panic_fd: i32, exit_fd: i32) -> Signal {
     loop {
-        if let Some(signal) = wait_inner(Some((panic_fd, exit_fd))) {
+        if let Some(signal) = wait_inner(Some((panic_fd, exit_fd)), false) {
             return signal;
         }
     }
 }
 
+/// As [`wait_or_ready`], but reads the byte from `panic_fd` or `exit_fd` it
+/// returns for, so each byte written there is returned once.
+pub(crate) fn next_or_ready(panic_fd: i32, exit_fd: i32) -> Signal {
+    loop {
+        if let Some(signal) = wait_inner(Some((panic_fd, exit_fd)), true) {
+            return signal;
+        }
+    }
+}
+
+/// Read one byte from a non-blocking fd. False when there is none, because
+/// another waiter read it first.
+fn take_byte(fd: i32) -> bool {
+    crate::sys::read_token(fd)
+}
+
 /// Poll the signal pipe, and the runtime's panic and worker-exit fds if given,
-/// until one is readable. Returns `None` when another waiter took the signal
-/// byte first.
-fn wait_inner(runtime_fds: Option<(i32, i32)>) -> Option<Signal> {
+/// until one is readable. With `take`, reads the byte from the runtime fd it
+/// returns for. Returns `None` when another waiter took the byte first.
+fn wait_inner(runtime_fds: Option<(i32, i32)>, take: bool) -> Option<Signal> {
     setup();
 
     let (read_fd, _) = *PIPE.get().unwrap();
@@ -189,10 +253,20 @@ fn wait_inner(runtime_fds: Option<(i32, i32)>) -> Option<Signal> {
     // EINTR: interrupted by a signal we don't handle — poll again.
     while unsafe { libc::poll(fds.as_mut_ptr(), count, -1) } <= 0 {}
     if count == 3 && fds[1].revents != 0 {
-        return Some(Signal::TaskPanic);
+        if !take {
+            return Some(Signal::TaskPanic);
+        }
+        if take_byte(fds[1].fd) {
+            return Some(Signal::TaskPanic);
+        }
     }
     if count == 3 && fds[2].revents != 0 {
-        return Some(Signal::WorkerExited);
+        if !take {
+            return Some(Signal::WorkerExited);
+        }
+        if take_byte(fds[2].fd) {
+            return Some(Signal::WorkerExited);
+        }
     }
     // The pipe is process-global and never closed by ringline; an invalid or
     // broken read end would make every later poll return at once.
@@ -204,12 +278,16 @@ fn wait_inner(runtime_fds: Option<(i32, i32)>) -> Option<Signal> {
     if fds[0].revents & libc::POLLIN != 0 {
         let mut buf = [0u8; 1];
         // Non-blocking: another waiter may have taken the byte (EAGAIN).
-        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
         if n == 1 {
+            #[cfg(not(target_os = "hermit"))]
             return Some(match buf[0] as i32 {
                 libc::SIGTERM => Signal::Terminate,
                 _ => Signal::Interrupt,
             });
+            // Hermit's eventfd is never written, so this is unreachable there.
+            #[cfg(target_os = "hermit")]
+            return Some(Signal::Interrupt);
         }
     }
     None

@@ -644,7 +644,7 @@ impl TlsTable {
     /// computes through it: `handler::bounded_send_slots` for the
     /// bounded-send future and both `send_bounded`s, which hand the
     /// `required_slots` to `SendCompletions::enqueue`, and
-    /// `encrypt_tls_send` for plain TLS sends on io_uring; the
+    /// `encrypt_tls_send` for every TLS send on io_uring; the
     /// oversize-rejection test uses it too. If the FIFO admits on a
     /// different number than the backend checks, the queue will admit a
     /// message the backend then refuses — which is the failure this bound
@@ -778,11 +778,11 @@ impl TlsTable {
     /// rustls.
     ///
     /// Returns `None` when the alert was placed in `out`, or when there was
-    /// nothing to queue. Returns `Some(ciphertext)` when the pool had no slot
-    /// for it: the unbuffered engine's encrypted alert, or an empty `Vec`
-    /// from the buffered engine, where rustls still holds the alert. The
-    /// caller keeps it in `ConnSendState::close_notify_pending` and passes it
-    /// to [`retry_close_notify_queued`](Self::retry_close_notify_queued).
+    /// nothing to queue. Returns `Some(ciphertext)`, the encrypted alert and
+    /// anything rustls had queued ahead of it, when the pool had no slots for
+    /// it. The caller keeps it in `ConnSendState::close_notify_pending` and
+    /// passes it to
+    /// [`retry_close_notify_queued`](Self::retry_close_notify_queued).
     #[cfg(has_io_uring)]
     pub fn send_close_notify_queued(
         &mut self,
@@ -827,19 +827,21 @@ impl TlsTable {
             let b = tls_conn.conn.as_buffered_mut()?;
             b.send_close_notify();
             tls_conn.close_notify_sent = true;
-            // On failure the alert is still in rustls' output buffer: with
-            // no free slot the writer refuses before copying, and
-            // `wants_write()` stays true for the retry.
-            if buffered::take_tls_output_sends(
-                tls_conn,
+            // The alert leaves rustls when it is drained, so when the pool
+            // has no slot for it the bytes are kept for the retry, as on the
+            // unbuffered engine.
+            let scratch = buffered::drain_tls_output(tls_conn).ok()?;
+            if backend_uring::ciphertext_to_sends(
                 send_copy_pool,
                 conn_index,
                 generation,
+                &scratch,
                 out,
-            ) {
+            ) || scratch.is_empty()
+            {
                 None
             } else {
-                Some(Vec::new())
+                Some(scratch)
             }
         }
     }
@@ -860,27 +862,10 @@ impl TlsTable {
         retained: &[u8],
         out: &mut Vec<crate::handler::BuiltSend>,
     ) -> bool {
-        #[cfg(not(feature = "tls-buffered"))]
-        {
-            if !self.has(conn_index) {
-                return false;
-            }
-            backend_uring::ciphertext_to_sends(
-                send_copy_pool,
-                conn_index,
-                generation,
-                retained,
-                out,
-            )
+        if !self.has(conn_index) {
+            return false;
         }
-        #[cfg(feature = "tls-buffered")]
-        {
-            let _ = retained;
-            let Some(tls_conn) = self.get_mut(conn_index) else {
-                return false;
-            };
-            buffered::take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out)
-        }
+        backend_uring::ciphertext_to_sends(send_copy_pool, conn_index, generation, retained, out)
     }
 
     /// Record that a connection's close_notify was dropped: the peer will

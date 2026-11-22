@@ -91,6 +91,26 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 )]
 pub static RING_PUSH_RETRIES_PENDING: Gauge = Gauge::new();
 
+/// io_uring: which guard-only sends from one registered region name the
+/// region's buffer, for a region not shown to be in base pages only, set
+/// when the fixed-buffer send probe runs
+/// (`docs/fixed-buffer-sends.md`): 0 none (the probe has not run, or did
+/// not pass), 1 a send of one guard, 2 sends of one guard and of several.
+#[metric(
+    name = "ringline/ring/fixed_buffer_sends",
+    description = "Guard-only sends from a region not in base pages that name its buffer: 0 none, 1 one guard, 2 one or several"
+)]
+pub static FIXED_BUFFER_SENDS: Gauge = Gauge::new();
+
+/// io_uring: as `ringline/ring/fixed_buffer_sends`, for a region whose
+/// registration showed it to be in base pages only
+/// (`docs/fixed-buffer-sends.md`).
+#[metric(
+    name = "ringline/ring/fixed_buffer_sends_base_pages",
+    description = "Guard-only sends from a region in base pages that name its buffer: 0 none, 1 one guard, 2 one or several"
+)]
+pub static FIXED_BUFFER_SENDS_BASE_PAGES: Gauge = Gauge::new();
+
 // ── Index constants ─────────────────────────────────────────────
 
 /// Counter slot indices for connection metrics.
@@ -152,11 +172,10 @@ pub mod conn {
     pub const ACCEPT_ERROR_BACKOFF: usize = 9;
     /// An acceptor thread stopped because its listening socket can no longer
     /// accept (`EBADF`, `ENOTSOCK`, `EINVAL` outside shutdown). Its listener
-    /// accepts nothing afterwards; the error is also written to stderr. In
+    /// accepts nothing afterwards; the error is also logged at `error`. In
     /// merged accept mode, a worker's multishot accept on one listener
     /// stopped outside shutdown for the same errors or `ECANCELED`; that
-    /// worker accepts nothing more on that listener, and nothing is written
-    /// to stderr.
+    /// worker accepts nothing more on that listener, and nothing is logged.
     pub const ACCEPTOR_STOPPED: usize = 10;
     /// TLS connections, inbound or outbound, closed because their handshake
     /// had not completed within `ConfigBuilder::tls_handshake_timeout`.
@@ -302,10 +321,7 @@ pub mod park_abandon {
     pub const CLOSING: usize = 6;
     /// Queued or in-flight sends hold this worker's pool slots.
     pub const SENDS: usize = 7;
-    // Slot 8 has no blocker.
-    /// A send chain has SQEs in the kernel.
-    pub const CHAIN: usize = 9;
-    // Slots 10 and 11 have no blocker.
+    // Slots 8 to 11 have no blocker.
     /// The slot was recycled while the install was in flight.
     pub const SLOT_RECYCLED: usize = 12;
     /// The `FixedFdInstall` failed.
@@ -365,7 +381,13 @@ pub mod ring {
     /// blocks until a completion or the retry is due; the wait starts at
     /// 50 µs and doubles up to 10 ms.
     pub const PUSH_RETRY_WAITS: usize = 9;
-    pub const COUNT: usize = 10;
+    /// io_uring: sends built as `SEND_ZC` or `SENDMSG_ZC` from a registered
+    /// buffer (`ConfigBuilder::fixed_buffer_sends`), counted when built. A send that
+    /// waits in the send queue and is dropped when its connection closes is
+    /// counted but never submitted. A send the kernel returns short or refuses
+    /// with `EAGAIN` is resent from plain iovecs and still counted once.
+    pub const SEND_FIXED_BUFFER: usize = 10;
+    pub const COUNT: usize = 11;
 }
 
 /// Slot indices for `RECV_RING`: copies in the receive path.
@@ -399,7 +421,10 @@ pub mod recv_direct {
     /// Connections closed because their hangup peek found the stream ended
     /// with no receive in flight and nothing buffered.
     pub const HANGUP: usize = 6;
-    pub const COUNT: usize = 7;
+    /// Of `ARMED`, receives armed with `IORING_RECVSEND_POLL_FIRST`, because
+    /// the connection's previous receive left its socket empty.
+    pub const POLL_FIRST: usize = 7;
+    pub const COUNT: usize = 8;
 }
 
 /// Slot indices for `RECV_ARRIVAL`.
@@ -419,14 +444,14 @@ pub mod recv_arrival {
 /// Slot indices for per-`OpTag` completion counters: the slot *is* the
 /// discriminant.
 pub mod cqe_tag {
-    /// One past the largest `OpTag` discriminant (`Disconnect = 39`).
+    /// One past the largest `OpTag` discriminant (`SendBufInstall = 41`).
     ///
     /// Deliberately not derived from the enum: `ShardedCounterGroup::new` needs
     /// a const, and there is no const way to ask an enum for its maximum
     /// discriminant. `count_covers_every_tag` in the tests below fails if a new
     /// tag is added above this, which is the case that would otherwise drop
     /// completions silently.
-    pub const COUNT: usize = 40;
+    pub const COUNT: usize = 42;
 }
 
 /// Counter slot indices for pool exhaustion metrics.
@@ -501,6 +526,7 @@ pub fn init_metadata() {
         "pool_allocated".into(),
     );
     RECV_DIRECT.insert_metadata(recv_direct::HANGUP, "op".into(), "hangup".into());
+    RECV_DIRECT.insert_metadata(recv_direct::POLL_FIRST, "op".into(), "poll_first".into());
     RECV_RING.insert_metadata(recv_ring::BYTES_COPIED, "op".into(), "bytes_copied".into());
     CONNECTIONS.insert_metadata(conn::ACCEPTED, "op".into(), "accepted".into());
     CONNECTIONS.insert_metadata(conn::CLOSED, "op".into(), "closed".into());
@@ -593,7 +619,6 @@ pub fn init_metadata() {
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OFFERED, "op".into(), "not_offered".into());
     PARK_ABANDONED.insert_metadata(park_abandon::CLOSING, "op".into(), "closing".into());
     PARK_ABANDONED.insert_metadata(park_abandon::SENDS, "op".into(), "sends".into());
-    PARK_ABANDONED.insert_metadata(park_abandon::CHAIN, "op".into(), "chain".into());
     PARK_ABANDONED.insert_metadata(
         park_abandon::SLOT_RECYCLED,
         "op".into(),
@@ -654,6 +679,11 @@ pub fn init_metadata() {
         ring::PUSH_RETRY_WAITS,
         "op".into(),
         "push_retry_waits".into(),
+    );
+    RING.insert_metadata(
+        ring::SEND_FIXED_BUFFER,
+        "op".into(),
+        "send_fixed_buffer".into(),
     );
 
     POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
@@ -757,6 +787,7 @@ mod tests {
             ring::CQE_UNKNOWN_TAG,
             ring::SHUTDOWN_STALE,
             ring::PUSH_RETRY_WAITS,
+            ring::SEND_FIXED_BUFFER,
         ] {
             assert!(RING.increment(idx), "RING[{idx}] out of bounds");
         }

@@ -295,13 +295,15 @@ impl Ring {
 
     /// Submit a direct receive: a one-shot recv of `len` bytes into `ptr`,
     /// the spare capacity of a connection's accumulator buffer held by
-    /// `Driver::direct_recvs[slot]` until the CQE.
+    /// `Driver::direct_recvs[slot]` until the CQE. `poll_first` sets
+    /// `IORING_RECVSEND_POLL_FIRST` (`Op::Recv`).
     pub fn submit_recv_direct(
         &mut self,
         conn_index: u32,
         ptr: *mut u8,
         len: u32,
         slot: u32,
+        poll_first: bool,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvDirect, conn_index, slot);
         let entry = Sqe::new(
@@ -310,6 +312,7 @@ impl Ring {
                 buf: ptr,
                 len,
                 flags: 0,
+                poll_first,
             },
             user_data.raw(),
         );
@@ -355,6 +358,7 @@ impl Ring {
                 buf,
                 len: 1,
                 flags: libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                poll_first: false,
             },
             user_data.raw(),
         );
@@ -745,6 +749,17 @@ impl Ring {
         Ok(())
     }
 
+    /// A real fd for the connection's socket, for `send_buffer_size`. The
+    /// completion closes it.
+    pub fn submit_send_buf_install(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let ud = UserData::encode(OpTag::SendBufInstall, conn_index, generation);
+        let entry = Sqe::new(Op::FixedFdInstall { index: conn_index }, ud.raw());
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
     /// Recover a real fd for a connection whose recv is already cancelled.
     pub fn submit_park_install(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         let ud = UserData::encode(OpTag::ParkInstall, conn_index, generation);
@@ -942,6 +957,40 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit the one-shot `POLL_ADD` for `POLLOUT` that a
+    /// `SendHalf::writable` future arms while the connection's
+    /// [`submit_send_pollout`](Self::submit_send_pollout) poll is multishot
+    /// (`OpTag::SendPollProbe`).
+    pub fn submit_send_probe(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::SendPollProbe, conn_index, generation);
+        let entry = Sqe::new(
+            Op::PollAdd {
+                fd: sqe::Fd::Fixed(conn_index),
+                mask: libc::POLLOUT as u32,
+                multi: false,
+            },
+            user_data.raw(),
+        );
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
+    /// Cancel the [`submit_send_probe`](Self::submit_send_probe) of
+    /// `conn_index`, if it is still in the kernel.
+    pub fn submit_cancel_send_probe(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let target = UserData::encode(OpTag::SendPollProbe, conn_index, generation);
+        let ud = UserData::encode(OpTag::Cancel, conn_index, 0);
+        let entry = Sqe::new(
+            Op::Cancel {
+                target: target.raw(),
+            },
+            ud.raw(),
+        );
+        unsafe { self.push_sqe(&entry) }
+    }
+
     /// Cancel the armed [`submit_send_pollout`](Self::submit_send_pollout) of
     /// `conn_index`. A multishot poll holds the socket open past its `Close`.
     pub fn submit_cancel_send_pollout(
@@ -977,44 +1026,6 @@ impl Ring {
             }
         }
         Ok(())
-    }
-
-    /// Push a chain of linked SQEs atomically.
-    ///
-    /// Sets `IOSQE_IO_LINK` on all entries except the last, so the kernel
-    /// executes them sequentially. The engine queues them contiguously
-    /// (`Engine::push_chain`).
-    ///
-    /// # Safety
-    /// All SQEs must reference valid memory for the lifetime of their operations.
-    pub(crate) unsafe fn push_sqe_chain(&mut self, entries: &mut [Sqe]) -> io::Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        // A short part would be followed by the next one across a gap, and the
-        // chain's accounting does not resubmit one (#734).
-        debug_assert!(
-            entries.iter().all(|entry| match entry.op {
-                Op::Send { flags, .. } => flags == crate::completion::CHAIN_SEND_FLAGS,
-                Op::SendMsg { flags, .. } | Op::SendMsgZc { flags, .. } => {
-                    flags == crate::completion::CHAIN_SEND_FLAGS as u32
-                }
-                _ => true,
-            }),
-            "a chain part must be built with the chain send flags"
-        );
-        if entries.len() == 1 {
-            return unsafe { self.push_sqe(&entries[0]) };
-        }
-
-        // Link every entry to the next, except the last.
-        let last = entries.len() - 1;
-        for entry in entries[..last].iter_mut() {
-            debug_assert_eq!(entry.link, Link::None, "a chain sets its own links");
-            entry.link = Link::Soft;
-        }
-
-        unsafe { self.engine.push_chain(entries) }
     }
 
     /// Close fixed-file slot `fd_index` with `IORING_OP_CLOSE`: an fs file's
@@ -1074,7 +1085,9 @@ impl Ring {
         std::mem::take(&mut self.disk_cancelled)
     }
 
-    /// Submit an NVMe passthrough command via `IORING_OP_URING_CMD`.
+    /// Submit an NVMe passthrough command via `IORING_OP_URING_CMD`, with
+    /// `IORING_URING_CMD_FIXED` when the command's data is in registered
+    /// buffer `buf_index`.
     ///
     /// The `fd_index` must be a fixed file table index pointing to an opened
     /// NVMe-generic character device (`/dev/ng<X>n<Y>`).
@@ -1086,6 +1099,7 @@ impl Ring {
         &mut self,
         fd_index: u32,
         cmd: &NvmeUringCmd,
+        buf_index: Option<u16>,
         user_data: UserData,
     ) -> io::Result<()> {
         let cmd_bytes = cmd.to_bytes();
@@ -1094,6 +1108,7 @@ impl Ring {
                 fd: sqe::Fd::Fixed(fd_index),
                 cmd_op: NVME_URING_CMD_IO,
                 cmd: cmd_bytes,
+                buf_index,
             },
             user_data.raw(),
         );
@@ -1101,7 +1116,8 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a file read via `IORING_OP_READ`.
+    /// Submit a file read via `IORING_OP_READ`, or `IORING_OP_READ_FIXED`
+    /// into registered buffer `buf_index`.
     ///
     /// The `fd_index` must be a fixed file table index pointing to an opened
     /// file.
@@ -1116,22 +1132,32 @@ impl Ring {
         buf: *mut u8,
         len: u32,
         offset: u64,
+        buf_index: Option<u16>,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = Sqe::new(
-            Op::Read {
-                fd: sqe::Fd::Fixed(fd_index),
+        let fd = sqe::Fd::Fixed(fd_index);
+        let op = match buf_index {
+            None => Op::Read {
+                fd,
                 buf,
                 len,
                 offset,
             },
-            user_data.raw(),
-        );
+            Some(buf_index) => Op::ReadFixed {
+                fd,
+                buf,
+                len,
+                offset,
+                buf_index,
+            },
+        };
+        let entry = Sqe::new(op, user_data.raw());
         unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
-    /// Submit a file write via `IORING_OP_WRITE`.
+    /// Submit a file write via `IORING_OP_WRITE`, or `IORING_OP_WRITE_FIXED`
+    /// from registered buffer `buf_index`.
     ///
     /// The `fd_index` must be a fixed file table index pointing to an opened
     /// file.
@@ -1146,17 +1172,26 @@ impl Ring {
         buf: *const u8,
         len: u32,
         offset: u64,
+        buf_index: Option<u16>,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = Sqe::new(
-            Op::Write {
-                fd: sqe::Fd::Fixed(fd_index),
+        let fd = sqe::Fd::Fixed(fd_index);
+        let op = match buf_index {
+            None => Op::Write {
+                fd,
                 buf,
                 len,
                 offset,
             },
-            user_data.raw(),
-        );
+            Some(buf_index) => Op::WriteFixed {
+                fd,
+                buf,
+                len,
+                offset,
+                buf_index,
+            },
+        };
+        let entry = Sqe::new(op, user_data.raw());
         unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }

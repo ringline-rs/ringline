@@ -7,15 +7,6 @@
 #[cfg(has_io_uring)]
 pub(crate) const STREAM_SEND_FLAGS: i32 = libc::MSG_DONTWAIT;
 
-/// Msg flags for the sends of a linked chain.
-///
-/// `MSG_WAITALL`: the kernel retries a short send, and fails the link if it
-/// cannot finish, because the next SQE of the chain would otherwise follow a
-/// gap (#734). A chain part on a full socket whose peer has half-closed waits
-/// on an io-wq worker.
-#[cfg(has_io_uring)]
-pub(crate) const CHAIN_SEND_FLAGS: i32 = libc::MSG_WAITALL;
-
 /// Operation tags encoded in the upper 8 bits of user_data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -112,6 +103,18 @@ pub enum OpTag {
     /// completion releases the hold on the `Close`. Payload = connection
     /// generation.
     Disconnect = 39,
+    /// One-shot `POLL_ADD` for `POLLOUT` that a `SendHalf::writable` future
+    /// arms while the connection's `SendPollOut` is multishot, which reports
+    /// only changes. After the peer half-closes it completes at
+    /// once, with `POLLOUT` if the socket is writable then; otherwise it
+    /// completes when the socket becomes writable. A connection arms one at a
+    /// time (`ConnSendState::send_probe`), and its `Close` cancels it.
+    /// Payload = connection generation.
+    SendPollProbe = 40,
+    /// The `FixedFdInstall` of `send_buffer_size`: a real fd for the
+    /// connection's socket, read with `getsockopt(SO_SNDBUF)` and closed in
+    /// the completion. Payload = connection generation.
+    SendBufInstall = 41,
 }
 
 impl OpTag {
@@ -145,6 +148,8 @@ impl OpTag {
             37 => Some(OpTag::HangupPoll),
             38 => Some(OpTag::HangupPeek),
             39 => Some(OpTag::Disconnect),
+            40 => Some(OpTag::SendPollProbe),
+            41 => Some(OpTag::SendBufInstall),
             _ => None,
         }
     }
@@ -186,6 +191,8 @@ impl OpTag {
             OpTag::HangupPoll => "hangup_poll",
             OpTag::HangupPeek => "hangup_peek",
             OpTag::Disconnect => "disconnect",
+            OpTag::SendPollProbe => "send_poll_probe",
+            OpTag::SendBufInstall => "send_buf_install",
         }
     }
 }

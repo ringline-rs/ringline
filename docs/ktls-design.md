@@ -113,12 +113,12 @@ measured and how it differs from — and improves on — the design below. The
 original formulation is kept unchanged, because the substitution is the
 interesting part.
 
-Extend the microbenchmark harness that already exists on
-the local `bench/tls-send-microbench` branch (the one that produced the
-allocation counter) with a third arm: a real kTLS socket, keys installed by
-hand, plaintext sent with `IORING_OP_SEND` **and no `MSG_WAITALL`** — kTLS
-refuses it [P-19], so ringline's own `STREAM_SEND_FLAGS` cannot be used
-verbatim. On hv01, at 1 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
+Extend the microbenchmark harness that already exists on a local branch, not in
+the repository (the one that produced the allocation counter) with a third arm:
+a real kTLS socket, keys installed by hand, plaintext sent with
+`IORING_OP_SEND` **and no `MSG_WAITALL`** — kTLS refuses it [P-19], so
+ringline's own `STREAM_SEND_FLAGS` cannot be used verbatim. On hv01, at 1 KiB /
+16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
 
 - **bytes allocated per operation inside the measured call**, the number that
   settled the last effort. Prediction from source: the kTLS arm allocates

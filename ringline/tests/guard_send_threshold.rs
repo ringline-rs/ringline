@@ -243,11 +243,12 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
             let guard = GuardBox::new(VecGuard(value_of_len(VLEN)));
             let result = conn
                 .send_parts()
-                .build(|b| b.copy(PREFIX).guard(guard).copy(SUFFIX).submit());
+                .build(|b| b.copy(PREFIX).guard(guard).copy(SUFFIX).submit())
+                .map(drop);
             trace(port, format!("send_parts -> {result:?}"));
             if let Err(e) = result {
-                let r = conn.send_nowait(format!("ERR:{e}").as_bytes());
-                trace(port, format!("ERR send_nowait -> {r:?}"));
+                let r = conn.send(format!("ERR:{e}").as_bytes());
+                trace(port, format!("ERR send -> {r:?}"));
             }
 
             // Keep the connection open until the client finishes reading.
@@ -262,63 +263,6 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
     }
     fn create_for_worker(_id: usize) -> Self {
         GuardPartsSender
-    }
-}
-
-#[cfg(has_io_uring)]
-/// Chain variant: sends TWO scatter-gather SQEs (each copy(PREFIX) +
-/// guard(value) + copy(SUFFIX)) linked in one chain via `send_chain`.
-/// Exercises `ChainPartsBuilder::add`, whose sub-threshold guard fold is
-/// separate from `SendBuilder::submit`'s.
-struct ChainGuardPartsSender<const VLEN: usize>;
-
-#[cfg(has_io_uring)]
-impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            let port = client_port(&conn);
-            let _end = EndTrace(port);
-            trace(port, "accepted");
-            let n = conn
-                .with_data(|data| ParseResult::Consumed(data.len()))
-                .await;
-            trace(port, format!("trigger with_data -> {n} bytes"));
-            if n == 0 {
-                return;
-            }
-
-            let g1 = GuardBox::new(VecGuard(value_of_len(VLEN)));
-            let g2 = GuardBox::new(VecGuard(value_of_len(VLEN)));
-            let result = conn.send_chain_nowait(|c| {
-                c.parts()
-                    .copy(PREFIX)
-                    .guard(g1)
-                    .copy(SUFFIX)
-                    .add()
-                    .parts()
-                    .copy(PREFIX)
-                    .guard(g2)
-                    .copy(SUFFIX)
-                    .add()
-                    .finish()
-            });
-            trace(port, format!("send_chain_nowait -> {result:?}"));
-            if let Err(e) = result {
-                let r = conn.send_nowait(format!("ERR:{e}").as_bytes());
-                trace(port, format!("ERR send_nowait -> {r:?}"));
-            }
-
-            loop {
-                let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
-                if n == 0 {
-                    trace(port, "with_data -> 0 (connection ended)");
-                    break;
-                }
-            }
-        }
-    }
-    fn create_for_worker(_id: usize) -> Self {
-        ChainGuardPartsSender
     }
 }
 
@@ -350,22 +294,9 @@ fn wait_for_server(addr: &str) {
 /// Launch a `GuardPartsSender::<VLEN>` server with `config`, trigger one
 /// guard send, and assert the byte-exact `PREFIX ++ value ++ SUFFIX` echo.
 fn run_case<const VLEN: usize>(config: Config) {
-    run_case_with::<GuardPartsSender<VLEN>, VLEN>(config, 1);
-}
-
-/// Chain variant: two linked part-groups → two copies of the payload.
-/// The chain API (`send_chain_nowait`) only exists on the io_uring backend.
-#[cfg(has_io_uring)]
-fn run_case_chain<const VLEN: usize>(config: Config) {
-    run_case_with::<ChainGuardPartsSender<VLEN>, VLEN>(config, 2);
-}
-
-/// Launch `H` with `config`, trigger one send, and assert `copies`
-/// byte-exact repetitions of `PREFIX ++ value ++ SUFFIX`.
-fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Config, copies: usize) {
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<H>()
+        .launch::<GuardPartsSender<VLEN>>()
         .expect("launch failed");
     let bound = shutdown
         .bound_addr()
@@ -382,7 +313,7 @@ fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Conf
     stream.write_all(b"go").unwrap();
     stream.flush().unwrap();
 
-    let expected: Vec<u8> = expected_payload(VLEN).repeat(copies);
+    let expected: Vec<u8> = expected_payload(VLEN);
     let mut buf = vec![0u8; expected.len()];
     let mut total = 0;
     let want = expected.len();
@@ -488,34 +419,4 @@ fn guard_send_threshold_disabled_zc() {
 fn guard_send_large_value_zc() {
     let config = test_config();
     run_case::<LARGE_VALUE>(config);
-}
-
-#[cfg(has_io_uring)]
-/// Chained sub-threshold guard sends take the small-gather fold in
-/// `ChainPartsBuilder::add` (previously chain parts always paid the ZC
-/// path regardless of size).
-#[test]
-fn chain_guard_send_below_threshold_small_gather() {
-    let config = test_config();
-    run_case_chain::<SMALL_VALUE>(config);
-}
-
-/// Threshold 1: the chain fold can't fire — same payload through the
-/// chained ZC path.
-#[cfg(has_io_uring)]
-#[test]
-fn chain_guard_send_above_threshold_zc() {
-    let config = test_config_builder()
-        .send_zc_threshold(1)
-        .build()
-        .expect("valid config");
-    run_case_chain::<SMALL_VALUE>(config);
-}
-
-/// Chained large values exceed the threshold — ZC path, two linked SQEs.
-#[cfg(has_io_uring)]
-#[test]
-fn chain_guard_send_large_value_zc() {
-    let config = test_config();
-    run_case_chain::<LARGE_VALUE>(config);
 }

@@ -1,0 +1,96 @@
+# CPU per 4 KiB direct I/O read with and without a registered buffer (#841).
+# experiments/fixed-buffer-bench.rs reads at random offsets from a null_blk
+# device with no backing memory, QD reads in flight, into slots of one
+# registered region; `fixed` names the region in each buffer (READ_FIXED),
+# `plain` uses the same memory unregistered (READ). null_blk completes without
+# touching memory, so the difference is the submission path: the kernel pins
+# and unpins a plain read's page and does neither for a fixed one.
+#
+# Each round runs fixed, plain and plain again, rotating the order; the two
+# plain arms give the run-to-run floor. Before timing, a traced 1 s run per
+# mode counts the io_uring opcodes, so a fixed arm that submitted plain READs
+# shows here and not as a null result.
+#
+# Prediction: fixed submits READ_FIXED only and plain READ only; fixed costs
+# less CPU per read than plain by more than the plain-vs-plain difference.
+# Refuted if fixed submits any READ, or if fixed and plain differ by no more
+# than plain and plain do.
+#
+# Result (2026-11-16, SystemsLab 01a1e30f-34f0, debian-13-6.12 on delta, qd
+# 32, 6 rounds of 5 s): the traced second submitted 62,692 READ_FIXED for
+# fixed and 42,453 READ for plain, nothing else but the close. Median CPU per
+# read 1.054 us fixed against 1.257 us plain (0.20 us less); fixed was lower
+# in every round, by 15.0% to 18.7% (median 16.6%), while the two plain arms
+# differed by a median of 1.3% and at most 7.7%; all percentages are relative
+# to the round's mean of the two plain arms. Process CPU equalled wall time
+# in every run (one saturated worker), so CPU per read is the inverse of
+# throughput here: fixed also read about 20% more per second. This is direct
+# I/O, where a plain read pins its page; a buffered fs read copies through
+# the page cache and was not measured. One run of the spec, on one kernel.
+#
+#   systemslab submit experiments/fixed-buffer-bench.toml [-p image=debian-13-7.1]
+name = "ringline fixed-buffer direct I/O read cost ({image}, qd {qd})"
+
+[params]
+branch = "main"
+repo   = "https://github.com/ringline-rs/ringline"
+image  = "debian-13-6.12"
+qd     = "32"
+secs   = "5"
+rounds = "6"
+
+[[jobs]]
+name = "bench"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "{image}"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bench.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json 2>/dev/null; echo
+  uname -srm; rustc --version; nproc
+  sudo -n true || { echo "NO SUDO"; exit 1; }
+  git clone -q {repo} src && git -C src checkout -q {branch} && cd src && git log --oneline -1
+  cp experiments/fixed-buffer-bench.rs ringline/examples/fixed_buffer_bench.rs
+  ulimit -Sn 65536
+  cargo build --locked --release -q -p ringline --example fixed_buffer_bench || { echo "BUILD FAILED"; exit 1; }
+  B=/home/anvil/src/target/release/examples/fixed_buffer_bench
+  cd /home/anvil
+  sudo modprobe null_blk nr_devices=1 bs=4096 gb=4 || { echo "SETUP FAILED: null_blk"; exit 1; }
+  sudo udevadm settle
+  echo "nullb0 write_cache=[$(cat /sys/block/nullb0/queue/write_cache)]"
+
+  T=/sys/kernel/tracing
+  for mode in fixed plain; do
+    sudo sh -c "echo 0 > $T/tracing_on; echo > $T/trace; echo 1 > $T/events/io_uring/io_uring_submit_req/enable; echo 1 > $T/tracing_on"
+    sudo $B /dev/nullb0 1 {qd} $mode > /dev/null; rc=$?
+    sudo sh -c "echo 0 > $T/tracing_on"
+    echo "OPCODES $mode rc=$rc $(sudo grep -o 'opcode [A-Z_]*' $T/trace | sort | uniq -c | tr '\n' ' ')"
+  done
+  sudo sh -c "echo 0 > $T/events/enable"
+
+  arms="fixed plain plain2"
+  for r in $(seq 1 {rounds}); do
+    for a in $arms; do
+      mode=$a; [ "$a" = plain2 ] && mode=plain
+      line=$(sudo $B /dev/nullb0 {secs} {qd} $mode); rc=$?
+      echo "ROUND $r arm=$a rc=$rc $line"
+    done
+    arms="$(echo $arms | awk '{print $2, $3, $1}')"
+  done
+  echo ALLDONE
+} 2>&1 | tee bench.log
+grep -q '^ALLDONE' bench.log || exit 1
+! grep -qE 'rc=[1-9]|BUILD FAILED|SETUP FAILED' bench.log
+'''

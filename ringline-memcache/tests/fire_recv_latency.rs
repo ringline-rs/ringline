@@ -38,7 +38,7 @@ impl AsyncEventHandler for MissServer {
                 let n = rx
                     .with_data(|data| match data.windows(2).position(|w| w == b"\r\n") {
                         Some(end) => {
-                            let _ = tx.send_nowait(b"END\r\n");
+                            let _ = tx.send(b"END\r\n");
                             ParseResult::Consumed(end + 2)
                         }
                         None => ParseResult::NeedMore,

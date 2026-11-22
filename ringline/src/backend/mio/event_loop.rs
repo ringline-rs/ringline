@@ -178,13 +178,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             disk_io_pool,
         )?;
 
-        let executor = Executor::new(
+        let mut executor = Executor::new(
             config.max_connections,
             config.standalone_task_capacity,
             crate::runtime::TIMER_SLOTS,
             config.udp_bind.len() as u32,
             config.udp_recv_queue_capacity,
         );
+        executor.set_send_admission_order(config.send_admission_order);
         // A waker woken off this thread rings the worker's own wake fd.
         if let Some(handle) = config
             .wake_keep_alive
@@ -208,7 +209,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     pub(crate) fn prepare_run(&mut self) -> Result<(), crate::error::Error> {
         // Register the wake pipe read-end with mio Poll.
         self.driver.poll.registry().register(
-            &mut mio::unix::SourceFd(&self.driver.wake_pipe_fd),
+            &mut super::SourceFd(&self.driver.wake_pipe_fd),
             WAKE_TOKEN,
             mio::Interest::READABLE,
         )?;
@@ -377,6 +378,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         if writable {
                             self.handle_writable(conn_index);
                         }
+                        // A `writable` future checks the socket again on any
+                        // event: room, an error, a hangup, or a close the
+                        // handlers above requested.
+                        self.wake_writable(conn_index);
                     }
                 }
             }
@@ -503,7 +508,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let result = unsafe {
                 libc::read(
                     self.driver.wake_pipe_fd,
-                    drain_buf.as_mut_ptr() as *mut libc::c_void,
+                    drain_buf.as_mut_ptr().cast(),
                     drain_buf.len(),
                 )
             };
@@ -513,7 +518,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         // Re-register so we get notified again (kqueue consumes the registration).
         let _ = self.driver.poll.registry().reregister(
-            &mut mio::unix::SourceFd(&self.driver.wake_pipe_fd),
+            &mut super::SourceFd(&self.driver.wake_pipe_fd),
             WAKE_TOKEN,
             mio::Interest::READABLE,
         );
@@ -549,6 +554,112 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Install one connection from the accept channel: register it and
+    /// spawn its accept task, start its TLS handshake, or close it if the
+    /// connection table is full or registration fails.
+    fn install_accepted(&mut self, conn: crate::acceptor::AcceptedConn) {
+        let crate::acceptor::AcceptedConn {
+            fd,
+            listener,
+            peer: peer_addr,
+        } = conn;
+        let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
+
+        let conn_index = match self.driver.connections.allocate() {
+            Some(idx) => idx,
+            None => {
+                metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_TABLE_FULL);
+                unsafe {
+                    libc::close(raw_fd);
+                }
+                return;
+            }
+        };
+
+        // Set peer address.
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.peer_addr = Some(peer_addr);
+            cs.listener = Some(listener);
+        }
+
+        // Convert raw fd to mio TcpStream.
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
+        std_stream.set_nonblocking(true).ok();
+        if self.driver.tcp_nodelay {
+            std_stream.set_nodelay(true).ok();
+        }
+        let mut mio_stream = mio::net::TcpStream::from_std(std_stream);
+
+        // READABLE *and* WRITABLE, registered once and never modified
+        // afterwards, except on Hermit (`WRITABLE_ON_DEMAND`), where WRITABLE
+        // is added at `WouldBlock` and removed in `handle_writable` once the
+        // queue is written. mio's epoll is edge-triggered, so a socket that is
+        // already writable fires one edge and then stays quiet — it does
+        // not spin. The outbound path (`handler.rs`) has always registered
+        // both; matching it here is what lets the per-send `epoll_ctl`
+        // toggling go away (ringline-rs/ringline#395).
+        let mio_token = mio::Token(conn_index as usize + 1);
+        if self
+            .driver
+            .poll
+            .registry()
+            .register(
+                &mut mio_stream,
+                mio_token,
+                crate::backend::mio::driver::STREAM_INTEREST,
+            )
+            .is_err()
+        {
+            metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_REGISTER_FAILED);
+            self.driver.connections.release(conn_index);
+            return;
+        }
+
+        let idx = conn_index as usize;
+        self.driver.tcp_streams[idx] = Some(mio_stream);
+        self.driver.accumulators.reset(conn_index);
+        self.driver.arrival[idx].clear();
+        // Defensive: a freshly allocated slot should have an empty send
+        // queue, but if anything survived, its awaited sends must be
+        // failed and its permits returned rather than dropped.
+        self.driver.clear_pending_sends(idx, || {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection slot reused by a new accept",
+            )
+        });
+        self.driver.writable[idx] = crate::backend::mio::driver::WRITABLE_ON_DEMAND;
+
+        // TLS path: defer accept until handshake completes in handle_readable.
+        if let Some(ref mut tls_table) = self.driver.tls_table
+            && tls_table.has_server_config_for(Some(listener))
+        {
+            if tls_table.create(conn_index, Some(listener)).is_err() {
+                self.driver.close_connection(conn_index);
+            } else {
+                let generation = self.driver.connections.generation(conn_index);
+                let driver = &mut self.driver;
+                driver
+                    .handshake_deadlines
+                    .arm(conn_index, generation, |i, g| {
+                        crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+                    });
+            }
+            return;
+        }
+
+        // Plaintext path: mark connection as established and spawn accept task.
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.established = true;
+        }
+
+        metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
+        metrics::CONNECTIONS_ACTIVE.increment();
+
+        // Spawn async accept task.
+        self.spawn_accept_task(conn_index);
+    }
+
     /// Drain all cross-thread channels: accept, resolve, spawn, blocking.
     ///
     /// Called unconditionally on every event loop iteration (not just on wake
@@ -575,107 +686,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Some(ref rx) => rx.try_recv().ok(),
                 None => None,
             };
-            let Some(crate::acceptor::AcceptedConn {
-                fd,
-                listener,
-                peer: peer_addr,
-            }) = item
-            else {
+            let Some(conn) = item else {
                 break;
             };
-            let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
-
-            let conn_index = match self.driver.connections.allocate() {
-                Some(idx) => idx,
-                None => {
-                    metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_TABLE_FULL);
-                    unsafe {
-                        libc::close(raw_fd);
-                    }
-                    continue;
-                }
-            };
-
-            // Set peer address.
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.peer_addr = Some(peer_addr);
-                cs.listener = Some(listener);
+            self.install_accepted(conn);
+            // After the install, so `Runtime::stop_accepting` returns only
+            // once the connection has a task or is closed.
+            if let Some(ref accept) = self.driver.accept_state {
+                accept.handled(self.driver.worker_index);
             }
-
-            // Convert raw fd to mio TcpStream.
-            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
-            std_stream.set_nonblocking(true).ok();
-            if self.driver.tcp_nodelay {
-                std_stream.set_nodelay(true).ok();
-            }
-            let mut mio_stream = mio::net::TcpStream::from_std(std_stream);
-
-            // READABLE *and* WRITABLE, registered once and never modified
-            // afterwards. mio's epoll is edge-triggered, so a socket that is
-            // already writable fires one edge and then stays quiet — it does
-            // not spin. The outbound path (`handler.rs`) has always registered
-            // both; matching it here is what lets the per-send `epoll_ctl`
-            // toggling go away (ringline-rs/ringline#395).
-            let mio_token = mio::Token(conn_index as usize + 1);
-            if self
-                .driver
-                .poll
-                .registry()
-                .register(
-                    &mut mio_stream,
-                    mio_token,
-                    crate::backend::mio::driver::STREAM_INTEREST,
-                )
-                .is_err()
-            {
-                metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_REGISTER_FAILED);
-                self.driver.connections.release(conn_index);
-                continue;
-            }
-
-            let idx = conn_index as usize;
-            self.driver.tcp_streams[idx] = Some(mio_stream);
-            self.driver.accumulators.reset(conn_index);
-            self.driver.arrival[idx].clear();
-            // Defensive: a freshly allocated slot should have an empty send
-            // queue, but if anything survived, its awaited sends must be
-            // failed and its permits returned rather than dropped.
-            self.driver.clear_pending_sends(idx, || {
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "connection slot reused by a new accept",
-                )
-            });
-            self.driver.writable[idx] = false;
-
-            // TLS path: defer accept until handshake completes in handle_readable.
-            if let Some(ref mut tls_table) = self.driver.tls_table
-                && tls_table.has_server_config_for(Some(listener))
-            {
-                if tls_table.create(conn_index, Some(listener)).is_err() {
-                    self.driver.close_connection(conn_index);
-                } else {
-                    let generation = self.driver.connections.generation(conn_index);
-                    let driver = &mut self.driver;
-                    driver
-                        .handshake_deadlines
-                        .arm(conn_index, generation, |i, g| {
-                            crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
-                        });
-                }
-                continue;
-            }
-
-            // Plaintext path: mark connection as established and spawn accept task.
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.established = true;
-            }
-
-            metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
-            metrics::CONNECTIONS_ACTIVE.increment();
-
-            // Spawn async accept task.
-            self.spawn_accept_task(conn_index);
         }
 
         // Drain DNS resolve responses.
@@ -1288,6 +1307,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         crate::backend::mio::driver::STREAM_INTEREST,
                     );
                 }
+                if crate::backend::mio::driver::WRITABLE_ON_DEMAND {
+                    self.driver.writable[idx] = true;
+                }
 
                 // Set TCP_NODELAY if configured.
                 if self.driver.tcp_nodelay
@@ -1341,6 +1363,40 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.writable[idx] = true;
         if let Err(e) = self.driver.flush_sends(conn_index) {
             self.fail_connection_on_send_error(conn_index, e);
+            return;
+        }
+        // The queue is written: stop waiting for room.
+        if crate::backend::mio::driver::WRITABLE_ON_DEMAND
+            && self.driver.writable[idx]
+            && let Some(stream) = self.driver.tcp_streams[idx].as_mut()
+        {
+            let _ = self.driver.poll.registry().reregister(
+                stream,
+                mio::Token(idx + 1),
+                crate::backend::mio::driver::STREAM_INTEREST,
+            );
+        }
+    }
+
+    /// Wake the task of a `writable` future waiting on `conn_index`, which
+    /// polls the socket again.
+    fn wake_writable(&mut self, conn_index: u32) {
+        if let Some(task) = self
+            .driver
+            .send_queues
+            .get_mut(conn_index as usize)
+            .and_then(|state| state.writable_task.take())
+        {
+            self.executor.wake_task(task);
+        }
+    }
+
+    /// Mark in the completion table the awaited sends a `writev` found the
+    /// socket full for (`Driver::room_waited_sends`), before any task reads
+    /// `SendCompletion::waited_for_room`.
+    fn mark_room_waited_sends(&mut self) {
+        for id in self.driver.room_waited_sends.drain(..) {
+            self.executor.send_completions.mark_send_waited_for_room(id);
         }
     }
 
@@ -1492,13 +1548,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             // Interest is registered once at accept/connect as
-            // READABLE|WRITABLE and never modified, so there is nothing to arm
-            // here. If we already know the socket is writable, flush now.
+            // READABLE|WRITABLE and never modified (on Hermit, WRITABLE is
+            // added by `flush_sends` at `WouldBlock`), so there is nothing to
+            // arm here. If we already know the socket is writable, flush now.
             if self.driver.writable[idx]
                 && let Err(e) = self.driver.flush_sends(conn_index)
             {
                 self.fail_connection_on_send_error(conn_index, e);
                 continue;
+            }
+            // A `writable` future waits until the queue is written.
+            if self.driver.pending_sends[idx].is_empty() {
+                self.wake_writable(conn_index);
             }
             if !self.driver.pending_sends[idx].is_empty() && !self.driver.sends_dirty_flag[idx] {
                 self.driver.sends_dirty_flag[idx] = true;
@@ -1598,6 +1659,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.forward_done[idx] = Some(Ok(st.forwarded));
             }
             self.driver.forward_resume_flag[idx] = false;
+            // A `writable` future on another task than the connection's,
+            // which `remove_connection` drops, polls again and finds the slot
+            // released.
+            self.wake_writable(conn_index);
 
             // Drops the connection's task if it is still alive, with the
             // driver state installed so the futures it holds clean up as
@@ -1617,11 +1682,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// [`drain_send_completions`](Self::drain_send_completions).
     ///
     /// Separate from the loop body so the tests can drive it directly.
+    ///
+    /// Under `SendAdmissionOrder::Budget` it also runs when the admission
+    /// queue asks for a scan (`Executor::send_scan_due`): a waiter can become
+    /// able to pass the head without any permit coming back.
     fn wake_capacity_if_released(&mut self) {
-        if self.driver.capacity_released {
+        if self.driver.capacity_released || self.executor.send_scan_due() {
             self.driver.capacity_released = false;
+            let driver = &self.driver;
             self.executor
-                .wake_send_capacity(self.driver.send_copy_pool.free_count());
+                .wake_send_capacity_in(&driver.send_copy_pool, |conn| driver.send_idle(conn));
         }
     }
 
@@ -1638,6 +1708,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// `capacity_released` wherever a permit goes back, and the run loop
     /// issues one `wake_send_capacity` per iteration (see step 8a).
     fn drain_send_completions(&mut self) {
+        self.mark_room_waited_sends();
         loop {
             let mut delivered = false;
             while let Some((id, result)) = self.driver.settled_sends.pop_front() {
@@ -1755,6 +1826,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // behind (for example, a closed connection's timer slot), so tasks
         // polled in this pass can reuse it.
         crate::fs::release_orphans(&mut self.driver, &mut self.executor);
+        self.mark_room_waited_sends();
         // Form raw pointers once and access driver/executor exclusively through
         // them for the duration of this method. This avoids Stacked Borrows
         // violations: accessing self.driver or self.executor directly after
@@ -2367,7 +2439,7 @@ mod tests {
             .join(format!(".ringline-mio-open-flags-{}", std::process::id()));
         std::fs::write(&path, [0u8; 4096]).unwrap();
         let getfl = |fd: &std::os::fd::OwnedFd| unsafe {
-            libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(fd), libc::F_GETFL)
+            libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(fd), libc::F_GETFL, 0)
         };
         let seq = el.executor.begin_disk_io(0);
         let (index, _) = el
@@ -3061,6 +3133,76 @@ mod tests {
         read_in_batch(&mut el, &mut client, conn_index, b"c\n", at(base, 3));
         assert_eq!(read_line(&mut el, ctx), Some((at(base, 2), at(base, 2))));
         assert_eq!(read_line(&mut el, ctx), Some((at(base, 2), at(base, 3))));
+    }
+
+    /// An awaited send that is refused after its id is registered, or a
+    /// `build` or `submit_batch` that sends nothing, leaves no entry in the
+    /// completion table: no completion would ever free it. Mio refuses a
+    /// plain send only on a stale or aborted connection; it never runs out
+    /// of pool for one.
+    #[test]
+    fn a_refused_awaited_send_leaves_no_entry() {
+        use crate::handler::SendPart;
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        let conn = ConnCtx::new(conn_index, generation);
+        el.driver.send_queues[conn_index as usize].aborted = true;
+        let kind = |r: io::Result<crate::SendCompletion>| r.err().map(|e| e.kind());
+        let batch_kind = |r: io::Result<(usize, crate::SendCompletion)>| r.err().map(|e| e.kind());
+        crate::runtime::io::with_driver_state(&mut el.driver, &mut el.executor, |_, _| {
+            for _ in 0..10 {
+                // Refused by the driver after the id is registered.
+                assert_eq!(kind(stale.send(b"x")), Some(io::ErrorKind::NotConnected));
+                let aborted = Some(io::ErrorKind::ConnectionAborted);
+                assert_eq!(kind(conn.send(b"x")), aborted);
+                assert_eq!(kind(conn.forward_recv_buf(b"x")), aborted);
+                assert_eq!(
+                    kind(conn.send_parts().build(|b| b.copy(b"x").submit())),
+                    aborted
+                );
+                assert_eq!(
+                    batch_kind(conn.send_parts().submit_batch(vec![SendPart::Copy(b"x")])),
+                    aborted
+                );
+
+                // Refused before an id is registered.
+                let invalid = Some(io::ErrorKind::InvalidInput);
+                assert_eq!(kind(conn.send_parts().build(|b| b.submit())), invalid);
+                let unsubmitted = conn.send_parts().build(|b| {
+                    let _unsubmitted = b.copy(b"x");
+                    Ok(())
+                });
+                assert_eq!(kind(unsubmitted), invalid);
+                assert_eq!(
+                    batch_kind(conn.send_parts().submit_batch(Vec::new())),
+                    invalid
+                );
+            }
+        });
+        assert_eq!(el.executor.send_completions.live(), 0);
+    }
+
+    /// A `build` closure that panics leaves no entry in the completion
+    /// table. Mio registers the id only after the closure returns.
+    #[test]
+    fn a_panicking_build_closure_leaves_no_entry() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        for _ in 0..10 {
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::runtime::io::with_driver_state(&mut el.driver, &mut el.executor, |_, _| {
+                    conn.send_parts()
+                        .build(|_b| -> io::Result<()> { panic!("a build closure panics") })
+                })
+            }));
+            assert!(built.is_err(), "the panic reached the caller");
+        }
+        assert_eq!(el.executor.send_completions.live(), 0);
     }
 
     /// `finish_close` empties the slot's arrival log.
@@ -3800,5 +3942,132 @@ mod tests {
             el.driver.tcp_streams[conn_index as usize].is_none(),
             "the close finalized"
         );
+    }
+
+    // ── `SendHalf::writable` ──────────────────────────────────────────
+
+    /// Write to `conn_index`'s socket directly until a zero-timeout
+    /// `poll(2)` reports it not writable, so that a gate on it waits. macOS
+    /// grows a loopback send buffer that fills, so one write to `WouldBlock`
+    /// is not enough there.
+    fn fill_socket(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let stream = el.driver.tcp_streams[conn_index as usize]
+            .as_mut()
+            .expect("an attached stream");
+        let chunk = [7u8; 1 << 16];
+        for _ in 0..500 {
+            loop {
+                match stream.write(&chunk) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("fill: {e}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            let mut pfd = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one valid `pollfd` for the call, and a zero timeout.
+            if unsafe { libc::poll(&mut pfd, 1, 0) } == 0 {
+                return;
+            }
+        }
+        panic!("the socket still polls writable after 500 fills");
+    }
+
+    /// What a `writable` task resolved with, as an error kind.
+    type GateSeen = std::rc::Rc<std::cell::Cell<Option<Result<(), io::ErrorKind>>>>;
+
+    /// Run `ctx.writable()` in a standalone task until it parks or resolves;
+    /// returns its result's cell and the task's id.
+    fn gate_task(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> (GateSeen, u32) {
+        let seen: GateSeen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = seen.clone();
+        let idx = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                let result = ctx.writable().await;
+                record.set(Some(result.map_err(|e| e.kind())));
+            }))
+            .expect("a free standalone slot");
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+        el.poll_ready_tasks();
+        (seen, idx | STANDALONE_BIT)
+    }
+
+    /// `abort` wakes a gate waiting in another task: with no event on the
+    /// connection and no release yet, its next poll finds the connection
+    /// aborted.
+    #[test]
+    fn an_abort_wakes_a_waiting_writable_gate() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        fill_socket(&mut el, conn_index);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (seen, _) = gate_task(&mut el, ctx);
+        assert_eq!(seen.get(), None, "the socket is full");
+        in_poll(&mut el, || ctx.abort());
+        el.poll_ready_tasks();
+        assert_eq!(seen.get(), Some(Err(io::ErrorKind::ConnectionAborted)));
+    }
+
+    /// Two gates on one connection: the first registers, the second does,
+    /// the first registers again, and the second is dropped. The drop leaves
+    /// the first's registration, which is not its own.
+    #[test]
+    fn a_second_writable_gate_dropped_leaves_the_first_registered() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        fill_socket(&mut el, conn_index);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (first, first_task) = gate_task(&mut el, ctx);
+        let release = std::rc::Rc::new(std::cell::Cell::new(false));
+        let released = release.clone();
+        let second = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                let mut gate = Box::pin(ctx.writable());
+                std::future::poll_fn(|cx| {
+                    if released.get() {
+                        return std::task::Poll::Ready(());
+                    }
+                    let _ = gate.as_mut().poll(cx);
+                    std::task::Poll::Pending
+                })
+                .await;
+            }))
+            .expect("a free standalone slot")
+            | STANDALONE_BIT;
+        el.executor.ready_queue.push_back(second);
+        el.poll_ready_tasks();
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert_eq!(
+            state.writable_task,
+            Some(second),
+            "the second registered last"
+        );
+        assert!(el.executor.wake_task(first_task), "the first is parked");
+        el.poll_ready_tasks();
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].writable_task,
+            Some(first_task)
+        );
+        release.set(true);
+        assert!(el.executor.wake_task(second), "the second is parked");
+        el.poll_ready_tasks();
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].writable_task,
+            Some(first_task),
+            "the second gate's drop cleared the first's registration"
+        );
+        assert_eq!(first.get(), None);
     }
 }

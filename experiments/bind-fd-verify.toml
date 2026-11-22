@@ -1,0 +1,96 @@
+name = "bind_fd verify on {image} ({ref})"
+# Verifies `RinglineBuilder::bind_fd` on the io_uring backend
+# (docs/journal/2026-11-listener-handoff.md, PR 2):
+#   systemslab submit experiments/bind-fd-verify.toml -p ref=<branch or sha>
+#
+# - green: tests/bind_fd.rs passes, and with `unstable-accept` the merged-mode
+#   refusal test runs too.
+# - bind-fd-verify-shut-rd.patch makes `ListenerSockets::shut_down` call
+#   `SHUT_RD` on a socket from `bind_fd`. On Linux that takes the socket out
+#   of the listening state, so
+#   `a_listener_from_an_fd_keeps_listening_after_shutdown` must fail. A pass
+#   means the test does not reach the case. macOS keeps a listener listening
+#   after `SHUT_RD`, so only Linux can show this.
+# Then the whole ringline suite and the io_uring lint and doc gates run.
+
+[params]
+image = "debian-13-6.12"
+ref = "bind-fd"
+repo = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "vm"
+tags = ["hypervisor", "x86_64"]
+
+[[jobs.steps]]
+uses = "anvil-vm"
+
+[jobs.steps.with]
+shape = "auto.c"
+image = "{image}"
+memory_gib = 8
+gpu = false
+boot_timeout = 600
+payload_timeout = 7200
+artifacts = ["/tmp/job/run.log"]
+payload = '''
+set -o pipefail
+mkdir -p /tmp/job
+echo 1 > /tmp/job/status
+{
+  echo "== guest =="; uname -r; nproc; grep PRETTY /etc/os-release
+  if ! command -v cc >/dev/null || ! command -v git >/dev/null; then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential git curl >/dev/null
+  fi
+  if ! command -v cargo >/dev/null; then
+    curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal -c clippy -c rustfmt
+    . "$HOME/.cargo/env"
+  fi
+  cargo --version
+  ulimit -Sn 65536
+  # On disk, not in /tmp: /tmp is tmpfs on these images.
+  export CARGO_BUILD_JOBS=8
+  git clone -q {repo} "$HOME/src" || exit 1
+  cd "$HOME/src" && git checkout -q {ref} || exit 1
+  git log --oneline -1
+  # A mio build would run none of the code under test.
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  backend=$(./target/debug/bench-server --print-backend)
+  echo "backend=$backend"
+  run_bind_fd() {
+    # Not `-q`: it makes the harness print dots, not one line per test.
+    cargo test --locked -p ringline $2 --test bind_fd -- --test-threads=1 > /tmp/job/$1.out 2>&1
+    echo "$1_rc=$?" | tee -a /tmp/job/rc.txt
+    grep -E "^test |test result|panicked" /tmp/job/$1.out
+  }
+  run_bind_fd green ""
+  run_bind_fd merged "--features unstable-accept"
+  grep -q "a_listener_from_an_fd_is_refused_in_merged_mode ... ok" /tmp/job/merged.out
+  echo "merged_ran=$?" | tee -a /tmp/job/rc.txt
+  git apply experiments/bind-fd-verify-shut-rd.patch && run_bind_fd shutrd ""
+  git checkout -q -- ringline/src
+  cargo test --locked -p ringline > /tmp/job/full.out 2>&1
+  echo "full_rc=$?" | tee -a /tmp/job/rc.txt
+  grep -E "^test result|FAILED|panicked" /tmp/job/full.out | sort | uniq -c | sort -rn | head -20
+  cargo fmt --all --check; echo "gate_fmt=$?" | tee -a /tmp/job/rc.txt
+  cargo clippy --locked -p ringline --all-targets -- -D warnings > /tmp/job/clippy.out 2>&1; echo "gate_clippy=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/clippy.out
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ringline > /tmp/job/doc.out 2>&1; echo "gate_doc=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/doc.out
+  fail=0
+  [ "$backend" = "io_uring" ] || { echo "FAIL backend $backend"; fail=1; }
+  grep -q "^green_rc=0" /tmp/job/rc.txt || { echo "FAIL green"; fail=1; }
+  grep -q "^merged_rc=0" /tmp/job/rc.txt || { echo "FAIL merged"; fail=1; }
+  grep -q "^merged_ran=0" /tmp/job/rc.txt || { echo "FAIL merged test did not run"; fail=1; }
+  # The mutation counts as red only if the test under check failed, not if
+  # the patched tree failed to build.
+  grep -qE "^    a_listener_from_an_fd_keeps_listening_after_shutdown$" /tmp/job/shutrd.out || { echo "FAIL shutrd: the test did not fail with SHUT_RD"; fail=1; }
+  for gate in full_rc gate_fmt gate_clippy gate_doc; do
+    grep -q "^$gate=0" /tmp/job/rc.txt && echo "ok   $gate" || { echo "FAIL $gate"; fail=1; }
+  done
+  echo "verdict_fail=$fail"
+  echo $fail > /tmp/job/status
+} 2>&1 | tee /tmp/job/run.log
+exit "$(cat /tmp/job/status)"
+'''

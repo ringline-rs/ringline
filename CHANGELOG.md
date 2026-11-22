@@ -9,6 +9,175 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The mio backend builds for `x86_64-unknown-hermit` (Hermit unikernels), with
+  `--features force-mio`. Building it needs `[patch.crates-io]` entries for
+  `ring` and `linkme-impl` with Hermit support: stock `ring` 0.17 does not
+  build its assembly or C for Hermit, and stock `linkme` (used by
+  `metriken`) has no Hermit `distributed_slice`. `linkme` requires
+  `linkme-impl` at exactly its own version, so the locked `linkme` must
+  match the patched `linkme-impl` (for example `cargo update -p linkme
+  --precise 0.3.37`). The `libc` requirement is
+  now 0.2.190, the first release with public `iovec` fields on Hermit. TCP
+  and UDP listeners and connections work; on Hermit:
+  - Hermit has no Unix-domain sockets: binding a Unix listener fails at
+    `socket(2)`, and `connect_unix` returns `Unsupported` as on every mio
+    target. Process spawn, kill and wait return `Unsupported`.
+  - File and direct I/O work on files in Hermit's file systems. Hermit has no
+    `pread` or `pwrite`, so each positional read or write seeks and then reads
+    or writes under one process-wide lock. Positional reads and writes do
+    not run in parallel. `O_DSYNC` and `O_DIRECT` are not passed;
+    `fs::rename` returns `ENOSYS`. Hermit's RAM file system ignores
+    `O_TRUNC`, so `fs::create` on an existing file keeps its old bytes.
+  - `SO_REUSEPORT` is not set, so a UDP address serves one worker. TCP
+    listeners, accepted on one thread by the mio backend, take any worker
+    count. `RLIMIT_NOFILE` is not checked or raised.
+  - There are no signals: `signal::wait()` blocks forever, and
+    `Runtime::wait_on_signal()` and `Runtime::next_signal()` return only for
+    a task panic or a worker exit.
+  - A stream registers `WRITABLE` only while a write waits for room, since
+    mio's poll selector, which Hermit uses, reports a stream registered
+    `WRITABLE` as writable after every read.
+  - `RinglineBuilder::bind_fd` cannot check that the socket is a stream
+    socket (Hermit has no `SO_TYPE`), so a datagram socket fails later.
+- `ConfigBuilder::fixed_buffer_sends`, on by default (#841). On io_uring, a
+  send whose parts are all guards in one registered region names the
+  region's buffer with `IORING_RECVSEND_FIXED_BUF`: a send of one guard as
+  `SEND_ZC`, a send of several as `SENDMSG_ZC`. The kernel then takes the
+  pages from the registered buffer instead of looking up and pinning them on
+  each send.
+  - A probe of the running kernel decides, once per process. It runs at the
+    first launch with `registered_regions`, the first
+    `Runtime::register_region` or the first `Runtime::fixed_buffer_sends`,
+    whichever comes first. The kernel must take the flag on the send's
+    opcode (`SEND_ZC` from Linux 6.0, `SENDMSG_ZC` from 6.15). It must also
+    charge such a send to the socket's send buffer by the bytes sent:
+    from Linux 6.3, kernels without the fix to `io_sg_from_iter` charge a send
+    from a huge page by its offset in the page, which stalls the connection.
+    On those kernels sends from a region keep using plain iovecs, unless the
+    region is in base pages only: private anonymous memory advised
+    `MADV_NOHUGEPAGE` before it was first touched, with no huge page in it,
+    as `/proc/self/smaps` shows at registration, while no multi-page folio
+    size below a PMD is set to `always`. Sends from such a region are
+    charged correctly on every kernel and use its buffer wherever the kernel
+    takes the flag and the probe's base-page result is `Enabled`.
+  - Each registration logs one line through the `log` crate saying whether
+    the region's sends use its buffer, for which sends, and if not why (at
+    `debug` when they do; when they do not, at `warn` for the first region
+    of its kind and at `debug` after that). The probe sets the
+    gauges `ringline/ring/fixed_buffer_sends` and
+    `ringline/ring/fixed_buffer_sends_base_pages` (0 no fixed sends, 1 one
+    guard, 2 one or several guards).
+  - `Runtime::fixed_buffer_sends` returns the result for a region not in base
+    pages only as a `FixedBufferSends`, and
+    `Runtime::region_fixed_buffer_sends(id)` the result that applies to a
+    registered region; `Enabled { multi_guard }` says whether sends of
+    several guards use the buffer too.
+    `ringline/ring` `op=send_fixed_buffer` counts the sends.
+  - The probe maps 6 MiB, collapses a 2 MiB transparent huge page inside it,
+    maps four base pages advised `MADV_NOHUGEPAGE`, and registers both on a
+    ring of its own. Without a huge page its result for other regions is
+    `Inconclusive` and the base-page result is still measured; without
+    `RLIMIT_MEMLOCK` room for it both are `Inconclusive`, and fixed sends
+    stay off.
+  - Changed for existing callers, with the default config: each launch, until
+    the probe has run, raises the process's soft `RLIMIT_MEMLOCK` when it is
+    below what the workers need plus the probe's charge (2 MiB and four base
+    pages, plus a small ring on a kernel that charges rings), to that sum if
+    the hard limit
+    allows, whether or not regions are registered.
+    A guard-only send whose guards all name one region now holds the region's
+    slot until it completes, including while it waits in the send queue.
+    `Runtime::unregister_region` called before such a send is submitted makes
+    it fail with `EFAULT` and closes the connection, so await those sends
+    first, or turn the setting off.
+
+- `Runtime::next_signal()`: waits for `SIGINT`, `SIGTERM`, a task panic or a
+  worker stop, as `Runtime::wait_on_signal` does, and returns it without
+  shutting the runtime down itself. The first task panic under
+  `TaskPanicPolicy::Shutdown`, and each worker stop, is returned once. With
+  `stop_accepting`, it lets a server wait for `SIGTERM`, stop accepting,
+  finish its work and then call `shutdown`.
+- `signal::install()`: installs the `SIGINT` and `SIGTERM` handlers now.
+  Before they are installed, by this or by the first wait, either signal ends
+  the process if its action is the default.
+- `Runtime::stop_accepting(timeout)`: stops every listener accepting without
+  shutting the workers down, and returns once each acceptor thread has exited
+  and each running worker has taken the connections already placed in its
+  accept channel (spawned their accept tasks, or closed them). The workers
+  keep serving their connections until `Runtime::shutdown`. A listener from
+  `bind_fd` keeps listening, so new connections wait in its backlog for the
+  next process; a listener from `bind`, `bind_unix` or `bind_tls` is shut
+  down with `SHUT_RD`. It returns `TimedOut` if an acceptor has not exited,
+  or a worker has not taken its connections, within `timeout`, and
+  `Deadlock` on a worker thread. After it, `ListenHandle` calls return an
+  error.
+- `RinglineBuilder::bind_fd`: a listener on a socket the caller made or
+  received, such as one systemd passes in `LISTEN_FDS` or keeps in its fd
+  store. It must be a bound, unconnected `SOCK_STREAM` socket in `AF_INET`,
+  `AF_INET6` or `AF_UNIX`, and may already be listening. The runtime never
+  calls `shutdown(SHUT_RD)` on it, so it keeps listening after
+  `Runtime::shutdown` and connections wait in its backlog for the next
+  process. The runtime sets close-on-exec, `O_NONBLOCK` and `SO_REUSEADDR`
+  on the socket and calls `listen(2)` with `ConfigBuilder::backlog`. It works
+  with `defer_listen()`. `launch()` refuses it under the `unstable-accept`
+  feature's `AcceptMode::Merged` on io_uring.
+- `SendAdmissionOrder` and `ConfigBuilder::send_admission_order`: the order in
+  which each worker admits `send_admitted` and `send_backpressured` sends that
+  wait for send-pool capacity. `Strict` admits only the oldest waiter.
+  `Budget { slots }` (default 32) also admits a waiter that fits ahead of an
+  older waiter on another connection that does not. A waiter passes only while
+  the slots held by passed sends, with its own, are at most min(`slots`, pool
+  slots - the head's need), and only when its connection has no send queued or
+  in flight and its last send did not wait for room in the socket. Sends on
+  one connection are admitted in order under either. `build()` refuses
+  `Budget { slots: 0 }`.
+- `AsyncSendBuilder::submit_batch_admitted`: a batch of `SendPart`s that
+  waits in the worker's admission FIFO for its own send-pool cost, as
+  `send_admitted` waits for a copied send's, and is submitted once admitted.
+  On io_uring a plaintext batch with copy parts waits for one slot, a batch of
+  guards alone joins no FIFO, and a TLS batch waits for the ciphertext bound
+  of its length; on mio a batch waits for its length. A refusal is a
+  `BatchRefused`, which returns every part, guards included, and converts to
+  an `io::Error`; `BatchAdmission::into_parts` takes the parts back from a
+  waiting batch, after a timeout for example. On a plaintext io_uring
+  connection a full send slab, checked once the batch is admitted, is refused
+  with `WouldBlock`. `submit_batch` is unchanged.
+- `ConfigBuilder::zero_copy_hold_cap` (default 16): once a worker's send
+  slab is over half used, a guarded send on a connection that holds that
+  many slab entries is refused. A zero-copy send holds its entry until the
+  peer has acknowledged the bytes, so before this cap peers that stopped
+  reading could take every entry, and every zero-copy send on the worker
+  failed. The cap does not prevent a full slab: with the defaults, 17
+  connections whose peers do not read can still fill the 512 entries.
+  `submit_batch_admitted` returns the parts with `WouldBlock`, so
+  the caller can send their bytes as a copy; `submit_batch` and `build` fail
+  with `Other` and drop the guards. Entries of coalesced copy
+  sends and of `forward_recv_buf` count toward the cap; `forward_recv_buf`
+  itself is not refused at it, and `forward_to_conn` copies a chunk whose
+  sink is at the cap. A connection that sends many guarded batches now has
+  the ones past the cap refused once the slab is over half used, even when
+  that connection's own entries are what put it over half used.
+  `SendHalf::zero_copy_capped` and
+  `Connection::zero_copy_capped` report whether a guarded send would be
+  refused now, so a caller of `submit_batch` or `build` can copy instead.
+  ringline-redis's and ringline-memcache's guarded sets and `Client::flush`
+  do: at the cap they send the bytes as one copy send. The guarded sets wait
+  for send-pool capacity; `flush` fails with `Other` when the pool cannot take
+  the copy now, or `InvalidInput` when it is wider than the whole pool.
+  `usize::MAX` turns the cap off.
+- `SendHalf::writable` and `Connection::writable`: wait until the socket
+  reports room (`POLLOUT`), after the connection's queued sends have been
+  handed to the kernel, without taking a send-pool slot. A server that sends
+  a large reply in pieces awaits it before each piece, so a peer that stops
+  reading holds no pool slots for the pieces it has not taken. The future
+  borrows its half (or the whole `Connection`) mutably, so a task that reads
+  while it waits splits the connection first. It has no bound of its own;
+  wrap it in `ringline::timeout`.
+- `SendHalf::send_buffer_size` and `Connection::send_buffer_size`: the
+  socket's `SO_SNDBUF`, for sizing those pieces. On io_uring it is one round
+  trip through the ring (`IORING_OP_FIXED_FD_INSTALL`).
+- `SendCompletion` (`SendFuture` in 0.6) implements `Debug`, showing the
+  connection the send targets and whether its result is known.
 - `ringline::buf`: the buffer traits the disk reads and writes take by
   value (#825). `IoBuf` (a write's source) is implemented for `Vec<u8>`,
   `BytesMut`, `Bytes`, `AlignedBuf` and `AlignedBytes`; `IoBufMut` (a read's destination)
@@ -26,6 +195,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `IoBufAligned` marks a buffer whose start is a multiple of 4096 bytes;
   direct I/O reads and writes take only such buffers, such as `AlignedBuf`
   and `AlignedBytes`.
+- `IoBuf::region`: a disk buffer whose memory is in a region registered
+  with `Runtime::register_region` returns its `RegionId` (#841). On
+  io_uring, fs and direct I/O reads and writes from it are then
+  `IORING_OP_READ_FIXED` / `IORING_OP_WRITE_FIXED`, and NVMe commands set
+  `IORING_URING_CMD_FIXED`, so a direct I/O or NVMe operation does not pin
+  and unpin the buffer's pages. A buffered fs read or write pins nothing
+  either way. A buffer whose range is not inside the region it names is
+  refused with `InvalidInput`. The method defaults to
+  `RegionId::UNREGISTERED`. The mio backend ignores it.
 - `nvme_lba_size(device)` returns the namespace's logical block size, which
   `open_nvme_device` now reads with Identify Namespace.
 - `SendHalf::send_admitted` and `Connection::send_admitted`, returning an
@@ -70,7 +248,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rings to the limit instead of failing with `Error::ResourceLimit`. It halves
   `cq_entries` until the rings fit, down to 1024, and lowers `sq_entries` and
   `max_connections` left at their defaults in proportion (`cq / 16` and
-  `cq * 16000 / 65536`), and writes one line to stderr naming the sizes. At
+  `cq * 16000 / 65536`), and logs one line at `warn` naming the sizes. At
   the 8 MiB systemd sets by default, four workers run at 32768 CQ entries,
   2048 SQ entries and 8000 connections each, where the defaults need about
   10 MiB. Sizes set on the builder are kept: a `cq_entries` set there is
@@ -179,7 +357,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   socket refused, usually `ENOTCONN` on a socket already in `TCP_CLOSE`
   after a reset or a retransmission timeout.
 - `yield_now()` wakes the calling task and returns `Pending` once, so a task
-  that makes many `send_nowait` calls without awaiting anything lets the
+  that makes many `send` calls without awaiting anything lets the
   worker poll its other queued tasks and process I/O between batches. Callers
   had each written this future themselves. Tasks woken by I/O or timers
   processed during the yield are polled after the yielding task resumes, and
@@ -349,20 +527,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once. `with_data` is unchanged and still reports `0` for both. First PR of
   the series that lands #318 (design:
   `docs/backpressured-sends-series-design.md`).
-- `SendHalf::send_backpressured` and `BackpressuredSend`: a send that
-  waits for send-pool capacity instead of failing when the pool is full.
-  Admission is first-come-first-served per worker, so a large message cannot
-  be starved by a stream of small ones, and a message that could never fit
-  the pool is rejected with `InvalidInput` before it joins the queue rather
-  than waiting forever. Nothing is submitted until the future is polled, so
-  dropping one you never awaited does nothing; dropping a parked one hands
-  the queue to the next waiter. `send` is unchanged and still fails fast —
-  use it when a full pool means you would rather shed the message than wait.
-  On a TLS connection admission is sized by the *ciphertext* bound. Final PR
-  of the series that lands #318.
+- `SendHalf::send_backpressured` and `BackpressuredSend`: a send that waits
+  for send-pool capacity instead of failing when the pool is full. Under
+  `SendAdmissionOrder::Strict` admission is first come first served per
+  worker, so a large message cannot be starved by a stream of small ones; a
+  message that could never fit the pool is rejected with `InvalidInput` before
+  it joins the queue rather than waiting forever. Nothing is submitted until
+  the future is polled, so dropping one you never awaited does nothing;
+  dropping a parked one hands the queue to the next waiter. `send` is
+  unchanged and still fails fast — use it when a full pool means you would
+  rather shed the message than wait. On a TLS connection admission is sized by
+  the *ciphertext* bound. Final PR of the series that lands #318.
+
+### Performance
+
+- io_uring: after a direct receive on a TCP connection returns bytes and
+  leaves the socket empty (no `IORING_CQE_F_SOCK_NONEMPTY`), the next
+  receive is armed with `IORING_RECVSEND_POLL_FIRST`, which skips a receive
+  attempt that would find the socket empty (#840). In a one-worker echo at
+  depth 1 over loopback on Linux 6.12, server CPU per byte fell 1.9% at
+  64-byte messages and 1.2% at 16 KiB. `ringline/recv_direct` `op=poll_first`
+  counts these receives.
 
 ### Changed
 
+- **Breaking:** ringline writes its messages through the `log` crate instead
+  of to stderr, so nothing appears unless the application installs a logger
+  (for example `env_logger`). Of the messages 0.6 printed, a worker that could
+  not be pinned to its CPU is now at `error`, and its launch error carries the
+  same text and no longer the OS error code; the `loop_diag` lines are at
+  `info`; and ringline's line for a task panic is at `error`. The panic hook
+  still prints the panic itself.
+
+- Bounded sends (`send_admitted`, `send_backpressured`) are admitted under
+  `SendAdmissionOrder::Budget { slots: 32 }` by default, so one can be
+  admitted ahead of an older waiter on another connection when the older one
+  does not fit the send pool; before, admission was strictly first come first
+  served per worker. Sends on one connection keep their order. Set
+  `ConfigBuilder::send_admission_order(SendAdmissionOrder::Strict)` to keep
+  strict order across connections.
+- Waiting bounded sends queue per connection. When one is admitted, the next
+  waiting on the same connection takes its place in the worker's admission
+  order, ahead of sends on other connections that started waiting after the
+  first.
+- A plain send (`send`, `send_parts().build`, `submit_batch`,
+  `forward_recv_buf`) made while a bounded send waits for send-pool slots on
+  the same connection is refused with `Other` ("a bounded send waits on this
+  connection"), on both backends; before, it went out ahead of the waiting
+  send. Nothing is queued, so the same buffer can be sent once the waiting
+  send is admitted. On io_uring a plaintext send of guards only at or above
+  `send_zc_threshold` (a batch, `forward_recv_buf` of the whole accumulator,
+  or a `forward_to_conn` chunk sent zero-copy) takes no send-pool slot, is
+  not refused, and goes out ahead of the waiting send. On io_uring a
+  `forward_to_conn` chunk below `send_zc_threshold`, or copied at
+  `zero_copy_hold_cap`, is refused the same way: the forward resolves `Other`
+  and the chunk stays on the source. On mio `forward_to_conn` is not refused
+  and can go out ahead of a waiting send.
+- `close()` fails every bounded send still waiting for send-pool slots on the
+  connection with `NotConnected` ("connection is closing"). Before, it stayed
+  queued: it was sent ahead of the close once it won capacity, or failed when
+  the connection was released.
+- `Runtime::shutdown` (and dropping the `Runtime`) returns once every
+  pool-mode acceptor thread has exited, so a pool-mode listener's port is
+  free when it returns. It may block for up to 10 ms while an acceptor
+  finishes.
+- **Breaking:** `forward_recv_buf` on `Connection` and `SendHalf` (on
+  `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`, resolving with
+  `data.len()`, instead of `io::Result<()>`. `send_parts().build(f)`
+  (`send_parts` on `ConnCtx` in 0.6) returns `io::Result<SendCompletion>`,
+  resolving with the total length of the parts; `f` still ends with
+  `submit()`. `submit_batch_await` is renamed `submit_batch` and returns
+  `io::Result<(usize, SendCompletion)>` (`SendFuture` in 0.6). Drop the
+  completion where the caller does not wait for the send; dropping it does not
+  cancel the send. A `build` whose parts carry no bytes is refused with
+  `InvalidInput`; in 0.6 on an io_uring plaintext connection one with at least
+  one part took a pool slot and broke the queue (see Fixed); one with no
+  parts, one on TLS, and any on mio sent nothing and returned `Ok`. So is a
+  `build` closure that returns `Ok` without a successful `submit`, including
+  one that discards `submit`'s error; mio used to send the parts of one that
+  never called `submit`.
 - **Breaking:** the direct I/O API is the `direct_io` module, with the same
   shapes as `fs` (#845): `direct_io::open(path)` and
   `open_with(path, options)` return an `OpenFuture` that resolves to a
@@ -726,19 +969,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tested) move 0.04-0.07 more per value byte. On mio, pipelined frames gain
   in some runs and not others. `with_bytes` readers are unchanged.
 - ringline requires `ringline-tls` 0.1.2. On the unbuffered engine (the
-  default), a TLS 1.3 send through `send`, `send_nowait` or
+  default), a TLS 1.3 send through `send` or
   `send_backpressured` costs 1 copy instead of 2 with the ring provider, and
   with aws-lc-rs on ChaCha20-Poly1305 or in FIPS mode: rustls seals the
   record in the send-pool slot (io_uring) or the queued buffer (mio). With
   aws-lc-rs on an AES-GCM suite outside FIPS mode it costs no copy: rustls
-  seals from the plaintext slice into the destination. `send_parts` and
-  `send_chain` gather their parts first and cost one more copy in each case.
+  seals from the plaintext slice into the destination. `send_parts`
+  gathers its parts first and costs one more copy in each case.
   ringline's builders use ring; the aws-lc-rs cases apply to a configuration
   built with that provider and passed to `TlsConfig::from_rustls`. On
   receive, rustls lends each decrypted record from ringline's ciphertext
   buffer instead of copying it out, on either TLS version and with any
   provider. TLS 1.2, or TLS 1.3 with another provider, still costs 2 copies
-  through `send` and 3 through `send_parts` and `send_chain`. The buffered
+  through `send` and 3 through `send_parts`. The buffered
   engine is unchanged.
 - **Breaking:** TLS and QUIC use ringline's forks of rustls and quinn-proto:
   `ringline-tls` 0.1 (ringline-rs/rustls, a fork of rustls 0.23.46) and
@@ -885,7 +1128,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which a plaintext connection (`H2AsyncConn::from_conn` over `connect`)
   needs. Over TLS it copies as many bytes as before and allocates less.
 - On io_uring, a copy send wider than one send-pool slot (`send`,
-  `send_nowait`, `send_backpressured`), and TLS ciphertext from one send
+  `send_backpressured`), and TLS ciphertext from one send
   that fills two or more slots, go to the kernel as one `sendmsg` over up to
   32 of their slots when nothing else is in flight on the connection; with
   the send slab full, the first slot goes alone, as before. Before, the
@@ -971,8 +1214,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   no `iou-wrk` thread. Before, 16 stalled sends to half-closed peers held 16
   threads, which `iowq_max_workers` does not cap. A send that fills its socket
   costs more ring enters, and the `ringline/pool` counter `send_eagain` now counts
-  ordinary backpressure. A `send_chain` keeps `MSG_WAITALL`, and holds a thread
-  while a part waits on a half-closed peer (#605).
+  ordinary backpressure (#605).
 
 - **Breaking (`ringline-quic`):** the `QuicEndpoint` methods that read the
   clock now take `now: Instant` as their first argument, as `flush`,
@@ -1147,6 +1389,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** io_uring: `send_chain` on `Connection` and `SendHalf`
+  (`send_chain` and `send_chain_nowait` on `ConnCtx` in 0.6), its builders
+  `SendChainBuilder` and `ChainPartsBuilder`, and
+  `ConfigBuilder::max_chain_length`. Sends on a connection go out in the
+  order they are made, and a send that fails closes the connection and fails
+  the sends queued behind it, as a failed chain did. Replace a chain with
+  `send` calls one after another and await the last `SendCompletion`. Parts
+  that fit one `send_parts(..).submit_batch(..)` can go as one batch with one
+  completion: at most 32 parts and 8 guard parts, and on a plaintext
+  connection the copy parts must fit one send-pool slot. A chain that found
+  the pool short sent none of its parts; successive `send` calls can send
+  the first parts before a later one is refused. A chain part's
+  `MSG_WAITALL` send held an io-wq thread while it waited on a half-closed
+  peer; no send does that now.
+- **Breaking:** `metrics::park_abandon::CHAIN` and the `chain` op of
+  `ringline/park_abandoned`. Slots 8 to 11 are unused.
+
 - **Breaking:** `fs::read` and `fs::write`, which took a raw pointer
   (#825). Use `fs::read_into` and `fs::write_from` (see Changed).
 
@@ -1254,7 +1513,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   did nothing. On mio `forward_held` worked on every connection and
   `set_recv_sink` on every plaintext one (`enable_recv_forward` did nothing),
   and code that used them there no longer compiles. Echo or forward with
-  `with_data` and `send_nowait` or `forward_recv_buf`, or with
+  `with_data` and `send` or `forward_recv_buf`, or with
   `forward_to_conn`. A recv sink is replaced by copying out of `with_data`
   into the caller's buffer, which on mio is one copy more than the sink.
   On io_uring every replacement for `run_direct_echo` wakes a task per
@@ -1298,9 +1557,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ones. UDP `recv_batch_timed` is unchanged. Client latency is timed with
   `Instant`. Remove `.timestamps(..)` and `.kernel_timestamps(..)` calls and
   the `timestamps` feature from `Cargo.toml`.
+- **Breaking:** `send_nowait` and `send_chain_nowait` on `Connection` and
+  `SendHalf` (on `ConnCtx` in 0.6), and the `AsyncSendBuilder::submit_batch`
+  that returned no completion. Replace `send_nowait(data)` with `send(data)`
+  and drop the `SendCompletion` it returns: dropping it does not cancel the
+  send, and `send` returns the same errors at the call. Drop it at once: a
+  `SendCompletion` kept alive, in a `let _sent =` binding or a `match` arm
+  `Ok(_)`, wakes its task when the send completes. `Ok(())` patterns become
+  `Ok(_)`. `send_chain_nowait` is removed with `send_chain` (see the
+  `send_chain` entry above).
+  `submit_batch_await` is now `submit_batch` (see Changed): drop its
+  completion where the caller does not wait for the send. A batch that carries
+  no bytes is refused with `InvalidInput`. The old `submit_batch` returned
+  `Ok(0)` for one with no parts; in 0.6 on an io_uring plaintext connection
+  one with at least one part took a pool slot and broke the queue (see Fixed),
+  and on TLS or mio it sent nothing.
 
 ### Fixed
 
+- Linux: `physical_core_count()`, and so the default worker count, counted
+  only the cores below the lowest-numbered offline CPU (#974). Releases from
+  0.2.0 have this. On a host booted with `nosmt` that numbers SMT siblings
+  adjacently, every odd CPU is offline and the count was 1. On such a host
+  `launch()` failed when two or more workers with `pin_to_core` on (the
+  default) pinned a worker to an offline CPU. Before 0.2.0 the default
+  worker count was the online CPU count, `launch()` succeeded, and each
+  worker pinned to an offline CPU exited, so the connections assigned to it
+  were closed. When `core_offset` plus the worker count exceeds the physical
+  cores, this can still happen, because those workers pin raw logical ids.
+- io_uring: an `ENOMEM` from registering memory that fits within the
+  `RLIMIT_MEMLOCK` soft limit by itself, a buffer added through
+  `Runtime::register_region` or a ring's regions at setup, no longer says the
+  limit is too low for that memory and suggests `ulimit -l` with its size, a
+  limit the process already has. It now says that if the limit is the cause,
+  memory already charged used the rest of it, including the regions
+  registered on the process's other rings (for a worker's ring at setup, the
+  same regions on the other workers' rings). An `ENOMEM` from
+  `Runtime::register_region` also gives the regions already registered and
+  the total the rings need with the new one, and names what that total
+  leaves out, including the fixed-buffer send probe's buffers and ring.
+  0.6.3 to 0.6.12 gave advice sized to that memory alone: registering a
+  32 GiB arena in 1 GiB regions with 8 workers under a 31 GiB limit failed
+  at the fourth region with "Raise it with `ulimit -l 1048576`".
 - io_uring: the `ringline/bytes` counter with `op=sent` now counts every
   TLS record a connection sends, handshake and alert records and every
   ciphertext chunk of an application send (#846). Every 0.6 release counted
@@ -1355,7 +1653,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   UDP re-arm or merged accept arm, which kept the worker from blocking at
   all. The gauge `ringline/ring/push_retries_pending` shows how many are
   owed, `ringline/ring` `op=push_retry_waits` counts the
-  waits, and after 1 s of refusals the worker writes one line to stderr.
+  waits, and after 1 s of refusals the worker logs one line at `warn`.
 - io_uring: an fs, direct I/O or NVMe call no longer fails when the ring
   refuses its submission (#877). A call that found the submission queue full
   and whose inline submit failed with `Interrupted`, `EBUSY` or `EAGAIN`
@@ -1490,16 +1788,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   had gone. At worker exit, requests the pool has not started are now answered
   `ECANCELED` without running. A worker whose pool is still running such a
   read or write when the 10 s run out leaks its event loop and tasks, as on
-  io_uring, closes its sockets and accept queue, and writes a line to stderr
+  io_uring, closes its sockets and accept queue, and logs a line at `warn`
   (#856).
-- io_uring: a guard part of a send on a Unix-domain connection is sent with
-  a plain `sendmsg`. Before, it went out as `SENDMSG_ZC`, which the kernel
-  refuses on a Unix socket with `EOPNOTSUPP`, and the send failed and closed
-  the connection. That covered a `send_parts` or `send_chain` part with a
-  guard, when the send totalled at least `send_zc_threshold` bytes or a
-  smaller one could not be gathered into a pool slot. The kernel copies the
-  guard's bytes into the socket, so the guard is released when the send
-  completes, with no notification to wait for (#829).
+- io_uring: a guard part of a send on a Unix-domain connection is sent with a
+  plain `sendmsg`. Before, it went out as `SENDMSG_ZC`, which the kernel refuses
+  on a Unix socket with `EOPNOTSUPP`, and the send failed and closed the
+  connection. That covered a `send_parts` part with a guard, when the send
+  totalled at least `send_zc_threshold` bytes or a smaller one could not be
+  gathered into a pool slot. The kernel copies the guard's bytes into the
+  socket, so the guard is released when the send completes, with no notification
+  to wait for (#829).
 - The acceptor thread no longer exits on an `accept` error that ends one
   pending connection or clears when an fd or memory frees: `ENOBUFS`,
   `ENOMEM`, the errors Linux's `accept4` passes through from the new socket
@@ -1507,7 +1805,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ENONET`, `EOPNOTSUPP`, `ENOPROTOOPT`) and `ETIMEDOUT`.
   Before, any of these ended the thread with nothing logged, and its listener
   accepted nothing while the workers ran. It now stops only on `EBADF`,
-  `ENOTSOCK` or `EINVAL` outside shutdown, writing the error to stderr and
+  `ENOTSOCK` or `EINVAL` outside shutdown, logging the error at `error` and
   counting `acceptor_stopped`; `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and
   any errno it does not classify wait 10 ms, are counted as
   `accept_error_backoff`, and accept again (#828).
@@ -1520,7 +1818,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   freed memory to disk. An operation a cancel does not end, such as one
   already running on io-wq, is waited for; a worker with one still running
   when the bound runs out leaks its event loop and its tasks instead of
-  dropping them, and writes a line to stderr (#824). A worker that leaks its
+  dropping them, and logs a line at `warn` (#824). A worker that leaks its
   event loop, here or after a panic in its exit drain, releases its
   references to the blocking, resolver and spawner pools, so their threads
   still exit.
@@ -1617,8 +1915,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reader still reading the peer's reply. A plaintext send, a zero-copy
   send and a plaintext coalesced run left the connection open after
   draining the queue behind the failed send, so a later send reached the
-  peer after a gap; a TLS chunk, a TLS run and a chain closed it without
-  recording why. Whichever of a send and a receive on a reset socket the
+  peer after a gap; a TLS chunk and a TLS run closed it without recording
+  why. Whichever of a send and a receive on a reset socket the
   kernel runs first takes the socket's error and the other reports a plain
   end of stream, so a reader whose connection's send took the error
   resolved `Ok(0)`, documented as a clean peer close. Found by the
@@ -1659,8 +1957,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   retried. The refusal set the write half back to `Open` and relied on the
   application calling `shutdown_write` again, which nothing does, so the FIN
   the public doc promises was dropped under submission-queue pressure; every
-  other refused SQE on the send path is retried or returned to the caller as
-  an error (`send_chain`), and `shutdown_write` returns nothing. The write half
+  other refused SQE on the send path is retried, and `shutdown_write`
+  returns nothing. The write half
   now reads `Shutdown` from the request on, the Close waits for the FIN's
   completion as it does for an accepted one, and the SQE is pushed again
   from the event loop on the close-retry backoff. Found by the send-path
@@ -1701,42 +1999,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
   F8).
 
-- Docs: `SendHalf::send` and `send_nowait` name the `NotConnected` errors
-  and both backends' pool behaviour; `send_parts` states the 32-part and
-  8-guard limits, the small-guard fold, the send-slab error and the TLS
-  path; `ConfigBuilder::send_slab_slots` says coalesced copy runs hold an entry
-  too, and `max_chain_length` that it bounds `send_chain` only;
-  `WriteHalf::Shutdown` says `send_backpressured` refuses in that state.
-  The four backpressured-sends design docs say the TLS ciphertext bound
-  gates plain TLS sends on io_uring, the series design docs carry a note
-  pointing at the renames since, and the 2026-09 journal entries list their
-  closed follow-ups as closed. The dead `ConnSendState::close_send_count`
-  field is removed. Found by the send-path audit
-  (`docs/journal/2026-11-send-path-audit.md`, F9, F12, F14).
+- Docs: `SendHalf::send` names the `NotConnected` errors and both backends' pool
+  behaviour; `send_parts` states the 32-part and 8-guard limits, the small-guard
+  fold, the send-slab error and the TLS path; `ConfigBuilder::send_slab_slots`
+  says coalesced copy runs hold an entry too; `WriteHalf::Shutdown` says
+  `send_backpressured` refuses in that state. The four backpressured-sends
+  design docs say the TLS ciphertext bound gates plain TLS sends on io_uring,
+  the series design docs carry a note pointing at the renames since, and the
+  2026-09 journal entries list their closed follow-ups as closed. The dead
+  `ConnSendState::close_send_count` field is removed. Found by the send-path
+  audit (`docs/journal/2026-11-send-path-audit.md`, F9, F12, F14).
 
-- io_uring: on a plaintext connection, a copy-only `send_parts` batch, a
-  `send_chain` copy, or a copy-only chain part whose copy data is wider
-  than one send-pool slot is rejected with `InvalidInput`, as the same data
-  beside a guard part already was. It was reported as `Other("send copy
-  pool exhausted")`, the error a caller following the `send` contract
-  retries, for a batch that can never fit. A TLS batch is encrypted into as
-  many slots as it needs and is unaffected. `SendHalf::send_parts`,
-  `AsyncSendBuilder::submit_batch` and `send_chain` document the one-slot
-  limit.
+- io_uring: on a plaintext connection, a copy-only `send_parts` batch whose copy
+  data is wider than one send-pool slot is rejected with `InvalidInput`, as the
+  same data beside a guard part already was. It was reported as `Other("send
+  copy pool exhausted")`, the error a caller following the `send` contract
+  retries, for a batch that can never fit. A TLS batch is encrypted into as many
+  slots as it needs and is unaffected. `SendHalf::send_parts` and
+  `AsyncSendBuilder::submit_batch` document the one-slot limit. Found by the
+  send-path audit (`docs/journal/2026-11-send-path-audit.md`, F13).
+
+- io_uring: a `send_parts` batch whose parts carry no bytes is refused with
+  `InvalidInput` (see Changed). On a plaintext connection, one with at least
+  one part took a send-pool slot and pushed a zero-length Send SQE, whose
+  result 0 the completion handler read as a failed send: every send queued
+  behind it on the connection was discarded with `ConnectionAborted`, the
+  connection stayed open, and later sends reached the peer after the gap. One
+  with no parts sent nothing, and mio sent nothing for either already. No
+  in-tree caller sends such a batch; `ringline-redis` sends an empty value as
+  an empty part beside a non-empty prefix and suffix, which was unaffected.
   Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
-  F13).
-
-- io_uring: a `send_parts` batch whose parts carry no bytes (through
-  `build` or `submit_batch`; `submit_batch_await` already rejected it)
-  queues nothing, as a `send` of an empty buffer does on a plaintext
-  connection. It took a send-pool slot and pushed a zero-length Send SQE,
-  whose result 0 the completion handler read as a failed send: every send
-  queued behind it on the connection was discarded with `ConnectionAborted`,
-  the connection stayed open, and later sends reached the peer after the
-  gap. mio sent nothing for such a batch already. No in-tree caller sends
-  such a batch; `ringline-redis` sends an empty value as an empty part
-  beside a non-empty prefix and suffix, which was unaffected. Found by the
-  send-path audit (`docs/journal/2026-11-send-path-audit.md`, F7).
+  F7).
 
 - io_uring: a TLS close that finds the send pool exhausted no longer drops
   its close_notify and records it as sent. The alert needs one pool slot;
@@ -1759,19 +2052,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ciphertext queued for it, so the next send would be rejected by the peer
   as `bad_record_mac`; the reachable failure is the traffic keys exhausted
   on TLS 1.2 AES-GCM (on by default) after 2^24 records, which TLS 1.2
-  cannot rekey. `SendHalf::send` and `send_nowait` document the rule. Found
+  cannot rekey. `SendHalf::send` documents the rule. Found
   by the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F4).
-
-- io_uring: `shutdown_write` while a `send_chain` is active defers the FIN
-  until the chain completes. It deferred only behind in-flight and queued
-  sends, and a chain sets neither, so a `send_chain_nowait` of parts larger
-  than the socket's free send-buffer space followed by `shutdown_write` in
-  the same poll pushed the Shutdown SQE beside the chain's linked parts: the
-  FIN went out behind the bytes already in the buffer, the remaining parts
-  failed with `EPIPE`, and the peer read a prefix followed by a clean FIN.
-  The deferred FIN is submitted when the chain completes, as it already was
-  when the queue drained. Found by the send-path audit
-  (`docs/journal/2026-11-send-path-audit.md`, F3).
 
 - A send awaited by one task on a connection whose own task returns while
   the send is queued resolves with the delivered count, not
@@ -1905,17 +2187,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   over half used, now stalls until it reads or that changes. Five stuck peers on
   a worker can still fill the slab at the default cap, and further peers are then
   not held (#733).
-- A chain that fails now closes the connection. Later sends used to reach the
-  peer after the bytes the chain and the send queue lost, and a
-  `send_chain_nowait` or a dropped `send_chain` future reported nothing. A
-  zero-copy part that hits `ENOMEM` on Linux 6.15+ causes this, because a chain
-  has no plain-send fallback (#734).
-- A zero-copy part of a chain no longer stops short. A part larger than the
-  socket's send buffer used to send what fit and report success, and the next
-  part followed the gap: 2,392,576 bytes of a 3 MiB part arrived on loopback.
-  The kernel now retries it, and a chain that still sends fewer bytes than it
-  holds fails (#734).
-- macOS: an acceptor thread exits at shutdown within about 100 ms. It used to
+- macOS: an acceptor thread exits at once at shutdown. It used to
   stay blocked in `accept` until a peer connected, and its listener kept the
   port until then (#560).
 - The acceptor thread no longer closes a connection when every worker's accept
@@ -1952,16 +2224,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it again after ciphertext was written, which can copy that ciphertext. The
   buffer ended at about twice the ciphertext for a send over 24 KiB, four
   times for one of 16 to 24 KiB, and 32 KiB for a smaller one.
-- io_uring: `send_chain` and `send_chain_nowait` did not check the
-  handle's generation when the handle's slot held a plaintext connection. A
-  stale handle (its connection closed, with or without TLS, and the slot
-  reused by a plaintext connection) submitted the chain on the slot's new
-  occupant, so the bytes went to that connection's socket. The completion
-  handlers discarded the chain's CQEs, which carried the old generation, so
-  the chain stayed active on the new occupant. Until the worker exited, the
-  new occupant's own chains returned `WouldBlock`, its plain sends stayed
-  queued, and its close never finished. `SendChainBuilder::finish` now
-  returns `NotConnected` on a stale handle, as the TLS path already did.
 - TLS: a close_notify that ringline receives in one read with the peer's
   last handshake flight was dropped. The handshake completion was reported
   and the close was not, so the connection stayed open: a peer that kept
@@ -1969,12 +2231,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   buffered engine on io_uring a later FIN was reported as truncated. The
   close is now handled after the completion, on both backends and both
   engines: the task reads what arrived, then a clean EOF.
-- io_uring: `send_chain` and `send_chain_nowait` on a TLS connection sent
-  the chain's bytes unencrypted, so the peer saw a record it could not
-  parse. The parts, guard parts included, are now gathered and encrypted
-  as one send, queued behind the connection's other sends, with one
-  completion for the chain. They are not linked SQEs, and `finish` does not
-  return `WouldBlock` for earlier sends in flight.
 - io_uring: a TLS connection closed by `ConnCtx::close()`,
   `Connection::close()` or `SendHalf::close()`, or by its handler returning,
   sends a close_notify alert before the FIN. Only `DriverCtx::close` queued
@@ -2075,8 +2331,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   counter `send_zc_enomem` counts each fallback. From Linux 6.15 a zero-copy
   send is charged `len / page_size + 2` pages while in flight, and on a kernel
   that charges rings the rings are charged to the same limit, so at the common
-  8 MiB limit a guard smaller than 8 MiB can reach it. A `send_chain` with a
-  guard part still fails on `-ENOMEM`, as on any send error (#642).
+  8 MiB limit a guard smaller than 8 MiB can reach it (#642).
 
 - io_uring: `ConfigBuilder::sqpoll(true)` works. Ring setup set
   `IORING_SETUP_COOP_TASKRUN` together with `IORING_SETUP_SQPOLL`, which the
@@ -2096,20 +2351,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   back to the standard form (#626).
 
 - On io_uring, an awaited send could resolve with another send's result. A
-  connection had one send waiter, and any send completion on it woke the
-  waiter: a `send().await` behind a `send_nowait`, an unawaited chain, a
-  `forward_recv_buf` or a `send_backpressured` resolved with
-  that send's byte count, and the awaited send's own completion then found no
-  waiter. Two awaited sends in flight at once on one connection could hang;
-  on mio they resolved with each other's lengths.
-  Every awaited send (`send`, `submit_batch_await`, `send_chain`) now owns
-  an entry in the worker's send completion table,
-  and only its own completion settles it, on both backends. Two awaited sends
-  in flight at once each resolve with their own result (#617).
+  connection had one send waiter, and any send completion on it woke the waiter:
+  a `send().await` behind a `send_nowait`, a `forward_recv_buf` or a
+  `send_backpressured` resolved with that send's byte count, and the awaited
+  send's own completion then found no waiter. Two awaited sends in flight at
+  once on one connection could hang; on mio they resolved with each other's
+  lengths. Every send (`send`, `submit_batch`) owns an entry in the worker's
+  send completion table, and only its own completion settles it, on both
+  backends. Two awaited sends in flight at once each resolve with their own
+  result (#617).
 
-- `send_chain` with a closure that submits nothing, and an awaited `send` of
-  no bytes, resolve `Ok(0)`. With no other send in flight on the connection
-  they used to hang (#617).
+- An awaited `send` of no bytes resolves `Ok(0)`. With no other send in
+  flight on the connection it used to hang (#617).
 
 - On io_uring, a second `forward_recv_buf` (on `ConnCtx` or `SendHalf`)
   called while an earlier one's send was still in flight overwrote that
@@ -2135,7 +2388,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   loop's `sendmsg`, poll, `sendmsg` retry never waited. Coalesced copy
   sends now answer `EAGAIN` with a plain `send` of the first unsent bytes,
   which waits for room, and then resubmit the rest. A guard
-  send (`SendMsgZc`) outside `send_chain` failed with `WouldBlock` in the
+  send (`SendMsgZc`) failed with `WouldBlock` in the
   same state; it now waits and delivers as well. A send waiting on a
   half-closed socket held an io-wq kernel thread until #605; see that entry
   (#603).

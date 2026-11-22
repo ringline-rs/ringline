@@ -25,7 +25,7 @@ use crate::runtime::io::{Connection, UdpSocket};
 ///             loop {
 ///                 let n = rx.with_data(|data| {
 ///                     // Echo back everything received.
-///                     tx.send_nowait(data).ok();
+///                     let _ = tx.send(data);
 ///                     ringline::ParseResult::Consumed(data.len())
 ///                 }).await;
 ///                 if n == 0 {

@@ -118,15 +118,15 @@ impl AsyncEventHandler for StreamStubServer {
                                             }
                                             _ => b"-ERR value mismatch\r\n",
                                         };
-                                        let _ = tx.send_nowait(reply);
+                                        let _ = tx.send(reply);
                                     } else if verb.eq_ignore_ascii_case(b"DEL") {
                                         // `DEL <key>`: reply with the deleted-key
                                         // count (a RESP integer).
-                                        let _ = tx.send_nowait(b":1\r\n");
+                                        let _ = tx.send(b":1\r\n");
                                     } else if let Some(Value::BulkString(key)) = items.get(1) {
                                         // `GET <key>`.
                                         let (reply, should_close) = decide(&key[..]);
-                                        let _ = tx.send_nowait(&reply);
+                                        let _ = tx.send(&reply);
                                         close_after = should_close;
                                     }
                                 }

@@ -10,7 +10,7 @@
   Phase A (2026-09-17) had narrowed the case: see "What Phase A did to
   criterion 1".
 - **Span:** 2026-09-17 → (open) · follows #415 (282773b), #416 Phase A ·
-  measurements on branch `exp/recv-strategies`
+  measurements with a standalone program that is not in the repository
 
 ## Goal
 
@@ -294,7 +294,7 @@ were read.
 
 ### Method
 
-`experiments/recv-strategies/` (branch `exp/recv-strategies`) is a standalone
+`experiments/recv-strategies/`, which is not in the repository, is a standalone
 io_uring program, not ringline: a single-threaded server pinned to one CPU,
 `DEFER_TASKRUN`, length-prefixed messages, and a client that counts acked
 messages and records latency. Each receive strategy is a small module
@@ -789,14 +789,14 @@ hybrid follow-up has not been decided.
 
 ### Demotion quiet period and migration time
 
-Benchmark at `aa46b64`: `--demote-quiet-ms` demotes a connection only once
-that long has passed since its last completion that counted toward
-promotion, and each move records the time from the decision to the re-arm
-on the new group and to the first delivery there. Two hosts, three reps,
-medians, 36 runs per kernel and none failed: 6.12 Debian 13
+Benchmark with the `recv-strategies` program: `--demote-quiet-ms` demotes a
+connection only once that long has passed since its last completion that
+counted toward promotion, and each move records the time from the decision to
+the re-arm on the new group and to the first delivery there. Two hosts, three
+reps, medians, 36 runs per kernel and none failed: 6.12 Debian 13
 `01a11d87-5b5d-710a-210d-caee1b974dd2`, 6.1 Debian 12
-`01a11d87-5bd5-7100-e089-358dd296381e`. Every cell is 1000
-request/response connections at 20k requests/s plus 16 streamers.
+`01a11d87-5bd5-7100-e089-358dd296381e`. Every cell is 1000 request/response
+connections at 20k requests/s plus 16 streamers.
 
 6.1, request p50 / p99 / p999 in ms, and streamer MB/s:
 

@@ -71,8 +71,8 @@ which only a runtime bug produces.
 
 `IORING_RECV_MULTISHOT` on `RECV` and `RECVMSG`: 6.0 (b3fdea6ecb55,
 9bb66906f23e). `IORING_CQE_F_SOCK_NONEMPTY` and
-`IORING_RECVSEND_POLL_FIRST`: 5.19 (liburing man pages; unverified as to
-commit). A multishot `RECV` requires buffer select and rejects
+`IORING_RECVSEND_POLL_FIRST`: 5.19 (both are in the 5.19 uapi header and
+not in 5.18's). A multishot `RECV` requires buffer select and rejects
 `MSG_WAITALL`; before 6.17 it also requires `sqe->len == 0`.
 
 An empty ring ends the arm with `-ENOBUFS` and no `F_MORE` on every kernel
@@ -108,7 +108,13 @@ Fixes:
 
 For ringline:
 
-- `SOCK_NONEMPTY` is a hint, and ringline does not read it.
+- `SOCK_NONEMPTY` is a hint. ringline reads it on a TCP connection's
+  direct receive: a completion that returned bytes without it arms the next
+  receive with `IORING_RECVSEND_POLL_FIRST`
+  (`docs/recv-direct-design.md`). A flag set for a pending FIN alone makes
+  the next receive try the socket first, which returns the end. A
+  `POLL_FIRST` receive whose poll the kernel cannot allocate completes with
+  `-EAGAIN` from io-wq; ringline receives again without the flag.
 - TCP and Unix connections arm no multishot receive: a plaintext connection
   receives with a one-shot `RECV` into its accumulator
   (`docs/recv-direct-design.md`), and a TLS connection with a one-shot

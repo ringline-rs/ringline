@@ -121,7 +121,7 @@ impl DirectIoOpenOptions {
     /// The `open(2)` flags these options add to `O_RDWR` and the backend's
     /// direct I/O flag.
     pub(crate) fn extra_flags(&self) -> libc::c_int {
-        if self.dsync { libc::O_DSYNC } else { 0 }
+        if self.dsync { crate::sys::O_DSYNC } else { 0 }
     }
 }
 

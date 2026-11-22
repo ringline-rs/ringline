@@ -59,7 +59,7 @@ name = "census {target}"
 context_name = "ringline: flake census under 2-vCPU scarcity"
 target = [
   "lib", "echo", "udp", "fs", "tls_echo", "stream_echo", "throughput",
-  "guard_send_threshold", "submit_batch_await", "shutdown_drop", "signal_shutdown",
+  "guard_send_threshold", "submit_batch", "shutdown_drop", "signal_shutdown",
   "blocking", "direct_io", "handler_callbacks", "process", "ready_queue_fairness",
   "recv_accumulator_cap", "region_registry", "memlock_limit", "ring_setup_eperm",
 ]

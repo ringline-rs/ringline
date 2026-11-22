@@ -87,7 +87,7 @@ impl AsyncEventHandler for Greeter {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let (mut tx, _rx) = conn.split();
-            let _ = tx.send_nowait(b"ok");
+            let _ = tx.send(b"ok");
             // Hold the connection open long enough for the client's read.
             let _ = ringline::sleep(Duration::from_millis(200)).await;
         }
@@ -110,7 +110,7 @@ impl AsyncEventHandler for ReleaseOnCue {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let (mut tx, _rx) = conn.split();
-            let _ = tx.send_nowait(b"ok");
+            let _ = tx.send(b"ok");
             let _ = ringline::sleep(Duration::from_millis(200)).await;
         }
     }
@@ -327,7 +327,7 @@ impl AsyncEventHandler for ReleaseImmediately {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let (mut tx, _rx) = conn.split();
-            let _ = tx.send_nowait(b"ok");
+            let _ = tx.send(b"ok");
             let _ = ringline::sleep(Duration::from_millis(200)).await;
         }
     }
@@ -401,7 +401,7 @@ impl AsyncEventHandler for ReleaseFromWorkerOne {
         async move {
             ACCEPTED_ON[worker].store(true, Ordering::Release);
             let (mut tx, _rx) = conn.split();
-            let _ = tx.send_nowait(b"ok");
+            let _ = tx.send(b"ok");
             let _ = ringline::sleep(Duration::from_millis(200)).await;
         }
     }

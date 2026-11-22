@@ -35,7 +35,7 @@ impl AsyncEventHandler for Echo {
             let (mut tx, mut rx) = conn.split();
             loop {
                 let n = rx.with_data(|data| {
-                    tx.send_nowait(data).ok();
+                    let _ = tx.send(data);
                     ParseResult::Consumed(data.len())
                 }).await;
                 if n == 0 { break; }
@@ -68,7 +68,7 @@ The io_uring backend has this worker-local shape:
 ```
                       ┌─────────────────────────────┐
                       │        Acceptor Thread       │
-                      │   blocking accept4() loop    │
+                      │ accept4() until EAGAIN, poll │
                       └──────────┬──────────────────┘
                                  │ round-robin
           ┌──────────────────────┼──────────────────────┐
@@ -102,7 +102,7 @@ handler instance. On the io_uring backend, each worker also owns:
 | Multishot recv | UDP — one SQE, many completions |
 | SendMsgZc | Zero-copy scatter-gather send — kernel DMAs directly from app buffers |
 | Fixed file table | Direct descriptors — no per-syscall fd table lookup |
-| IO_LINK chains | Atomic multi-step operations (connect + timeout) |
+| IO_HARDLINK chains | A close's lead (shutdown, cancel, or at worker exit an `SO_LINGER` reset) and its `Close`; `abort`'s disconnect, lead and `Close` |
 | COOP_TASKRUN (not with SQPOLL) | Reduced context switches |
 | SINGLE_ISSUER | Lock-free kernel-side optimizations |
 
@@ -111,7 +111,7 @@ handler instance. On the io_uring backend, each worker also owns:
 | Type | Description |
 |------|-------------|
 | `AsyncEventHandler` | Trait: `on_accept(Connection) -> Future` — one task per connection |
-| `Connection` | An owned connection: `send()`, `send_nowait()`, `with_data()`; `split()` gives `SendHalf` and `RecvHalf` |
+| `Connection` | An owned connection: `send()`, `with_data()`; `split()` gives `SendHalf` and `RecvHalf` |
 | `ParseResult` | Closure return type: `Consumed(n)` or `NeedMore` |
 | `ConfigBuilder` | Discoverable builder: `ConfigBuilder::default().workers(4).build()` |
 | `RinglineBuilder` | Launch builder: `RinglineBuilder::new(config).bind(addr).launch::<H>()` |

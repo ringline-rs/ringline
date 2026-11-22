@@ -33,7 +33,7 @@ impl AsyncEventHandler for AsyncEcho {
                 let n = rx
                     .with_data(|data| {
                         let owned = data.to_vec();
-                        let _ = tx.send_nowait(&owned);
+                        let _ = tx.send(&owned);
                         ParseResult::Consumed(owned.len())
                     })
                     .await;

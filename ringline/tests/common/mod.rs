@@ -14,12 +14,69 @@ use std::time::{Duration, Instant};
 ///
 /// A bound socket that never listens does not work here: macOS drops a SYN
 /// to it instead of refusing, so the connect times out.
+///
+/// The client end is bound to `127.0.0.1:0` before it connects. Linux lets a
+/// later `connect` take a port that an earlier `connect` chose as its own
+/// source port when the two 4-tuples differ (`__inet_hash_connect` skips only
+/// ports a `bind` took). A connect to this port could then choose the port
+/// itself as its source and connect to itself, so the connect succeeds instead
+/// of being refused.
 pub fn refusing_port() -> ((TcpStream, TcpStream), u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let client = bound_connect(listener.local_addr().unwrap());
     let (server, _) = listener.accept().unwrap();
     let port = client.local_addr().unwrap().port();
     ((client, server), port)
+}
+
+/// A blocking TCP connection to `to` from a socket bound to `127.0.0.1:0`
+/// first.
+fn bound_connect(to: std::net::SocketAddr) -> TcpStream {
+    use std::os::fd::FromRawFd;
+
+    let std::net::SocketAddr::V4(to) = to else {
+        panic!("bound_connect takes an IPv4 address");
+    };
+    let sockaddr = |ip: std::net::Ipv4Addr, port: u16| {
+        // SAFETY: all-zero is a valid `sockaddr_in`.
+        let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        {
+            a.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        }
+        a.sin_family = libc::AF_INET as libc::sa_family_t;
+        a.sin_port = port.to_be();
+        a.sin_addr.s_addr = u32::from(ip).to_be();
+        a
+    };
+    let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: a new socket this function owns until it is wrapped below.
+    let fd = unsafe { libc::socket(libc::AF_INET, kind, 0) };
+    assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+    // SAFETY: `fd` is the new socket, and `stream` owns it from here.
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    let local = sockaddr(std::net::Ipv4Addr::LOCALHOST, 0);
+    let remote = sockaddr(*to.ip(), to.port());
+    // SAFETY: both addresses are valid `sockaddr_in`s of length `len`.
+    unsafe {
+        assert_eq!(
+            libc::bind(fd, (&raw const local).cast(), len),
+            0,
+            "bind: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::connect(fd, (&raw const remote).cast(), len),
+            0,
+            "connect: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    stream
 }
 
 /// How long [`join_workers`] waits for the workers to exit before it shuts

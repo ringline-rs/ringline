@@ -55,7 +55,7 @@ impl AsyncEventHandler for Server {
                     break;
                 }
                 RECEIVED.fetch_add(1, Ordering::Relaxed);
-                if tx.send_nowait(b"k").is_err() {
+                if tx.send(b"k").is_err() {
                     break;
                 }
             }

@@ -262,7 +262,7 @@ impl AsyncEventHandler for DropsWithSendsQueued {
         Some(Box::pin(async {
             let mut conn = ringline::connect(peer_addr()).await.expect("connect");
             for i in 0..QUEUED_SENDS {
-                conn.send_nowait(&[i as u8; 4096]).expect("send");
+                conn.send(&[i as u8; 4096]).expect("send");
             }
             drop(conn);
             ringline::sleep(Duration::from_secs(60)).await;
@@ -385,7 +385,7 @@ impl AsyncEventHandler for StuckCloseHoldsBackend {
         async move {
             let _backend = ringline::connect(peer_addr()).await.expect("connect");
             let block = [0u8; 16384];
-            while conn.send_nowait(&block).is_ok() {}
+            while conn.send(&block).is_ok() {}
             conn.close();
             std::future::pending::<()>().await;
         }

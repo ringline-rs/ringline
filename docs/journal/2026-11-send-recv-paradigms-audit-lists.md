@@ -313,7 +313,7 @@ Each is promised in the sources and absent from both lists.
   - `ringline/tests/close_on_drop.rs:277`.
 - SM18 (D). Two sends can be in flight from one half. connection-handle-ownership-design.md:300-302 "two sends can still be in flight from one half".
 - SM19 (D). Every send's completion is checked against the slot generation. PRINCIPLES.md:24-25. Covered by record C2.
-- SM20 (D). A panic on some inputs is stated and a fallible variant exists. PRINCIPLES.md:171-173.
+- SM20 (D). A panic on some inputs is stated and a fallible variant exists. PRINCIPLES.md:179-181.
   - `SendFuture` and `BackpressuredSendFuture` panic when polled after completion (io.rs:4184).
   - `shutdown_write` runs `with_state` (io.rs:1481), while `close` returns silently outside the executor (io.rs:1532-1535).
   - Neither panic is in the rustdoc. I did not read `with_state`.

@@ -1,7 +1,7 @@
 #![allow(clippy::manual_async_fn)]
 //! An awaited send resolves with its own send's result, not with the
-//! completion of an earlier send on the same connection that nothing awaits
-//! (#617).
+//! completion of an earlier or later send on the same connection whose
+//! completion was dropped (#617).
 
 use std::future::Future;
 use std::io::{Read, Write};
@@ -28,24 +28,21 @@ const SECOND: usize = 10;
 /// `send_zc_threshold` so the batch is sent with `SendMsgZc`.
 const GUARDED: usize = 16384;
 
-/// `send_nowait` then an awaited `send`.
-const NOWAIT_THEN_SEND: u8 = b'1';
-/// `send_nowait` then an awaited copy-only `submit_batch_await`.
-const NOWAIT_THEN_COPY_BATCH: u8 = b'2';
-/// `send_nowait` then an awaited zero-copy `submit_batch_await`.
-const NOWAIT_THEN_ZC_BATCH: u8 = b'3';
-/// `send_chain_nowait` then an awaited `send`.
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
-const CHAIN_NOWAIT_THEN_SEND: u8 = b'4';
-/// An awaited `send`, then a `send_nowait` submitted before the await.
-const SEND_THEN_NOWAIT: u8 = b'5';
+/// A `send` whose completion is dropped, then an awaited `send`.
+const UNAWAITED_THEN_SEND: u8 = b'1';
+/// A `send` whose completion is dropped, then an awaited copy-only
+/// `submit_batch`.
+const UNAWAITED_THEN_COPY_BATCH: u8 = b'2';
+/// A `send` whose completion is dropped, then an awaited zero-copy
+/// `submit_batch`.
+const UNAWAITED_THEN_ZC_BATCH: u8 = b'3';
+/// An awaited `send`, then a `send` submitted before the await whose
+/// completion is dropped.
+const SEND_THEN_UNAWAITED: u8 = b'5';
 /// Two awaited sends in flight at once, the second awaited first.
 const TWO_AWAITED: u8 = b'6';
 /// An awaited `send` of no bytes.
 const EMPTY_SEND: u8 = b'7';
-/// A `send_chain` whose closure submits nothing.
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
-const EMPTY_CHAIN: u8 = b'8';
 
 struct VecGuard(Vec<u8>);
 
@@ -76,46 +73,34 @@ impl AsyncEventHandler for Scenarios {
                 return;
             }
             let result = match trigger {
-                NOWAIT_THEN_SEND => {
-                    conn.send_nowait(&[b'a'; FIRST]).expect("send_nowait");
+                UNAWAITED_THEN_SEND => {
+                    conn.send(&[b'a'; FIRST]).expect("unawaited send");
                     match conn.send(&[b'b'; SECOND]) {
                         Ok(fut) => fut.await,
                         Err(e) => Err(e),
                     }
                 }
-                NOWAIT_THEN_COPY_BATCH => {
-                    conn.send_nowait(&[b'a'; FIRST]).expect("send_nowait");
+                UNAWAITED_THEN_COPY_BATCH => {
+                    conn.send(&[b'a'; FIRST]).expect("unawaited send");
                     match conn
                         .send_parts()
-                        .submit_batch_await(vec![SendPart::Copy(&[b'b'; SECOND])])
+                        .submit_batch(vec![SendPart::Copy(&[b'b'; SECOND])])
                     {
                         Ok((_, fut)) => fut.await,
                         Err(e) => Err(e),
                     }
                 }
-                NOWAIT_THEN_ZC_BATCH => {
-                    conn.send_nowait(&[b'a'; FIRST]).expect("send_nowait");
+                UNAWAITED_THEN_ZC_BATCH => {
+                    conn.send(&[b'a'; FIRST]).expect("unawaited send");
                     let guard = GuardBox::new(VecGuard(vec![b'b'; GUARDED]));
-                    match conn
-                        .send_parts()
-                        .submit_batch_await(vec![SendPart::Guard(guard)])
-                    {
+                    match conn.send_parts().submit_batch(vec![SendPart::Guard(guard)]) {
                         Ok((_, fut)) => fut.await,
                         Err(e) => Err(e),
                     }
                 }
-                #[cfg(has_io_uring)]
-                CHAIN_NOWAIT_THEN_SEND => {
-                    conn.send_chain_nowait(|chain| chain.copy(&[b'a'; FIRST]).finish())
-                        .expect("send_chain_nowait");
-                    match conn.send(&[b'b'; SECOND]) {
-                        Ok(fut) => fut.await,
-                        Err(e) => Err(e),
-                    }
-                }
-                SEND_THEN_NOWAIT => match conn.send(&[b'b'; SECOND]) {
+                SEND_THEN_UNAWAITED => match conn.send(&[b'b'; SECOND]) {
                     Ok(fut) => {
-                        conn.send_nowait(&[b'a'; FIRST]).expect("send_nowait");
+                        conn.send(&[b'a'; FIRST]).expect("unawaited send");
                         fut.await
                     }
                     Err(e) => Err(e),
@@ -135,16 +120,8 @@ impl AsyncEventHandler for Scenarios {
                 }
                 EMPTY_SEND => {
                     // Something to read, so the client knows the send ran.
-                    conn.send_nowait(&[b'a'; FIRST]).expect("send_nowait");
+                    conn.send(&[b'a'; FIRST]).expect("unawaited send");
                     match conn.send(&[]) {
-                        Ok(fut) => fut.await,
-                        Err(e) => Err(e),
-                    }
-                }
-                #[cfg(has_io_uring)]
-                EMPTY_CHAIN => {
-                    conn.send_nowait(&[b'a'; FIRST]).expect("send_nowait");
-                    match conn.send_chain(|_chain| Ok(())) {
                         Ok(fut) => fut.await,
                         Err(e) => Err(e),
                     }
@@ -213,7 +190,7 @@ fn run(scenario: u8, expected_bytes: usize) -> Result<u32, String> {
 
 #[test]
 fn an_awaited_send_reports_its_own_length() {
-    let n = run(NOWAIT_THEN_SEND, FIRST + SECOND).expect("the awaited send failed");
+    let n = run(UNAWAITED_THEN_SEND, FIRST + SECOND).expect("the awaited send failed");
     assert_eq!(
         n as usize, SECOND,
         "the awaited send resolved with another send's result"
@@ -222,7 +199,7 @@ fn an_awaited_send_reports_its_own_length() {
 
 #[test]
 fn an_awaited_copy_batch_reports_its_own_length() {
-    let n = run(NOWAIT_THEN_COPY_BATCH, FIRST + SECOND).expect("the awaited batch failed");
+    let n = run(UNAWAITED_THEN_COPY_BATCH, FIRST + SECOND).expect("the awaited batch failed");
     assert_eq!(
         n as usize, SECOND,
         "the awaited batch resolved with another send's result"
@@ -231,20 +208,10 @@ fn an_awaited_copy_batch_reports_its_own_length() {
 
 #[test]
 fn an_awaited_zero_copy_batch_reports_its_own_length() {
-    let n = run(NOWAIT_THEN_ZC_BATCH, FIRST + GUARDED).expect("the awaited batch failed");
+    let n = run(UNAWAITED_THEN_ZC_BATCH, FIRST + GUARDED).expect("the awaited batch failed");
     assert_eq!(
         n as usize, GUARDED,
         "the awaited batch resolved with another send's result"
-    );
-}
-
-#[cfg(has_io_uring)]
-#[test]
-fn a_send_after_an_unawaited_chain_reports_its_own_length() {
-    let n = run(CHAIN_NOWAIT_THEN_SEND, FIRST + SECOND).expect("the awaited send failed");
-    assert_eq!(
-        n as usize, SECOND,
-        "the awaited send resolved with the chain's result"
     );
 }
 
@@ -254,7 +221,7 @@ fn a_send_after_an_unawaited_chain_reports_its_own_length() {
 /// rather than the awaited one.
 #[test]
 fn a_send_followed_by_an_unawaited_one_reports_its_own_length() {
-    let n = run(SEND_THEN_NOWAIT, SECOND + FIRST).expect("the awaited send failed");
+    let n = run(SEND_THEN_UNAWAITED, SECOND + FIRST).expect("the awaited send failed");
     assert_eq!(
         n as usize, SECOND,
         "the awaited send resolved with a later send's result"
@@ -277,10 +244,4 @@ fn two_awaited_sends_in_flight_each_report_their_own_length() {
 #[test]
 fn an_awaited_empty_send_resolves_with_zero() {
     assert_eq!(run(EMPTY_SEND, FIRST).expect("the empty send failed"), 0);
-}
-
-#[cfg(has_io_uring)]
-#[test]
-fn a_chain_that_submits_nothing_resolves_with_zero() {
-    assert_eq!(run(EMPTY_CHAIN, FIRST).expect("the empty chain failed"), 0);
 }
