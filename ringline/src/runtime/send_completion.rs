@@ -282,7 +282,12 @@ pub struct SendAdmissionCounters {
 #[doc(hidden)]
 pub fn send_admission_counters() -> SendAdmissionCounters {
     super::io::with_state(|driver, executor| {
-        executor.send_admission_counters(&driver.send_copy_pool)
+        let counters = executor.send_admission_counters(&driver.send_copy_pool);
+        SendAdmissionCounters {
+            #[cfg(has_io_uring)]
+            bare_fin_closes: driver.bare_fin_closes,
+            ..counters
+        }
     })
 }
 
