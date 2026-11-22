@@ -328,8 +328,9 @@ fn refused_outcome(refused: ringline::BatchRefused<'_>, waited: bool) -> Outcome
 }
 
 /// Fill the send pool with bounded sends until one has to wait. The client
-/// does not read until `WAITING` is set, so the socket fills and the sends
-/// queued hold their slots. Returns the bytes queued.
+/// does not read until `WAITING` is set, but the socket can still take more
+/// bytes afterwards and return slots; call `fill_socket` first to hold them.
+/// Returns the bytes queued.
 async fn fill_pool(conn: &mut Connection) -> usize {
     let chunk = vec![b'f'; SLOT as usize];
     let mut queued = 0usize;
@@ -470,6 +471,9 @@ impl AsyncEventHandler for Scenarios {
                     return;
                 }
                 TIMED_OUT => {
+                    // The bounded sends queue behind a send that cannot
+                    // finish, so their slots stay held past the timeout.
+                    fill_socket(&mut conn);
                     fill_pool(&mut conn).await;
                     let mut batch = conn.send_parts().submit_batch_admitted(parts_for(WAITS));
                     let outcome =
