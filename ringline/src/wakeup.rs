@@ -103,13 +103,7 @@ fn wake_fd(fd: RawFd) {
         }
     }
     #[cfg(not(has_io_uring))]
-    {
-        // pipe expects any non-zero write; 1 byte suffices.
-        let val: u8 = 1;
-        unsafe {
-            libc::write(fd, &val as *const u8 as *const libc::c_void, 1);
-        }
-    }
+    crate::sys::write_token(fd);
 }
 
 /// Create a per-worker wake fd.
@@ -149,6 +143,12 @@ pub(crate) type WakeKeepAlive = Arc<[WakeHandle]>;
 /// owns both ends.
 #[cfg(not(has_io_uring))]
 pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
+    #[cfg(target_os = "hermit")]
+    let fds = {
+        let (r, w) = crate::sys::token_pair()?;
+        [r, w]
+    };
+    #[cfg(not(target_os = "hermit"))]
     let mut fds = [0i32; 2];
     // Both ends non-blocking and close-on-exec. On Linux `pipe2` sets the
     // flags atomically, so a child spawned on another thread cannot inherit
@@ -157,16 +157,16 @@ pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "hermit")))]
     {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
             return Err(io::Error::last_os_error());
         }
         for fd in &fds {
             unsafe {
-                let flags = libc::fcntl(*fd, libc::F_GETFL);
+                let flags = libc::fcntl(*fd, libc::F_GETFL, 0);
                 libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                let fd_flags = libc::fcntl(*fd, libc::F_GETFD);
+                let fd_flags = libc::fcntl(*fd, libc::F_GETFD, 0);
                 libc::fcntl(*fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
             }
         }

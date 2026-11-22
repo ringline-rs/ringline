@@ -109,6 +109,11 @@ impl InFlightSendSlab {
         }
     }
 
+    /// Whether [`allocate`](Self::allocate) would find a free entry.
+    pub fn has_free(&self) -> bool {
+        !self.free_list.is_empty()
+    }
+
     /// Allocate a slot, store iovecs/guards, and return (slab_index, msghdr_ptr).
     /// Returns `None` if the slab is full.
     ///
@@ -406,6 +411,13 @@ impl InFlightSendSlab {
     /// Whether more than half the entries are in use.
     pub fn over_half_used(&self) -> bool {
         self.free_list.len() * 2 < self.entries.len()
+    }
+
+    /// Whether a zero-copy send on the connection is refused: more than half
+    /// the entries are in use and the connection holds at least `cap`
+    /// (`ConfigBuilder::zero_copy_hold_cap`).
+    pub fn zero_copy_over_cap(&self, conn_index: u32, generation: u32, cap: usize) -> bool {
+        self.over_half_used() && self.held_by(conn_index, generation) >= cap
     }
 
     /// Get the total original send length for an entry.

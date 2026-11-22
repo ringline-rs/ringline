@@ -9,7 +9,6 @@ use crate::handler::{Disconnect, SendPoll, SendProbe, WritableEvent};
 
 use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
-use crate::chain::ChainEvent;
 use crate::completion::{OpTag, UserData};
 use crate::connection::{Lifecycle, ReadHalf};
 use crate::metrics;
@@ -156,6 +155,17 @@ fn choose_placement(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -> 
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
+    /// [`Driver::park_blocker`], plus a bounded send waiting on the
+    /// connection, which blocks a park as a queued send does
+    /// ([`ParkBlocker::Sends`]): its future lives in a task on this worker.
+    fn park_blocker(&self, conn_index: u32) -> Option<super::driver::ParkBlocker> {
+        self.driver.park_blocker(conn_index).or_else(|| {
+            self.executor
+                .send_waiting_on(conn_index)
+                .then_some(super::driver::ParkBlocker::Sends)
+        })
+    }
+
     /// Report the panics caught in the `Drop` of removed futures.
     fn report_drop_panics(&mut self) {
         for payload in self.executor.take_drop_panics() {
@@ -398,7 +408,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // clock reads and the output are gated.
         let loop_diag = self.driver.loop_diag;
 
-        // ── Diagnostic counters (printed to stderr at shutdown) ────────────────
+        // ── Diagnostic counters (logged at shutdown) ───────────────────────────
         // These measure the event-loop iteration mix to help diagnose client
         // throughput deficits.
         let mut diag_iters: u64 = 0;
@@ -561,14 +571,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // Check for shutdown after processing completions.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
-                // Print per-worker diagnostics before exiting.
+                // Log per-worker diagnostics before exiting.
                 if loop_diag {
                     let dead_pct = if diag_iters > 0 {
                         100.0 * diag_dead_iters as f64 / diag_iters as f64
                     } else {
                         0.0
                     };
-                    eprintln!(
+                    log::info!(
                         "[ringline diag] iters={diag_iters} dead={diag_dead_iters} ({dead_pct:.1}%) \
                          cqes_1st_avg={:.2} cqes_2nd_avg={:.2} \
                          tasks_1st_avg={:.2} tasks_fp_avg={:.2}",
@@ -577,7 +587,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         diag_tasks_1st as f64 / diag_iters.max(1) as f64,
                         diag_tasks_fp as f64 / diag_iters.max(1) as f64,
                     );
-                    eprintln!(
+                    log::info!(
                         "[ringline stall] \
                          wait_ge_1ms={diag_wait_ge_1ms} wait_ge_5ms={diag_wait_ge_5ms} \
                          wait_ge_10ms={diag_wait_ge_10ms} wait_max={:.1}ms | \
@@ -1115,11 +1125,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Commit every close registered on `pending_finalize_closes` this
     /// iteration: by `close_connection` from a CQE handler or the task-exit
     /// arm, by `DriverCtx::close` from a task, or by `defer_finalize_close`
-    /// from the completion that drained the connection's sends, chain or
+    /// from the completion that drained the connection's sends or
     /// `Shutdown`. Runs after `poll_ready_tasks`, so a task woken by a read
     /// error is polled, and a send it queues drains, before the Close is
     /// committed (#371). `try_finalize_close` is guarded: a connection with
-    /// sends, a chain or a `Shutdown` still outstanding is dropped from the
+    /// sends or a `Shutdown` still outstanding is dropped from the
     /// list here and registered again by the completion that drains it.
     fn finalize_pending_closes(&mut self) {
         if self.driver.pending_finalize_closes.is_empty() {
@@ -2058,7 +2068,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.connections.get(conn_index).is_some_and(|c| {
                     c.recv_direct_armed || c.hangup_poll_armed || c.hangup_peek_armed
                 });
-            if !armed && self.driver.park_blocker(conn_index).is_none() {
+            if !armed && self.park_blocker(conn_index).is_none() {
                 if self
                     .driver
                     .ring
@@ -2187,7 +2197,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.park_in_flight[conn_index as usize].is_some() {
             return false;
         }
-        if !self.driver.is_parkable(conn_index) {
+        if self.park_blocker(conn_index).is_some() {
             return false;
         }
         // A hangup peek completes at once and may close the connection; the
@@ -2405,7 +2415,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // closed: `park_started` minus `park_completed` is a large number under
         // load and on its own it cannot say why, which left the dominant cause
         // a matter of inference rather than measurement.
-        if let Some(blocker) = self.driver.park_blocker(conn_index) {
+        if let Some(blocker) = self.park_blocker(conn_index) {
             metrics::PARK_ABANDONED.increment(blocker.abandon_metric());
             self.rearm_direct_after_park(conn_index);
             return; // `fd` drops.
@@ -2466,7 +2476,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // The socket belongs to the target worker from here. Commit the Close
         // now so every send path refuses (`close_submitted`) instead of
         // queueing bytes, unencrypted once the TLS state has left, onto it.
-        // The gate guaranteed no sends, chain or shutdown, so this sets
+        // The gate guaranteed no sends or shutdown, so this sets
         // `close_submitted` and pushes the Close, or queues it on
         // `pending_close_retries` when the SQ is full.
         self.driver.try_finalize_close(conn_index);
@@ -2763,6 +2773,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
         match tx.try_send(conn) {
             Ok(()) => {
+                if let Some(ref accept) = self.driver.accept_state {
+                    accept.placed(target);
+                }
                 // Claim the slot on the target's behalf straight away. The
                 // target only republishes once it drains, and a burst of
                 // accepts all read the table before that happens — so without
@@ -2821,11 +2834,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             };
             match action {
                 AcceptErrorAction::Stop => {
-                    if !self
+                    // Shutdown and `Runtime::stop_accepting` stop the listener
+                    // on purpose; only an unrequested stop is counted.
+                    let requested = self
                         .driver
                         .shutdown_flag
                         .load(std::sync::atomic::Ordering::Acquire)
-                    {
+                        || self
+                            .driver
+                            .accept_state
+                            .as_ref()
+                            .is_some_and(|accept| accept.is_stopping());
+                    if !requested {
                         metrics::CONNECTIONS.increment(metrics::conn::ACCEPTOR_STOPPED);
                     }
                     if let Some(i) = arm {
@@ -2961,6 +2981,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 };
                 let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
                 self.install_accepted(raw_fd, listener, peer_addr);
+                // After the install, so `Runtime::stop_accepting` returns
+                // only once the connection has a task or is closed.
+                if let Some(ref accept) = self.driver.accept_state {
+                    accept.handled(self.driver.worker_index);
+                }
             }
         }
         self.publish_load();
@@ -3069,33 +3094,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.executor.forget_send(id);
             }
             self.release_pool_slot(pool_slot);
-            return;
-        }
-
-        // Chain path.
-        if self.driver.chain_table.is_active(conn_index) {
-            // A chain's SQEs are tagged `OpTag::Send` and bypass the send
-            // queue, so while one is active this branch claims *every* Send
-            // CQE on the connection. A TLS connection never has one:
-            // `send_chain` on it encrypts and queues instead
-            // (`SendChainBuilder::finish_tls`). Sends submitted while a chain is active
-            // are queued behind it, so no other send's CQE should land here;
-            // if one does, its id must not be dropped on the floor: take it
-            // (or `release` trips) and report this CQE's own outcome.
-            let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-            self.release_pool_slot(pool_slot);
-            if let Some((id, logical_len)) = settles {
-                let settled = if result > 0 {
-                    Ok(logical_len)
-                } else {
-                    Err(Self::send_error(result))
-                };
-                self.settle_send(id, settled);
-            }
-            let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
-            if matches!(event, ChainEvent::Complete { .. }) {
-                self.fire_chain_complete(conn_index);
-            }
             return;
         }
 
@@ -3967,44 +3965,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // Chain path.
-        if self.driver.chain_table.is_active(conn_index) {
-            if cqueue::notif(flags) {
-                self.driver.send_slab.dec_pending_notifs(slab_idx);
-                if self.driver.send_slab.should_release(slab_idx) {
-                    let ps = self.driver.send_slab.release(slab_idx);
-                    if ps != u16::MAX {
-                        self.release_pool_slot(ps);
-                    }
-                }
-                let event = self.driver.chain_table.on_notif_cqe(conn_index);
-                if matches!(event, ChainEvent::Complete { .. }) {
-                    self.fire_chain_complete(conn_index);
-                }
-                return;
-            }
-            if cqueue::more(flags) {
-                // A notification follows whenever the main CQE carries
-                // IORING_CQE_F_MORE -- on error and on a zero result too
-                // (`io_sendrecv_fail`, `io_sendmsg_zc`), -ECANCELED included.
-                // Hold the entry until it arrives.
-                self.driver.send_slab.inc_pending_notifs(slab_idx);
-                self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                self.driver.chain_table.inc_zc_notif(conn_index);
-            } else {
-                // No F_MORE: no notification is coming; release now.
-                let ps = self.driver.send_slab.release(slab_idx);
-                if ps != u16::MAX {
-                    self.release_pool_slot(ps);
-                }
-            }
-            let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
-            if matches!(event, ChainEvent::Complete { .. }) {
-                self.fire_chain_complete(conn_index);
-            }
-            return;
-        }
-
         if cqueue::notif(flags) {
             self.driver.send_slab.dec_pending_notifs(slab_idx);
             if self.driver.send_slab.should_release(slab_idx) {
@@ -4409,47 +4369,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.forward_zc_held[conn_index as usize] = None;
         self.driver.arrival[conn_index as usize].release();
         self.driver.connections.release(conn_index);
-    }
-
-    fn fire_chain_complete(&mut self, conn_index: u32) {
-        let chain = match self.driver.chain_table.take(conn_index) {
-            Some(c) => c,
-            None => return,
-        };
-
-        let failure = chain.failure();
-        let failed = failure.is_some();
-        if failed {
-            self.driver.drain_conn_send_queue(conn_index);
-        } else {
-            self.driver.submit_next_queued(conn_index);
-            self.wake_writable_if_unblocked(conn_index);
-        }
-
-        // `SendHalf::send_chain` attaches an id; a chain built through
-        // `DriverCtx::send_chain` has none.
-        if let Some(id) = chain.send_id {
-            let result = match failure {
-                Some(error) => Err(error),
-                None => {
-                    self.driver.end_logical_send(conn_index);
-                    Ok(chain.bytes_sent)
-                }
-            };
-            self.settle_send(id, result);
-        }
-
-        // The bytes of the chain and the queue behind it are gone, and a dropped
-        // `send_chain` future reports that to nobody but the reader. Later sends
-        // must not reach the peer after that gap.
-        if let Some(err) = chain.failure() {
-            self.abort_connection(conn_index, err);
-        }
-
-        // A close_connection that arrived while the chain was active deferred
-        // its Close on chain_drained. The chain state was just taken, so
-        // register the close for the end-of-iteration drain.
-        self.driver.defer_finalize_close(conn_index);
     }
 
     fn handle_recv_msg_udp(&mut self, ud: UserData, result: i32, flags: u32) {
@@ -5089,10 +5008,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 continue;
             }
-            // Nothing parked any more — the queue was released, or another
-            // path (a completed send chain) already pushed the head: the
-            // entry is stale, and pushing now would put a second SQE on the
-            // stream alongside the one in flight.
+            // Nothing parked any more (the queue was released, or the head was
+            // already pushed): the entry is stale, and pushing again would put
+            // a second SQE on the stream.
             let state = &self.driver.send_queues[conn_index as usize];
             if !state.parked || state.queue.is_empty() {
                 continue;
@@ -5239,16 +5157,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Test-only: inject multiple NOPs and dispatch them all in one batch.
-    /// This tests batch CQE processing where one handler's side effects
-    /// affect subsequent handlers in the same drain_completions() call.
+    /// Test-only: inject NOPs linked in order and dispatch them in one batch.
+    /// Every entry but the last has `IOSQE_IO_LINK` set. From Linux 6.10 the
+    /// kernel propagates a failure along the links; below that `inject`
+    /// models it.
     #[cfg(test)]
-    /// Test-only: submit a linked chain of NOP injects and dispatch.
-    /// The first N-1 SQEs have IO_LINK set; the last does not.
-    /// From Linux 6.10 this tests `IOSQE_IO_LINK` error propagation through
-    /// the kernel; below that it uses `inject`'s model of it.
-    #[cfg(test)]
-    pub(crate) fn inject_linked_chain_and_dispatch(&mut self, cqes: &[(u64, i32)]) {
+    pub(crate) fn inject_linked_and_dispatch(&mut self, cqes: &[(u64, i32)]) {
         let last = cqes.len() - 1;
         for (i, &(user_data_raw, result)) in cqes.iter().enumerate() {
             if i < last {
@@ -5993,17 +5907,6 @@ mod tests {
     ) -> crate::runtime::send_completion::SendId {
         let id = el.executor.register_send(conn_index);
         el.driver.send_slab.set_send_id(slab_idx, id, len);
-        id
-    }
-
-    /// Register an awaited send on `conn_index` and attach it to the
-    /// connection's active chain, as `send_chain` does.
-    fn await_chain(
-        el: &mut AsyncEventLoop<NoopHandler>,
-        conn_index: u32,
-    ) -> crate::runtime::send_completion::SendId {
-        let id = el.executor.register_send(conn_index);
-        el.driver.chain_table.set_send_id(conn_index, id);
         id
     }
 
@@ -7411,11 +7314,206 @@ mod tests {
         assert_eq!(result, -libc::EINVAL, "an unaligned O_DIRECT write");
     }
 
+    /// A send whose parts are all guards in one registered region is pushed
+    /// with that region's buffer index when the setting is on and the probe
+    /// passed that kind of send for the region's kind of memory (base pages
+    /// only, or not): `SEND_ZC` for one guard, `SENDMSG_ZC` for several. Guards
+    /// in two regions, guards outside any region, a copy part, the setting off,
+    /// or the probe failed each give the plain `SENDMSG_ZC`.
+    #[test]
+    fn a_guard_only_send_from_one_region_uses_its_buffer() {
+        use crate::backend::uring::fixed_send::{Allowed, Modes};
+        use crate::backend::uring::sqe::Op;
+        use crate::buffer::fixed::{MemoryRegion, RegionId};
+        use crate::handler::SendPart;
+        const ALL: Modes = Modes {
+            single: true,
+            multi: true,
+        };
+        const BOTH: Allowed = Allowed {
+            huge: ALL,
+            base: ALL,
+        };
+
+        struct RegionGuard {
+            ptr: *const u8,
+            len: u32,
+            region: RegionId,
+        }
+        // Safety: the memory is leaked and never written while sent.
+        unsafe impl Send for RegionGuard {}
+        impl crate::SendGuard for RegionGuard {
+            fn as_ptr_len(&self) -> (*const u8, u32) {
+                (self.ptr, self.len)
+            }
+            fn region(&self) -> RegionId {
+                self.region
+            }
+        }
+        // Registered memory must outlive the ring, so it is leaked.
+        let leak = || Box::leak(vec![5u8; 16384].into_boxed_slice()).as_mut_ptr();
+        let (a, b, outside) = (leak(), leak(), leak());
+        // Safety: leaked, so valid and unmoved for the life of the process.
+        let mut regions = unsafe { vec![MemoryRegion::new(a, 16384), MemoryRegion::new(b, 16384)] };
+        // Region 0 as a registration that found it in base pages only.
+        regions[0].base_pages = true;
+        // Each case takes a slab entry that is never released: more than the
+        // default test slab's 8.
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .registered_regions(regions)
+                .max_registered_regions(4)
+                .send_slab_slots(32)
+                .build()
+                .expect("valid config"),
+        );
+        el.driver.probe_passed = Some(BOTH);
+        let guard = |ptr: *mut u8, offset: usize, region: u16| {
+            crate::GuardBox::new(RegionGuard {
+                ptr: ptr.wrapping_add(offset),
+                len: 4096,
+                region: RegionId(region),
+            })
+        };
+        let send = |el: &mut AsyncEventLoop<NoopHandler>, parts: Vec<SendPart<'_>>| {
+            let conn_index = accept_connection(el);
+            let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+            with_driver_state(el, || conn.send_parts().submit_batch(parts)).expect("submitted");
+            last_pushed_op(el)
+        };
+
+        let op = send(
+            &mut el,
+            vec![
+                SendPart::Guard(guard(b, 0, 1)),
+                SendPart::Guard(guard(b, 8192, 1)),
+                SendPart::Guard(guard(b, 4096, 1)),
+            ],
+        );
+        assert!(
+            matches!(op, Op::SendMsgZcFixed { buf_index: 1, .. }),
+            "three guards in region 1: {op:?}"
+        );
+        let op = send(&mut el, vec![SendPart::Guard(guard(b, 8192, 1))]);
+        assert!(
+            matches!(
+                op,
+                Op::SendZcFixed {
+                    buf_index: 1,
+                    len: 4096,
+                    ..
+                }
+            ),
+            "one guard in region 1: {op:?}"
+        );
+        let op = send(
+            &mut el,
+            vec![SendPart::Guard(guard(outside, 0, RegionId::UNREGISTERED.0))],
+        );
+        assert!(
+            matches!(op, Op::SendMsgZc { .. }),
+            "one guard outside any region: {op:?}"
+        );
+
+        // A kernel that takes the flag on `SEND_ZC` only (before 6.15).
+        let single_only = Modes {
+            single: true,
+            multi: false,
+        };
+        el.driver.probe_passed = Some(Allowed {
+            huge: single_only,
+            base: single_only,
+        });
+        let op = send(&mut el, vec![SendPart::Guard(guard(a, 0, 0))]);
+        assert!(
+            matches!(op, Op::SendZcFixed { buf_index: 0, .. }),
+            "single only, one guard: {op:?}"
+        );
+        let op = send(
+            &mut el,
+            vec![
+                SendPart::Guard(guard(a, 0, 0)),
+                SendPart::Guard(guard(a, 4096, 0)),
+            ],
+        );
+        assert!(
+            matches!(op, Op::SendMsgZc { .. }),
+            "single only, two guards: {op:?}"
+        );
+        el.driver.probe_passed = Some(BOTH);
+
+        let cases: Vec<(&str, Vec<SendPart<'_>>)> = vec![
+            (
+                "guards in two regions",
+                vec![
+                    SendPart::Guard(guard(a, 0, 0)),
+                    SendPart::Guard(guard(b, 0, 1)),
+                ],
+            ),
+            (
+                "a guard outside any region",
+                vec![
+                    SendPart::Guard(guard(a, 0, 0)),
+                    SendPart::Guard(guard(outside, 0, RegionId::UNREGISTERED.0)),
+                ],
+            ),
+            (
+                "every guard outside any region",
+                vec![
+                    SendPart::Guard(guard(outside, 0, RegionId::UNREGISTERED.0)),
+                    SendPart::Guard(guard(outside, 4096, RegionId::UNREGISTERED.0)),
+                ],
+            ),
+            (
+                "a copy part",
+                vec![SendPart::Copy(&[1; 64]), SendPart::Guard(guard(a, 0, 0))],
+            ),
+        ];
+        for (case, parts) in cases {
+            let op = send(&mut el, parts);
+            assert!(matches!(op, Op::SendMsgZc { .. }), "{case}: {op:?}");
+        }
+
+        // A kernel without the charge fix: only the region in base pages
+        // uses its buffer.
+        el.driver.probe_passed = Some(Allowed {
+            huge: Modes::default(),
+            base: ALL,
+        });
+        let op = send(
+            &mut el,
+            vec![
+                SendPart::Guard(guard(a, 0, 0)),
+                SendPart::Guard(guard(a, 4096, 0)),
+            ],
+        );
+        assert!(
+            matches!(op, Op::SendMsgZcFixed { buf_index: 0, .. }),
+            "base pages only, region in base pages: {op:?}"
+        );
+        let op = send(&mut el, vec![SendPart::Guard(guard(b, 0, 1))]);
+        assert!(
+            matches!(op, Op::SendMsgZc { .. }),
+            "base pages only, other region: {op:?}"
+        );
+
+        el.driver.probe_passed = Some(Allowed::default());
+        let op = send(&mut el, vec![SendPart::Guard(guard(a, 0, 0))]);
+        assert!(matches!(op, Op::SendMsgZc { .. }), "probe failed: {op:?}");
+
+        el.driver.probe_passed = Some(BOTH);
+        el.driver.fixed_buffer_sends = false;
+        let op = send(&mut el, vec![SendPart::Guard(guard(a, 0, 0))]);
+        assert!(matches!(op, Op::SendMsgZc { .. }), "setting off: {op:?}");
+    }
+
     /// A read or write whose buffer names a registered region is submitted
     /// as `READ_FIXED` / `WRITE_FIXED` with the region's index and moves the
     /// data; the same file with an unregistered buffer gets a plain `WRITE`;
     /// and a buffer outside the region it names is refused before anything
-    /// is pushed (#841).
+    /// is pushed and without taking a command slot, for a read and for a
+    /// write (#841). The slab holds one command, so a slot taken by a
+    /// refusal would make the operation after it fail with `WouldBlock`.
     #[test]
     fn a_buffer_in_a_registered_region_uses_the_fixed_opcodes() {
         use crate::backend::uring::sqe::Op;
@@ -7429,7 +7527,7 @@ mod tests {
         let region = unsafe { MemoryRegion::new(base, 16384) };
         let mut el = make_test_loop_with_config(
             test_config_builder()
-                .direct_io(crate::direct_io::DirectIoConfig::default())
+                .direct_io(crate::direct_io::DirectIoConfig::default().max_commands_in_flight(1))
                 .registered_regions(vec![region])
                 .max_registered_regions(4)
                 .build()
@@ -7527,25 +7625,51 @@ mod tests {
         assert_eq!(wait_for_result(&mut el, plain_key), 4096, "plain write");
 
         el.driver.ring.last_pushed = None;
-        let outside_key = el.executor.begin_disk_io(0);
-        let refused = unsafe {
-            el.driver.make_ctx().file_write(
-                kind,
-                index,
-                generation,
-                0,
-                plain.as_ptr(),
-                4096,
-                rid,
-                outside_key,
-            )
+        for read in [false, true, false, true] {
+            let outside_key = el.executor.begin_disk_io(0);
+            let mut ctx = el.driver.make_ctx();
+            // Safety: refused before anything is pushed, so the kernel never
+            // sees `plain` through these calls.
+            let refused = unsafe {
+                if read {
+                    ctx.file_read(
+                        kind,
+                        index,
+                        generation,
+                        0,
+                        plain.as_ptr().cast_mut(),
+                        4096,
+                        rid,
+                        outside_key,
+                    )
+                } else {
+                    ctx.file_write(
+                        kind,
+                        index,
+                        generation,
+                        0,
+                        plain.as_ptr(),
+                        4096,
+                        rid,
+                        outside_key,
+                    )
+                }
+            }
+            .expect_err("a buffer outside the region it names");
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "read {read}");
+            assert!(
+                el.driver.ring.last_pushed.is_none(),
+                "read {read}: nothing was pushed for the refused operation"
+            );
         }
-        .expect_err("a buffer outside the region it names");
-        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            el.driver.ring.last_pushed.is_none(),
-            "nothing was pushed for the refused write"
-        );
+        let after_key = el.executor.begin_disk_io(0);
+        unsafe {
+            el.driver
+                .make_ctx()
+                .file_write(kind, index, generation, 0, base, 4096, rid, after_key)
+        }
+        .expect("the refusals left the one command slot free");
+        assert_eq!(wait_for_result(&mut el, after_key), 4096, "write after");
 
         let _ = el.driver.make_ctx().file_close(kind, index, generation);
         let _ = std::fs::remove_file(&path);
@@ -7554,9 +7678,10 @@ mod tests {
     /// An NVMe read or write from a buffer that names a registered region
     /// pushes its `URING_CMD` with that region's index
     /// (`IORING_URING_CMD_FIXED`), and one from an unregistered buffer with
-    /// none (#841). The device slot is filled in by hand and has no device
-    /// behind it, so the kernel fails the commands; only what was pushed is
-    /// checked.
+    /// none (#841). A buffer outside the region it names is refused with
+    /// `InvalidInput`, with nothing pushed and no command slot taken. The
+    /// device slot is filled in by hand and has no device behind it, so the
+    /// kernel fails the commands; only what was pushed is checked.
     #[test]
     fn an_nvme_command_from_a_registered_region_sets_the_fixed_index() {
         use crate::backend::uring::sqe::Op;
@@ -7606,6 +7731,32 @@ mod tests {
                 other => panic!("expected a URING_CMD, got {other:?}"),
             }
             let _ = wait_for_result(&mut el, key);
+        }
+
+        let outside = crate::buf::AlignedBuf::zeroed(4096, 4096);
+        for write in [false, true] {
+            el.driver.ring.last_pushed = None;
+            let key = el.executor.begin_disk_io(0);
+            let mut ctx = el.driver.make_ctx();
+            // Safety: refused before anything is pushed, so the kernel never
+            // sees `outside`.
+            let refused = unsafe {
+                if write {
+                    ctx.nvme_write(device, 0, 1, outside.as_ptr() as u64, 4096, rid, key)
+                } else {
+                    ctx.nvme_read(device, 0, 1, outside.as_ptr() as u64, 4096, rid, key)
+                }
+            }
+            .expect_err("a buffer outside the region it names");
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "write {write}");
+            assert!(
+                el.driver.ring.last_pushed.is_none(),
+                "write {write}: nothing was pushed"
+            );
+            assert!(
+                !el.driver.nvme_cmd_slab.as_ref().unwrap().has_in_flight(),
+                "write {write}: no command slot was taken"
+            );
         }
     }
 
@@ -9145,7 +9296,7 @@ mod tests {
             let mut fds = [0i32; 2];
             assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
             unsafe {
-                let fl = libc::fcntl(fds[0], libc::F_GETFL);
+                let fl = libc::fcntl(fds[0], libc::F_GETFL, 0);
                 libc::fcntl(fds[0], libc::F_SETFL, fl | libc::O_NONBLOCK);
             }
             FdProbe {
@@ -9298,14 +9449,15 @@ mod tests {
     /// Whether a forced close (`force_finalize_close`, as when a TLS
     /// close_notify deadline passes) of a connection with a send stuck in the
     /// kernel, with `lead` ahead of its `Close`, releases the socket. The send
-    /// is a chain part, whose `MSG_WAITALL` keeps it in the kernel, or (with
-    /// `chain` false) a send waiting for room, which leaves only its poll
+    /// is a `MSG_WAITALL` send, which stays in the kernel until it finishes
+    /// (no send path submits one; the test pushes it directly), or (with
+    /// `waitall` false) a send waiting for room, which leaves only its poll
     /// there. Either holds the socket until something ends it; the peer never
     /// reads, and sees a hang-up once the socket is shut down or released
     /// (#586).
     fn forced_close_releases_a_stuck_send(
         lead: crate::backend::uring::ring::CloseLead,
-        chain: bool,
+        waitall: bool,
     ) -> bool {
         use std::os::fd::AsRawFd;
         let mut config = test_config();
@@ -9329,11 +9481,23 @@ mod tests {
         }
         drop(ours);
 
-        if chain {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(&[7u8; 16384]).unwrap();
+        if waitall {
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &[7u8; 16384])
+                .unwrap();
             let payload = UserData::send_payload(slot, generation);
             let ud = UserData::encode(OpTag::Send, conn_index, payload);
-            let entry = crate::backend::uring::sqe::Sqe::chain_send(conn_index, ptr, len, ud.raw());
+            let entry = crate::backend::uring::sqe::Sqe::new(
+                crate::backend::uring::sqe::Op::Send {
+                    fd: crate::backend::uring::sqe::Fd::Fixed(conn_index),
+                    buf: ptr,
+                    len,
+                    flags: libc::MSG_WAITALL,
+                },
+                ud.raw(),
+            );
             unsafe { el.driver.ring.push_sqe(&entry) }.expect("push");
             el.driver.send_queues[conn_index as usize].in_flight = true;
         } else {
@@ -9580,7 +9744,11 @@ mod tests {
 
         // Allocate a pool slot (simulating a copy send).
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         // Simulate send CQE: all bytes sent.
@@ -9601,7 +9769,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         // Simulate send error (ECONNRESET = -104).
@@ -9621,7 +9793,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, data.len() as u32);
 
         let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
@@ -9651,8 +9827,16 @@ mod tests {
         let chunk0 = vec![b'a'; 16384];
         let chunk1 = vec![b'b'; 4096];
         let total = (chunk0.len() + chunk1.len()) as u32;
-        let (slot0, _p0, _l0) = el.driver.send_copy_pool.copy_in(&chunk0).unwrap();
-        let (slot1, ptr1, len1) = el.driver.send_copy_pool.copy_in(&chunk1).unwrap();
+        let (slot0, _p0, _l0) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &chunk0)
+            .unwrap();
+        let (slot1, ptr1, len1) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &chunk1)
+            .unwrap();
         // One logical send split across two slots: only the last carries the id.
         let id = await_slot(&mut el, conn_index, slot1, total);
 
@@ -9705,9 +9889,21 @@ mod tests {
         let token = crate::handler::ConnId::new(conn_index, generation);
 
         // Hold three of the four slots so only one is free.
-        let (_f1, _, _) = el.driver.send_copy_pool.copy_in(b"a").unwrap();
-        let (_f2, _, _) = el.driver.send_copy_pool.copy_in(b"b").unwrap();
-        let (_f3, _, _) = el.driver.send_copy_pool.copy_in(b"c").unwrap();
+        let (_f1, _, _) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"a")
+            .unwrap();
+        let (_f2, _, _) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"b")
+            .unwrap();
+        let (_f3, _, _) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"c")
+            .unwrap();
         assert_eq!(el.driver.send_copy_pool.free_count(), 1);
 
         // 100 bytes over 64-byte slots needs 2 slots; only 1 is free.
@@ -9782,7 +9978,11 @@ mod tests {
         // Pool of 6, one slot held, a 4-slot send: the final free count then
         // tells "reservation consumed" (1 free) from "reservation still
         // outstanding" (0 free).
-        let (_held, _, _) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+        let (_held, _, _) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+            .unwrap();
         assert_eq!(el.driver.send_copy_pool.free_count(), 5);
 
         // With a send already in flight, every chunk is queued rather than
@@ -9830,7 +10030,11 @@ mod tests {
         data: &[u8],
     ) -> crate::handler::BuiltSend {
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, ptr, len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -10412,7 +10616,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let tls_send = |el: &mut AsyncEventLoop<NoopHandler>, data: &[u8]| {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+                .unwrap();
             let ud = UserData::encode(
                 OpTag::TlsSend,
                 conn_index,
@@ -10489,8 +10697,16 @@ mod tests {
         // pass for the other.
         let a = b"HELLO";
         let b = b"WORLD!!";
-        let (slot_a, _pa, _la) = el.driver.send_copy_pool.copy_in(a).unwrap();
-        let (slot_b, ptr_b, len_b) = el.driver.send_copy_pool.copy_in(b).unwrap();
+        let (slot_a, _pa, _la) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, a)
+            .unwrap();
+        let (slot_b, ptr_b, len_b) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b)
+            .unwrap();
         let id_a = await_slot(&mut el, conn_index, slot_a, a.len() as u32);
         let id_b = await_slot(&mut el, conn_index, slot_b, b.len() as u32);
 
@@ -10545,7 +10761,11 @@ mod tests {
         let old_gen = el.driver.connections.generation(conn_index);
 
         // A copy send in flight when the connection goes away.
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"orphaned bytes").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"orphaned bytes")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -10559,7 +10779,11 @@ mod tests {
         assert_ne!(el.driver.connections.generation(conn_index), old_gen);
 
         // The new occupant has its own send slot outstanding.
-        let (slot2, _p2, _l2) = el.driver.send_copy_pool.copy_in(b"new occupant").unwrap();
+        let (slot2, _p2, _l2) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"new occupant")
+            .unwrap();
 
         // Stale partial-send CQE for the old occupant.
         el.test_dispatch_cqe(ud.raw(), 3, 0);
@@ -10575,7 +10799,11 @@ mod tests {
 
         // Error-result variant: must not drain the new occupant's queue or
         // fail its send.
-        let (slot3, _p3, _l3) = el.driver.send_copy_pool.copy_in(b"orphan two").unwrap();
+        let (slot3, _p3, _l3) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"orphan two")
+            .unwrap();
         let ud3 = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -10669,7 +10897,11 @@ mod tests {
 
         // A send in flight; close is forced past it (deadline path):
         // in_flight cleared, close_pending set, finalize submits Close.
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"stuck send").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"stuck send")
+            .unwrap();
         el.driver.send_queues[conn_index as usize].close_pending = true;
         el.driver.force_finalize_close(conn_index);
         assert!(
@@ -10712,7 +10944,11 @@ mod tests {
         }
         assert!(!el.driver.send_queues[conn_index as usize].close_submitted);
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"response").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"response")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -10727,191 +10963,7 @@ mod tests {
         );
     }
 
-    /// close_connection must defer the Close SQE while a send chain's SQEs
-    /// are still in the kernel, and finalize once the chain drains.
-    /// A plain send issued while a chain is in flight must queue behind it.
-    /// io_uring does not order independent SQEs, so pushing it directly let
-    /// its bytes reach the peer interleaved with the chain's. Chain completion
-    /// already drains the send queue (`fire_chain_complete`); the send path
-    /// just never queued into it while only a chain was active.
-    #[test]
-    fn a_plain_send_queues_behind_an_active_chain() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnId::new(conn_index, generation);
-
-        el.driver.chain_table.start(conn_index, 1);
-        {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send(token, b"after the chain")
-                .expect("a send behind a chain is accepted");
-        }
-        assert_eq!(
-            el.driver.send_queues[conn_index as usize].queue.len(),
-            1,
-            "a send issued while a chain is active must wait in the queue"
-        );
-
-        // The chain completes; its completion submits what queued behind it.
-        let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
-        assert!(matches!(event, ChainEvent::Complete { .. }));
-        el.fire_chain_complete(conn_index);
-        let state = &el.driver.send_queues[conn_index as usize];
-        assert!(state.queue.is_empty(), "the queued send was not submitted");
-        assert!(state.in_flight, "the queued send is now in flight");
-
-        // And the next send waits behind it rather than pushing past it.
-        {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send(token, b"next").expect("accepted");
-        }
-        assert_eq!(
-            el.driver.send_queues[conn_index as usize].queue.len(),
-            1,
-            "a send issued after the chain completed overtook the queued one"
-        );
-    }
-
-    /// A chain issued while plain sends are queued or in flight would
-    /// overtake them, and the plain queue cannot hold a linked chain, so the
-    /// chain is refused with `WouldBlock` and releases what it built.
-    #[test]
-    fn a_chain_refuses_while_plain_sends_are_in_flight() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnId::new(conn_index, generation);
-        el.driver.send_queues[conn_index as usize].in_flight = true;
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        let result = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send_chain(token).copy(b"chained").finish()
-        };
-        let err = result.expect_err("a chain behind in-flight plain sends must be refused");
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert!(
-            !el.driver.chain_table.is_active(conn_index),
-            "a refused chain must not start"
-        );
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            free_before,
-            "a refused chain must release the slots it built"
-        );
-    }
-
-    /// Guarded memory for a chain's zero-copy part.
-    struct ChainTestGuard(Box<[u8]>);
-
-    impl crate::guard::SendGuard for ChainTestGuard {
-        fn as_ptr_len(&self) -> (*const u8, u32) {
-            (self.0.as_ptr(), self.0.len() as u32)
-        }
-        fn region(&self) -> crate::buffer::fixed::RegionId {
-            crate::buffer::fixed::RegionId::UNREGISTERED
-        }
-    }
-
-    /// A stale handle's chain must not be submitted on the slot's new
-    /// occupant. Its SQEs would write to the new occupant's socket, and the
-    /// `chain_table` entry it started would never complete, since the CQEs
-    /// carry the old generation.
-    #[test]
-    fn a_chain_refuses_a_stale_handle() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let old_gen = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, old_gen);
-
-        el.driver.connections.release(conn_index);
-        let reused = accept_connection(&mut el);
-        assert_eq!(reused, conn_index, "test premise: index reused");
-        let new_gen = el.driver.connections.generation(conn_index);
-        assert_ne!(new_gen, old_gen);
-
-        let pool_free = el.driver.send_copy_pool.free_count();
-        let slab_free = el.driver.send_slab.free_count();
-        let result = with_driver_state(&mut el, || {
-            stale.send_chain(|chain| {
-                chain
-                    .copy(b"chained")
-                    .parts()
-                    .copy(b"head")
-                    .guard(crate::guard::GuardBox::new(ChainTestGuard(
-                        vec![7u8; 8192].into_boxed_slice(),
-                    )))
-                    .add()
-                    .finish()
-            })
-        });
-        let Err(err) = result else {
-            panic!("a stale handle's chain must be refused");
-        };
-        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
-        assert!(
-            !el.driver.chain_table.is_active(conn_index),
-            "a stale handle must not start a chain on the new occupant"
-        );
-        assert_eq!(el.driver.send_copy_pool.free_count(), pool_free);
-        assert_eq!(el.driver.send_slab.free_count(), slab_free);
-
-        // The control: the new occupant's own handle still chains.
-        let current = ConnCtx::new(conn_index, new_gen);
-        let result = with_driver_state(&mut el, || {
-            current.send_chain(|chain| chain.copy(b"chained").finish())
-        });
-        assert!(result.is_ok(), "the current handle must still chain");
-        assert!(el.driver.chain_table.is_active(conn_index));
-    }
-
-    /// A chain on a handle whose connection is gone and whose slot is free
-    /// is refused before anything is submitted.
-    #[test]
-    fn a_chain_refuses_a_handle_whose_slot_is_free() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnId::new(conn_index, generation);
-        el.driver.connections.release(conn_index);
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        let result = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send_chain(token).copy(b"chained").finish()
-        };
-        let err = result.expect_err("a chain on a free slot must be refused");
-        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
-        assert!(!el.driver.chain_table.is_active(conn_index));
-        assert_eq!(el.driver.send_copy_pool.free_count(), free_before);
-    }
-
-    #[test]
-    fn close_defers_while_chain_active() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        el.driver.chain_table.start(conn_index, 1);
-        el.driver.close_connection(conn_index);
-        assert!(
-            el.driver.send_queues[conn_index as usize].close_pending,
-            "close must stay pending while the chain is active"
-        );
-
-        // The chain's operation CQE arrives and completes it; the
-        // end-of-iteration drain then commits the close.
-        let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
-        assert!(matches!(event, ChainEvent::Complete { .. }));
-        el.fire_chain_complete(conn_index);
-        el.finalize_pending_closes();
-        assert!(
-            !el.driver.send_queues[conn_index as usize].close_pending,
-            "close must finalize once the chain drains"
-        );
-    }
-
-    /// A copy-only batch, chain send or chain part wider than one send-pool
+    /// A copy-only batch wider than one send-pool
     /// slot can never fit: it is refused with `InvalidInput`, as the same
     /// data beside a guard part already is, not with the retryable `Other`
     /// of an exhausted pool. Nothing is taken from the pool.
@@ -10927,7 +10979,6 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
         let token = crate::handler::ConnId::new(conn_index, generation);
         let half = [0u8; 40];
-        let whole = [0u8; 100];
 
         let err = {
             let mut ctx = el.driver.make_ctx();
@@ -10939,38 +10990,12 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "send_parts: {err}");
 
-        let err = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send_chain(token)
-                .copy(&whole)
-                .finish()
-                .expect_err("100 bytes do not fit a 64-byte slot")
-        };
-        assert_eq!(
-            err.kind(),
-            io::ErrorKind::InvalidInput,
-            "send_chain copy: {err}"
-        );
-
-        let err = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send_chain(token)
-                .parts()
-                .copy(&half)
-                .copy(&half)
-                .add()
-                .finish()
-                .expect_err("80 bytes do not fit a 64-byte slot")
-        };
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "chain part: {err}");
-
         assert_eq!(
             el.driver.send_copy_pool.free_count(),
             4,
             "nothing was taken"
         );
         assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
-        assert!(!el.driver.chain_table.is_active(conn_index));
     }
 
     /// A `send_parts` batch whose parts carry no bytes queues nothing: no
@@ -11078,47 +11103,6 @@ mod tests {
             el.driver.connections.get(conn_index).unwrap().write,
             crate::connection::WriteHalf::Shutdown
         ));
-    }
-
-    /// `shutdown_write` while a send chain is active defers the FIN until
-    /// the chain completes. The chain's parts are linked SQEs with
-    /// `MSG_WAITALL` and set neither `in_flight` nor the queue, so a
-    /// Shutdown SQE pushed beside them is not ordered behind them: the FIN
-    /// queues behind the bytes already in the socket buffer and the parts
-    /// still waiting for room fail `EPIPE`.
-    #[test]
-    fn shutdown_write_defers_while_chain_active() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnId::new(conn_index, generation);
-
-        el.driver.chain_table.start(conn_index, 1);
-        el.driver.make_ctx().shutdown_write(token);
-        assert!(
-            matches!(
-                el.driver.connections.get(conn_index).unwrap().write,
-                crate::connection::WriteHalf::ShutdownPending
-            ),
-            "the FIN must wait for the chain"
-        );
-        assert!(
-            !el.driver.send_queues[conn_index as usize].shutdown_inflight,
-            "no Shutdown SQE beside the chain's linked parts"
-        );
-
-        // The chain's operation CQE completes it; the FIN goes out then.
-        let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
-        assert!(matches!(event, ChainEvent::Complete { .. }));
-        el.fire_chain_complete(conn_index);
-        assert!(
-            matches!(
-                el.driver.connections.get(conn_index).unwrap().write,
-                crate::connection::WriteHalf::Shutdown
-            ),
-            "the deferred FIN is submitted once the chain drains"
-        );
-        assert!(el.driver.send_queues[conn_index as usize].shutdown_inflight);
     }
 
     /// Dropping the last half closes gracefully, with a close_notify on TLS. An
@@ -11246,7 +11230,11 @@ mod tests {
     /// make a close find the pool exhausted and then hand slots back.
     fn exhaust_send_pool(el: &mut AsyncEventLoop<NoopHandler>) -> Vec<u16> {
         let mut held = Vec::new();
-        while let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"x") {
+        while let Some((slot, _, _)) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+        {
             held.push(slot);
         }
         assert_eq!(el.driver.send_copy_pool.free_count(), 0);
@@ -11332,7 +11320,11 @@ mod tests {
 
         // A send SQE is in the kernel.
         el.driver.send_queues[conn_index as usize].in_flight = true;
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"in flight").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"in flight")
+            .unwrap();
 
         {
             let mut ctx = el.driver.make_ctx();
@@ -11898,7 +11890,11 @@ mod tests {
         // A send is in the kernel when the FIN arrives, so the close waits
         // on its CQE.
         el.driver.send_queues[conn_index as usize].in_flight = true;
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data")
+            .unwrap();
         let send_ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -12442,7 +12438,11 @@ mod tests {
     /// returned.
     fn forward_a_put_back_remainder(len: usize, tls: bool) -> (bool, bool) {
         use std::sync::atomic::Ordering;
-        let mut el = make_test_loop();
+        let mut el = if tls {
+            tls_bounded_test_loop()
+        } else {
+            make_test_loop()
+        };
         let conn_index = accept_connection(&mut el);
         if tls {
             install_handshaked_tls(&mut el, conn_index);
@@ -13243,7 +13243,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         // Simulate full TLS send completion (all bytes sent, try_advance returns None).
@@ -13263,7 +13267,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         // Simulate TLS send error (result < 0).
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
@@ -13291,7 +13299,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
         el.test_dispatch_cqe(ud.raw(), 0, 0);
 
@@ -13314,7 +13326,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let before = metrics::BYTES.value(metrics::bytes::SENT).unwrap_or(0);
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
         el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
@@ -13363,7 +13379,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"reply").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"reply")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -13418,7 +13438,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let plain_send = |el: &mut AsyncEventLoop<NoopHandler>, data: &[u8]| {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+                .unwrap();
             let ud = UserData::encode(
                 OpTag::Send,
                 conn_index,
@@ -13460,7 +13484,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"ciphertext").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"ciphertext")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::TlsSend,
             conn_index,
@@ -13472,36 +13500,6 @@ mod tests {
         assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
     }
 
-    /// A chain whose first send fails closed the connection before; the
-    /// reader is now told why as well.
-    #[test]
-    fn a_chain_send_error_aborts_the_connection() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        el.driver.chain_table.start(conn_index, 2);
-        let ud1 = UserData::encode(
-            OpTag::Send,
-            conn_index,
-            UserData::send_payload(s1, generation),
-        );
-        let ud2 = UserData::encode(
-            OpTag::Send,
-            conn_index,
-            UserData::send_payload(s2, generation),
-        );
-
-        el.inject_linked_chain_and_dispatch(&[(ud1.raw(), -libc::ECONNRESET), (ud2.raw(), 0)]);
-
-        assert!(
-            !el.driver.chain_table.is_active(conn_index),
-            "the chain completed"
-        );
-        assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
-    }
-
     /// A send the close's lead cancelled is not a failure of the connection:
     /// the read half stays as the requested close left it, and no error is
     /// recorded for the reader.
@@ -13510,7 +13508,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"reply").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"reply")
+            .unwrap();
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -13546,7 +13548,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
         el.test_dispatch_cqe(ud.raw(), -(libc::EAGAIN), 0);
@@ -13621,7 +13627,11 @@ mod tests {
     fn stage_send(el: &mut AsyncEventLoop<NoopHandler>, data: &[u8]) -> (u32, u16, UserData) {
         let conn_index = accept_connection(el);
         let generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let payload = UserData::send_payload(slot, generation);
         (
@@ -13639,7 +13649,11 @@ mod tests {
         let mut iovecs = Vec::new();
         let mut slots = Vec::new();
         for _ in 0..2 {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(&data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &data)
+                .unwrap();
             iovecs.push(libc::iovec {
                 iov_base: ptr as *mut libc::c_void,
                 iov_len: len as usize,
@@ -13888,7 +13902,11 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), 100, 0);
         assert!(!el.driver.send_copy_pool.in_use(slot));
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(&[7u8; 100]).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &[7u8; 100])
+            .unwrap();
         let generation = el.driver.connections.generation(conn_index);
         let payload = UserData::send_payload(slot, generation);
         let next = UserData::encode(OpTag::Send, conn_index, payload);
@@ -14505,7 +14523,11 @@ mod tests {
         // Allocate and immediately release a slot, then deliver a stale
         // TlsSend CQE for it (Close CQE processed earlier in the same batch).
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         el.driver.send_copy_pool.release(slot);
         let free_before = el.driver.send_copy_pool.free_count();
 
@@ -14536,7 +14558,11 @@ mod tests {
         }
 
         let data = b"datagram";
-        let (pool_slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (pool_slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         // Pop the send slot we'll "simulate" — so the CQE pushes it back cleanly
@@ -14572,7 +14598,11 @@ mod tests {
         el.executor.udp_send_ready_waiters[0] = Some(42);
 
         let data = b"wake";
-        let (pool_slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (pool_slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let slot_idx = el.driver.udp_sockets[0].send_freelist.pop().unwrap();
 
         let payload = crate::backend::uring::driver::encode_udp_send_payload(slot_idx, pool_slot);
@@ -14605,7 +14635,11 @@ mod tests {
 
         // Allocate a pool slot with 10 bytes.
         let data = b"0123456789";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         // Mark send as in-flight.
         el.driver.send_queues[conn_index as usize].in_flight = true;
@@ -14629,7 +14663,11 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, data.len() as u32);
 
         // Simulate send error (ECONNRESET).
@@ -14731,7 +14769,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
@@ -14751,7 +14793,11 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, data.len() as u32);
 
         // Inject ECONNRESET through real io_uring.
@@ -14814,7 +14860,11 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
         let data = b"hello";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, data.len() as u32);
 
         let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
@@ -14955,7 +15005,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
@@ -14970,7 +15024,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"ciphertext";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
         el.inject_and_dispatch(ud.raw(), -104);
@@ -15006,7 +15064,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data")
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, 4);
 
         let send_ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
@@ -15045,7 +15107,11 @@ mod tests {
         let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data")
+            .unwrap();
 
         // Recv EOF + stale send in the same batch.
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
@@ -15076,8 +15142,16 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
-        let (slot1, _p, _l) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (slot2, _p, _l) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (slot1, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"aaa")
+            .unwrap();
+        let (slot2, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"bbb")
+            .unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
 
         let ud1 = UserData::encode(OpTag::Send, conn_index, slot1 as u32);
@@ -15102,8 +15176,16 @@ mod tests {
         el.driver.send_queues[c1 as usize].in_flight = true;
         el.driver.send_queues[c2 as usize].in_flight = true;
 
-        let (s1, _p, _l) = el.driver.send_copy_pool.copy_in(b"hello").unwrap();
-        let (s2, _p, _l) = el.driver.send_copy_pool.copy_in(b"world").unwrap();
+        let (s1, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"hello")
+            .unwrap();
+        let (s2, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"world")
+            .unwrap();
         let id1 = await_slot(&mut el, c1, s1, 5);
         let id2 = await_slot(&mut el, c2, s2, 5);
 
@@ -15136,7 +15218,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         let data = b"retry-data";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
         let generation = el.driver.connections.generation(conn_index);
 
         // Queue the retry.
@@ -15170,7 +15256,11 @@ mod tests {
         let old_generation = el.driver.connections.generation(conn_index);
 
         let data = b"retry-data";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+            .unwrap();
 
         // Queue the retry with the old generation.
         el.driver
@@ -15211,7 +15301,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let old_generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"retry-data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"retry-data")
+            .unwrap();
         let id = await_slot(&mut el, conn_index, slot, 10);
         el.driver
             .push_copy_retry(conn_index, old_generation, slot, OpTag::Send);
@@ -15598,7 +15692,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data")
+            .unwrap();
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let id = await_slot(&mut el, conn_index, slot, 4);
 
@@ -15848,119 +15946,6 @@ mod tests {
             2,
             "a blocked sender's wake was lost (single-slot send_waiter)"
         );
-    }
-
-    // ── Linked SQE chain error propagation tests ───────────────────
-    //
-    // Submit linked NOP chains where the first SQE fails. The kernel
-    // cancels subsequent linked SQEs with ECANCELED. This tests the
-    // chain error handling path end-to-end through the real kernel.
-
-    #[test]
-    fn linked_chain_copy_send_first_fails_releases_all() {
-        // 3-SQE chain: first Send fails, second and third get ECANCELED.
-        // All pool slots should be released, chain should complete.
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // Allocate 3 pool slots for the chain.
-        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        let (s3, _, _) = el.driver.send_copy_pool.copy_in(b"ccc").unwrap();
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        // Register chain state: 3 SQEs, 9 total bytes.
-        el.driver.chain_table.start(conn_index, 3);
-        let id = await_chain(&mut el, conn_index);
-
-        // Submit linked NOPs: first with injected error, rest linked.
-        // The completions are: error CQE, ECANCELED CQE, ECANCELED CQE.
-        let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
-        let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
-        let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
-
-        el.inject_linked_chain_and_dispatch(&[
-            (ud1.raw(), -104), // ECONNRESET — first SQE fails
-            (ud2.raw(), 0),    // kernel sets result for linked NOPs
-            (ud3.raw(), 0),    // kernel sets result for linked NOPs
-        ]);
-
-        // All 3 pool slots should be released.
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            free_before + 3,
-            "not all pool slots released after chain error"
-        );
-
-        // Chain should be complete (no longer active).
-        assert!(
-            !el.driver.chain_table.is_active(conn_index),
-            "chain still active after all CQEs processed"
-        );
-
-        // The awaited chain settled with an error.
-        assert!(
-            matches!(send_result(&mut el, id), Some(Err(_))),
-            "chain result not stored"
-        );
-    }
-
-    #[test]
-    fn linked_chain_middle_fails_rest_canceled() {
-        // 3-SQE chain: first succeeds, second fails, third ECANCELED.
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        let (s3, _, _) = el.driver.send_copy_pool.copy_in(b"ccc").unwrap();
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        el.driver.chain_table.start(conn_index, 3);
-        let id = await_chain(&mut el, conn_index);
-
-        let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
-        let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
-        let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
-
-        el.inject_linked_chain_and_dispatch(&[
-            (ud1.raw(), 3),    // first succeeds (3 bytes)
-            (ud2.raw(), -104), // second fails
-            (ud3.raw(), 0),    // third ECANCELED
-        ]);
-
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            free_before + 3,
-            "not all pool slots released"
-        );
-        assert!(!el.driver.chain_table.is_active(conn_index));
-        assert!(matches!(send_result(&mut el, id), Some(Err(_))));
-    }
-
-    #[test]
-    fn linked_chain_all_succeed() {
-        // 3-SQE chain: all succeed. No errors.
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
-        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        let (s3, _, _) = el.driver.send_copy_pool.copy_in(b"ccc").unwrap();
-        let free_before = el.driver.send_copy_pool.free_count();
-
-        el.driver.chain_table.start(conn_index, 3);
-        let id = await_chain(&mut el, conn_index);
-
-        let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
-        let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
-        let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
-
-        el.inject_linked_chain_and_dispatch(&[(ud1.raw(), 3), (ud2.raw(), 3), (ud3.raw(), 3)]);
-
-        assert_eq!(el.driver.send_copy_pool.free_count(), free_before + 3);
-        assert!(!el.driver.chain_table.is_active(conn_index));
-        assert_eq!(send_result(&mut el, id).unwrap().unwrap(), 9);
     }
 
     // ── Bounded-send settlement, teardown and identity ─────────────
@@ -16230,7 +16215,11 @@ mod tests {
     fn hold_all_but(el: &mut AsyncEventLoop<NoopHandler>, leave: usize) -> Vec<u16> {
         let mut held = Vec::new();
         while el.driver.send_copy_pool.free_count() > leave {
-            let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+            let (slot, _p, _l) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+                .unwrap();
             held.push(slot);
         }
         held
@@ -16356,16 +16345,15 @@ mod tests {
         assert_eq!(peer.decrypt(&wire).as_deref(), Ok(&b"hello"[..]));
     }
 
-    /// Where no bound can be expressed (the unbuffered engine with a slot too
-    /// small to hold one whole record) a plain send is attempted without one.
-    /// `Config::validate` rejects such a slot for every configured rustls
-    /// config, so this test installs TLS state directly, after validation. If
-    /// the pool runs dry mid-encryption the records already sealed have spent
-    /// their sequence numbers, so the connection is closed rather than left
-    /// open to emit records the peer will reject.
+    /// A plain TLS send whose slot size has no ciphertext bound (the
+    /// unbuffered engine with a slot too small to hold one whole record) is
+    /// refused with `InvalidInput` before rustls mutates: nothing is taken
+    /// from the pool and the connection stays open. `Config::validate`
+    /// rejects such a slot for every configured rustls config, so this test
+    /// installs TLS state directly, after validation.
     #[cfg(not(feature = "tls-buffered"))]
     #[test]
-    fn plain_tls_send_that_fails_mid_encryption_closes_the_connection() {
+    fn plain_tls_send_whose_slot_size_has_no_bound_is_refused_before_encrypting() {
         let mut el = make_test_loop_with_config(
             test_config_builder()
                 .send_pool(8, 4096)
@@ -16388,26 +16376,28 @@ mod tests {
             None,
             "the premise: this slot size has no expressible bound"
         );
+        let free_before = el.driver.send_copy_pool.free_count();
 
-        let held = hold_all_but(&mut el, 1);
-        let result = {
+        let err = {
             let mut ctx = el.driver.make_ctx();
             ctx.send(token, &[b'z'; 16384])
-        };
-        assert!(result.is_err(), "one 4 KiB slot cannot hold 16 KiB");
-        let conn = el.driver.connections.get(conn_index);
+        }
+        .expect_err("a 4 KiB slot cannot bound a TLS send");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(
-            conn.is_none() || conn.unwrap().close_requested(),
-            "records were sealed and dropped, so the connection must close"
+            err.to_string().contains("send_copy_slot_size"),
+            "the refusal names the slot size: {err}"
         );
-        // The close queues a close_notify, and it can only have got a slot if
-        // the failed encryption gave back the one it took.
-        assert_eq!(el.driver.send_copy_pool.free_count(), 0);
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before,
+            "nothing was encrypted"
+        );
+        let conn = el.driver.connections.get(conn_index).expect("still open");
         assert!(
-            el.driver.send_queues[conn_index as usize].in_flight,
-            "the close_notify is on its way, in the slot the encryption returned"
+            !conn.close_requested(),
+            "a refusal before rustls mutates closes nothing"
         );
-        release_slots(&mut el, held);
     }
 
     /// A bounded TLS send whose slot size has no ciphertext bound is refused
@@ -16593,7 +16583,11 @@ mod tests {
         // three-slot ciphertext bound.
         let mut held = Vec::new();
         while el.driver.send_copy_pool.free_count() > 2 {
-            let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+            let (slot, _p, _l) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+                .unwrap();
             held.push(slot);
         }
 
@@ -16788,7 +16782,11 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let data = [b'p'; 20];
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(&data).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &data)
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 20);
         let ud = UserData::encode(
             OpTag::Send,
@@ -16895,7 +16893,11 @@ mod tests {
     fn a_queued_awaited_send_fails_when_the_send_ahead_of_it_fails() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"ahead").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"ahead")
+            .unwrap();
         let ahead = await_slot(&mut el, conn_index, slot, 5);
         let behind = built_copy_send(&mut el, conn_index, b"behind");
         let queued = await_slot(&mut el, conn_index, behind.pool_slot, 6);
@@ -16963,25 +16965,6 @@ mod tests {
         assert!(!el.driver.send_slab.in_use(slab_idx));
     }
 
-    /// A chain abandoned by a forced close fails the send it carries.
-    #[test]
-    fn a_force_closed_chain_fails_its_send() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver.chain_table.start(conn_index, 1);
-        let id = await_chain(&mut el, conn_index);
-
-        el.driver.force_finalize_close(conn_index);
-
-        assert_eq!(
-            send_result(&mut el, id)
-                .expect("the cancelled chain settled its send")
-                .expect_err("the chain never completed")
-                .kind(),
-            io::ErrorKind::ConnectionAborted
-        );
-    }
-
     /// A zero-copy send settles on its operation CQE, before the
     /// notification that frees its guards.
     #[test]
@@ -17024,16 +17007,12 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let conn = ConnCtx::new(conn_index, generation);
-        // Another send is in flight, so every chain is refused.
+        // Another send is in flight.
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let huge = vec![0u8; 1 << 24];
         let kind = |r: io::Result<crate::SendCompletion>| r.err().map(|e| e.kind());
         for _ in 0..10 {
             with_driver_state(&mut el, || {
-                let refused = conn.send_chain(|chain| chain.copy(b"x").finish());
-                assert_eq!(kind(refused), Some(io::ErrorKind::WouldBlock));
-                let empty = conn.send_chain(|_chain| Ok(()));
-                assert!(empty.is_ok());
                 assert_eq!(kind(conn.send(&huge)), Some(io::ErrorKind::InvalidInput));
 
                 // `build`: an empty batch, a closure that never submits, and
@@ -17098,10 +17077,10 @@ mod tests {
         assert_eq!(el.executor.send_completions.live(), 0);
     }
 
-    /// A `build` or `send_chain` closure that panics leaves no entry in the
-    /// completion table: the id was registered before the closure ran.
+    /// A `build` closure that panics leaves no entry in the completion table:
+    /// the id was registered before the closure ran.
     #[test]
-    fn a_panicking_build_or_chain_closure_leaves_no_entry() {
+    fn a_panicking_build_closure_leaves_no_entry() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
@@ -17113,12 +17092,6 @@ mod tests {
                 })
             }));
             assert!(built.is_err(), "the panic reached the caller");
-            let chained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_driver_state(&mut el, || {
-                    conn.send_chain(|_c| -> io::Result<()> { panic!("a chain closure panics") })
-                })
-            }));
-            assert!(chained.is_err(), "the panic reached the caller");
         }
         assert_eq!(el.executor.send_completions.live(), 0);
     }
@@ -17154,59 +17127,45 @@ mod tests {
         assert_eq!(el.executor.send_completions.live(), 0);
     }
 
-    /// A `build` or `send_chain` closure that panics after its send was
-    /// submitted leaves no entry, and the send's completion, when it arrives,
-    /// settles nothing: not the withdrawn id, and not a later send that took
-    /// its slot in the table.
+    /// A `build` closure that panics after its send was submitted leaves no
+    /// entry, and the send's completion, when it arrives, settles nothing: not
+    /// the withdrawn id, and not a later send that took its slot in the table.
     #[test]
-    fn a_panic_after_a_submitted_build_or_chain_settles_nothing() {
+    fn a_panic_after_a_submitted_build_settles_nothing() {
         let mut el = make_test_loop();
-        for chain in [false, true] {
-            let conn_index = accept_connection(&mut el);
-            let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_driver_state(&mut el, || {
-                    if chain {
-                        let _ = conn.send_chain(|c| -> io::Result<()> {
-                            c.copy(b"x").finish()?;
-                            panic!("a chain closure panics after finish")
-                        });
-                    } else {
-                        let _ = conn.send_parts().build(|b| -> io::Result<()> {
-                            b.copy(b"x").submit()?;
-                            panic!("a build closure panics after submit")
-                        });
-                    }
-                })
-            }));
-            assert!(
-                panicked.is_err(),
-                "the panic reached the caller (chain: {chain})"
-            );
-            assert_eq!(el.executor.send_completions.live(), 0, "chain: {chain}");
-            let ud = el
-                .driver
-                .ring
-                .last_pushed
-                .as_ref()
-                .expect("the send was pushed")
-                .user_data;
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_driver_state(&mut el, || {
+                let _ = conn.send_parts().build(|b| -> io::Result<()> {
+                    b.copy(b"x").submit()?;
+                    panic!("a build closure panics after submit")
+                });
+            })
+        }));
+        assert!(panicked.is_err(), "the panic reached the caller");
+        assert_eq!(el.executor.send_completions.live(), 0);
+        let ud = el
+            .driver
+            .ring
+            .last_pushed
+            .as_ref()
+            .expect("the send was pushed")
+            .user_data;
 
-            // A later send takes the withdrawn id's slot in the table.
-            let later = el.executor.register_send(conn_index);
-            el.test_dispatch_cqe(ud, 1, 0);
-            assert!(
-                !el.driver.send_queues[conn_index as usize].in_flight
-                    && !el.driver.chain_table.is_active(conn_index),
-                "the completion was handled (chain: {chain})"
-            );
-            assert!(
-                el.executor.take_send_result(later).is_none(),
-                "the completion settled a later send (chain: {chain})"
-            );
-            el.executor.withdraw_send(later);
-            assert_eq!(el.executor.send_completions.live(), 0, "chain: {chain}");
-        }
+        // A later send takes the withdrawn id's slot in the table.
+        let later = el.executor.register_send(conn_index);
+        el.test_dispatch_cqe(ud, 1, 0);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].in_flight,
+            "the completion was handled"
+        );
+        assert!(
+            el.executor.take_send_result(later).is_none(),
+            "the completion settled a later send"
+        );
+        el.executor.withdraw_send(later);
+        assert_eq!(el.executor.send_completions.live(), 0);
     }
 
     /// A send owned by its connection's own task is abandoned when the
@@ -17217,7 +17176,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let old_gen = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"orphaned").unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"orphaned")
+            .unwrap();
         crate::runtime::CURRENT_TASK_ID.with(|c| c.set(conn_index));
         let id = await_slot(&mut el, conn_index, slot, 8);
         let ud = UserData::encode(
@@ -17367,7 +17330,11 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"doomed").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"doomed")
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 6);
         let ud = UserData::encode(
             OpTag::Send,
@@ -17402,7 +17369,11 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"nothing went").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"nothing went")
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 12);
         let ud = UserData::encode(
             OpTag::Send,
@@ -17438,7 +17409,11 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let ciphertext = [b'c'; 30];
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&ciphertext).unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &ciphertext)
+            .unwrap();
         // 12 bytes of plaintext became 30 bytes on the wire.
         el.driver.send_copy_pool.set_send_id(slot, id, 12);
         let ud = UserData::encode(
@@ -17649,7 +17624,11 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let data = [b'x'; 20];
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&data).unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &data)
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 20);
         el.driver.send_queues[conn_index as usize].close_submitted = true;
 
@@ -17684,7 +17663,11 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let ciphertext = [b'c'; 20];
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&ciphertext).unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &ciphertext)
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 20);
         el.driver.send_queues[conn_index as usize].close_submitted = true;
 
@@ -17719,7 +17702,11 @@ mod tests {
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"stuck").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"stuck")
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 5);
         el.driver.send_queues[conn_index as usize].in_flight = true;
         el.driver
@@ -18003,7 +17990,11 @@ mod tests {
             (OpTag::TlsSend, &b"record-1"[..]),
             (OpTag::Send, b"record-2"),
         ] {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+                .unwrap();
             let ud = UserData::encode(tag, conn_index, UserData::send_payload(slot, generation));
             let entry =
                 crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
@@ -18036,7 +18027,11 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
         el.driver.send_queues[conn_index as usize].in_flight = true;
         for data in [&b"record-1"[..], b"record-2"] {
-            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let (slot, ptr, len) = el
+                .driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
+                .unwrap();
             let ud = UserData::encode(
                 OpTag::Send,
                 conn_index,
@@ -18184,8 +18179,16 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (s0, p0, l0) = el.driver.send_copy_pool.copy_in(b"aa").unwrap();
-        let (s1, p1, l1) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (s0, p0, l0) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"aa")
+            .unwrap();
+        let (s1, p1, l1) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"bbb")
+            .unwrap();
         let iovecs = [
             libc::iovec {
                 iov_base: p0 as *mut libc::c_void,
@@ -18740,7 +18743,11 @@ mod tests {
     fn a_forced_close_abandoning_an_unawaited_send_releases_capacity() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(b"unawaited").unwrap();
+        let (slot, ptr, len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"unawaited")
+            .unwrap();
         let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
         let entry = crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
         {
@@ -18784,7 +18791,11 @@ mod tests {
         let old_gen = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, old_gen);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"orphaned").unwrap();
+        let (slot, _p, _l) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"orphaned")
+            .unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 8);
         let ud = UserData::encode(
             OpTag::Send,
@@ -18798,7 +18809,11 @@ mod tests {
         assert_eq!(reused, conn_index, "test premise: index reused");
         assert_ne!(el.driver.connections.generation(conn_index), old_gen);
         // The new occupant has a send of its own outstanding.
-        let (slot2, _p2, _l2) = el.driver.send_copy_pool.copy_in(b"new occupant").unwrap();
+        let (slot2, _p2, _l2) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"new occupant")
+            .unwrap();
 
         el.test_dispatch_cqe(ud.raw(), 8, 0);
 
@@ -18905,7 +18920,7 @@ mod tests {
     // `IORING_NOP_INJECT_RESULT` (Linux 6.10, modelled below it) is the
     // mechanism, as it is for the `nop_inject_*` tests above;
     // `inject_and_dispatch`,
-    // `inject_batch_and_dispatch` and `inject_linked_chain_and_dispatch` are
+    // `inject_batch_and_dispatch` and `inject_linked_and_dispatch` are
     // the three shapes.
 
     /// A generation whose low bits are a real pattern rather than 0 or 1.
@@ -18961,7 +18976,7 @@ mod tests {
         let (slot, _ptr, _len) = el
             .driver
             .send_copy_pool
-            .copy_in(data)
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, data)
             .expect("free pool slot");
         el.driver.send_copy_pool.set_send_id(slot, id, logical_len);
         (id, slot)
@@ -19248,8 +19263,16 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (s0, p0, l0) = el.driver.send_copy_pool.copy_in(b"aa").unwrap();
-        let (s1, p1, l1) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (s0, p0, l0) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"aa")
+            .unwrap();
+        let (s1, p1, l1) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"bbb")
+            .unwrap();
         let iovecs = [
             libc::iovec {
                 iov_base: p0 as *mut libc::c_void,
@@ -19317,8 +19340,16 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
-        let (s0, p0, l0) = el.driver.send_copy_pool.copy_in(b"aa").unwrap();
-        let (s1, p1, l1) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (s0, p0, l0) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"aa")
+            .unwrap();
+        let (s1, p1, l1) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"bbb")
+            .unwrap();
         let iovecs = [
             libc::iovec {
                 iov_base: p0 as *mut libc::c_void,
@@ -19535,7 +19566,7 @@ mod tests {
             UserData::send_payload(slot, generation),
         );
         let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
-        el.inject_linked_chain_and_dispatch(&[(send_ud.raw(), 9), (close_ud.raw(), 0)]);
+        el.inject_linked_and_dispatch(&[(send_ud.raw(), 9), (close_ud.raw(), 0)]);
 
         assert!(
             el.driver.connections.get(conn_index).is_none(),
@@ -19584,7 +19615,7 @@ mod tests {
             UserData::send_payload(slot, generation),
         );
         let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
-        el.inject_linked_chain_and_dispatch(&[(close_ud.raw(), 0), (send_ud.raw(), 8)]);
+        el.inject_linked_and_dispatch(&[(close_ud.raw(), 0), (send_ud.raw(), 8)]);
 
         assert!(
             el.driver.connections.get(conn_index).is_none(),
@@ -20266,7 +20297,11 @@ mod tests {
         let probe = probe_ud(&el, conn_index);
         assert_last_poll(&el, probe, false);
 
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(&[7u8; 100]).unwrap();
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, &[7u8; 100])
+            .unwrap();
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let ud = UserData::encode(
             OpTag::Send,
@@ -20846,7 +20881,7 @@ mod tests {
 
                 for action in &actions {
                     let data = b"test";
-                    let (slot, _, _) = match el.driver.send_copy_pool.copy_in(data) {
+                    let (slot, _, _) = match el.driver.send_copy_pool.copy_in(crate::buffer::send_copy::SlotOwner::NONE, data) {
                         Some(s) => s,
                         None => break, // pool exhausted — stop sequence
                     };
@@ -20997,7 +21032,7 @@ mod tests {
                         // Send success on a random live connection.
                         1 if !live_conns.is_empty() => {
                             let ci = live_conns[0];
-                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
+                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data") {
                                 let ud = UserData::encode(
                                     OpTag::Send,
                                     ci,
@@ -21014,7 +21049,7 @@ mod tests {
                         // closes it, and the Close CQE follows.
                         2 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
-                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
+                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data") {
                                 let ud = UserData::encode(
                                     OpTag::Send,
                                     ci,
@@ -21101,7 +21136,7 @@ mod tests {
                         // Send + Recv EOF in same batch (the cross-CQE bug pattern).
                         7 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
-                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
+                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"data") {
                                 pool_slots_in_flight.push(slot);
                                 let send_ud = UserData::encode(
                                     OpTag::Send,
@@ -21224,6 +21259,148 @@ mod tests {
         unsafe {
             libc::close(handled);
         }
+    }
+
+    // ── Non-waiting sends behind a waiting bounded send ──────────────
+
+    /// Put a bounded send on `conn_index`'s ticket queue that waits, owned
+    /// by a parked standalone task.
+    fn wait_a_ticket(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) -> SendId {
+        let task_id = parked_standalone(&mut el.executor);
+        let generation = el.driver.connections.generation(conn_index);
+        el.executor
+            .enqueue_send_capacity(conn_index, generation, 1, task_id)
+    }
+
+    /// A guard of `len` bytes in no registered region.
+    struct PlainGuard(Vec<u8>);
+
+    impl crate::SendGuard for PlainGuard {
+        fn as_ptr_len(&self) -> (*const u8, u32) {
+            (self.0.as_ptr(), self.0.len() as u32)
+        }
+        fn region(&self) -> crate::RegionId {
+            crate::RegionId::UNREGISTERED
+        }
+    }
+
+    fn is_ticket_refusal(r: &io::Result<impl Sized>) -> bool {
+        matches!(r, Err(e) if e.kind() == io::ErrorKind::Other
+            && e.to_string() == crate::handler::TICKET_WAITING_REFUSAL)
+    }
+
+    /// A plain send on a connection with a bounded send waiting is refused
+    /// with `Other` and takes no slot; once the waiting send leaves, the
+    /// plain send is accepted.
+    #[test]
+    fn a_plain_send_behind_a_waiting_bounded_send_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let ticket = wait_a_ticket(&mut el, conn_index);
+        let free = el.driver.send_copy_pool.free_count();
+        let refused = with_driver_state(&mut el, || conn.send(b"x"));
+        assert!(is_ticket_refusal(&refused), "{refused:?}");
+        assert_eq!(el.driver.send_copy_pool.free_count(), free);
+        assert_eq!(el.executor.send_completions.live(), 1, "no id left behind");
+        el.executor.cancel_send(ticket);
+        let sent = with_driver_state(&mut el, || conn.send(b"x"));
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// A bounded send waiting on one connection refuses no send on another.
+    #[test]
+    fn a_waiting_ticket_refuses_no_send_on_another_connection() {
+        let mut el = make_test_loop();
+        let waiting_on = accept_connection(&mut el);
+        let other = accept_connection(&mut el);
+        let conn = ConnCtx::new(other, el.driver.connections.generation(other));
+        wait_a_ticket(&mut el, waiting_on);
+        let sent = with_driver_state(&mut el, || conn.send(b"x"));
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// A batch of guards only, at or above `send_zc_threshold`, takes a send
+    /// slab entry and no slot, so a waiting bounded send does not refuse it.
+    #[test]
+    fn a_guarded_batch_that_takes_no_slot_is_not_refused_behind_a_ticket() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        let len = el.driver.send_zc_threshold as usize;
+        let sent = with_driver_state(&mut el, || {
+            let guard = crate::GuardBox::new(PlainGuard(vec![7; len]));
+            conn.send_parts()
+                .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+        });
+        assert!(sent.is_ok(), "{:?}", sent.err());
+    }
+
+    /// A batch of guards below `send_zc_threshold` would be gathered into a
+    /// slot, so behind a waiting bounded send it is refused, and does not go
+    /// out zero-copy instead.
+    #[test]
+    fn a_small_guarded_batch_behind_a_ticket_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        let slab_free = el.driver.send_slab.free_count();
+        let refused = with_driver_state(&mut el, || {
+            let guard = crate::GuardBox::new(PlainGuard(vec![7; 100]));
+            conn.send_parts()
+                .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+        });
+        assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+        assert_eq!(el.driver.send_slab.free_count(), slab_free);
+    }
+
+    /// A `build` with a copy part behind a waiting bounded send is refused.
+    #[test]
+    fn a_built_copy_send_behind_a_ticket_is_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        let refused = with_driver_state(&mut el, || {
+            conn.send_parts().build(|b| b.copy(b"x").submit())
+        });
+        assert!(is_ticket_refusal(&refused), "{:?}", refused.err());
+    }
+
+    /// `forward_recv_buf` of the whole accumulator behind a waiting bounded
+    /// send is refused, and the accumulator keeps its bytes.
+    #[test]
+    fn forward_recv_buf_behind_a_ticket_is_refused_with_the_bytes_kept() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        wait_a_ticket(&mut el, conn_index);
+        assert!(el.driver.accumulators.append(conn_index, b"message"));
+        let data = el.driver.accumulators.data(conn_index);
+        // SAFETY: the accumulator is not touched before the call below
+        // returns, except by the refused forward, which puts it back.
+        let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+        let refused = with_driver_state(&mut el, || conn.forward_recv_buf(view).map(drop));
+        assert!(is_ticket_refusal(&refused), "{refused:?}");
+        assert_eq!(el.driver.accumulators.data(conn_index), b"message");
+        assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
+    }
+
+    /// A bounded send waiting on an otherwise parkable connection blocks the
+    /// park as a queued send does; once it leaves, the connection is
+    /// parkable again.
+    #[test]
+    fn a_waiting_bounded_send_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered.insert(conn_index);
+        assert_eq!(el.park_blocker(conn_index), None, "precondition");
+        let ticket = wait_a_ticket(&mut el, conn_index);
+        assert_eq!(el.park_blocker(conn_index), Some(ParkBlocker::Sends));
+        el.executor.cancel_send(ticket);
+        assert_eq!(el.park_blocker(conn_index), None);
     }
 }
 

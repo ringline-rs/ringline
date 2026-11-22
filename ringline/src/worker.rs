@@ -1,7 +1,5 @@
 use std::any::Any;
 use std::io;
-#[cfg(target_os = "linux")]
-use std::io::Write as _;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -9,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::acceptor::{AcceptorConfig, run_acceptor};
 use crate::backend::AsyncEventLoop;
@@ -133,6 +132,9 @@ pub struct Runtime {
     max_connections: u32,
     sq_entries: u32,
     cq_entries: u32,
+    /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends).
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    fixed_buffer_sends: bool,
 }
 
 impl Runtime {
@@ -159,8 +161,9 @@ impl Runtime {
     }
 
     /// The actual TCP address of the **first** TCP listener, if any. Returns
-    /// `Some` for a TCP `bind()` (the port may have been zero-resolved) and
-    /// `None` for client-only mode or when every listener is a Unix socket.
+    /// `Some` for a TCP `bind()` (the port may have been zero-resolved) or an
+    /// inet `bind_fd()`, and `None` for client-only mode or when every
+    /// listener is a Unix socket.
     ///
     /// With more than one listener, prefer [`bound_addr_of`] or
     /// [`bound_addrs`]: this returns the first TCP bind and cannot express
@@ -340,6 +343,21 @@ impl Runtime {
     /// [`SendGuard::region`](crate::SendGuard::region) and
     /// [`IoBuf::region`](crate::buf::IoBuf::region) on any worker.
     ///
+    /// The first registration in the process runs the fixed-buffer send
+    /// probe first, when
+    /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)
+    /// is on and no earlier call ran it, and blocks while it runs. With the
+    /// setting on, the registration also reads `/proc/self/smaps` to find
+    /// whether the region is in base pages only, which decides which of the
+    /// probe's results applies to it
+    /// ([`region_fixed_buffer_sends`](Self::region_fixed_buffer_sends)), and
+    /// logs the result for the region: at `debug` when its sends use its
+    /// buffer, and when they do not at `warn` for the first region of its
+    /// kind in the process and at `debug` after that. The kernel builds
+    /// `/proc/self/smaps` by walking every mapping's page tables, so the read
+    /// takes longer the more memory the process has mapped; its cost has not
+    /// been measured.
+    ///
     /// # Errors
     ///
     /// - `io::ErrorKind::Other` "registered-region table is full" if the
@@ -348,7 +366,10 @@ impl Runtime {
     /// - The first kernel error reported by any worker if the underlying
     ///   `register_buffers_update` call fails. The slot is then released on
     ///   every worker, and reused by a later registration if every release
-    ///   succeeds.
+    ///   succeeds. io_uring charges `RLIMIT_MEMLOCK` once for each worker's
+    ///   ring, so under a finite limit an `ENOMEM` error (kind
+    ///   `OutOfMemory`) also gives the regions already registered and the
+    ///   total the rings need with this one.
     /// - `io::ErrorKind::Other` if a worker has exited. The slot is not
     ///   reused, so each such failure leaves one fewer free slot.
     /// - On the mio backend (no io_uring): always returns
@@ -365,7 +386,23 @@ impl Runtime {
     ) -> io::Result<crate::buffer::fixed::RegionId> {
         #[cfg(has_io_uring)]
         {
-            self.region_registrar.register(region)
+            let mut region = region;
+            // The probe runs before the first region is registered, so a
+            // send from the region finds its result (`fixed_send::allowed`).
+            if !self.fixed_buffer_sends {
+                return self.region_registrar.register(region);
+            }
+            let results = crate::backend::uring::fixed_send::probe_once();
+            region.base_pages = crate::backend::uring::fixed_send::in_base_pages(&region);
+            let (len, base_pages) = (region.len(), region.base_pages);
+            let id = self.region_registrar.register(region)?;
+            crate::backend::uring::fixed_send::log_region(
+                id,
+                len,
+                base_pages,
+                &results.for_region(base_pages),
+            );
+            Ok(id)
         }
         #[cfg(not(has_io_uring))]
         {
@@ -377,6 +414,63 @@ impl Runtime {
         }
     }
 
+    /// Whether a send whose parts are all guards in one registered region
+    /// names that region's buffer
+    /// ([`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)),
+    /// and if not, why, for a region not shown to be in base pages only: one
+    /// that may lie in huge pages. With `Enabled { multi_guard: false }`, only
+    /// a send of one guard does. A region in base pages only can have a
+    /// different result ([`region_fixed_buffer_sends`](Self::region_fixed_buffer_sends)).
+    /// The first call runs the kernel probe if no earlier call ran it, and
+    /// blocks for it. The result holds for the life of the process. On the
+    /// mio backend it is always
+    /// [`Unsupported`](crate::FixedBufferSends::Unsupported), whatever the
+    /// setting.
+    pub fn fixed_buffer_sends(&self) -> crate::FixedBufferSends {
+        #[cfg(has_io_uring)]
+        {
+            if self.fixed_buffer_sends {
+                crate::backend::uring::fixed_send::probe_once().huge
+            } else {
+                crate::FixedBufferSends::Disabled
+            }
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            crate::FixedBufferSends::Unsupported
+        }
+    }
+
+    /// As [`fixed_buffer_sends`](Self::fixed_buffer_sends), for the registered
+    /// region `id`. A region whose registration found it in base pages only
+    /// (private anonymous memory advised `MADV_NOHUGEPAGE` before it was
+    /// first touched, with no huge page in it, while no multi-page folio size
+    /// below a PMD is set to `always`) takes the probe's result for
+    /// base pages, which the kernel charges correctly whether or not it
+    /// carries the fix to how sends from huge pages are charged; any other
+    /// region takes `fixed_buffer_sends`. `None` when `id` names no
+    /// registered region, which on the mio backend, where registration
+    /// fails, is always.
+    pub fn region_fixed_buffer_sends(
+        &self,
+        id: crate::buffer::fixed::RegionId,
+    ) -> Option<crate::FixedBufferSends> {
+        #[cfg(has_io_uring)]
+        {
+            let base_pages = self.region_registrar.base_pages(id)?;
+            Some(if self.fixed_buffer_sends {
+                crate::backend::uring::fixed_send::probe_once().for_region(base_pages)
+            } else {
+                crate::FixedBufferSends::Disabled
+            })
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
     /// Unregister a previously registered region. Blocks until every worker
     /// has acknowledged. The slot is returned to the free list on success.
     ///
@@ -384,6 +478,16 @@ impl Runtime {
     ///
     /// No SQE referencing the slot may be in flight when this is called.
     /// After it returns, the underlying memory may be safely unmapped.
+    ///
+    /// With [`region_fixed_buffer_sends(id)`](Self::region_fixed_buffer_sends)
+    /// `Some(Enabled { .. })`, a send of one guard naming this region, and
+    /// with `multi_guard` a send of several guards all naming it, references
+    /// the slot from
+    /// the call that submits it until its
+    /// [`SendCompletion`](crate::SendCompletion) resolves, including while it
+    /// waits in the connection's send queue. Await those sends first: one
+    /// submitted after the slot is cleared fails with `EFAULT`, and the
+    /// connection closes.
     ///
     /// On the mio backend, always returns `io::ErrorKind::Unsupported`.
     pub fn unregister_region(&self, id: crate::buffer::fixed::RegionId) -> io::Result<()> {
@@ -426,6 +530,85 @@ impl Runtime {
         sig
     }
 
+    /// Block until `SIGINT` or `SIGTERM` is received, a task panic shuts the
+    /// runtime down under
+    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown), or a
+    /// worker stops, and return which, without shutting the runtime down.
+    ///
+    /// The first task panic under `Shutdown`, and each worker stop, is
+    /// returned once: a later call waits for the next event. Under
+    /// `TaskPanicPolicy::Contain` the other workers keep serving after a
+    /// worker stop; under `Shutdown` a worker stop also shuts the runtime
+    /// down, and that shutdown may not have started when
+    /// [`Signal::WorkerExited`](crate::signal::Signal::WorkerExited) is
+    /// returned. A task panic shuts the runtime down before
+    /// [`Signal::TaskPanic`](crate::signal::Signal::TaskPanic) is returned.
+    /// The process-wide signal handlers are installed on the first call, as by
+    /// [`signal::install`](crate::signal::install).
+    ///
+    /// With [`stop_accepting`](Self::stop_accepting), this splits
+    /// [`wait_on_signal`](Self::wait_on_signal) into steps: wait for
+    /// `SIGTERM`, stop accepting, finish the work that needs the workers, then
+    /// call [`shutdown`](Self::shutdown).
+    ///
+    /// An event returned here is not returned by a later `wait_on_signal`; a
+    /// `wait_on_signal` already waiting when it arrives returns it too. A task
+    /// panic or worker stop already returned by `wait_on_signal` is returned
+    /// here too.
+    pub fn next_signal(&self) -> crate::signal::Signal {
+        crate::signal::next_or_ready(self.shutdown.panic_fd(), self.shutdown.exit_fd())
+    }
+
+    /// Stop accepting connections without shutting the workers down, and wait
+    /// until every connection already accepted has reached its worker.
+    ///
+    /// This is the first phase of a restart that hands a listening socket to
+    /// the next process: after it returns, the workers keep polling tasks and
+    /// I/O and serve the connections they hold. Call
+    /// [`shutdown`](Self::shutdown) afterwards to close what is left.
+    ///
+    /// It closes every listen gate (a [`ListenHandle`](crate::ListenHandle)'s
+    /// calls return an error from then on), signals every acceptor thread to
+    /// stop, and waits for each to exit. An acceptor holding a connection no
+    /// worker has room for waits until a worker takes it. Then it waits until
+    /// each worker that is still running has taken every connection placed
+    /// in its accept channel and either spawned its accept task (`on_accept`
+    /// has been called) or closed it (connection table full, registration
+    /// failed, or TLS state creation failed). On a TLS listener, `on_accept`
+    /// is called after the handshake, so it may be called after this returns.
+    ///
+    /// A listener from [`RinglineBuilder::bind`],
+    /// [`bind_unix`](RinglineBuilder::bind_unix) or
+    /// [`bind_tls`](RinglineBuilder::bind_tls) is shut down with `SHUT_RD`
+    /// when its acceptor exits: on Linux, for a TCP listener, the kernel
+    /// resets the connections in its backlog and refuses new ones. A listener
+    /// from [`RinglineBuilder::bind_fd`] keeps listening, and new connections
+    /// wait in its backlog for another process that holds the socket.
+    ///
+    /// With the `unstable-accept` feature in `AcceptMode::Merged`, the
+    /// workers' listeners are shut down with `SHUT_RD`, and a connection a
+    /// worker accepted before the `SHUT_RD` may reach `on_accept`, on that
+    /// worker or another, after this returns.
+    ///
+    /// Returns `Ok(())` at once if the runtime has shut down, and also if it
+    /// shuts down during the wait. A second call repeats the wait, which
+    /// returns at once when nothing has been placed since. A `timeout` too
+    /// long to add to the current time, such as `Duration::MAX`, waits
+    /// without a deadline.
+    ///
+    /// # Errors
+    ///
+    /// - [`io::ErrorKind::TimedOut`] if an acceptor has not exited, or a worker
+    ///   has not taken the connections in its channel, within `timeout`: for
+    ///   example a worker blocked in synchronous code. Accepting stays stopped,
+    ///   and an acceptor still holding a connection keeps trying to place it
+    ///   until a worker takes it or [`shutdown`](Self::shutdown) closes it.
+    /// - [`io::ErrorKind::Deadlock`] at once if called on one of this runtime's
+    ///   worker threads, which would wait for its own channel.
+    pub fn stop_accepting(&self, timeout: Duration) -> io::Result<()> {
+        self.shutdown.stop_accepting(timeout)
+    }
+
     /// Signal all workers to shut down gracefully.
     ///
     /// Workers stop accepting new connections, close all active connections (on
@@ -449,8 +632,8 @@ impl Runtime {
     /// has started, is still running when the 10 s run out, or an
     /// io_uring worker's ring fails during that wait, the worker does not drop
     /// its tasks or its event loop: it leaks them, since the operation can
-    /// still use their memory, closes its sockets, and writes a line to
-    /// stderr. Its join result is the same as without the leak.
+    /// still use their memory, closes its sockets, and logs a line at `warn`.
+    /// Its join result is the same as without the leak.
     ///
     /// A task woken after the worker's last poll pass is dropped even when
     /// what it awaited is ready. On both backends a task can be woken after the
@@ -461,7 +644,8 @@ impl Runtime {
     /// Work that must finish before exit has to complete before shutdown is
     /// requested.
     ///
-    /// The listeners stop accepting at once. A listener's sockets close, and
+    /// The listeners stop accepting at once. Apart from a listener from
+    /// [`RinglineBuilder::bind_fd`] (below), a listener's sockets close, and
     /// its port is free, once the threads accepting on it have exited: its
     /// acceptor thread, or with the `unstable-accept` feature in merged accept
     /// mode the workers. An acceptor exits at once, within about 1 ms if it
@@ -469,6 +653,11 @@ impl Runtime {
     /// backing off after `EMFILE` or a similar error. This method, and any
     /// call made while it runs, returns after every acceptor thread has
     /// exited. This `Runtime` does not hold the sockets open.
+    ///
+    /// A listener from [`RinglineBuilder::bind_fd`] is not shut down with
+    /// `SHUT_RD`: its socket keeps listening, and stays open in any other
+    /// process that holds it; its port is held for as long as any process
+    /// holds the socket.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
     }
@@ -483,9 +672,14 @@ pub(crate) struct RuntimeShutdown {
     /// Each listener's sockets and whether it is merged, added as `launch()`
     /// creates the listeners and released by `shutdown()`.
     listeners: std::sync::Mutex<Vec<(Arc<ListenerSockets>, bool)>>,
-    /// Raised by `shutdown()`; wakes every acceptor from `poll`.
+    /// Raised by `shutdown()` and `stop_accepting()`; wakes every acceptor
+    /// from `poll`.
     stop: crate::acceptor::StopSignal,
-    /// The acceptor threads `launch()` started, joined by `shutdown()`.
+    /// The `stop_accepting()` flag and the per-worker accept counts, shared
+    /// with the acceptors and the workers.
+    accept: Arc<crate::acceptor::AcceptState>,
+    /// The acceptor threads `launch()` started, joined by `shutdown()`, or by
+    /// `stop_accepting()` once they have exited.
     acceptors: std::sync::Mutex<Vec<thread::JoinHandle<()>>>,
     wake: crate::wakeup::WakeKeepAlive,
     /// Readable once a task panic has shut the runtime down;
@@ -506,6 +700,20 @@ pub(crate) struct RuntimeShutdown {
     #[cfg(target_os = "linux")]
     steering: std::sync::Mutex<()>,
 }
+
+/// Records in `AcceptState` that a worker thread has ended when dropped, so
+/// `stop_accepting` does not wait for a channel nobody drains.
+struct WorkerDone(Arc<crate::acceptor::AcceptState>, usize);
+
+impl Drop for WorkerDone {
+    fn drop(&mut self) {
+        self.0.worker_done(self.1);
+    }
+}
+
+/// How often `stop_accepting` checks whether the acceptors have exited and
+/// the workers have taken what was placed in their channels.
+const STOP_ACCEPTING_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Accept and close every connection queued on a listening socket.
 #[cfg(target_os = "linux")]
@@ -530,12 +738,18 @@ fn close_queued(fd: RawFd) {
 
 /// A non-blocking, close-on-exec pipe: `(read end, write end)`.
 fn nonblocking_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(target_os = "hermit")]
+    let fds = {
+        let (r, w) = crate::sys::token_pair()?;
+        [r, w]
+    };
+    #[cfg(not(target_os = "hermit"))]
     let mut fds = [0 as RawFd; 2];
     #[cfg(target_os = "linux")]
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "hermit")))]
     {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
             return Err(io::Error::last_os_error());
@@ -545,7 +759,7 @@ fn nonblocking_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
                 libc::fcntl(
                     fd,
                     libc::F_SETFL,
-                    libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+                    libc::fcntl(fd, libc::F_GETFL, 0) | libc::O_NONBLOCK,
                 );
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
@@ -560,6 +774,7 @@ impl RuntimeShutdown {
         flag: Arc<AtomicBool>,
         listen_gates: Arc<crate::listen_gate::ListenGates>,
         wake: crate::wakeup::WakeKeepAlive,
+        workers: usize,
     ) -> io::Result<Self> {
         let (panic_read, panic_write) = nonblocking_pipe()?;
         let (exit_read, exit_write) = nonblocking_pipe()?;
@@ -568,6 +783,7 @@ impl RuntimeShutdown {
             listen_gates,
             listeners: std::sync::Mutex::new(Vec::new()),
             stop: crate::acceptor::StopSignal::new()?,
+            accept: Arc::new(crate::acceptor::AcceptState::new(workers)),
             acceptors: std::sync::Mutex::new(Vec::new()),
             wake,
             panic_read,
@@ -621,7 +837,7 @@ impl RuntimeShutdown {
         for (sockets, _) in listeners {
             // In merged mode, ends the multishot accept a worker has armed on
             // each socket; on Linux, takes a pool socket out of the listening
-            // state.
+            // state unless it came from `bind_fd`.
             sockets.shut_down();
         }
         // Wake all workers so they see the flag even if blocked on I/O.
@@ -644,6 +860,104 @@ impl RuntimeShutdown {
         self.stop.clone()
     }
 
+    /// See [`Runtime::stop_accepting`].
+    fn stop_accepting(&self, timeout: Duration) -> io::Result<()> {
+        if self.flag.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if crate::listen_gate::is_worker_of(&self.listen_gates) {
+            return Err(io::Error::new(
+                io::ErrorKind::Deadlock,
+                "stop_accepting() called on a worker thread, which would wait for its own \
+                 accept channel",
+            ));
+        }
+        // `None` when `timeout` is too long to add to now: no deadline.
+        let deadline = Instant::now().checked_add(timeout);
+        let expired = || deadline.is_some_and(|d| Instant::now() >= d);
+        self.accept.begin_stopping();
+        // After this no gate starts a socket listening, and an acceptor
+        // parked on a gate that was never opened returns.
+        self.listen_gates.shutdown();
+        // Wakes an acceptor waiting in `poll`; it then sees `stopping`.
+        self.stop.raise();
+        // Merged listeners have no acceptor; their workers' multishot accepts
+        // end on `SHUT_RD`. A connection a worker is handing to another as
+        // this runs may be placed after the counts below are read.
+        for (sockets, merged) in self
+            .listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if *merged {
+                sockets.shut_down();
+            }
+        }
+
+        // Each acceptor exits at its next stop check. One holding a
+        // connection no worker has room for places it first.
+        loop {
+            {
+                let mut acceptors = self.acceptors.lock().unwrap_or_else(|e| e.into_inner());
+                let mut i = 0;
+                while i < acceptors.len() {
+                    if acceptors[i].is_finished() {
+                        // A panic in an acceptor has already been reported
+                        // by the panic hook.
+                        let _ = acceptors.swap_remove(i).join();
+                    } else {
+                        i += 1;
+                    }
+                }
+                if acceptors.is_empty() {
+                    break;
+                }
+            }
+            if self.flag.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if expired() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stop_accepting(): an acceptor did not exit in time",
+                ));
+            }
+            thread::sleep(STOP_ACCEPTING_POLL_INTERVAL);
+        }
+
+        // Every acceptor has exited, so these counts are final for the
+        // connections they placed.
+        let workers = self.accept.workers();
+        let placed: Vec<u64> = (0..workers).map(|w| self.accept.placed_count(w)).collect();
+        loop {
+            let exited = self
+                .exited
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            // A worker that has stopped, or whose thread has ended, closed
+            // what was left in its channel.
+            let pending = placed.iter().enumerate().any(|(w, &n)| {
+                !exited.contains(&w) && !self.accept.is_done(w) && self.accept.handled_count(w) < n
+            });
+            if !pending {
+                return Ok(());
+            }
+            if self.flag.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if expired() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stop_accepting(): a worker did not take the connections in its accept \
+                     channel in time",
+                ));
+            }
+            thread::sleep(STOP_ACCEPTING_POLL_INTERVAL);
+        }
+    }
+
     /// Hold an acceptor thread for `shutdown()` to join. One started after a
     /// shutdown exits on its own and is joined by the next `shutdown()`
     /// (`Drop for Runtime` runs one).
@@ -658,10 +972,7 @@ impl RuntimeShutdown {
     pub(crate) fn shutdown_for_panic(&self) {
         self.shutdown();
         if !self.panicked.swap(true, Ordering::AcqRel) {
-            let byte = 1u8;
-            unsafe {
-                libc::write(self.panic_write.as_raw_fd(), (&byte as *const u8).cast(), 1);
-            }
+            crate::sys::write_token(self.panic_write.as_raw_fd());
         }
     }
 
@@ -683,11 +994,8 @@ impl RuntimeShutdown {
             .unwrap_or_else(|e| e.into_inner())
             .push(worker);
         #[cfg(target_os = "linux")]
-        self.stop_accepting(worker);
-        let byte = 1u8;
-        unsafe {
-            libc::write(self.exit_write.as_raw_fd(), (&byte as *const u8).cast(), 1);
-        }
+        self.steer_away_from(worker);
+        crate::sys::write_token(self.exit_write.as_raw_fd());
         if shutdown {
             self.shutdown();
         }
@@ -708,7 +1016,7 @@ impl RuntimeShutdown {
     /// shut down. If only workers taken out of the rotation are left, they go
     /// back in.
     #[cfg(target_os = "linux")]
-    fn stop_accepting(&self, worker: usize) {
+    fn steer_away_from(&self, worker: usize) {
         let Some(accepting) = self.accepting.get() else {
             return;
         };
@@ -730,10 +1038,11 @@ impl RuntimeShutdown {
             .filter(|i| accepting[*i as usize].load(Ordering::Acquire))
             .collect();
         if live.is_empty() && !alive.is_empty() {
-            let _ = writeln!(
-                io::stderr(),
-                "ringline: worker {worker} exited; returning {alive:?} to the accept rotation"
-            );
+            // On the worker's exit path (`report_worker_exit`), ahead of its
+            // drain.
+            crate::task_panic::log_guarded(|| {
+                log::warn!("worker {worker} exited; returning {alive:?} to the accept rotation")
+            });
             for i in &alive {
                 accepting[*i as usize].store(true, Ordering::Release);
             }
@@ -748,10 +1057,9 @@ impl RuntimeShutdown {
             if let Some(fd) = sockets.fds().next()
                 && let Err(e) = crate::reuseport_bpf::attach_live_set(fd, &live)
             {
-                let _ = writeln!(
-                    io::stderr(),
-                    "ringline: steering around worker {worker} failed: {e}"
-                );
+                crate::task_panic::log_guarded(|| {
+                    log::warn!("steering around worker {worker} failed: {e}")
+                });
             }
             close_queued(sockets.fd(worker));
         }
@@ -785,7 +1093,7 @@ impl RuntimeShutdown {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             for worker in exited {
-                self.stop_accepting(worker);
+                self.steer_away_from(worker);
             }
         }
     }
@@ -813,11 +1121,127 @@ impl Drop for Runtime {
 enum BindAddr {
     Tcp(SocketAddr),
     Unix(PathBuf),
+    /// A socket from `RinglineBuilder::bind_fd`.
+    Fd(OwnedFd),
 }
 
 impl BindAddr {
     fn is_unix(&self) -> bool {
-        matches!(self, BindAddr::Unix(_))
+        match self {
+            BindAddr::Tcp(_) => false,
+            BindAddr::Unix(_) => true,
+            BindAddr::Fd(fd) => socket_family(fd.as_raw_fd()) == Some(crate::sys::AF_UNIX),
+        }
+    }
+}
+
+/// The address family a socket is bound in, from `getsockname(2)`.
+fn socket_family(fd: RawFd) -> Option<libc::c_int> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(storage.ss_family as libc::c_int)
+}
+
+/// Whether a Unix-domain socket is bound to a path or, on Linux, an abstract
+/// name. An unbound one reports no bytes after the family from `getsockname`
+/// on Linux, and an empty path (16 bytes, the first NUL) on macOS.
+fn unix_socket_is_bound(fd: RawFd) -> bool {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    let path_offset = std::mem::offset_of!(crate::sys::sockaddr_un, sun_path);
+    if (len as usize) <= path_offset {
+        return false;
+    }
+    // SAFETY: `storage` is large enough for a `sockaddr_un`.
+    let un =
+        unsafe { &*(&storage as *const libc::sockaddr_storage as *const crate::sys::sockaddr_un) };
+    // A leading NUL is an abstract name on Linux, and no path elsewhere.
+    cfg!(target_os = "linux") || un.sun_path[0] != 0
+}
+
+/// Why `fd` cannot be a listener from `RinglineBuilder::bind_fd`, if it
+/// cannot: it must be a `SOCK_STREAM` socket bound in `AF_INET`, `AF_INET6`
+/// or `AF_UNIX` and not connected, and an inet socket must not be on port 0,
+/// which is what `getsockname` reports for one that was never bound.
+///
+/// Hermit has no `SO_TYPE` option, so there the socket type is not checked
+/// and a datagram socket fails later, when it is listened on or accepted
+/// from.
+fn check_listener_fd(fd: RawFd) -> Result<(), String> {
+    #[cfg(not(target_os = "hermit"))]
+    check_stream_socket(fd)?;
+    check_unconnected_and_bound(fd)
+}
+
+/// `fd` is a `SOCK_STREAM` socket (`SO_TYPE`).
+#[cfg(not(target_os = "hermit"))]
+fn check_stream_socket(fd: RawFd) -> Result<(), String> {
+    let mut kind: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut kind as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "bind_fd(): fd {fd} is not a socket: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if kind != libc::SOCK_STREAM {
+        return Err(format!("bind_fd(): fd {fd} is not a SOCK_STREAM socket"));
+    }
+    Ok(())
+}
+
+/// `fd` is not connected and is bound in `AF_INET`, `AF_INET6` or `AF_UNIX`.
+fn check_unconnected_and_bound(fd: RawFd) -> Result<(), String> {
+    // A connected stream socket cannot listen. `getpeername` fails with
+    // `ENOTCONN` on one that is not connected.
+    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    if unsafe {
+        libc::getpeername(
+            fd,
+            &mut peer as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut peer_len,
+        )
+    } == 0
+    {
+        return Err(format!("bind_fd(): fd {fd} is a connected socket"));
+    }
+    match socket_family(fd) {
+        Some(crate::sys::AF_UNIX) if unix_socket_is_bound(fd) => Ok(()),
+        Some(crate::sys::AF_UNIX) => Err(format!("bind_fd(): fd {fd} is not bound to a path")),
+        Some(libc::AF_INET) | Some(libc::AF_INET6) => match getsockname_v4_v6(fd) {
+            Some(addr) if addr.port() != 0 => Ok(()),
+            _ => Err(format!("bind_fd(): fd {fd} is not bound to a port")),
+        },
+        _ => Err(format!(
+            "bind_fd(): fd {fd} is not an AF_INET, AF_INET6 or AF_UNIX socket"
+        )),
     }
 }
 
@@ -1059,6 +1483,60 @@ impl RinglineBuilder {
         self
     }
 
+    /// Add a listener on a socket the caller made or received, such as one
+    /// systemd passes in `LISTEN_FDS` or keeps in its fd store.
+    ///
+    /// The socket must be a `SOCK_STREAM` socket in `AF_INET`, `AF_INET6` or
+    /// `AF_UNIX`, bound (an inet socket to a port other than 0) and not
+    /// connected; `launch()` refuses anything else. It may already be
+    /// listening. A Unix-domain socket's path is neither created nor removed.
+    /// Accumulates like [`bind`](Self::bind).
+    ///
+    /// The runtime owns `fd`: it closes it when the listener closes, or when
+    /// `launch()` fails. To keep using the socket, pass a duplicate
+    /// ([`OwnedFd::try_clone`]). Systemd keeps its own copy of a socket it
+    /// passes or stores.
+    ///
+    /// The runtime changes the socket, and every process holding it sees the
+    /// changes, since they are on the socket or its open file description: it
+    /// sets close-on-exec, `O_NONBLOCK` and `SO_REUSEADDR`, and calls
+    /// `listen(2)` with [`ConfigBuilder::backlog`](crate::ConfigBuilder::backlog),
+    /// at launch or, with [`defer_listen()`](Self::defer_listen), when the
+    /// gate opens. On a socket already listening, that sets its backlog,
+    /// replacing systemd's `Backlog=`.
+    ///
+    /// The runtime never calls `shutdown(SHUT_RD)` on this socket, which
+    /// would take it out of the listening state for every process holding it
+    /// and reset the connections in its backlog. When its acceptor exits for
+    /// any reason, such as [`Runtime::shutdown`](crate::Runtime::shutdown),
+    /// every worker exiting, or a fatal accept error, it keeps listening, and
+    /// connections wait in its backlog until another holder accepts them or
+    /// the last holder closes it. Connections already taken from the backlog
+    /// are closed at shutdown, including any not yet handed to a handler, and
+    /// the acceptor can take one more if it is in `accept` when the shutdown
+    /// begins.
+    ///
+    /// With `defer_listen()`, a socket that is already listening defers only
+    /// `accept`: the kernel completes handshakes and queues them, so a TCP
+    /// check passes before the gate opens.
+    ///
+    /// TLS falls back to the process-wide
+    /// [`ConfigBuilder::tls`](crate::ConfigBuilder::tls), as for `bind`. There
+    /// is no per-listener TLS variant, so a TLS listener from an fd cannot sit
+    /// beside plaintext listeners.
+    ///
+    /// With the `unstable-accept` feature, not supported with
+    /// `AcceptMode::Merged` on the io_uring backend, where `launch()` refuses
+    /// it.
+    pub fn bind_fd(mut self, fd: OwnedFd) -> Self {
+        self.listeners.push(ListenerSpec {
+            addr: BindAddr::Fd(fd),
+            tls: None,
+            defer_listen: false,
+        });
+        self
+    }
+
     /// Bind a TCP listener that terminates TLS with its own configuration.
     ///
     /// The config applies to this listener alone, so one process can serve
@@ -1108,10 +1586,11 @@ impl RinglineBuilder {
     /// not.
     ///
     /// Applies to the listener added by the most recent
-    /// [`bind`](Self::bind), [`bind_unix`](Self::bind_unix) or
-    /// [`bind_tls`](Self::bind_tls) call, so it is written immediately after
-    /// one. UDP binds are not listeners and are unaffected. Calling it before
-    /// any of those three is a configuration error that `launch()` reports.
+    /// [`bind`](Self::bind), [`bind_unix`](Self::bind_unix),
+    /// [`bind_tls`](Self::bind_tls) or [`bind_fd`](Self::bind_fd) call, so it
+    /// is written immediately after one. UDP binds are not listeners and are
+    /// unaffected. Calling it before any of those is a configuration error
+    /// that `launch()` reports.
     ///
     /// With the `unstable-accept` feature, not supported with
     /// `AcceptMode::Merged` on the io_uring backend, where `launch()` refuses
@@ -1200,6 +1679,18 @@ impl RinglineBuilder {
                  AcceptMode::Pool, or bind that listener without deferring"
                     .into(),
             ));
+        }
+        for spec in &self.listeners {
+            if let BindAddr::Fd(fd) = &spec.addr {
+                if merged {
+                    return Err(crate::error::Error::RingSetup(
+                        "bind_fd() is not supported with AcceptMode::Merged; use the default \
+                         AcceptMode::Pool"
+                            .into(),
+                    ));
+                }
+                check_listener_fd(fd.as_raw_fd()).map_err(crate::error::Error::RingSetup)?;
+            }
         }
         Ok(())
     }
@@ -1329,14 +1820,12 @@ impl RinglineBuilder {
                 // buffer (#824, #856).
                 let memory_in_use = !drain_panicked && event_loop.memory_in_use_at_exit();
                 if memory_in_use {
-                    // Not `eprintln!`, which panics if stderr fails.
-                    let _ = std::io::Write::write_fmt(
-                        &mut std::io::stderr(),
-                        format_args!(
-                            "ringline: worker {worker_id} exited with a disk operation still \
-                             in flight; leaking its tasks and event loop\n"
-                        ),
-                    );
+                    crate::task_panic::log_guarded(|| {
+                        log::warn!(
+                            "worker {worker_id} exited with a disk operation still in \
+                             flight; leaking its tasks and event loop"
+                        )
+                    });
                 }
                 if drain_panicked || memory_in_use {
                     let task_panic = event_loop.take_task_panic();
@@ -1443,6 +1932,25 @@ impl RinglineBuilder {
         #[cfg(has_io_uring)]
         ensure_memlock_limit(&mut self.config, num_threads)?;
         ensure_nofile_limit(self.config.max_connections, num_threads)?;
+        #[cfg(has_io_uring)]
+        if self.config.fixed_buffer_sends {
+            reserve_probe_memlock(&self.config, num_threads);
+            // Before the workers start, so they read the result.
+            if !self.config.registered_regions.is_empty() {
+                let results = crate::backend::uring::fixed_send::probe_once();
+                let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap_or_default();
+                for (slot, region) in self.config.registered_regions.iter_mut().enumerate() {
+                    region.base_pages =
+                        crate::backend::uring::fixed_send::in_base_pages_by(&smaps, region);
+                    crate::backend::uring::fixed_send::log_region(
+                        crate::buffer::fixed::RegionId(slot as u16),
+                        region.len(),
+                        region.base_pages,
+                        &results.for_region(region.base_pages),
+                    );
+                }
+            }
+        }
 
         crate::metrics::init_metadata();
 
@@ -1581,6 +2089,7 @@ impl RinglineBuilder {
                 shutdown_flag.clone(),
                 listen_gates.clone(),
                 wake_keep_alive.clone(),
+                num_threads,
             )
             .map_err(crate::error::Error::Io)?,
         );
@@ -1708,6 +2217,7 @@ impl RinglineBuilder {
             // in merged accept mode (io_uring) it wakes peers.
             config.wake_keep_alive = Some(wake_keep_alive.clone());
             config.runtime_shutdown = Some(runtime_shutdown.clone());
+            config.accept_state = Some(Arc::clone(&runtime_shutdown.accept));
             config.worker_index = worker_id;
             config.sq_thread_cpu = sq_thread_cpus[worker_id];
             config.worker_loads = worker_loads.clone();
@@ -1745,6 +2255,7 @@ impl RinglineBuilder {
             let worker_listen_gates = listen_gates.clone();
             let worker_fn = worker_fn.clone();
             let startup_tx = startup_tx.clone();
+            let worker_done = WorkerDone(Arc::clone(&runtime_shutdown.accept), worker_id);
 
             let (worker_resolve_rx, worker_resolve_tx, worker_resolver) =
                 if let Some(ref rxs) = resolve_rxs {
@@ -1782,19 +2293,30 @@ impl RinglineBuilder {
             let spawn_result = thread::Builder::new()
                 .name(format!("rl-work-{worker_id}"))
                 .spawn(move || {
+                    // Dropped when this thread ends, however it ends.
+                    let _worker_done = worker_done;
                     if config.worker.pin_to_core {
                         let core = pin_cpu;
                         // Report the failure before bailing — otherwise
                         // the launching thread waits indefinitely for
                         // a startup signal that never arrives.
                         if let Err(e) = pin_to_core(core) {
-                            // A bare EINVAL here is opaque — name the knob.
-                            eprintln!(
-                                "ringline: failed to pin worker {worker_id} to logical CPU {core} \
-                                 (core_offset {} + worker id): {e} — check Config::core_offset \
-                                 against the machine's CPU count",
-                                config.worker.core_offset
-                            );
+                            // A bare EINVAL here is opaque, so the error names
+                            // the knob.
+                            let (kind, detail) = match &e {
+                                crate::error::Error::Io(io) => (io.kind(), io.to_string()),
+                                other => (io::ErrorKind::Other, other.to_string()),
+                            };
+                            let e = crate::error::Error::Io(io::Error::new(
+                                kind,
+                                format!(
+                                    "failed to pin worker {worker_id} to logical CPU {core} \
+                                     (core_offset {} + worker id): {detail}; check \
+                                     ConfigBuilder::core_offset against the machine's CPU count",
+                                    config.worker.core_offset
+                                ),
+                            ));
+                            crate::task_panic::log_guarded(|| log::error!("{e}"));
                             let _ = startup_tx.send(Err(e));
                             return Err(startup_failure_placeholder());
                         }
@@ -1917,7 +2439,9 @@ impl RinglineBuilder {
             let worker_txs = pending_worker_txs.expect("worker senders must exist");
             let mut listeners: Vec<ListenerHandle> = Vec::with_capacity(pending_listeners.len());
 
-            for (idx, spec) in pending_listeners.iter().enumerate() {
+            for (idx, spec) in pending_listeners.into_iter().enumerate() {
+                let is_unix = spec.addr.is_unix();
+                let defer_listen = spec.defer_listen;
                 // Merged listeners were bound before the workers started; all
                 // that is left is to listen, which is the moment the runtime
                 // becomes reachable.
@@ -1935,16 +2459,26 @@ impl RinglineBuilder {
                 let created: Result<
                     (Arc<ListenerSockets>, Option<SocketAddr>),
                     crate::error::Error,
-                > = match (&spec.addr, merged_entry) {
+                > = match (spec.addr, merged_entry) {
                     (BindAddr::Tcp(_), Some((_, sockets, resolved))) => {
                         Ok((Arc::clone(sockets), *resolved))
                     }
-                    (BindAddr::Tcp(addr), None) => create_listener(*addr).map(|fd| {
+                    (BindAddr::Tcp(addr), None) => create_listener(addr).map(|fd| {
                         let bound = getsockname_v4_v6(fd.as_raw_fd());
                         (ListenerSockets::new(vec![fd]), bound)
                     }),
                     (BindAddr::Unix(path), _) => {
-                        create_unix_listener(path).map(|fd| (ListenerSockets::new(vec![fd]), None))
+                        create_unix_listener(&path).map(|fd| (ListenerSockets::new(vec![fd]), None))
+                    }
+                    // Checked by `validate_listeners`. A socket received from
+                    // systemd may not be close-on-exec.
+                    (BindAddr::Fd(fd), _) => {
+                        unsafe {
+                            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD, 0);
+                            libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                        }
+                        let bound = getsockname_v4_v6(fd.as_raw_fd());
+                        Ok((ListenerSockets::from_fd(fd), bound))
                     }
                 };
                 let (sockets, bound_addr) = match created {
@@ -1966,7 +2500,7 @@ impl RinglineBuilder {
                 // recorded the request, and `register` honours it.
                 let registered = listen_gates.register(idx as u32, Arc::clone(&sockets));
                 if let Err(error) = registered.and_then(|()| {
-                    if spec.defer_listen {
+                    if defer_listen {
                         Ok(())
                     } else {
                         listen_gates.open(idx as u32)
@@ -2003,9 +2537,10 @@ impl RinglineBuilder {
                         shutdown_flag: shutdown_flag.clone(),
                         listen_gates: listen_gates.clone(),
                         // A Unix listener has no TCP_NODELAY to set.
-                        tcp_nodelay: !spec.addr.is_unix() && self.config.tcp_nodelay,
+                        tcp_nodelay: !is_unix && self.config.tcp_nodelay,
                         conn_chunk_size: self.config.conn_chunk_size,
                         stop: runtime_shutdown.stop_signal(),
+                        accept: Arc::clone(&runtime_shutdown.accept),
                     };
                     thread::Builder::new()
                         .name(format!("rl-acpt-{idx}"))
@@ -2013,7 +2548,10 @@ impl RinglineBuilder {
                             run_acceptor(acceptor_config);
                             // An acceptor that stops on its own, because every
                             // worker has exited, must not leave the socket
-                            // listening with nothing accepting.
+                            // listening with nothing accepting. A socket from
+                            // `bind_fd` is left listening whatever ended the
+                            // acceptor: other processes may hold it, and its
+                            // clients queue in the backlog.
                             acceptor_sockets.shut_down();
                         })
                 };
@@ -2055,7 +2593,12 @@ impl RinglineBuilder {
 
         let region_registrar = Arc::new(crate::region_registry::RegionRegistrar::new(
             self.config.max_registered_regions,
-            self.config.registered_regions.len() as u16,
+            &self
+                .config
+                .registered_regions
+                .iter()
+                .map(|r| (crate::region_registry::page_rounded(r), r.base_pages))
+                .collect::<Vec<_>>(),
             region_txs,
             worker_wake_handles.clone(),
         ));
@@ -2071,6 +2614,7 @@ impl RinglineBuilder {
             max_connections: self.config.max_connections,
             sq_entries: self.config.sq_entries,
             cq_entries: self.config.cq_entries,
+            fixed_buffer_sends: self.config.fixed_buffer_sends,
         };
 
         Ok((runtime, handles))
@@ -2089,56 +2633,65 @@ fn ensure_nofile_limit(
     max_connections: u32,
     num_workers: usize,
 ) -> Result<(), crate::error::Error> {
-    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
-    if ret != 0 {
-        return Err(crate::error::Error::Io(io::Error::last_os_error()));
+    // Hermit has no resource limits.
+    #[cfg(target_os = "hermit")]
+    {
+        let _ = (max_connections, num_workers);
+        Ok(())
     }
-
-    // io_uring: register_files_sparse(max_connections) needs RLIMIT_NOFILE
-    // >= max_connections (the kernel's check is per-ring; connections live
-    // in fixed-file tables, not real fds). Add per-worker overhead (ring
-    // fd, eventfd, transient socket fds) and global overhead (listen
-    // socket, stdio, misc).
-    //
-    // mio: every connection holds a REAL fd and each worker has its own
-    // max_connections-slot table, so the worst case scales with the worker
-    // count — the io_uring formula under-provisioned and configs passed
-    // the check only to fail with EMFILE under load.
-    let per_worker_overhead: u64 = 8;
-    let global_overhead: u64 = 64;
-    #[cfg(has_io_uring)]
-    let conn_fds = max_connections as u64;
-    #[cfg(not(has_io_uring))]
-    let conn_fds = max_connections as u64 * num_workers as u64;
-    let required = conn_fds + per_worker_overhead * num_workers as u64 + global_overhead;
-
-    let soft = rlim.rlim_cur;
-    let hard = rlim.rlim_max;
-
-    if soft >= required {
-        return Ok(());
-    }
-
-    if hard >= required || hard == libc::RLIM_INFINITY {
-        // Raise soft limit to required (or hard if hard is finite and smaller)
-        let new_soft = if hard == libc::RLIM_INFINITY {
-            required
-        } else {
-            std::cmp::min(required, hard)
-        };
-        rlim.rlim_cur = new_soft;
-        let ret = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) };
+    #[cfg(not(target_os = "hermit"))]
+    {
+        let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
         if ret != 0 {
             return Err(crate::error::Error::Io(io::Error::last_os_error()));
         }
-        Ok(())
-    } else {
-        Err(crate::error::Error::ResourceLimit(format!(
-            "RLIMIT_NOFILE too low: need {} but hard limit is {} (soft: {}). \
+
+        // io_uring: register_files_sparse(max_connections) needs RLIMIT_NOFILE
+        // >= max_connections (the kernel's check is per-ring; connections live
+        // in fixed-file tables, not real fds). Add per-worker overhead (ring
+        // fd, eventfd, transient socket fds) and global overhead (listen
+        // socket, stdio, misc).
+        //
+        // mio: every connection holds a REAL fd and each worker has its own
+        // max_connections-slot table, so the worst case scales with the worker
+        // count — the io_uring formula under-provisioned and configs passed
+        // the check only to fail with EMFILE under load.
+        let per_worker_overhead: u64 = 8;
+        let global_overhead: u64 = 64;
+        #[cfg(has_io_uring)]
+        let conn_fds = max_connections as u64;
+        #[cfg(not(has_io_uring))]
+        let conn_fds = max_connections as u64 * num_workers as u64;
+        let required = conn_fds + per_worker_overhead * num_workers as u64 + global_overhead;
+
+        let soft = rlim.rlim_cur;
+        let hard = rlim.rlim_max;
+
+        if soft >= required {
+            return Ok(());
+        }
+
+        if hard >= required || hard == libc::RLIM_INFINITY {
+            // Raise soft limit to required (or hard if hard is finite and smaller)
+            let new_soft = if hard == libc::RLIM_INFINITY {
+                required
+            } else {
+                std::cmp::min(required, hard)
+            };
+            rlim.rlim_cur = new_soft;
+            let ret = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) };
+            if ret != 0 {
+                return Err(crate::error::Error::Io(io::Error::last_os_error()));
+            }
+            Ok(())
+        } else {
+            Err(crate::error::Error::ResourceLimit(format!(
+                "RLIMIT_NOFILE too low: need {} but hard limit is {} (soft: {}). \
              Raise it with: ulimit -n {}",
-            required, hard, soft, required
-        )))
+                required, hard, soft, required
+            )))
+        }
     }
 }
 
@@ -2181,13 +2734,14 @@ fn check_kernel_floor(
 /// When the hard limit is too low and the CQ was left at its default, the
 /// rings are fitted to the hard limit instead (`fit_ring_sizes`), which lowers
 /// `cq_entries`, and the `sq_entries` and `max_connections` left at their
-/// defaults, in `config`, and writes one line to stderr naming the sizes.
+/// defaults, in `config`, and logs one line at `warn` naming the sizes.
 ///
 /// The kernel compares the limit with everything the same user has charged in
 /// any process, which this cannot see, so passing here does not rule out an
 /// `ENOMEM` at setup; the setup error names the limit in that case. A region
 /// added later through `Runtime::register_region` is not counted here; if that
-/// call fails with `ENOMEM`, its error names the limit.
+/// call fails with `ENOMEM`, its error names the limit and the regions already
+/// registered.
 #[cfg(has_io_uring)]
 fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate::error::Error> {
     use crate::error::{MemlockLimit, MemlockPlan, describe_memlock_shortfall, memlock_plan};
@@ -2263,28 +2817,24 @@ fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate
                 config.max_connections = sizes.max_connections;
                 config.sq_entries = sizes.sq_entries;
                 config.cq_entries = sizes.cq_entries;
-                // Not `eprintln!`, which panics if stderr fails.
-                let _ = std::io::Write::write_fmt(
-                    &mut std::io::stderr(),
-                    format_args!(
-                        "ringline: RLIMIT_MEMLOCK hard limit {} KiB is below the {} KiB that \
+                log::warn!(
+                    "RLIMIT_MEMLOCK hard limit {} KiB is below the {} KiB that \
                          {workers} worker(s) need at max_connections {}, sq_entries {}, \
                          cq_entries {}; using max_connections {}, sq_entries {}, cq_entries {} \
                          per worker. Raise the limit (`ulimit -l`, or `LimitMEMLOCK=`) to run \
                          at max_connections {}, sq_entries {}, cq_entries {}, or set \
-                         cq_entries on the builder to fail instead of running smaller.\n",
-                        limit.hard.div_ceil(1024),
-                        required.div_ceil(1024),
-                        current.max_connections,
-                        current.sq_entries,
-                        current.cq_entries,
-                        sizes.max_connections,
-                        sizes.sq_entries,
-                        sizes.cq_entries,
-                        current.max_connections,
-                        current.sq_entries,
-                        current.cq_entries,
-                    ),
+                         cq_entries on the builder to fail instead of running smaller.",
+                    limit.hard.div_ceil(1024),
+                    required.div_ceil(1024),
+                    current.max_connections,
+                    current.sq_entries,
+                    current.cq_entries,
+                    sizes.max_connections,
+                    sizes.sq_entries,
+                    sizes.cq_entries,
+                    current.max_connections,
+                    current.sq_entries,
+                    current.cq_entries,
                 );
                 return Ok(());
             }
@@ -2350,6 +2900,64 @@ fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: 
         charges_rings,
         page,
     )
+}
+
+/// Make room in `RLIMIT_MEMLOCK` for the fixed-buffer send probe
+/// (`backend/uring/fixed_send.rs`), on top of what the workers need, by
+/// raising the soft limit when the hard limit allows. When it does not, the
+/// probe is told not to run, so its charge cannot take memory the workers or
+/// the regions were given; launch does not fail for it.
+#[cfg(has_io_uring)]
+fn reserve_probe_memlock(config: &Config, workers: usize) {
+    use crate::backend::uring::fixed_send;
+    use crate::error::MemlockLimit;
+    use crate::memlock::{
+        KernelVersion, charges_rings_by_version, has_cap_ipc_lock, kernel_charges_rings,
+    };
+
+    if fixed_send::probed() || has_cap_ipc_lock() {
+        fixed_send::allow();
+        return;
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let Ok(limit) = MemlockLimit::read() else {
+        fixed_send::refuse("RLIMIT_MEMLOCK could not be read".into());
+        return;
+    };
+    let needed = |charges_rings| {
+        let workers = memlock_required(config, workers, charges_rings, page);
+        (
+            workers,
+            workers.saturating_add(fixed_send::memlock_charge(charges_rings, page)),
+        )
+    };
+    // As `ensure_memlock_limit`: the version rule first, and a measurement
+    // of the running kernel when that does not fit.
+    let mut charges_rings = charges_rings_by_version(KernelVersion::current());
+    if charges_rings && needed(true).1 > limit.hard {
+        charges_rings = kernel_charges_rings().charged;
+    }
+    let (workers_need, total) = needed(charges_rings);
+    if limit.soft >= total {
+        fixed_send::allow();
+        return;
+    }
+    if limit.hard >= total {
+        let rlim = libc::rlimit {
+            rlim_cur: total,
+            rlim_max: limit.hard,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) } == 0 {
+            fixed_send::allow();
+            return;
+        }
+    }
+    fixed_send::refuse(format!(
+        "RLIMIT_MEMLOCK (hard limit {} KiB) has no room for the probe's buffer beside the \
+         {} KiB the workers need",
+        limit.hard.div_ceil(1024),
+        workers_need.div_ceil(1024),
+    ));
 }
 
 /// [`memlock_required`] with the rings sized `sq_entries` and `cq_entries`.
@@ -2432,7 +3040,13 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<OwnedFd, crate::error::Erro
     let owned = stream_socket(domain).map_err(crate::error::Error::Io)?;
     let fd = owned.as_raw_fd();
     let optval: libc::c_int = 1;
-    for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+    // Hermit has no SO_REUSEPORT. This path serves io_uring's merged accept
+    // mode, which Hermit never builds; the option list only has to compile.
+    #[cfg(not(target_os = "hermit"))]
+    let opts = [libc::SO_REUSEADDR, libc::SO_REUSEPORT];
+    #[cfg(target_os = "hermit")]
+    let opts = [libc::SO_REUSEADDR];
+    for opt in opts {
         let ret = unsafe {
             libc::setsockopt(
                 fd,
@@ -2473,7 +3087,7 @@ fn stream_socket(domain: libc::c_int) -> io::Result<OwnedFd> {
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     #[cfg(not(target_os = "linux"))]
     unsafe {
-        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD, 0);
         if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -2545,7 +3159,7 @@ fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, Socke
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     #[cfg(not(target_os = "linux"))]
     unsafe {
-        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD, 0);
         if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -2564,18 +3178,22 @@ fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, Socke
         return Err(io::Error::last_os_error());
     }
 
-    let optval: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
+    // Hermit has no SO_REUSEPORT, so only one worker can bind a port there.
+    #[cfg(not(target_os = "hermit"))]
+    {
+        let optval: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     let resolved = getsockname_v4_v6(fd.as_raw_fd())
         .ok_or_else(|| io::Error::other("getsockname on a bound UDP socket returned no address"))?;
@@ -2673,7 +3291,7 @@ fn create_unix_listener(path: &Path) -> Result<OwnedFd, crate::error::Error> {
     // Remove existing socket file if present (ignore errors — path may not exist).
     let _ = std::fs::remove_file(path);
 
-    let fd = stream_socket(libc::AF_UNIX).map_err(crate::error::Error::Io)?;
+    let fd = stream_socket(crate::sys::AF_UNIX).map_err(crate::error::Error::Io)?;
 
     // Bind using the driver's sockaddr helper.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -3204,6 +3822,66 @@ mod worker_exit_tests {
         }
     }
 
+    /// `next_signal` returns `WorkerExited` once for each stopped worker and
+    /// leaves the others serving: of two callers waiting for one stop, one
+    /// returns and the other waits for the second stop, after which the exit
+    /// pipe is empty.
+    #[test]
+    fn next_signal_reports_each_worker_exit_once_and_keeps_serving() {
+        let (runtime, handles, fault) = launch(3, AcceptMode::Pool, TaskPanicPolicy::Contain);
+        let mut streams = connect_all(runtime.bound_addr().unwrap(), 12);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let waiter = runtime.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(waiter.next_signal());
+            });
+        }
+        // Both callers in `poll` before the stop, so both are likely to wake
+        // for its byte; the kernel re-checks readiness, so one may not.
+        std::thread::sleep(Duration::from_millis(50));
+        let exit_pipe_readable = || {
+            let mut fds = [libc::pollfd {
+                fd: runtime.shutdown.exit_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+            ready > 0
+        };
+
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, 3);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).ok(),
+            Some(Signal::WorkerExited)
+        );
+        wait_for_exit(&handles, 1);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(300)).ok(),
+            None,
+            "one worker exit was returned to both callers"
+        );
+        check_service_after_exit(&runtime, &mut streams, 3);
+
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, 3);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).ok(),
+            Some(Signal::WorkerExited)
+        );
+        wait_for_exit(&handles, 2);
+        assert!(
+            !exit_pipe_readable(),
+            "the worker exit would be returned again"
+        );
+
+        runtime.shutdown();
+        wait_for_exit(&handles, 3);
+    }
+
     /// `shutdown` returns after the acceptor thread has exited, so the
     /// listener's socket is closed when it returns. Nothing connects, so the
     /// acceptor is in `poll`; on macOS only the stop signal wakes it, and on
@@ -3226,6 +3904,7 @@ mod worker_exit_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             crate::listen_gate::ListenGates::new(0, 128),
             Arc::from(Vec::new()),
+            0,
         )
         .expect("runtime shutdown")
     }
@@ -3552,6 +4231,7 @@ mod worker_exit_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             crate::listen_gate::ListenGates::new(0, 128),
             Arc::from(Vec::new()),
+            2,
         )
         .unwrap();
         let accepting = (0..2)
@@ -3589,6 +4269,7 @@ mod worker_exit_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             crate::listen_gate::ListenGates::new(0, 128),
             Arc::from(Vec::new()),
+            2,
         )
         .unwrap();
         let accepting = (0..2)

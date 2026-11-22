@@ -1,0 +1,13 @@
+diff --git a/ringline/src/worker.rs b/ringline/src/worker.rs
+index 1d9981b7..463c8a6c 100644
+--- a/ringline/src/worker.rs
++++ b/ringline/src/worker.rs
+@@ -803,7 +803,7 @@ impl RuntimeShutdown {
+             // A worker that has stopped, or whose thread has ended, closed
+             // what was left in its channel.
+             let pending = placed.iter().enumerate().any(|(w, &n)| {
+-                !exited.contains(&w) && !self.accept.is_done(w) && self.accept.handled_count(w) < n
++                !exited.contains(&w) && self.accept.handled_count(w) < n
+             });
+             if !pending {
+                 return Ok(());

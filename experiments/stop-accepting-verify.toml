@@ -1,0 +1,118 @@
+name = "stop_accepting verify on {image} ({ref})"
+# Verifies `Runtime::stop_accepting` on Linux, on the io_uring backend and mio
+# (docs/journal/2026-11-listener-handoff.md, PR 3):
+#   systemslab submit experiments/stop-accepting-verify.toml -p ref=<branch or sha>
+#
+# - green: tests/stop_accepting.rs passes three times, with
+#   `unstable-accept` (where the merged-mode test runs too), and once on mio
+#   (`force-mio`), where the ended-worker mutation runs.
+# - Each patch removes one part of the change, and the named test must fail:
+#   - stop-accepting-verify-no-drain.patch returns without waiting for the
+#     workers' handled counts:
+#     `stop_accepting_waits_for_the_connections_in_a_workers_channel`;
+#   - stop-accepting-verify-no-stopping.patch drops the acceptor's check of
+#     the `stopping` flag:
+#     `an_acceptor_holding_a_connection_places_it_and_accepts_no_more`;
+#   - stop-accepting-verify-merged-count.patch counts a merged listener
+#     stopped by `stop_accepting` in `ACCEPTOR_STOPPED`:
+#     `stop_accepting_in_merged_mode_counts_no_stopped_acceptor`;
+#   - stop-accepting-verify-no-done.patch waits for a worker whose thread has
+#     ended: `stop_accepting_does_not_wait_for_a_worker_that_ended`, on the
+#     mio backend (`force-mio`). An io_uring worker drains its accept channel
+#     in the iteration that sees its shutdown request, so there the test
+#     leaves nothing in the channel of the worker that ended.
+# Then the whole ringline suite, with and without `unstable-accept`, and the
+# io_uring lint and doc gates run.
+
+[params]
+image = "debian-13-6.12"
+ref = "stop-accepting"
+repo = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "vm"
+tags = ["hypervisor", "x86_64"]
+
+[[jobs.steps]]
+uses = "anvil-vm"
+
+[jobs.steps.with]
+shape = "auto.c"
+image = "{image}"
+memory_gib = 8
+gpu = false
+boot_timeout = 600
+payload_timeout = 7200
+artifacts = ["/tmp/job/run.log"]
+payload = '''
+set -o pipefail
+mkdir -p /tmp/job
+echo 1 > /tmp/job/status
+{
+  echo "== guest =="; uname -r; nproc; grep PRETTY /etc/os-release
+  if ! command -v cc >/dev/null || ! command -v git >/dev/null; then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential git curl >/dev/null
+  fi
+  if ! command -v cargo >/dev/null; then
+    curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal -c clippy -c rustfmt
+    . "$HOME/.cargo/env"
+  fi
+  cargo --version
+  ulimit -Sn 65536
+  # On disk, not in /tmp: /tmp is tmpfs on these images.
+  export CARGO_BUILD_JOBS=8
+  git clone -q {repo} "$HOME/src" || exit 1
+  cd "$HOME/src" && git checkout -q {ref} || exit 1
+  git log --oneline -1
+  # A mio build would run none of the code under test.
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  backend=$(./target/debug/bench-server --print-backend)
+  echo "backend=$backend"
+  run_tests() {
+    # Not `-q`: it makes the harness print dots, not one line per test.
+    cargo test --locked -p ringline $2 --test stop_accepting > /tmp/job/$1.out 2>&1
+    echo "$1_rc=$?" | tee -a /tmp/job/rc.txt
+    grep -E "^test |test result|panicked" /tmp/job/$1.out
+  }
+  # A patch counts as red only if the named test failed, not if the patched
+  # tree failed to build.
+  mutate() {
+    git apply experiments/stop-accepting-verify-$1.patch || { echo "$1_applied=1" | tee -a /tmp/job/rc.txt; return; }
+    run_tests "mut_$1" "$2"
+    grep -qE "^    $3$" /tmp/job/mut_$1.out
+    echo "$1_red=$?" | tee -a /tmp/job/rc.txt
+    git checkout -q -- ringline/src
+  }
+  for i in 1 2 3; do run_tests green$i ""; done
+  run_tests merged "--features unstable-accept"
+  run_tests mio "--features force-mio"
+  grep -q "stop_accepting_in_merged_mode_counts_no_stopped_acceptor ... ok" /tmp/job/merged.out
+  echo "merged_ran=$?" | tee -a /tmp/job/rc.txt
+  mutate no-drain "" stop_accepting_waits_for_the_connections_in_a_workers_channel
+  mutate no-stopping "" an_acceptor_holding_a_connection_places_it_and_accepts_no_more
+  mutate merged-count "--features unstable-accept" stop_accepting_in_merged_mode_counts_no_stopped_acceptor
+  mutate no-done "--features force-mio" stop_accepting_does_not_wait_for_a_worker_that_ended
+  cargo test --locked -p ringline > /tmp/job/full.out 2>&1
+  echo "full_rc=$?" | tee -a /tmp/job/rc.txt
+  grep -E "^test result|FAILED|panicked" /tmp/job/full.out | sort | uniq -c | sort -rn | head -20
+  cargo test --locked -p ringline --features unstable-accept > /tmp/job/full_ua.out 2>&1
+  echo "full_ua_rc=$?" | tee -a /tmp/job/rc.txt
+  grep -E "FAILED|panicked" /tmp/job/full_ua.out | sort | uniq -c | sort -rn | head -20
+  cargo fmt --all --check; echo "gate_fmt=$?" | tee -a /tmp/job/rc.txt
+  cargo clippy --locked -p ringline --all-targets -- -D warnings > /tmp/job/clippy.out 2>&1; echo "gate_clippy=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/clippy.out
+  cargo clippy --locked -p ringline --all-targets --features unstable-accept -- -D warnings > /tmp/job/clippy_ua.out 2>&1; echo "gate_clippy_ua=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/clippy_ua.out
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ringline > /tmp/job/doc.out 2>&1; echo "gate_doc=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/doc.out
+  fail=0
+  [ "$backend" = "io_uring" ] || { echo "FAIL backend $backend"; fail=1; }
+  for rc in green1_rc green2_rc green3_rc merged_rc merged_ran mio_rc no-drain_red no-stopping_red merged-count_red no-done_red full_rc full_ua_rc gate_fmt gate_clippy gate_clippy_ua gate_doc; do
+    grep -q "^$rc=0" /tmp/job/rc.txt && echo "ok   $rc" || { echo "FAIL $rc"; fail=1; }
+  done
+  echo "verdict_fail=$fail"
+  echo $fail > /tmp/job/status
+} 2>&1 | tee /tmp/job/run.log
+exit "$(cat /tmp/job/status)"
+'''

@@ -1,4 +1,4 @@
-//! Load for the contended cases of Experiments B and C
+//! Load for the contended cases of Experiments B to E
 //! (`docs/send-admission-design.md`, section 4), against `admission-server`.
 //!
 //! Every request is 24 bytes, in the format `admission-server` documents. It
@@ -23,6 +23,12 @@
 //!   sends their replies outside the send-capacity FIFO. They read every reply
 //!   as it arrives. The server drops a request whose reply the pool refuses,
 //!   so a missing reply is counted as dropped, not as an error.
+//! - `--fast-conns` closed-loop connections each keep `--fast-depth`
+//!   requests for `--fast-size` bytes outstanding: each writes that many,
+//!   then one more as each reply is read in full, and reads as fast as the
+//!   socket allows (Closed-loop depth connections, below).
+//! - `--batch-conns` connections each run rounds of `--batch-requests`
+//!   requests for `--batch-size` bytes (Batch connections, below).
 //!
 //! Every `--episode-ms`, from the start of the window:
 //! - `--drainers` connections each ask for a `--drain-size` reply and read it
@@ -38,12 +44,58 @@
 //!   them.
 //! - `--large-delay-ms` later, one connection asks for a `--large-size` reply,
 //!   which needs more slots than are free and waits at the head of the
-//!   server's FIFO, then reads it.
+//!   server's FIFO, then reads it as fast as it can, with `SO_RCVBUF` set to
+//!   `--head-rcvbuf` before the connect (0 leaves it to the kernel). With
+//!   `--large-size 0` the episode has no head.
+//!
+//! With `--ports-file`, each stalled peer, drainer and head appends its local
+//! port to the file as it connects, so that a sampler can pick its socket out
+//! of `ss`.
+//!
+//! # Closed loop
+//!
+//! With `--closed-loop N` the load runs only workload U of Experiment D: one
+//! connection, with `SO_RCVBUF` set to `--head-rcvbuf` before the connect,
+//! writes a request for `--large-size` bytes, reads the reply in full, and
+//! writes the next, `--closed-warmup` times uncounted and then N times. It
+//! prints the `SO_RCVBUF` the kernel reports, each counted reply's time from
+//! its request to its last byte in microseconds, their median, p99 and
+//! maximum, and the window over which they ran. It exits 1 if a reply was not
+//! read in full.
 //!
 //! The head's tag is `u32::MAX`, each drainer's `0x8000_0000` plus its index,
-//! and each stalled peer's its index; `admission-server` records the tag of
-//! every large reply. Their requests' scheduled times are when they are
-//! written.
+//! each closed-loop depth connection's `0x4000_0000` plus its index, each
+//! batch connection's `0x6000_0000` plus its index, and each stalled peer's
+//! its index; `admission-server` records the tag of every large reply. Their
+//! requests' scheduled times are when they are written, except a batch
+//! round's, whose requests all carry the round's start.
+//!
+//! # Closed-loop depth connections
+//!
+//! Each `--fast-conns` connection starts with the warmup and stops writing
+//! and reading when the window ends; replies still outstanding then are not
+//! read. Its socket is blocking, with a 10 ms read timeout so that it sees
+//! the window end. Its requests carry flag bit 2 when written inside the
+//! window. A reply counts when its last byte is read inside the window, and
+//! its latency is from its request's write to that read. A connection that
+//! ends is reopened, its outstanding requests forgotten, and counted in
+//! `reconnects`.
+//!
+//! # Batch connections
+//!
+//! Each `--batch-conns` connection sets `SO_RCVBUF` to `--batch-rcvbuf` and
+//! `SO_SNDBUF` to `--batch-sndbuf` before the connect (0 leaves either to the
+//! kernel), and its socket is non-blocking. From the start of the warmup it
+//! runs rounds. A round writes all `--batch-requests` requests, waiting for
+//! room in the socket while it takes none and reading nothing, then reads
+//! all the replies. Its requests carry the round's start as their scheduled
+//! time, and flag bit 2 if that is inside the window. A round not finished
+//! `--batch-round-limit-ms` after it began is stalled: the connection closes
+//! and runs no more rounds. The stall records whether the round was writing
+//! or reading, the requests the socket (or under TLS, rustls) had taken, and
+//! the replies read in full. A round under way when the window ends stops
+//! there and is reported as unfinished, with the same fields. A connection
+//! that ends otherwise is reopened, and a new round begins.
 //!
 //! A reply's latency is measured from its request's scheduled send time to
 //! the read of its last byte, so a reply delayed behind the head is charged
@@ -125,11 +177,34 @@
 //! One JSON object: for the fast small connections, the replies offered after
 //! `--warmup` (sent before the drain), delivered within `--within-ms`,
 //! delivered late and lost, their latency percentiles, and each episode's
-//! large-reply outcome, as in Experiment B; the same for the slow connections
+//! head: its time from request to last byte in milliseconds (`large_ms`) and
+//! microseconds (`large_us`), `null` where it was not read in full, and
+//! whether it was (`large_completed`); the same for the slow connections
 //! under `slow`; each drainer's time from request to last byte per episode,
-//! or `null`, under `drainers`; counts for the outside connections under
+//! in milliseconds and microseconds, or `null`, and whether its reply was
+//! read in full, under `drainers`; counts for the outside connections under
 //! `outside`; and the window's start and end in nanoseconds of
-//! `CLOCK_MONOTONIC` under `window_ns`.
+//! `CLOCK_MONOTONIC` under `window_ns`. The closed loop prints its own
+//! object (above).
+//!
+//! `slow.bytes_read` counts the slow connections' reply bytes over the whole
+//! run, and `slow.bytes_read_window` those read inside the window.
+//!
+//! Under `fast`, for the closed-loop depth connections: their flags, and
+//! over the window the replies read in full (`replies`), the reply bytes
+//! read (`bytes_read`), both per second of `--duration` (`replies_per_s`,
+//! `bytes_per_s`), the median, p99 and maximum latency in microseconds
+//! (`p50_us`, `p99_us`, `max_us`, 0 with no replies), and `reconnects`.
+//!
+//! Under `batch`, for the batch connections: their flags; the rounds that
+//! finished inside the window (`rounds`) and at any time (`rounds_run`); the
+//! connections whose round stalled (`stalled`), and for each such round
+//! (`stalls`) its connection's index (`conn`), the phase it stalled in
+//! (`phase`, `write` or `read`), the requests written (`written`), the
+//! replies read (`read`) and the time of the stall in nanoseconds of
+//! `CLOCK_MONOTONIC` (`at_ns`); the rounds under way when the window ended,
+//! with the same fields (`unfinished`); and `reconnects`. A stall counts
+//! whenever it happens, in the warmup too.
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
@@ -146,7 +221,7 @@ use serde_json::{Value, json};
 #[derive(Parser, Clone)]
 #[command(
     name = "admission-load",
-    about = "The contended-case load of Experiments B and C"
+    about = "The contended-case load of Experiments B to E"
 )]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7979")]
@@ -224,6 +299,55 @@ struct Args {
     /// --tls-cert-out` writes it.
     #[arg(long, requires = "tls")]
     tls_ca: Option<PathBuf>,
+    /// `SO_RCVBUF` on the head's socket, and on the closed loop's, set
+    /// before the connect; 0 leaves it to the kernel.
+    #[arg(long, default_value_t = 0)]
+    head_rcvbuf: i32,
+    /// Run only a closed loop of this many `--large-size` requests on one
+    /// connection, each written once the reply before it has been read in
+    /// full, and nothing else (Experiment D's workload U).
+    #[arg(long, default_value_t = 0)]
+    closed_loop: u32,
+    /// Replies the closed loop reads before the ones it counts, outside the
+    /// measurement window.
+    #[arg(long, default_value_t = 10)]
+    closed_warmup: u32,
+    /// Append a line for each stalled peer, drainer and head connection to
+    /// this file as it connects: the `CLOCK_MONOTONIC` time in ns, the
+    /// episode, the kind (`stall`, `drain` or `head`), its index, and its
+    /// local port.
+    #[arg(long)]
+    ports_file: Option<std::path::PathBuf>,
+    /// Closed-loop connections that each keep `--fast-depth` requests
+    /// outstanding.
+    #[arg(long, default_value_t = 0)]
+    fast_conns: usize,
+    #[arg(long, default_value_t = 1024)]
+    fast_size: u32,
+    /// Requests each `--fast-conns` connection keeps outstanding.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    fast_depth: u32,
+    /// Connections that each write `--batch-requests` requests, then read
+    /// their replies, in rounds.
+    #[arg(long, default_value_t = 0)]
+    batch_conns: usize,
+    /// Requests in one round of a batch connection.
+    #[arg(long, default_value_t = 0)]
+    batch_requests: u32,
+    #[arg(long, default_value_t = 1024)]
+    batch_size: u32,
+    /// `SO_RCVBUF` on the batch connections' sockets, set before the
+    /// connect; 0 leaves it to the kernel.
+    #[arg(long, default_value_t = 0)]
+    batch_rcvbuf: i32,
+    /// `SO_SNDBUF` on the batch connections' sockets, set before the
+    /// connect; 0 leaves it to the kernel.
+    #[arg(long, default_value_t = 0)]
+    batch_sndbuf: i32,
+    /// A batch round not finished this long after it began is stalled, and
+    /// its connection stops.
+    #[arg(long, default_value_t = 10_000)]
+    batch_round_limit_ms: u64,
 }
 
 const REQUEST_LEN: usize = 24;
@@ -232,6 +356,11 @@ const FLAG_OUTSIDE: u32 = 1 << 1;
 const FLAG_WINDOW: u32 = 1 << 2;
 const HEAD_TAG: u32 = u32::MAX;
 const DRAIN_TAG: u32 = 0x8000_0000;
+const FAST_TAG: u32 = 0x4000_0000;
+const BATCH_TAG: u32 = 0x6000_0000;
+/// The longest a closed-loop depth or batch connection waits for its socket
+/// before it checks the time again.
+const SOCKET_POLL: Duration = Duration::from_millis(10);
 /// The most a paced reader takes in one read.
 const READ_CHUNK: usize = 4096;
 /// The longest a paced reader sleeps between checks.
@@ -474,10 +603,16 @@ fn request(len: u32, tag: u32, flags: u32, scheduled_ns: u64) -> [u8; REQUEST_LE
 /// the connect (`connect_with_rcvbuf`). A handshake that fails `HANDSHAKE_TRIES` times in a row ends the
 /// process, since it would otherwise retry forever on a bad `--tls-ca`.
 fn connect_wire(addr: SocketAddr, rcvbuf: i32) -> Wire {
+    connect_wire_bufs(addr, rcvbuf, 0)
+}
+
+/// `connect_wire`, with `SO_SNDBUF` too set to `sndbuf` before the connect
+/// if above 0.
+fn connect_wire_bufs(addr: SocketAddr, rcvbuf: i32, sndbuf: i32) -> Wire {
     let mut failures = 0;
     loop {
-        let sock = if rcvbuf > 0 {
-            try_connect_with_rcvbuf(addr, rcvbuf)
+        let sock = if rcvbuf > 0 || sndbuf > 0 {
+            try_connect_with_bufs(addr, rcvbuf, sndbuf)
         } else {
             TcpStream::connect(addr)
         };
@@ -504,14 +639,64 @@ fn connect(addr: SocketAddr) -> Wire {
     connect_wire(addr, 0)
 }
 
+/// The `SO_RCVBUF` the kernel reports for `s`: on Linux twice the size set,
+/// capped at `net.core.rmem_max` doubled.
+fn rcvbuf(s: &TcpStream) -> i32 {
+    let mut size: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: `s` is a live socket, and `size` and `len` outlive the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&mut size as *mut i32).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 { size } else { -1 }
+}
+
+/// Where the stalled peers', drainers' and heads' local ports are written
+/// (`--ports-file`).
+#[derive(Clone)]
+struct Ports(Option<Arc<Mutex<std::fs::File>>>);
+
+impl Ports {
+    fn open(path: Option<&std::path::Path>) -> Ports {
+        Ports(path.map(|p| {
+            Arc::new(Mutex::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .expect("open --ports-file"),
+            ))
+        }))
+    }
+
+    fn note(&self, episode: usize, kind: &str, index: usize, s: &TcpStream) {
+        let (Some(f), Ok(local)) = (&self.0, s.local_addr()) else {
+            return;
+        };
+        let line = format!("{} {episode} {kind} {index} {}\n", mono_ns(), local.port());
+        let _ = f.lock().unwrap().write_all(line.as_bytes());
+    }
+}
+
 fn set_rcvbuf(s: &TcpStream, size: i32) {
+    set_buf(s, libc::SO_RCVBUF, size);
+}
+
+/// Set the socket buffer `option` (`SO_RCVBUF` or `SO_SNDBUF`) on `s`.
+fn set_buf(s: &TcpStream, option: libc::c_int, size: i32) {
     let fd = s.as_raw_fd();
     // SAFETY: `fd` is a live socket owned by `s`, and `size` outlives the call.
     unsafe {
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
+            option,
             (&size as *const i32).cast(),
             std::mem::size_of::<i32>() as libc::socklen_t,
         );
@@ -528,7 +713,9 @@ fn connect_with_rcvbuf(addr: SocketAddr, rcvbuf: i32) -> Wire {
     connect_wire(addr, rcvbuf)
 }
 
-fn try_connect_with_rcvbuf(addr: SocketAddr, rcvbuf: i32) -> std::io::Result<TcpStream> {
+/// Open a socket, set `SO_RCVBUF` to `rcvbuf` and `SO_SNDBUF` to `sndbuf`
+/// where each is above 0, and connect it to `addr`.
+fn try_connect_with_bufs(addr: SocketAddr, rcvbuf: i32, sndbuf: i32) -> std::io::Result<TcpStream> {
     use std::os::fd::FromRawFd;
     let family = if addr.is_ipv4() {
         libc::AF_INET
@@ -543,7 +730,12 @@ fn try_connect_with_rcvbuf(addr: SocketAddr, rcvbuf: i32) -> std::io::Result<Tcp
     // SAFETY: `fd` is a socket this function just opened and nothing else
     // owns; the stream closes it, on the error paths below too.
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
-    set_rcvbuf(&stream, rcvbuf);
+    if rcvbuf > 0 {
+        set_rcvbuf(&stream, rcvbuf);
+    }
+    if sndbuf > 0 {
+        set_buf(&stream, libc::SO_SNDBUF, sndbuf);
+    }
     // SAFETY: all-zero bytes are a valid `sockaddr_storage`.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let len = match addr {
@@ -677,6 +869,8 @@ struct Conn {
     latencies: Vec<u64>,
     reconnects: u64,
     bytes_read: u64,
+    /// Reply bytes read inside the window. Slow connections only.
+    bytes_read_window: u64,
     /// For requests scheduled in the window, how late each was written, in
     /// nanoseconds after its scheduled time. Fast connections only.
     send_late: Vec<u64>,
@@ -881,6 +1075,9 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
                     out.bytes_read += n as u64;
                     filled += n;
                     let at = Instant::now();
+                    if window.contains(at) {
+                        out.bytes_read_window += n as u64;
+                    }
                     let mut used = 0;
                     while filled - used >= size {
                         let got = u32::from_le_bytes(buf[used..used + 4].try_into().unwrap());
@@ -921,11 +1118,300 @@ fn slow_conn(args: &Args, index: usize, start: Instant, window: Window, clock: C
     out
 }
 
+/// One closed-loop depth connection's results, over replies whose last byte
+/// was read inside the window.
+#[derive(Default)]
+struct DepthConn {
+    replies: u64,
+    /// Reply bytes read inside the window, of any reply.
+    bytes_read: u64,
+    /// Each reply's time from its request's write to its last byte, in
+    /// microseconds.
+    latencies_us: Vec<u64>,
+    reconnects: u64,
+}
+
+/// Count the replies of `size` bytes that `n` bytes just read, read at `at`,
+/// complete. `left` is what the oldest unfinished reply still lacks, and
+/// `written` holds each outstanding request's write time, oldest first.
+/// Returns the write times of the replies completed.
+fn complete_replies(
+    n: usize,
+    size: usize,
+    left: &mut usize,
+    written: &mut VecDeque<Instant>,
+) -> Vec<Instant> {
+    let mut done = Vec::new();
+    let mut n = n;
+    while n > 0 {
+        let take = n.min(*left);
+        n -= take;
+        *left -= take;
+        if *left == 0 {
+            done.push(written.pop_front().expect("a reply with no request"));
+            *left = size;
+        }
+    }
+    done
+}
+
+/// One `--fast-conns` connection: from the start of the warmup until the
+/// window ends, keep `--fast-depth` requests for `--fast-size` bytes
+/// outstanding, writing one more as each reply is read in full, and read as
+/// fast as the socket allows. A connection that ends is reopened, and the
+/// requests outstanding on it are forgotten.
+fn depth_conn(
+    args: &Args,
+    index: usize,
+    start: Instant,
+    window: Window,
+    clock: Clock,
+) -> DepthConn {
+    thread::sleep(start.saturating_duration_since(Instant::now()));
+    let size = args.fast_size.max(8) as usize;
+    let tag = FAST_TAG | index as u32;
+    let mut out = DepthConn::default();
+    let mut buf = vec![0u8; 64 << 10];
+    'conn: while Instant::now() < window.stop {
+        let mut conn = connect(args.addr);
+        conn.sock().set_read_timeout(Some(SOCKET_POLL)).ok();
+        let mut written: VecDeque<Instant> = VecDeque::new();
+        let mut left = size;
+        while Instant::now() < window.stop {
+            while written.len() < args.fast_depth as usize {
+                let at = Instant::now();
+                let r = request(args.fast_size, tag, window.flag(at), clock.ns(at));
+                if conn.write_all(&r).is_err() {
+                    out.reconnects += 1;
+                    continue 'conn;
+                }
+                written.push_back(at);
+            }
+            match conn.read(&mut buf, usize::MAX) {
+                Ok((0, 0)) => {}
+                Ok((_, n)) => {
+                    let at = Instant::now();
+                    let done = complete_replies(n, size, &mut left, &mut written);
+                    if window.contains(at) {
+                        out.bytes_read += n as u64;
+                        out.replies += done.len() as u64;
+                        out.latencies_us
+                            .extend(done.iter().map(|w| (at - *w).as_micros() as u64));
+                    }
+                    continue;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    continue;
+                }
+                Err(_) => {}
+            }
+            out.reconnects += 1;
+            continue 'conn;
+        }
+    }
+    out
+}
+
+/// Where a batch round stopped: the phase, the requests written and the
+/// replies read by then, and when, in nanoseconds of `CLOCK_MONOTONIC`.
+struct RoundStop {
+    conn: usize,
+    phase: &'static str,
+    written: u64,
+    read: u64,
+    at_ns: u64,
+}
+
+impl RoundStop {
+    fn json(&self) -> Value {
+        json!({
+            "conn": self.conn,
+            "phase": self.phase,
+            "written": self.written,
+            "read": self.read,
+            "at_ns": self.at_ns,
+        })
+    }
+}
+
+/// One batch connection's results.
+#[derive(Default)]
+struct BatchConn {
+    /// Rounds that finished inside the window.
+    rounds: u64,
+    /// Rounds that finished, at any time.
+    rounds_run: u64,
+    /// The round that passed `--batch-round-limit-ms`, if one did.
+    stall: Option<RoundStop>,
+    /// The round under way when the window ended, if it had not stalled.
+    unfinished: Option<RoundStop>,
+    reconnects: u64,
+}
+
+/// How a phase of a batch round ended.
+enum Phase {
+    Done,
+    /// The connection ended or failed.
+    Broken,
+    /// The round passed its limit.
+    Stalled,
+    /// The window ended.
+    Ended,
+}
+
+/// One `--batch-conns` connection: from the start of the warmup until the
+/// window ends, rounds of `--batch-requests` requests for `--batch-size`
+/// bytes. A round writes every request, waiting for room in the socket as
+/// needed and reading nothing, then reads every reply. A round not finished
+/// `--batch-round-limit-ms` after it began is stalled: the connection closes
+/// and runs no more rounds. A connection that ends otherwise is reopened, and
+/// a new round begins. The requests of a round carry its start as their
+/// scheduled time, and flag bit 2 if it is inside the window.
+fn batch_conn(
+    args: &Args,
+    index: usize,
+    start: Instant,
+    window: Window,
+    clock: Clock,
+) -> BatchConn {
+    thread::sleep(start.saturating_duration_since(Instant::now()));
+    let size = args.batch_size.max(8) as usize;
+    let k = args.batch_requests as usize;
+    let tag = BATCH_TAG | index as u32;
+    let limit = Duration::from_millis(args.batch_round_limit_ms);
+    let mut out = BatchConn::default();
+    let mut buf = vec![0u8; 64 << 10];
+    let connect_batch = || {
+        let w = connect_wire_bufs(args.addr, args.batch_rcvbuf, args.batch_sndbuf);
+        w.sock().set_nonblocking(true).expect("non-blocking socket");
+        w
+    };
+    let mut conn = connect_batch();
+    loop {
+        let began = Instant::now();
+        if began >= window.stop {
+            break;
+        }
+        let deadline = began + limit;
+        // How a wait ends, or how long it may take.
+        let wait_for = |now: Instant| -> Result<Duration, Phase> {
+            if now >= deadline {
+                Err(Phase::Stalled)
+            } else if now >= window.stop {
+                Err(Phase::Ended)
+            } else {
+                Ok(deadline
+                    .min(window.stop)
+                    .duration_since(now)
+                    .min(SOCKET_POLL))
+            }
+        };
+        let r = request(args.batch_size, tag, window.flag(began), clock.ns(began));
+        let unsent: Vec<u8> = (0..k).flat_map(|_| r).collect();
+        let mut off = 0usize;
+        let mut replies = 0usize;
+        let mut phase = "write";
+        let written_all = loop {
+            let flushed = match conn.flush() {
+                Ok(f) => f,
+                Err(_) => break Phase::Broken,
+            };
+            if flushed && off == unsent.len() {
+                break Phase::Done;
+            }
+            if flushed {
+                match conn.write(&unsent[off..]) {
+                    Ok(0) => break Phase::Broken,
+                    Ok(n) => {
+                        off += n;
+                        continue;
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(_) => break Phase::Broken,
+                }
+            }
+            match wait_for(Instant::now()) {
+                Ok(d) => {
+                    wait_writable(conn.sock(), d);
+                }
+                Err(p) => break p,
+            }
+        };
+        let ended = match written_all {
+            Phase::Done => {
+                phase = "read";
+                let mut written: VecDeque<Instant> = std::iter::repeat_n(began, k).collect();
+                let mut left = size;
+                loop {
+                    if replies == k {
+                        break Phase::Done;
+                    }
+                    match conn.read(&mut buf, usize::MAX) {
+                        Ok((0, 0)) => break Phase::Broken,
+                        Ok((_, n)) => {
+                            replies += complete_replies(n, size, &mut left, &mut written).len();
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            match wait_for(Instant::now()) {
+                                Ok(d) => {
+                                    if !conn.buffered() {
+                                        wait_readable(conn.sock(), d);
+                                    }
+                                }
+                                Err(p) => break p,
+                            }
+                        }
+                        Err(_) => break Phase::Broken,
+                    }
+                }
+            }
+            other => other,
+        };
+        let stop = || RoundStop {
+            conn: index,
+            phase,
+            written: (off / REQUEST_LEN) as u64,
+            read: replies as u64,
+            at_ns: mono_ns(),
+        };
+        match ended {
+            Phase::Done => {
+                out.rounds_run += 1;
+                if window.contains(Instant::now()) {
+                    out.rounds += 1;
+                }
+            }
+            Phase::Broken => {
+                out.reconnects += 1;
+                conn = connect_batch();
+            }
+            Phase::Stalled => {
+                out.stall = Some(stop());
+                break;
+            }
+            Phase::Ended => {
+                out.unfinished = Some(stop());
+                break;
+            }
+        }
+    }
+    drop(conn);
+    out
+}
+
 /// One drainer: ask for a `--drain-size` reply and read it at most at
 /// `--drain-read-bps`. Returns the time from the request to the last byte, or
 /// `None` if the connection ended or `until` came first.
-fn drainer(args: &Args, index: usize, until: Instant, clock: Clock) -> Option<Duration> {
+fn drainer(
+    args: &Args,
+    index: usize,
+    until: Instant,
+    clock: Clock,
+    ports: &Ports,
+    episode: usize,
+) -> Option<Duration> {
     let mut s = connect_with_rcvbuf(args.addr, args.drain_rcvbuf);
+    ports.note(episode, "drain", index, s.sock());
     let began = Instant::now();
     let r = request(
         args.drain_size,
@@ -962,7 +1448,9 @@ fn drainer(args: &Args, index: usize, until: Instant, clock: Clock) -> Option<Du
 }
 
 /// One episode's outcome: the large reply's time from request to its last
-/// byte, and each drainer's, or `None` where the connection ended first.
+/// byte, and each drainer's, or `None` where the connection ended first or
+/// the reply was not read in full. `large` is `None` too in an episode with
+/// no head (`--large-size 0`).
 struct Episode {
     large: Option<Duration>,
     drainers: Vec<Option<Duration>>,
@@ -970,18 +1458,20 @@ struct Episode {
 
 /// One episode's drainers, stalled peers and large reply. The stalled peers
 /// stay open until 100 ms before the episode ends, so the server, not this
-/// client, ends them; the drainers stop reading then.
-fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
+/// client, ends them; the drainers stop reading then. With `--large-size 0`
+/// the episode has no head.
+fn episode(args: &Args, at: Instant, clock: Clock, ports: &Ports, number: usize) -> Episode {
     thread::sleep(at.saturating_duration_since(Instant::now()));
     let hold_until = at + Duration::from_millis(args.episode_ms.saturating_sub(100));
     thread::scope(|scope| {
         let drainers: Vec<_> = (0..args.drainers)
-            .map(|i| scope.spawn(move || drainer(args, i, hold_until, clock)))
+            .map(|i| scope.spawn(move || drainer(args, i, hold_until, clock, ports, number)))
             .collect();
         let mut stalled = Vec::new();
         for i in 0..args.stall_peers {
             let mut s = connect(args.addr);
             set_rcvbuf(s.sock(), args.stall_rcvbuf);
+            ports.note(number, "stall", i, s.sock());
             let r = request(
                 args.stall_size,
                 i as u32,
@@ -992,24 +1482,21 @@ fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
             stalled.push(s);
         }
         thread::sleep(Duration::from_millis(args.large_delay_ms));
-        let mut large = connect(args.addr);
-        large
-            .sock()
-            .set_read_timeout(Some(Duration::from_millis(args.episode_ms)))
-            .ok();
-        let began = Instant::now();
-        let r = request(args.large_size, HEAD_TAG, FLAG_WINDOW, clock.ns(began));
-        let took = large.write_all(&r).ok().and_then(|()| {
-            let mut left = args.large_size as usize;
-            let mut buf = vec![0u8; 1 << 20];
-            while left > 0 {
-                match large.read(&mut buf, usize::MAX) {
-                    Ok((0, 0)) | Err(_) => return None,
-                    Ok((_, n)) => left = left.saturating_sub(n),
-                }
-            }
-            Some(began.elapsed())
-        });
+        let took = (args.large_size > 0)
+            .then(|| {
+                let mut large = connect_with_rcvbuf(args.addr, args.head_rcvbuf);
+                ports.note(number, "head", 0, large.sock());
+                large
+                    .sock()
+                    .set_read_timeout(Some(Duration::from_millis(args.episode_ms)))
+                    .ok();
+                let began = Instant::now();
+                let r = request(args.large_size, HEAD_TAG, FLAG_WINDOW, clock.ns(began));
+                large.write_all(&r).ok()?;
+                read_reply(&mut large, args.large_size as usize)?;
+                Some(began.elapsed())
+            })
+            .flatten();
         thread::sleep(hold_until.saturating_duration_since(Instant::now()));
         drop(stalled);
         Episode {
@@ -1019,6 +1506,77 @@ fn episode(args: &Args, at: Instant, clock: Clock) -> Episode {
                 .map(|h| h.join().expect("drainer thread"))
                 .collect(),
         }
+    })
+}
+
+/// Read one reply of `len` bytes from `s`. `None` if the connection ended,
+/// failed or timed out first.
+fn read_reply(s: &mut Wire, len: usize) -> Option<()> {
+    let mut left = len.max(8);
+    let mut buf = vec![0u8; 1 << 20];
+    while left > 0 {
+        match s.read(&mut buf[..left.min(1 << 20)], usize::MAX) {
+            Ok((0, 0)) | Err(_) => return None,
+            Ok((_, n)) => left = left.saturating_sub(n),
+        }
+    }
+    Some(())
+}
+
+/// Experiment D's workload U: `--closed-loop` requests for `--large-size`
+/// bytes on one connection, each written once the reply before it has been
+/// read in full, after `--closed-warmup` replies that are not counted. The
+/// socket's `SO_RCVBUF` is `--head-rcvbuf`, set before the connect, and the
+/// size the kernel reports is printed. Only the counted requests carry flag
+/// bit 2, so the server records only them.
+fn closed_loop(args: &Args, clock: Clock) -> Value {
+    let mut s = connect_with_rcvbuf(args.addr, args.head_rcvbuf);
+    let reported = rcvbuf(s.sock());
+    s.sock()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok();
+    let mut us: Vec<u64> = Vec::with_capacity(args.closed_loop as usize);
+    let mut error = None;
+    let mut window = (0u64, 0u64);
+    let total = args.closed_warmup + args.closed_loop;
+    for i in 0..total {
+        let counted = i >= args.closed_warmup;
+        let began = Instant::now();
+        if i == args.closed_warmup {
+            window.0 = clock.ns(began);
+        }
+        let flags = if counted { FLAG_WINDOW } else { 0 };
+        let r = request(args.large_size, HEAD_TAG, flags, clock.ns(began));
+        if s.write_all(&r).is_err() {
+            error = Some(format!("request {i}: write failed"));
+            break;
+        }
+        if read_reply(&mut s, args.large_size as usize).is_none() {
+            error = Some(format!("request {i}: reply not read in full"));
+            break;
+        }
+        if counted {
+            us.push(began.elapsed().as_micros() as u64);
+        }
+    }
+    window.1 = clock.ns(Instant::now());
+    let mut sorted = us.clone();
+    sorted.sort_unstable();
+    json!({
+        "closed_loop": {
+            "requests": args.closed_loop,
+            "warmup": args.closed_warmup,
+            "completed": us.len(),
+            "size": args.large_size,
+            "rcvbuf_set": args.head_rcvbuf,
+            "rcvbuf_reported": reported,
+            "p50_us": percentile(&sorted, 0.50),
+            "p99_us": percentile(&sorted, 0.99),
+            "max_us": sorted.last().copied().unwrap_or(0),
+            "us": us,
+            "error": error,
+        },
+        "window_ns": [window.0, window.1],
     })
 }
 
@@ -1040,9 +1598,19 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 /// `poll` waits whole milliseconds, rounded down, and the loop comes back
 /// early rather than late.
 fn wait_readable(conn: &TcpStream, timeout: Duration) -> bool {
+    wait_ready(conn, libc::POLLIN, timeout)
+}
+
+/// Wait until `conn` has room to write or `timeout` passes, as
+/// `wait_readable` waits; true if it has.
+fn wait_writable(conn: &TcpStream, timeout: Duration) -> bool {
+    wait_ready(conn, libc::POLLOUT, timeout)
+}
+
+fn wait_ready(conn: &TcpStream, events: libc::c_short, timeout: Duration) -> bool {
     let mut pfd = libc::pollfd {
         fd: conn.as_raw_fd(),
-        events: libc::POLLIN,
+        events,
         revents: 0,
     };
     #[cfg(target_os = "linux")]
@@ -1109,6 +1677,10 @@ fn millis(d: Option<Duration>) -> Option<u64> {
     d.map(|d| d.as_millis() as u64)
 }
 
+fn micros(d: Option<Duration>) -> Option<u64> {
+    d.map(|d| d.as_micros() as u64)
+}
+
 fn main() {
     let args = Args::parse();
     let _ = TLS.set(
@@ -1125,7 +1697,18 @@ fn main() {
         eprintln!("admission-load: --outside-conns needs --outside-rate");
         std::process::exit(2);
     }
+    if args.batch_conns > 0 && args.batch_requests == 0 {
+        eprintln!("admission-load: --batch-conns needs --batch-requests");
+        std::process::exit(2);
+    }
     let clock = Clock::new();
+    if args.closed_loop > 0 {
+        let out = closed_loop(&args, clock);
+        let failed = out["closed_loop"]["error"].is_string();
+        println!("{out}");
+        std::process::exit(i32::from(failed));
+    }
+    let ports = Ports::open(args.ports_file.as_deref());
     let start = Instant::now() + Duration::from_millis(200);
     let window = {
         let start_at = start + Duration::from_secs(args.warmup);
@@ -1143,10 +1726,12 @@ fn main() {
         let episodes = Arc::clone(&episodes);
         thread::spawn(move || {
             let mut at = window.start;
+            let mut number = 0;
             while at + Duration::from_millis(args.episode_ms) <= window.stop {
-                let e = episode(&args, at, clock);
+                let e = episode(&args, at, clock, &ports, number);
                 episodes.lock().unwrap().push(e);
                 at += Duration::from_millis(args.episode_ms);
+                number += 1;
             }
         })
     };
@@ -1173,12 +1758,26 @@ fn main() {
             thread::spawn(move || slow_conn(&args, i, start, window, clock))
         })
         .collect();
+    let depths: Vec<_> = (0..args.fast_conns)
+        .map(|i| {
+            let args = args.clone();
+            thread::spawn(move || depth_conn(&args, i, start, window, clock))
+        })
+        .collect();
+    let batches: Vec<_> = (0..args.batch_conns)
+        .map(|i| {
+            let args = args.clone();
+            thread::spawn(move || batch_conn(&args, i, start, window, clock))
+        })
+        .collect();
     let join = |hs: Vec<thread::JoinHandle<Conn>>| -> Vec<Conn> {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     };
     let smalls = join(smalls);
     let outsides = join(outsides);
     let slows = join(slows);
+    let depths: Vec<DepthConn> = depths.into_iter().map(|h| h.join().unwrap()).collect();
+    let batches: Vec<BatchConn> = batches.into_iter().map(|h| h.join().unwrap()).collect();
     episode_thread.join().unwrap();
 
     let episodes = std::mem::take(&mut *episodes.lock().unwrap());
@@ -1188,6 +1787,23 @@ fn main() {
         "large_ms".into(),
         json!(episodes.iter().map(|e| millis(e.large)).collect::<Vec<_>>()),
     );
+    // Per episode's head: the time from its request to its last byte, in
+    // microseconds, or null where it was not read in full.
+    out.insert(
+        "large_us".into(),
+        json!(episodes.iter().map(|e| micros(e.large)).collect::<Vec<_>>()),
+    );
+    out.insert(
+        "large_completed".into(),
+        json!(
+            episodes
+                .iter()
+                .map(|e| e.large.is_some())
+                .collect::<Vec<_>>()
+        ),
+    );
+    out.insert("large_size".into(), json!(args.large_size));
+    out.insert("head_rcvbuf".into(), json!(args.head_rcvbuf));
     let mut slow = summary(&slows, args.within_ms);
     slow.extend([
         ("conns".to_string(), json!(args.slow_conns)),
@@ -1198,6 +1814,10 @@ fn main() {
         (
             "bytes_read".to_string(),
             json!(slows.iter().map(|s| s.bytes_read).sum::<u64>()),
+        ),
+        (
+            "bytes_read_window".to_string(),
+            json!(slows.iter().map(|s| s.bytes_read_window).sum::<u64>()),
         ),
     ]);
     out.insert("slow".into(), Value::Object(slow));
@@ -1212,6 +1832,14 @@ fn main() {
                 .iter()
                 .map(|e| e.drainers.iter().map(|&d| millis(d)).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
+            "us": episodes
+                .iter()
+                .map(|e| e.drainers.iter().map(|&d| micros(d)).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            "completed": episodes
+                .iter()
+                .map(|e| e.drainers.iter().map(|d| d.is_some()).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
         }),
     );
     out.insert(
@@ -1225,6 +1853,53 @@ fn main() {
             "dropped": outsides.iter().map(|s| s.dropped).sum::<u64>(),
             "lost": outsides.iter().map(|s| s.lost).sum::<u64>(),
             "reconnects": outsides.iter().map(|s| s.reconnects).sum::<u64>(),
+        }),
+    );
+    let secs = args.duration as f64;
+    let fast_replies: u64 = depths.iter().map(|d| d.replies).sum();
+    let fast_bytes: u64 = depths.iter().map(|d| d.bytes_read).sum();
+    let mut fast_us: Vec<u64> = depths
+        .iter()
+        .flat_map(|d| d.latencies_us.iter().copied())
+        .collect();
+    fast_us.sort_unstable();
+    out.insert(
+        "fast".into(),
+        json!({
+            "conns": args.fast_conns,
+            "size": args.fast_size,
+            "depth": args.fast_depth,
+            "replies": fast_replies,
+            "bytes_read": fast_bytes,
+            "replies_per_s": fast_replies as f64 / secs,
+            "bytes_per_s": fast_bytes as f64 / secs,
+            "p50_us": percentile(&fast_us, 0.50),
+            "p99_us": percentile(&fast_us, 0.99),
+            "max_us": fast_us.last().copied().unwrap_or(0),
+            "reconnects": depths.iter().map(|d| d.reconnects).sum::<u64>(),
+        }),
+    );
+    out.insert(
+        "batch".into(),
+        json!({
+            "conns": args.batch_conns,
+            "requests": args.batch_requests,
+            "size": args.batch_size,
+            "rcvbuf": args.batch_rcvbuf,
+            "sndbuf": args.batch_sndbuf,
+            "round_limit_ms": args.batch_round_limit_ms,
+            "rounds": batches.iter().map(|b| b.rounds).sum::<u64>(),
+            "rounds_run": batches.iter().map(|b| b.rounds_run).sum::<u64>(),
+            "stalled": batches.iter().filter(|b| b.stall.is_some()).count(),
+            "stalls": batches
+                .iter()
+                .filter_map(|b| b.stall.as_ref().map(RoundStop::json))
+                .collect::<Vec<_>>(),
+            "unfinished": batches
+                .iter()
+                .filter_map(|b| b.unfinished.as_ref().map(RoundStop::json))
+                .collect::<Vec<_>>(),
+            "reconnects": batches.iter().map(|b| b.reconnects).sum::<u64>(),
         }),
     );
     out.insert(

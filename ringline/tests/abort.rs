@@ -774,8 +774,9 @@ fn assert_head_kept(order: ringline::SendAdmissionOrder, passing: &Passing) {
     );
 }
 
-/// Under `Strict` nothing passes the waiting head, and every count stays
-/// zero; the pool's free slots are the four the stalled sends leave.
+/// Under `Strict` nothing passes the waiting head, and every passing and
+/// scan count stays zero; the pool's free slots are the four the stalled
+/// sends leave, and the stalled connection held those four.
 #[test]
 fn strict_admits_nothing_past_a_waiting_head() {
     let order = ringline::SendAdmissionOrder::Strict;
@@ -788,6 +789,12 @@ fn strict_admits_nothing_past_a_waiting_head() {
         passing.counters,
         ringline::SendAdmissionCounters {
             main_free: 4,
+            conn_held_max: 4,
+            // The head, the waiter behind it on its connection, and the
+            // sends to the reader, the staller and the idler each wait on
+            // their first poll; the head's connection has two waiting.
+            tickets_waited: 5,
+            conn_tickets_max: 2,
             ..ringline::SendAdmissionCounters::default()
         }
     );
@@ -990,10 +997,17 @@ async fn wake_the_parked(conn: &mut Connection, idle: bool) -> Woken {
         let last = fill_awaited(&mut drained);
         let _ = drain.send(());
         let _ = last.await;
-        let waiter = park(drained.send_admitted(&ONE)).await;
+        let mut flagged = drained.send_admitted(&ONE);
+        let mut waited = poll_once(&mut flagged).await.is_pending();
         ringline::sleep(Duration::from_millis(20)).await;
-        out.room_waited.0 = waiter.first_waited.get() && !waiter.resolved();
+        waited &= poll_once(&mut flagged).await.is_pending();
+        // A plain send is refused while a bounded send waits on its
+        // connection, so the send that completes without waiting goes first,
+        // and the waiter made behind it waits for it to settle.
+        drop(flagged);
         let clean = drained.send(b"x").expect("queued");
+        let waiter = park(drained.send_admitted(&ONE)).await;
+        out.room_waited.0 = waited && waiter.first_waited.get();
         let _ = clean.await;
         out.room_waited.1 = resolved_soon(&waiter).await;
     }
@@ -1092,7 +1106,7 @@ fn the_event_loop_wakes_a_parked_passer() {
 
 /// Under `Budget` a connection whose last send waited for room, and has
 /// drained since, lets no send pass; once a send on it completes without
-/// waiting, the event loop wakes the parked one and admits it.
+/// waiting, the event loop wakes the send parked behind it and admits it.
 #[test]
 fn budget_admits_once_the_connection_s_last_send_did_not_wait() {
     let woken = run_wakes(ringline::SendAdmissionOrder::Budget { slots: 2 }, b'i');

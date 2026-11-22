@@ -10,10 +10,10 @@ use crate::guard::GuardBox;
 
 /// Per-connection send queue state.
 ///
-/// At most one stream send operation is in the kernel per connection: one
-/// SQE, one coalesced `sendmsg`, or the linked SQEs of one chain. While one
-/// is in flight, later sends are queued, and the next is pushed from the
-/// completion handler before control returns to the event loop.
+/// At most one stream send operation is in the kernel per connection: one SQE
+/// or one coalesced `sendmsg`. While one is in flight, later sends are queued,
+/// and the next is pushed from the completion handler before control returns to
+/// the event loop.
 pub(crate) struct ConnSendState {
     pub in_flight: bool,
     pub queue: VecDeque<BuiltSend>,
@@ -33,8 +33,8 @@ pub(crate) struct ConnSendState {
     ///
     /// io_uring: the `Close` SQE is submitted from `try_finalize_close`,
     /// driven from the event loop's end-of-iteration drain of
-    /// `pending_finalize_closes` (never inside the close request or a send,
-    /// chain or `Shutdown` completion, so the task gets its poll window —
+    /// `pending_finalize_closes` (never inside the close request or a send
+    /// or `Shutdown` completion, so the task gets its poll window —
     /// #371; the park install commits at once, see `try_finalize_close`);
     /// each send CQE registers the connection on that list again
     /// until the serialized `submit_next_queued` cycle drains the queue and
@@ -97,8 +97,8 @@ pub(crate) struct ConnSendState {
     #[cfg(has_io_uring)]
     pub on_send_backstop: bool,
     /// A close_notify the send pool had no slot for when the close was
-    /// requested: its ciphertext (unbuffered engine), or empty when rustls
-    /// still holds it (buffered engine). `try_finalize_close` places it once
+    /// requested: its ciphertext, and anything rustls had queued ahead of
+    /// it. `try_finalize_close` places it once
     /// the connection's own sends have drained, or drops it and clears the
     /// connection's `close_notify_sent`.
     #[cfg(has_io_uring)]
@@ -341,6 +341,23 @@ impl ConnId {
     }
 }
 
+/// The message of a non-waiting send refused because a bounded send waits on
+/// its connection.
+pub(crate) const TICKET_WAITING_REFUSAL: &str = "a bounded send waits on this connection";
+
+/// The refusal of a non-waiting send that would take send-pool slots while a
+/// bounded send waits on its connection: kind `Other`, the kind of pool
+/// exhaustion.
+pub(crate) fn ticket_waiting_error() -> io::Error {
+    io::Error::other(TICKET_WAITING_REFUSAL)
+}
+
+/// The message of a guarded send refused because its connection holds
+/// `zero_copy_hold_cap` send slab entries while the slab is over half used.
+#[cfg(has_io_uring)]
+pub(crate) const ZERO_COPY_CAP_REFUSAL: &str =
+    "send slab entries held by the connection at zero_copy_hold_cap";
+
 /// How long a close waits for its queued sends to drain before the
 /// connection is closed without them: a close after a fatal encrypt error
 /// (io_uring), with its close_notify, and a close before the handshake
@@ -393,9 +410,8 @@ impl std::fmt::Display for ListenerId {
 
 // ── io_uring DriverCtx + send builders ──────────────��───────────────────
 //
-// The entire DriverCtx implementation, SendBuilder, SendChainBuilder, and
-// ChainPartsBuilder are io_uring-specific. On the mio backend, a minimal
-// DriverCtx is provided below.
+// The entire DriverCtx implementation and SendBuilder are io_uring-specific. On
+// the mio backend, a minimal DriverCtx is provided below.
 
 /// How many send-copy-pool slots a **bounded** send of `len` bytes on
 /// `conn_index` can need, or why it can never be admitted.
@@ -405,8 +421,7 @@ impl std::fmt::Display for ListenerId {
 ///
 /// - `send_backpressured`'s future passes it to `SendCompletions::enqueue`,
 ///   which will not release the future until the pool's free count covers it;
-/// - `DriverCtx::send_bounded` then reserves (mio) or capacity-checks
-///   (io_uring) against it.
+/// - `DriverCtx::send_bounded` then reserves against it.
 ///
 /// If the future's number were the smaller of the two, the FIFO would admit a
 /// message the backend immediately refuses. On the TLS path that refusal
@@ -491,14 +506,20 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) tcp_nodelay: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
+    /// Which guard-only sends whose guards all lie in one registered region
+    /// name that region's buffer (`IORING_RECVSEND_FIXED_BUF`): those the
+    /// kernel probe passed, when
+    /// [`ConfigBuilder::fixed_buffer_sends`](crate::ConfigBuilder::fixed_buffer_sends)
+    /// is on.
+    pub(crate) fixed_buffer_sends: crate::backend::uring::fixed_send::Allowed,
+    /// Send slab entries a connection may hold before its zero-copy sends are
+    /// refused, once the slab is over half used
+    /// (`ConfigBuilder::zero_copy_hold_cap`).
+    pub(crate) zero_copy_hold_cap: usize,
     /// The worker's connect deadlines (io_uring only).
     #[cfg(has_io_uring)]
     pub(crate) connect_deadlines:
         &'a mut crate::backend::uring::connect_deadlines::ConnectDeadlines,
-    /// Per-connection send chain tracking.
-    pub(crate) chain_table: &'a mut crate::chain::SendChainTable,
-    /// Maximum SQEs per chain (0 = disabled).
-    pub(crate) max_chain_length: u16,
     /// Per-connection send queues for serializing sends.
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
     /// Connection indices with armed `close_notify_deadline`s. See the
@@ -528,7 +549,7 @@ pub(crate) struct DriverCtx<'a> {
     /// `DriverCtx::close`); the event loop re-drives `try_finalize_close`
     /// for each before the iteration ends. This keeps ctx-initiated closes
     /// on the same deferred path as `close_connection` — the Close SQE is
-    /// only submitted once in-flight sends, queued sends, and chains drain.
+    /// only submitted once in-flight and queued sends drain.
     pub(crate) pending_finalize_closes: &'a mut Vec<u32>,
     /// `Shutdown` SQEs the ring refused; see `Driver::pending_shutdown_retries`.
     pub(crate) pending_shutdown_retries: &'a mut Vec<(u32, u32)>,
@@ -557,17 +578,18 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) next_disk_io_seq: &'a mut u16,
     /// See `Driver::write_orders`.
     pub(crate) write_orders: &'a mut crate::disk_order::WriteOrders<(u32, u64)>,
-    /// Set when `finish` on a TLS chain gave the chain's id to
-    /// `attach_send_id`: on its last ciphertext send, or settled at once if the
-    /// plaintext was empty. `SendHalf::send_chain` reads it to return a pending
-    /// future, because a TLS chain does not use `chain_table`, so
-    /// `chain_table.carries` is false for it.
-    pub(crate) tls_chain_carried: bool,
     /// Set when a [`SendBuilder`] with an awaited id gave the id to
     /// `attach_send_id`. `AsyncSendBuilder::build` reads it after its
     /// closure returns: a closure that returned `Ok` without a successful
     /// `submit` left the id with nothing to settle it.
     pub(crate) parts_id_carried: bool,
+    /// A bounded send waits on the connection this context is made for
+    /// (`docs/send-pool-partition-design.md`, section 2). A non-waiting send
+    /// that would take send-pool slots is then refused with
+    /// [`ticket_waiting_error`], so it does not go out ahead of the waiting
+    /// send. Set by the entry points of the non-waiting sends; false
+    /// elsewhere.
+    pub(crate) ticket_waiting: bool,
 }
 
 /// The refusal of a TLS send made after this side's close_notify was queued:
@@ -612,27 +634,27 @@ impl<'a> DriverCtx<'a> {
         tls_table.get_info(conn.index)
     }
 
-    /// Encrypt a plain (not bounded) TLS send into pool-backed sends, admitting
-    /// it against the ciphertext bound first.
+    /// Encrypt a TLS send into pool-backed sends, taking the slots its
+    /// ciphertext can need before rustls mutates.
     ///
-    /// The admission is the point. `encrypt_to_sends` allocates as it seals
-    /// records, so running out of pool partway left the sealed records'
-    /// sequence numbers spent with no ciphertext on the wire, and every later
-    /// record failed `bad_record_mac` at the peer. Checking the bound
-    /// `send_backpressured` uses (`TlsTable::ciphertext_capacity`) before
-    /// rustls mutates turns that into the same refusal the plaintext path
-    /// gives: `Other` while the pool is short, `InvalidInput` when it never
-    /// could hold the message, nothing committed either way. A plain capacity
-    /// check is enough: the worker is single-threaded and nothing allocates
-    /// between the check and the call.
+    /// The slots are reserved against the bound `send_backpressured` uses
+    /// (`TlsTable::ciphertext_capacity`), encryption writes into them
+    /// (`SendCopyPool::alloc_raw_reserved`), and the ones it did not use are
+    /// returned. Encryption therefore cannot run out of pool after rustls has
+    /// sealed a record, which would leave the sealed records' sequence
+    /// numbers spent with no ciphertext on the wire and fail every later
+    /// record with `bad_record_mac` at the peer. A send the pool cannot cover
+    /// gets the refusal the plaintext path gives: `Other` while the pool is
+    /// short, `InvalidInput` when it never could hold the message, nothing
+    /// committed either way.
     ///
-    /// No bound is expressible for the unbuffered engine with a slot too small
-    /// for one whole record. `Config::validate` rejects such a slot for every
-    /// configured rustls config, so a runtime does not reach that case; if it
-    /// did, the send would be attempted without a bound. If encryption fails
-    /// after rustls has sealed anything, the connection is closed: by
-    /// departure 1 a record gap is fatal, and leaving the connection open only
-    /// lets it emit records the peer will reject.
+    /// No bound is expressible for the unbuffered engine with a slot too
+    /// small for one whole record, and the send is refused with
+    /// `InvalidInput`. `Config::validate` rejects such a slot for every
+    /// configured rustls config, so a runtime does not reach that case. If
+    /// encryption fails after rustls has sealed anything, the connection is
+    /// closed: by departure 1 a record gap is fatal, and leaving the
+    /// connection open only lets it emit records the peer will reject.
     ///
     /// The caller has checked that `conn` is current and has TLS state.
     fn encrypt_tls_send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<Vec<BuiltSend>> {
@@ -645,12 +667,26 @@ impl<'a> DriverCtx<'a> {
         // other `tls_table` use in this module; no other reference to the
         // table is live across this function.
         let tls_table = unsafe { &mut *self.tls_table };
-        let needed = tls_table
+        let bound = tls_table
             .ciphertext_capacity(conn.index, data.len())
-            .and_then(|bound| bound.slots(slot_size));
-        if let Some(needed) = needed {
-            let capacity = self.send_copy_pool.slot_count();
-            if needed > capacity {
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no TLS state"))?;
+        let Some(needed) = bound.slots(slot_size) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a TLS send needs a send-pool slot of at least {} bytes to hold one whole \
+                     record, but Config::send_copy_slot_size is {slot_size}",
+                    bound.min_slot_size()
+                ),
+            ));
+        };
+        let owner = crate::buffer::send_copy::SlotOwner::conn(conn.index, conn.generation);
+        let mut permit = match self.send_copy_pool.reserve_slots(owner, needed) {
+            Ok(r) => r,
+            Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
+                return Err(io::Error::other("send copy pool exhausted"));
+            }
+            Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -660,33 +696,20 @@ impl<'a> DriverCtx<'a> {
                     ),
                 ));
             }
-            if self.send_copy_pool.free_count() < needed {
-                crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
-                return Err(io::Error::other("send copy pool exhausted"));
-            }
-        }
-        let free_before = self.send_copy_pool.free_count();
-        match crate::tls::encrypt_to_sends(
+        };
+        let result = crate::tls::encrypt_to_sends(
             tls_table,
             self.send_copy_pool,
             conn.index,
             conn.generation,
             data,
-        ) {
-            Ok(sends) => {
-                // If encryption took more slots than the bound, the bound is
-                // wrong, and a later send it admits can run out of pool
-                // mid-encryption and close the connection.
-                if let Some(needed) = needed {
-                    debug_assert!(
-                        free_before.saturating_sub(self.send_copy_pool.free_count()) <= needed,
-                        "TLS ciphertext bound beaten: admitted against {needed} slots, \
-                         encryption took {}",
-                        free_before.saturating_sub(self.send_copy_pool.free_count()),
-                    );
-                }
-                Ok(sends)
-            }
+            &mut permit,
+        );
+        // The slots encryption did not use go back before anything else
+        // allocates, the close's close_notify included.
+        self.send_copy_pool.release_reservation(permit);
+        match result {
+            Ok(sends) => Ok(sends),
             Err(e) => {
                 // `encrypt_to_sends` released every slot it took, but any
                 // record it sealed first spent a sequence number.
@@ -759,9 +782,12 @@ impl<'a> DriverCtx<'a> {
         // Aborted, or the Close already submitted — a new send SQE would
         // race it, and a parked one would never be re-driven (the retry
         // drain skips connections whose Close is committed). Same refusal as
-        // `send_parts` and `send_chain`.
+        // `send_parts`.
         if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
             return Err(e);
+        }
+        if !bounded && self.ticket_waiting {
+            return Err(ticket_waiting_error());
         }
 
         // SAFETY: read-only probe; see the `tls_table` field's contract.
@@ -795,7 +821,8 @@ impl<'a> DriverCtx<'a> {
         // The reservation is a count, not popped slots, so a refusal has no
         // side effects (see `SendCopyPool::reserve_slots`).
         let needed = data.len().div_ceil(slot_size);
-        let mut reservation = match self.send_copy_pool.reserve_slots(needed) {
+        let owner = crate::buffer::send_copy::SlotOwner::conn(conn.index, conn.generation);
+        let mut reservation = match self.send_copy_pool.reserve_slots(owner, needed) {
             Ok(r) => r,
             Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
                 return Err(io::Error::other("send copy pool exhausted"));
@@ -883,16 +910,11 @@ impl<'a> DriverCtx<'a> {
     ///
     /// Admission is the caller's: the send-capacity FIFO admits this id only
     /// when `free_count()` covers `bounded_send_slots`, and this function
-    /// checks the same number again before encrypting. For a TLS connection
-    /// that number is the ciphertext bound (`TlsTable::ciphertext_capacity`),
-    /// not the plaintext length.
-    ///
-    /// Unlike mio, the reservation is *not* the permit and is not held
-    /// across the TLS branch. It cannot be: on io_uring `encrypt_to_sends`
-    /// allocates the ciphertext's slots out of this same pool, and an
-    /// outstanding reservation hides them from `alloc_raw` (see
-    /// `SendCopyPool::reserve_slots`). So the TLS branch returns before the
-    /// reservation, exactly as `send` does.
+    /// reserves the same number before copying or encrypting. For a TLS
+    /// connection that number is the ciphertext bound
+    /// (`TlsTable::ciphertext_capacity`), not the plaintext length;
+    /// `encrypt_tls_send` encrypts into the reserved slots and returns the
+    /// ones it did not use.
     ///
     /// On `Ok` exactly one completion for `id` is coming: from a send CQE,
     /// from a teardown that destroys the queued entry
@@ -989,16 +1011,10 @@ impl<'a> DriverCtx<'a> {
     /// loop's `drain_send_retries` re-pushes it each iteration until the ring
     /// takes it. Nothing is dropped or released here (Domain Invariant 7).
     pub(crate) fn submit_or_queue(&mut self, conn_index: u32, built: BuiltSend) {
-        // An active IO_LINK chain counts as in flight: io_uring does not order
-        // independent SQEs, so pushing this send now could interleave its bytes
-        // with the chain's on the wire. Queue it and mark the queue as owning
-        // the send order (`in_flight`), as parking does; the invariant is that
-        // a non-empty queue implies `in_flight`, which `submit_next_queued`
-        // relies on. Chain completion submits the queue
-        // (`fire_chain_complete` -> `submit_next_queued`).
-        let chain_active = self.chain_table.is_active(conn_index);
+        // A non-empty queue implies `in_flight`, which `submit_next_queued`
+        // relies on.
         let state = &mut self.send_queues[conn_index as usize];
-        if state.in_flight || chain_active {
+        if state.in_flight {
             state.queue.push_back(built);
             state.in_flight = true;
             return;
@@ -1019,15 +1035,13 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit the sends just queued on `conn_index`, as one `sendmsg`
     /// (`submit_coalesced_run`), or the head alone if the run cannot be
-    /// coalesced. With a send already in flight
-    /// or a chain active they wait in the queue, as in `submit_or_queue`.
-    /// Infallible in the same way: on a full SQ the head is parked and the
-    /// connection goes on `pending_send_retries`.
+    /// coalesced. With a send already in flight they wait in the queue, as in
+    /// `submit_or_queue`. Infallible in the same way: on a full SQ the head is
+    /// parked and the connection goes on `pending_send_retries`.
     pub(crate) fn submit_queued_run(&mut self, conn_index: u32) {
-        let chain_active = self.chain_table.is_active(conn_index);
         let ci = conn_index as usize;
         let state = &mut self.send_queues[ci];
-        if state.in_flight || chain_active || state.queue.is_empty() {
+        if state.in_flight || state.queue.is_empty() {
             state.in_flight |= !state.queue.is_empty();
             return;
         }
@@ -1059,45 +1073,6 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Begin building an IO_LINK send chain for a connection.
-    ///
-    /// Multiple sends (copy-only or scatter-gather) are collected and submitted
-    /// as a linked SQE chain. The kernel executes them sequentially, and the
-    /// chain completes once, when every SQE in it has.
-    ///
-    /// On a TLS connection the parts are gathered, guard parts included,
-    /// encrypted as one send and queued behind the connection's other sends.
-    ///
-    /// Returns a [`SendChainBuilder`]. Call `.copy()`, `.parts()...add()` to
-    /// add SQEs, then `.finish()` to submit.
-    pub fn send_chain(&mut self, conn: ConnId) -> SendChainBuilder<'_, 'a> {
-        // SAFETY: read-only probe; see the `tls_table` field's contract.
-        let tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) };
-        SendChainBuilder {
-            ctx: self,
-            conn,
-            built: Vec::new(),
-            tls_plaintext: tls.then(Vec::new),
-            tls_parts: 0,
-            total_len: 0,
-            error: None,
-            finished: false,
-            send_id: None,
-        }
-    }
-
-    /// [`send_chain`](Self::send_chain), with `id` settled by the chain's
-    /// completion once `finish` submits it.
-    pub(crate) fn send_chain_awaited(
-        &mut self,
-        conn: ConnId,
-        id: crate::runtime::send_completion::SendId,
-    ) -> SendChainBuilder<'_, 'a> {
-        let mut builder = self.send_chain(conn);
-        builder.send_id = Some(id);
-        builder
-    }
-
     /// [`send_parts`](Self::send_parts), with `id` settled by the send's
     /// completion once `submit` queues it. `submit` refuses an empty batch
     /// with `InvalidInput`.
@@ -1109,6 +1084,131 @@ impl<'a> DriverCtx<'a> {
         let mut builder = self.send_parts(conn);
         builder.send_id = Some(id);
         builder
+    }
+
+    /// The send-pool slots a waiting batch of `parts` on a plaintext
+    /// connection waits for, or the refusal [`SendBuilder::submit`] would give it
+    /// for its shape: one slot if it has copy parts, none if it has only
+    /// guards. Reads the parts and consumes nothing, so a refusal can return
+    /// every part.
+    #[cfg(has_io_uring)]
+    pub(crate) fn batch_plain_slots(&self, parts: &[SendPart<'_>]) -> io::Result<usize> {
+        if parts.len() > MAX_IOVECS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many send parts (max 32)",
+            ));
+        }
+        let mut copy_len = 0usize;
+        let mut guards = 0usize;
+        let mut total = 0u64;
+        for part in parts {
+            match part {
+                SendPart::Copy(data) => {
+                    copy_len += data.len();
+                    total += data.len() as u64;
+                }
+                SendPart::Guard(guard) => {
+                    guards += 1;
+                    let (ptr, len) = guard.as_ptr_len();
+                    total += u64::from(len);
+                    let region = guard.region();
+                    if region != crate::buffer::fixed::RegionId::UNREGISTERED {
+                        self.fixed_buffers
+                            .validate_region_ptr(region, ptr, len)
+                            .map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+                            })?;
+                    }
+                }
+            }
+        }
+        if guards > MAX_GUARDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many guards (max 8)",
+            ));
+        }
+        if total > u64::from(u32::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send batch longer than u32::MAX bytes",
+            ));
+        }
+        if copy_len > self.send_copy_pool.slot_size() as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "total copy data exceeds send pool slot size",
+            ));
+        }
+        Ok(usize::from(copy_len > 0))
+    }
+
+    /// Whether [`SendBuilder::submit`] can queue a waiting batch of `parts`
+    /// on plaintext connection `conn` now, checked without consuming a part:
+    /// the connection checks, [`batch_plain_slots`](Self::batch_plain_slots),
+    /// a free pool slot for copy parts, and, for a batch with guards that
+    /// does not fit the small-send gather, a free send-slab entry the
+    /// connection may take (`zero_copy_over_cap`). On `Ok`, `submit` does not
+    /// refuse the batch.
+    #[cfg(has_io_uring)]
+    pub(crate) fn batch_plain_ready(&self, conn: ConnId, parts: &[SendPart<'_>]) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
+        }
+        let needed = self.batch_plain_slots(parts)?;
+        let free = self.send_copy_pool.free_count();
+        if free < needed {
+            return Err(io::Error::other("send copy pool exhausted"));
+        }
+        let has_guards = parts.iter().any(|p| matches!(p, SendPart::Guard(_)));
+        if has_guards {
+            let total: usize = parts
+                .iter()
+                .map(|p| match p {
+                    SendPart::Copy(d) => d.len(),
+                    SendPart::Guard(g) => g.as_ptr_len().1 as usize,
+                })
+                .sum();
+            // `submit_small_gather` takes one slot when one is free and the
+            // whole batch fits it; otherwise the batch needs a slab entry.
+            let threshold = self.send_zc_threshold as usize;
+            let gathers = threshold > 0
+                && total < threshold
+                && total <= self.send_copy_pool.slot_size() as usize
+                && free >= 1;
+            if !gathers && !self.send_slab.has_free() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "send slab exhausted",
+                ));
+            }
+            if !gathers && self.zero_copy_over_cap(conn) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    ZERO_COPY_CAP_REFUSAL,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a zero-copy send on `conn` is refused: the connection holds
+    /// `zero_copy_hold_cap` send slab entries and the slab is over half used.
+    #[cfg(has_io_uring)]
+    pub(crate) fn zero_copy_over_cap(&self, conn: ConnId) -> bool {
+        self.send_slab
+            .zero_copy_over_cap(conn.index, conn.generation, self.zero_copy_hold_cap)
     }
 
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
@@ -1126,6 +1226,7 @@ impl<'a> DriverCtx<'a> {
             total_len: 0,
             error: None,
             send_id: None,
+            zero_copy_capped: true,
         }
     }
 
@@ -1199,10 +1300,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Shutdown the write side of a connection.
     ///
-    /// If a send is in flight or queued, or a send chain is active, the
-    /// shutdown is deferred until the send queue drains
-    /// (`submit_next_queued_inner`'s empty-queue arm submits it, which
-    /// `fire_chain_complete` reaches too): io_uring does not order an
+    /// If a send is in flight or queued, the shutdown is deferred until the
+    /// send queue drains (`submit_next_queued_inner`'s empty-queue arm
+    /// submits it): io_uring does not order an
     /// independent Shutdown SQE behind those sends.
     pub fn shutdown_write(&mut self, conn: ConnId) {
         let Some(cs) = self.connections.get_mut(conn.index) else {
@@ -1222,10 +1322,7 @@ impl<'a> DriverCtx<'a> {
         if self.send_queues[idx].close_submitted {
             return;
         }
-        if self.send_queues[idx].in_flight
-            || !self.send_queues[idx].queue.is_empty()
-            || self.chain_table.is_active(conn.index)
-        {
+        if self.send_queues[idx].in_flight || !self.send_queues[idx].queue.is_empty() {
             // Defer until the send queue drains (submit_next_queued issues it).
             cs.write = crate::connection::WriteHalf::ShutdownPending;
         } else {
@@ -2537,6 +2634,13 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) direct_io_files: &'a mut Option<crate::fs::FsFileTable>,
     /// Direct I/O fds, indexed by file slot.
     pub(crate) direct_io_fds: &'a mut Vec<Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
+    /// A bounded send waits on the connection this context is made for
+    /// (`docs/send-pool-partition-design.md`, section 2). A non-waiting send
+    /// that would take send-pool slots is then refused with
+    /// [`ticket_waiting_error`], so it does not go out ahead of the waiting
+    /// send. Set by the entry points of the non-waiting sends; false
+    /// elsewhere.
+    pub(crate) ticket_waiting: bool,
 }
 
 #[cfg(not(has_io_uring))]
@@ -2592,6 +2696,14 @@ impl<'a> DriverCtx<'a> {
         // mio sets only `aborted`.
         if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
             return Err(e);
+        }
+        // Every non-waiting mio send comes through here and is queued in
+        // order on the connection, so each is refused behind a waiting one,
+        // guards included. `forward_to_conn` queues its chunks from the event loop
+        // (`Driver::forward_push`) and is not refused: it can go out ahead of
+        // a waiting send.
+        if self.ticket_waiting {
+            return Err(ticket_waiting_error());
         }
 
         // TLS path: encrypt and push ciphertext into the pending send queue.
@@ -2694,7 +2806,8 @@ impl<'a> DriverCtx<'a> {
         // construction rather than by agreement.
         let needed =
             bounded_send_slots(self.send_copy_pool, self.tls_table, conn.index, data.len())?;
-        let mut permit = match self.send_copy_pool.reserve_slots(needed) {
+        let owner = crate::buffer::send_copy::SlotOwner::conn(conn.index, conn.generation);
+        let mut permit = match self.send_copy_pool.reserve_slots(owner, needed) {
             Ok(r) => r,
             Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
                 return Err(io::Error::other("send copy pool exhausted"));
@@ -2907,7 +3020,7 @@ impl<'a> DriverCtx<'a> {
         if let Err(e) = self.poll.registry().register(
             &mut mio_stream,
             token,
-            crate::backend::mio::driver::STREAM_INTEREST,
+            crate::backend::mio::driver::CONNECT_INTEREST,
         ) {
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
@@ -3221,23 +3334,16 @@ impl<'a> DriverCtx<'a> {
         #[cfg(not(target_os = "macos"))]
         let _ = nocache;
         let work = Box::new(move || {
-            let fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    flags | libc::O_CLOEXEC,
-                    mode as libc::c_int,
-                )
+            let fd = match crate::sys::open(&c_path, flags, mode) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    return crate::disk_io_pool::DiskIoResult {
+                        result: -e.raw_os_error().unwrap_or(libc::EIO),
+                        metadata: None,
+                        opened: None,
+                    };
+                }
             };
-            if fd < 0 {
-                let errno = io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO);
-                return crate::disk_io_pool::DiskIoResult {
-                    result: -errno,
-                    metadata: None,
-                    opened: None,
-                };
-            }
             // macOS has no O_DIRECT; F_NOCACHE bypasses the page cache.
             #[cfg(target_os = "macos")]
             if nocache {
@@ -3286,20 +3392,14 @@ impl<'a> DriverCtx<'a> {
         let fd = self.validate_file(kind, index, generation)?;
         let buf_addr = buf as usize;
         let work = Box::new(move || {
-            let result = unsafe {
-                libc::pread(
-                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
-                    buf_addr as *mut libc::c_void,
-                    len as usize,
-                    offset as libc::off_t,
-                )
-            };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                result as i32
+            let r = match crate::sys::pread(
+                std::os::fd::AsRawFd::as_raw_fd(&*fd),
+                buf_addr as *mut u8,
+                len as usize,
+                offset,
+            ) {
+                Ok(n) => n as i32,
+                Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO)),
             };
             crate::disk_io_pool::DiskIoResult {
                 result: r,
@@ -3328,20 +3428,14 @@ impl<'a> DriverCtx<'a> {
         let fd = self.validate_file(kind, index, generation)?;
         let buf_addr = buf as usize;
         let work = Box::new(move || {
-            let result = unsafe {
-                libc::pwrite(
-                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
-                    buf_addr as *const libc::c_void,
-                    len as usize,
-                    offset as libc::off_t,
-                )
-            };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                result as i32
+            let r = match crate::sys::pwrite(
+                std::os::fd::AsRawFd::as_raw_fd(&*fd),
+                buf_addr as *const u8,
+                len as usize,
+                offset,
+            ) {
+                Ok(n) => n as i32,
+                Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO)),
             };
             crate::disk_io_pool::DiskIoResult {
                 result: r,
@@ -3369,13 +3463,9 @@ impl<'a> DriverCtx<'a> {
     ) -> io::Result<()> {
         let fd = self.validate_file(kind, index, generation)?;
         let work = Box::new(move || {
-            let result = unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&*fd)) };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                0
+            let r = match crate::sys::fsync(std::os::fd::AsRawFd::as_raw_fd(&*fd)) {
+                Ok(()) => 0,
+                Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO)),
             };
             crate::disk_io_pool::DiskIoResult {
                 result: r,
@@ -3575,13 +3665,9 @@ impl<'a> DriverCtx<'a> {
         let c_from = crate::fs::path_to_cstring(from)?;
         let c_to = crate::fs::path_to_cstring(to)?;
         let work = Box::new(move || {
-            let result = unsafe { libc::rename(c_from.as_ptr(), c_to.as_ptr()) };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                0
+            let r = match crate::sys::rename(&c_from, &c_to) {
+                Ok(()) => 0,
+                Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO)),
             };
             crate::disk_io_pool::DiskIoResult {
                 result: r,
@@ -3693,10 +3779,22 @@ pub struct SendBuilder<'b, 'a> {
     error: Option<io::Error>,
     /// Settled by the send's completion; see `submit_awaited`.
     send_id: Option<crate::runtime::send_completion::SendId>,
+    /// Whether `zero_copy_hold_cap` refuses the send. Cleared by
+    /// `forward_recv_buf` (`without_zero_copy_cap`), which `forward_hold_cap`
+    /// bounds instead.
+    zero_copy_capped: bool,
 }
 
 #[cfg(has_io_uring)]
 impl<'b, 'a> SendBuilder<'b, 'a> {
+    /// Exempt the send from `zero_copy_hold_cap`. A connection that forwards
+    /// its receive buffers stops receiving at `forward_hold_cap` entries; a
+    /// refusal below that would leave it receiving into its accumulator.
+    pub(crate) fn without_zero_copy_cap(mut self) -> Self {
+        self.zero_copy_capped = false;
+        self
+    }
+
     /// Add a copy part. The data will be copied into the send pool on `submit()`.
     /// The data reference must outlive the builder (guaranteed by the `'b` lifetime).
     pub fn copy(mut self, data: &'b [u8]) -> Self {
@@ -3814,6 +3912,10 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             return Ok(());
         }
 
+        if self.ctx.ticket_waiting && self.takes_pool_slot() {
+            return Err(ticket_waiting_error());
+        }
+
         // TLS path: gather all data, encrypt, copy-send. Drop guards immediately.
         if !self.ctx.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.ctx.tls_table };
@@ -3837,8 +3939,24 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             return Ok(());
         }
 
-        // With guards: build iovecs mixing copy pool subranges and guard pointers.
+        // With guards: build iovecs mixing copy pool subranges and guard
+        // pointers, in a slab entry the connection may take.
+        if self.zero_copy_capped && self.ctx.zero_copy_over_cap(self.conn) {
+            return Err(io::Error::other(ZERO_COPY_CAP_REFUSAL));
+        }
         self.submit_with_guards()
+    }
+
+    /// Whether [`submit`](Self::submit) would take a send-pool slot: on a TLS
+    /// connection, for copy parts, or for a batch below `send_zc_threshold`,
+    /// which is gathered into one slot. A batch of guards only, at or above
+    /// the threshold, takes a send slab entry and no slot.
+    fn takes_pool_slot(&self) -> bool {
+        // SAFETY: read-only probe; see the `tls_table` field's contract.
+        let tls =
+            !self.ctx.tls_table.is_null() && unsafe { (*self.ctx.tls_table).has(self.conn.index) };
+        let threshold = self.ctx.send_zc_threshold;
+        tls || self.copy_count > 0 || (threshold > 0 && self.total_len < threshold)
     }
 
     /// TLS fallback: gather all data into a contiguous buffer, encrypt, copy-send.
@@ -3886,6 +4004,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         }
         let (slot, ptr, len) = unsafe {
             self.ctx.send_copy_pool.copy_in_gather(
+                crate::buffer::send_copy::SlotOwner::conn(self.conn.index, self.conn.generation),
                 &self.copy_slices[..self.copy_count as usize],
                 self.total_copy_len,
             )
@@ -3925,6 +4044,10 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         if self.total_copy_len > 0 {
             let (slot, pool_ptr, _pool_len) = unsafe {
                 self.ctx.send_copy_pool.copy_in_gather(
+                    crate::buffer::send_copy::SlotOwner::conn(
+                        self.conn.index,
+                        self.conn.generation,
+                    ),
                     &self.copy_slices[..self.copy_count as usize],
                     self.total_copy_len,
                 )
@@ -4020,6 +4143,15 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 iov_base: std::ptr::null_mut(),
                 iov_len: 0,
             }; MAX_IOVECS];
+            // The registered buffer every guard lies in, when there is one and
+            // this send's kind may name it: one guard goes out as `SEND_ZC`,
+            // several as `SENDMSG_ZC`.
+            let allowed = self.ctx.fixed_buffer_sends;
+            let single = self.part_count == 1;
+            let kind = |m: crate::backend::uring::fixed_send::Modes| {
+                if single { m.single } else { m.multi }
+            };
+            let mut buf_index = (kind(allowed.huge) || kind(allowed.base)).then_some(None);
             for i in 0..self.part_count as usize {
                 if let PartSlot::Guard { guard_idx } = self.parts[i] {
                     let g = self.guards[guard_idx as usize].as_ref().unwrap();
@@ -4033,6 +4165,13 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                                 io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
                             })?;
                     }
+                    buf_index = match buf_index {
+                        Some(None) if region != crate::buffer::fixed::RegionId::UNREGISTERED => {
+                            Some(Some(region.0))
+                        }
+                        Some(Some(index)) if index == region.0 => Some(Some(index)),
+                        _ => None,
+                    };
                     iovecs[i] = libc::iovec {
                         iov_base: gptr as *mut _,
                         iov_len: glen as usize,
@@ -4040,6 +4179,13 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 }
             }
 
+            // Whether this kind of send may name the buffer depends on whether
+            // the region is in base pages only.
+            if let Some(Some(index)) = buf_index
+                && !kind(allowed.for_region(self.ctx.fixed_buffers.base_pages(index)))
+            {
+                buf_index = None;
+            }
             let guards = std::mem::take(&mut self.guards);
             let iov_slice = &iovecs[..self.part_count as usize];
             let total_len = self.total_len;
@@ -4069,6 +4215,29 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             let entry = if self.ctx.conn_is_unix(self.conn.index) {
                 self.ctx.send_slab.set_plain_msg(slab_idx);
                 crate::backend::uring::sqe::Sqe::send_msg(self.conn.index, msg_ptr, user_data.raw())
+            } else if let Some(Some(buf_index)) = buf_index {
+                // Every iovec lies in registered buffer `buf_index` (checked
+                // above), so the kernel takes the pages from the buffer
+                // instead of looking them up and pinning them. The completion
+                // is handled as the `SENDMSG_ZC` the entry describes, which a
+                // short send's rest is resent as.
+                crate::metrics::RING.increment(crate::metrics::ring::SEND_FIXED_BUFFER);
+                if single {
+                    crate::backend::uring::sqe::Sqe::send_zc_fixed(
+                        self.conn.index,
+                        iovecs[0].iov_base as *const u8,
+                        iovecs[0].iov_len as u32,
+                        buf_index,
+                        user_data.raw(),
+                    )
+                } else {
+                    crate::backend::uring::sqe::Sqe::send_msg_zc_fixed(
+                        self.conn.index,
+                        msg_ptr,
+                        buf_index,
+                        user_data.raw(),
+                    )
+                }
             } else {
                 crate::backend::uring::sqe::Sqe::send_msg_zc(
                     self.conn.index,
@@ -4128,9 +4297,11 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         // `self.total_len` equals the sum of all gathered part lengths, so the
         // slot's `remaining` accounting matches the bytes actually copied in.
         let Some((slot, ptr, len)) = (unsafe {
-            self.ctx
-                .send_copy_pool
-                .copy_in_gather(&slices[..n], self.total_len as usize)
+            self.ctx.send_copy_pool.copy_in_gather(
+                crate::buffer::send_copy::SlotOwner::conn(self.conn.index, self.conn.generation),
+                &slices[..n],
+                self.total_len as usize,
+            )
         }) else {
             // Pool exhausted or gather exceeds slot size: keep guards, use ZC path.
             return Ok(false);
@@ -4163,689 +4334,6 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         let built = self.build_with_guards()?;
         self.commit(built);
         Ok(())
-    }
-}
-
-#[cfg(has_io_uring)]
-/// Builder for submitting multiple SQEs as a linked IO_LINK chain.
-///
-/// Collects send operations (copy-only or scatter-gather) and submits them
-/// as an atomic chain. The kernel executes linked SQEs sequentially. If any
-/// SQE fails, subsequent linked SQEs are cancelled with -ECANCELED.
-///
-/// On a TLS connection the parts are not SQEs: they are gathered, encrypted
-/// as one send and queued behind the connection's other sends, so the chain
-/// completes as one send does.
-///
-/// Passed to the closure given to [`SendHalf::send_chain`](crate::SendHalf::send_chain).
-pub struct SendChainBuilder<'b, 'a> {
-    ctx: &'b mut DriverCtx<'a>,
-    conn: ConnId,
-    built: Vec<BuiltSend>,
-    /// On a TLS connection, the chain's plaintext in order. The parts are not
-    /// sent as linked SQEs: `finish` encrypts them as one send through the
-    /// connection's send queue, which keeps the records in order.
-    tls_plaintext: Option<Vec<u8>>,
-    /// Parts added to `tls_plaintext`, counted against `max_chain_length`.
-    tls_parts: usize,
-    /// Bytes in the chain's linked SQEs.
-    total_len: u32,
-    error: Option<io::Error>,
-    finished: bool,
-    /// Carried by `finish` into the chain's `ChainState`; on a TLS connection,
-    /// `finish_tls` passes it to `attach_send_id` with the last ciphertext
-    /// send.
-    send_id: Option<crate::runtime::send_completion::SendId>,
-}
-
-#[cfg(has_io_uring)]
-impl<'b, 'a> SendChainBuilder<'b, 'a> {
-    /// Add a copy-only send to the chain. On a plaintext connection `data`
-    /// must fit one send-pool slot, or `finish` fails with `InvalidInput`;
-    /// on a TLS connection it is appended to the chain's plaintext.
-    pub fn copy(mut self, data: &[u8]) -> Self {
-        if self.error.is_some() {
-            return self;
-        }
-        if data.len() > self.ctx.send_copy_pool.slot_size() as usize && self.tls_plaintext.is_none()
-        {
-            self.error = Some(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "copy data exceeds send pool slot size",
-            ));
-            return self;
-        }
-        if self.built.len() + self.tls_parts >= self.ctx.max_chain_length as usize {
-            self.error = Some(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "chain exceeds max_chain_length",
-            ));
-            return self;
-        }
-        if let Some(plaintext) = self.tls_plaintext.as_mut() {
-            plaintext.extend_from_slice(data);
-            self.tls_parts += 1;
-            return self;
-        }
-
-        let (slot, ptr, len) = match self.ctx.send_copy_pool.copy_in(data) {
-            Some(v) => v,
-            None => {
-                self.error = Some(io::Error::other("send copy pool exhausted"));
-                return self;
-            }
-        };
-
-        let user_data = crate::completion::UserData::encode(
-            crate::completion::OpTag::Send,
-            self.conn.index,
-            crate::completion::UserData::send_payload(slot, self.conn.generation),
-        );
-        let entry =
-            crate::backend::uring::sqe::Sqe::chain_send(self.conn.index, ptr, len, user_data.raw());
-
-        self.built.push(BuiltSend {
-            entry,
-            pool_slot: slot,
-            slab_idx: u16::MAX,
-        });
-        self.total_len += len;
-        self
-    }
-
-    /// Begin a scatter-gather send within the chain.
-    /// Returns a [`ChainPartsBuilder`] that collects copy + guard parts
-    /// for a single SendMsgZc SQE.
-    pub fn parts(self) -> ChainPartsBuilder<'b, 'a> {
-        ChainPartsBuilder {
-            chain: self,
-            parts: [PartSlot::Empty; MAX_IOVECS],
-            part_count: 0,
-            copy_slices: [(std::ptr::null(), 0); MAX_IOVECS],
-            copy_count: 0,
-            total_copy_len: 0,
-            guards: [const { None }; crate::buffer::send_slab::MAX_GUARDS],
-            guard_count: 0,
-            total_len: 0,
-        }
-    }
-
-    /// Submit the chain.
-    ///
-    /// On a plaintext connection the SQEs are linked with IO_LINK except the
-    /// last. A chain with at least one part returns `WouldBlock` while a send
-    /// on the connection is in flight or queued, or another chain is active.
-    /// On a TLS connection the parts are encrypted as one send and queued
-    /// behind the connection's other sends. A chain with at least one part
-    /// returns `NotConnected` if the handle is stale (its connection's slot
-    /// was released) or the connection's Close has been submitted.
-    pub fn finish(mut self) -> io::Result<()> {
-        if let Some(e) = self.error.take() {
-            // finished stays false — Drop will call release_all().
-            return Err(e);
-        }
-        if let Some(plaintext) = self.tls_plaintext.take() {
-            return self.finish_tls(plaintext);
-        }
-
-        let count = self.built.len();
-        if count == 0 {
-            self.finished = true;
-            return Ok(());
-        }
-
-        let conn_index = self.conn.index;
-
-        // The token's connection is gone when its slot is free or holds a
-        // later generation. On a reused slot the chain's SQEs would write to
-        // the new connection's socket and start its `chain_table` entry.
-        // Their CQEs carry the token's generation, fail the generation checks
-        // in `handle_send` and `handle_send_msg_zc`, and never complete that
-        // entry.
-        // finished stays false so Drop releases the built entries' resources.
-        let current = self
-            .ctx
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.generation == self.conn.generation);
-        if !current {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "stale connection",
-            ));
-        }
-
-        // Aborted, or the Close already submitted — chain SQEs would race it.
-        // finished stays false so Drop releases the built entries' resources.
-        if let Some(e) = self.ctx.send_queues[conn_index as usize].closing_refusal() {
-            return Err(e);
-        }
-
-        // Plain sends queued, in flight or parked, or another chain active:
-        // this chain would overtake them, since io_uring does not order
-        // independent SQEs, and the plain send queue cannot hold a linked
-        // chain. Refuse rather than reorder; finished stays false, so Drop
-        // releases what was built. Await the earlier send, then retry.
-        let state = &self.ctx.send_queues[conn_index as usize];
-        if state.in_flight || !state.queue.is_empty() || self.ctx.chain_table.is_active(conn_index)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "earlier sends are still in flight on this connection",
-            ));
-        }
-
-        // Submit from self.built without moving the entries out of it.
-        // On failure, Drop will call release_all() on the original entries.
-        if count == 1 {
-            unsafe {
-                self.ctx.ring.push_sqe(&self.built[0].entry)?;
-            }
-            self.ctx.chain_table.start(conn_index, 1);
-        } else {
-            let mut entries: Vec<crate::backend::uring::sqe::Sqe> =
-                self.built.iter().map(|b| b.entry).collect();
-            unsafe {
-                self.ctx.ring.push_sqe_chain(&mut entries)?;
-            }
-            self.ctx.chain_table.start(conn_index, count as u16);
-        }
-        self.ctx
-            .chain_table
-            .set_expected_bytes(conn_index, self.total_len);
-        if let Some(id) = self.send_id {
-            self.ctx.chain_table.set_send_id(conn_index, id);
-        }
-
-        // Submission succeeded — resources now owned by kernel/CQE handlers.
-        self.built.clear();
-
-        self.finished = true;
-        Ok(())
-    }
-
-    /// TLS: encrypt the chain's plaintext as one send and queue it behind the
-    /// connection's other sends, with the chain's id on the last ciphertext
-    /// send.
-    fn finish_tls(mut self, plaintext: Vec<u8>) -> io::Result<()> {
-        self.finished = true;
-        if self.tls_parts == 0 {
-            return Ok(());
-        }
-        let conn = self.conn;
-        let current = self
-            .ctx
-            .connections
-            .get(conn.index)
-            .is_some_and(|c| c.generation == conn.generation);
-        if !current {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "stale connection",
-            ));
-        }
-        if let Some(e) = self.ctx.send_queues[conn.index as usize].closing_refusal() {
-            return Err(e);
-        }
-        let sends = self.ctx.encrypt_tls_send(conn, &plaintext)?;
-        if let Some(id) = self.send_id {
-            self.ctx
-                .attach_send_id(sends.last(), id, plaintext.len() as u32);
-            self.ctx.tls_chain_carried = true;
-        }
-        self.ctx.queue_built_sends(conn.index, sends);
-        Ok(())
-    }
-
-    /// Release all allocated resources (pool slots and slab entries).
-    fn release_all(&mut self) {
-        for built in self.built.drain(..) {
-            if built.slab_idx != u16::MAX {
-                let pool_slot = self.ctx.send_slab.release(built.slab_idx);
-                if pool_slot != u16::MAX {
-                    self.ctx.send_copy_pool.release(pool_slot);
-                }
-            } else if built.pool_slot != u16::MAX {
-                self.ctx.send_copy_pool.release(built.pool_slot);
-            }
-        }
-    }
-}
-
-#[cfg(has_io_uring)]
-impl Drop for SendChainBuilder<'_, '_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.release_all();
-        }
-    }
-}
-
-#[cfg(has_io_uring)]
-/// Sub-builder for a scatter-gather SQE within a [`SendChainBuilder`] chain.
-///
-/// Created via [`SendChainBuilder::parts`]. Call `.copy()` and `.guard()`
-/// to add parts, then `.add()` to finalize and return to the chain builder.
-pub struct ChainPartsBuilder<'b, 'a> {
-    chain: SendChainBuilder<'b, 'a>,
-    parts: [PartSlot; MAX_IOVECS],
-    part_count: u8,
-    copy_slices: [(*const u8, usize); MAX_IOVECS],
-    copy_count: u8,
-    total_copy_len: usize,
-    guards: [Option<GuardBox>; MAX_GUARDS],
-    guard_count: u8,
-    total_len: u32,
-}
-
-#[cfg(has_io_uring)]
-impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
-    /// Add a copy part to this scatter-gather SQE. The data reference must
-    /// outlive the builder (guaranteed by the `'b` lifetime) — the bytes are
-    /// only read when `.add()` gathers them into the send pool, or on a TLS
-    /// connection into the chain's plaintext.
-    pub fn copy(mut self, data: &'b [u8]) -> Self {
-        if self.chain.error.is_some() {
-            return self;
-        }
-        if self.part_count as usize >= MAX_IOVECS {
-            self.chain.error = Some(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "too many send parts (max 32)",
-            ));
-            return self;
-        }
-        let idx = self.copy_count;
-        self.copy_slices[idx as usize] = (data.as_ptr(), data.len());
-        self.copy_count += 1;
-        self.parts[self.part_count as usize] = PartSlot::Copy { slice_idx: idx };
-        self.part_count += 1;
-        self.total_len += data.len() as u32;
-        self.total_copy_len += data.len();
-        self
-    }
-
-    /// Add a zero-copy guard part to this scatter-gather SQE. On a TLS
-    /// connection its bytes are copied into the chain's plaintext in `add`,
-    /// and the guard is dropped there.
-    pub fn guard(mut self, guard: GuardBox) -> Self {
-        if self.chain.error.is_some() {
-            return self;
-        }
-        if self.part_count as usize >= MAX_IOVECS {
-            self.chain.error = Some(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "too many send parts (max 32)",
-            ));
-            return self;
-        }
-        if self.guard_count as usize >= MAX_GUARDS {
-            self.chain.error = Some(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "too many guards (max 8)",
-            ));
-            return self;
-        }
-        let (_, len) = guard.as_ptr_len();
-        let gidx = self.guard_count;
-        self.guards[gidx as usize] = Some(guard);
-        self.guard_count += 1;
-        self.parts[self.part_count as usize] = PartSlot::Guard { guard_idx: gidx };
-        self.part_count += 1;
-        self.total_len += len;
-        self
-    }
-
-    /// Finalize this scatter-gather SQE and add it to the chain.
-    /// Returns the chain builder for further chaining.
-    #[allow(clippy::needless_range_loop)]
-    pub fn add(mut self) -> SendChainBuilder<'b, 'a> {
-        if self.chain.error.is_some() || self.part_count == 0 {
-            return self.chain;
-        }
-
-        if self.chain.built.len() + self.chain.tls_parts >= self.chain.ctx.max_chain_length as usize
-        {
-            self.chain.error = Some(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "chain exceeds max_chain_length",
-            ));
-            return self.chain;
-        }
-
-        // TLS: append this SQE's parts, guard bytes included, to the chain's
-        // plaintext; the guards drop here, as on `SendBuilder`'s TLS path.
-        if let Some(plaintext) = self.chain.tls_plaintext.as_mut() {
-            for i in 0..self.part_count as usize {
-                match self.parts[i] {
-                    PartSlot::Copy { slice_idx } => {
-                        let (ptr, len) = self.copy_slices[slice_idx as usize];
-                        // SAFETY: the slice was borrowed for 'b by `copy`.
-                        plaintext
-                            .extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len) });
-                    }
-                    PartSlot::Guard { guard_idx } => {
-                        if let Some(ref g) = self.guards[guard_idx as usize] {
-                            let (ptr, len) = g.as_ptr_len();
-                            // SAFETY: the guard keeps its memory alive while held.
-                            plaintext.extend_from_slice(unsafe {
-                                std::slice::from_raw_parts(ptr, len as usize)
-                            });
-                        }
-                    }
-                    PartSlot::Empty => {}
-                }
-            }
-            for g in self.guards.iter_mut() {
-                *g = None;
-            }
-            self.chain.tls_parts += 1;
-            return self.chain;
-        }
-
-        // Build the SQE using a temporary SendBuilder on the chain's context.
-        let conn_index = self.chain.conn.index;
-
-        // Small guard sends: ZC bookkeeping (slab entry + notification CQE)
-        // costs more than a memcpy below the threshold. Same fold that
-        // `SendBuilder::submit` performs via `submit_small_gather`; without
-        // it, chained sub-threshold guard parts paid the ZC path
-        // unconditionally. Gather all parts — guard bytes included — into
-        // one pool slot and emit a plain Send; guards drop immediately
-        // (data is copied out before return). Falls through to the ZC path
-        // when the pool is exhausted or the gather doesn't fit a slot.
-        let threshold = self.chain.ctx.send_zc_threshold;
-        let folded: Option<BuiltSend> =
-            if self.guard_count > 0 && threshold > 0 && self.total_len < threshold {
-                let mut all_slices = [(std::ptr::null::<u8>(), 0usize); MAX_IOVECS];
-                let mut n = 0usize;
-                for i in 0..self.part_count as usize {
-                    match self.parts[i] {
-                        PartSlot::Copy { slice_idx } => {
-                            all_slices[n] = self.copy_slices[slice_idx as usize];
-                            n += 1;
-                        }
-                        PartSlot::Guard { guard_idx } => {
-                            let g = self.guards[guard_idx as usize].as_ref().unwrap();
-                            let (gptr, glen) = g.as_ptr_len();
-                            all_slices[n] = (gptr, glen as usize);
-                            n += 1;
-                        }
-                        PartSlot::Empty => {}
-                    }
-                }
-                let gathered = unsafe {
-                    self.chain
-                        .ctx
-                        .send_copy_pool
-                        .copy_in_gather(&all_slices[..n], self.total_len as usize)
-                };
-                gathered.map(|(slot, ptr, len)| {
-                    // Data is in the pool now — release the guards.
-                    for g in self.guards.iter_mut() {
-                        *g = None;
-                    }
-                    let user_data = crate::completion::UserData::encode(
-                        crate::completion::OpTag::Send,
-                        conn_index,
-                        crate::completion::UserData::send_payload(slot, self.chain.conn.generation),
-                    );
-                    let entry = crate::backend::uring::sqe::Sqe::chain_send(
-                        conn_index,
-                        ptr,
-                        len,
-                        user_data.raw(),
-                    );
-                    BuiltSend {
-                        entry,
-                        pool_slot: slot,
-                        slab_idx: u16::MAX,
-                    }
-                })
-            } else {
-                None
-            };
-
-        let built = if let Some(built) = folded {
-            built
-        } else if self.guard_count == 0 {
-            // Copy-only: gather into pool slot. An oversize gather is refused
-            // here, as the guard arm refuses it, so `copy_in_gather`'s `None`
-            // below means the pool is empty.
-            if self.total_copy_len > self.chain.ctx.send_copy_pool.slot_size() as usize {
-                self.chain.error = Some(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "total copy data exceeds send pool slot size",
-                ));
-                return self.chain;
-            }
-            let result = unsafe {
-                self.chain.ctx.send_copy_pool.copy_in_gather(
-                    &self.copy_slices[..self.copy_count as usize],
-                    self.total_copy_len,
-                )
-            };
-            match result {
-                Some((slot, ptr, len)) => {
-                    let user_data = crate::completion::UserData::encode(
-                        crate::completion::OpTag::Send,
-                        conn_index,
-                        crate::completion::UserData::send_payload(slot, self.chain.conn.generation),
-                    );
-                    let entry = crate::backend::uring::sqe::Sqe::chain_send(
-                        conn_index,
-                        ptr,
-                        len,
-                        user_data.raw(),
-                    );
-
-                    BuiltSend {
-                        entry,
-                        pool_slot: slot,
-                        slab_idx: u16::MAX,
-                    }
-                }
-                None => {
-                    self.chain.error = Some(io::Error::other("send copy pool exhausted"));
-                    return self.chain;
-                }
-            }
-        } else {
-            // With guards: allocate pool slot (if copy data) + slab entry.
-            let slot_size = self.chain.ctx.send_copy_pool.slot_size() as usize;
-            if self.total_copy_len > slot_size {
-                self.chain.error = Some(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "total copy data exceeds send pool slot size",
-                ));
-                return self.chain;
-            }
-
-            if self.total_copy_len > 0 {
-                let result = unsafe {
-                    self.chain.ctx.send_copy_pool.copy_in_gather(
-                        &self.copy_slices[..self.copy_count as usize],
-                        self.total_copy_len,
-                    )
-                };
-                match result {
-                    Some((slot, pool_ptr, _)) => {
-                        // Build iovecs with copy parts pointing into pool slot.
-                        let mut iovecs = [libc::iovec {
-                            iov_base: std::ptr::null_mut(),
-                            iov_len: 0,
-                        }; MAX_IOVECS];
-                        let mut copy_offset: usize = 0;
-                        for i in 0..self.part_count as usize {
-                            match self.parts[i] {
-                                PartSlot::Copy { slice_idx } => {
-                                    let (_, src_len) = self.copy_slices[slice_idx as usize];
-                                    iovecs[i] = libc::iovec {
-                                        iov_base: pool_ptr.wrapping_add(copy_offset) as *mut _,
-                                        iov_len: src_len,
-                                    };
-                                    copy_offset += src_len;
-                                }
-                                PartSlot::Guard { guard_idx } => {
-                                    let g = self.guards[guard_idx as usize].as_ref().unwrap();
-                                    let (gptr, glen) = g.as_ptr_len();
-                                    let region = g.region();
-                                    if region != crate::buffer::fixed::RegionId::UNREGISTERED
-                                        && let Err(e) = self
-                                            .chain
-                                            .ctx
-                                            .fixed_buffers
-                                            .validate_region_ptr(region, gptr, glen)
-                                    {
-                                        // Same check SendBuilder performs — an
-                                        // out-of-region pointer must not reach a
-                                        // kernel iovec.
-                                        self.chain.ctx.send_copy_pool.release(slot);
-                                        self.chain.error = Some(io::Error::new(
-                                            io::ErrorKind::InvalidInput,
-                                            e.to_string(),
-                                        ));
-                                        return self.chain;
-                                    }
-                                    iovecs[i] = libc::iovec {
-                                        iov_base: gptr as *mut _,
-                                        iov_len: glen as usize,
-                                    };
-                                }
-                                PartSlot::Empty => {}
-                            }
-                        }
-
-                        let iov_slice = &iovecs[..self.part_count as usize];
-                        let total_len = self.total_len;
-                        let guards = std::mem::take(&mut self.guards);
-                        match self.chain.ctx.send_slab.allocate(
-                            conn_index,
-                            self.chain.conn.generation,
-                            iov_slice,
-                            slot,
-                            guards,
-                            self.guard_count,
-                            total_len,
-                        ) {
-                            Some((slab_idx, msg_ptr)) => {
-                                let user_data = crate::completion::UserData::encode(
-                                    crate::completion::OpTag::SendMsgZc,
-                                    conn_index,
-                                    slab_idx as u32,
-                                );
-                                // A Unix socket refuses `SENDMSG_ZC` (#829).
-                                let entry = if self.chain.ctx.conn_is_unix(conn_index) {
-                                    crate::backend::uring::sqe::Sqe::chain_send_msg(
-                                        conn_index,
-                                        msg_ptr,
-                                        user_data.raw(),
-                                    )
-                                } else {
-                                    crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
-                                        conn_index,
-                                        msg_ptr,
-                                        user_data.raw(),
-                                    )
-                                };
-
-                                BuiltSend {
-                                    entry,
-                                    pool_slot: slot,
-                                    slab_idx,
-                                }
-                            }
-                            None => {
-                                self.chain.ctx.send_copy_pool.release(slot);
-                                self.chain.error = Some(io::Error::other("send slab exhausted"));
-                                return self.chain;
-                            }
-                        }
-                    }
-                    None => {
-                        self.chain.error = Some(io::Error::other("send copy pool exhausted"));
-                        return self.chain;
-                    }
-                }
-            } else {
-                // Guards only, no copy data.
-                let mut iovecs = [libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                }; MAX_IOVECS];
-                for i in 0..self.part_count as usize {
-                    if let PartSlot::Guard { guard_idx } = self.parts[i] {
-                        let g = self.guards[guard_idx as usize].as_ref().unwrap();
-                        let (gptr, glen) = g.as_ptr_len();
-                        let region = g.region();
-                        if region != crate::buffer::fixed::RegionId::UNREGISTERED
-                            && let Err(e) = self
-                                .chain
-                                .ctx
-                                .fixed_buffers
-                                .validate_region_ptr(region, gptr, glen)
-                        {
-                            self.chain.error =
-                                Some(io::Error::new(io::ErrorKind::InvalidInput, e.to_string()));
-                            return self.chain;
-                        }
-                        iovecs[i] = libc::iovec {
-                            iov_base: gptr as *mut _,
-                            iov_len: glen as usize,
-                        };
-                    }
-                }
-
-                let iov_slice = &iovecs[..self.part_count as usize];
-                let total_len = self.total_len;
-                let guards = std::mem::take(&mut self.guards);
-                match self.chain.ctx.send_slab.allocate(
-                    conn_index,
-                    self.chain.conn.generation,
-                    iov_slice,
-                    u16::MAX,
-                    guards,
-                    self.guard_count,
-                    total_len,
-                ) {
-                    Some((slab_idx, msg_ptr)) => {
-                        let user_data = crate::completion::UserData::encode(
-                            crate::completion::OpTag::SendMsgZc,
-                            conn_index,
-                            slab_idx as u32,
-                        );
-                        // A Unix socket refuses `SENDMSG_ZC` (#829).
-                        let entry = if self.chain.ctx.conn_is_unix(conn_index) {
-                            crate::backend::uring::sqe::Sqe::chain_send_msg(
-                                conn_index,
-                                msg_ptr,
-                                user_data.raw(),
-                            )
-                        } else {
-                            crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
-                                conn_index,
-                                msg_ptr,
-                                user_data.raw(),
-                            )
-                        };
-
-                        BuiltSend {
-                            entry,
-                            pool_slot: u16::MAX,
-                            slab_idx,
-                        }
-                    }
-                    None => {
-                        self.chain.error = Some(io::Error::other("send slab exhausted"));
-                        return self.chain;
-                    }
-                }
-            }
-        };
-
-        self.chain.built.push(built);
-        self.chain.total_len += self.total_len;
-        self.chain
     }
 }
 

@@ -165,8 +165,6 @@ pub mod buf;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod buffer;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
-pub(crate) mod chain;
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod completion;
 pub(crate) mod connection;
 pub mod direct_io;
@@ -191,7 +189,13 @@ pub(crate) mod resolver;
 #[cfg(target_os = "linux")]
 pub(crate) mod reuseport_bpf;
 pub(crate) mod runtime;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+pub(crate) mod smaps;
 pub(crate) mod spawner;
+// Under io_uring the file wrappers and `linger` are unused; they serve the
+// mio backend.
+#[cfg_attr(has_io_uring, allow(dead_code, unused_imports))]
+pub(crate) mod sys;
 pub(crate) mod task_panic;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod tls;
@@ -390,6 +394,7 @@ pub use runtime::io::try_timeout;
 pub use runtime::io::try_timeout_at;
 /// Return control to the worker's event loop once.
 pub use runtime::io::yield_now;
+pub use runtime::io::{BatchAdmission, BatchAdmitted, BatchRefused};
 /// Future returned by [`join()`].
 pub use runtime::join::Join;
 /// Future returned by [`join3()`].
@@ -466,6 +471,9 @@ pub use runtime::stream::ConnStream;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────
 
+/// Whether guard-only sends use a registered buffer; see
+/// [`Runtime::region_fixed_buffer_sends`] and [`Runtime::fixed_buffer_sends`].
+pub use buffer::fixed::FixedBufferSends;
 /// Memory region for io_uring fixed buffer registration.
 pub use buffer::fixed::MemoryRegion;
 /// Region identifier for [`SendGuard`] implementations.

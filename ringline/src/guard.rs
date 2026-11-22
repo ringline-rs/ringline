@@ -10,7 +10,11 @@ use crate::buffer::fixed::RegionId;
 pub trait SendGuard: Send + 'static {
     /// Pointer and length of the data to send.
     fn as_ptr_len(&self) -> (*const u8, u32);
-    /// The registered memory region this data belongs to.
+    /// The registered memory region this data belongs to, or
+    /// [`RegionId::UNREGISTERED`]. When every guard of a send names the same
+    /// registered region, the send may reference the region's slot until it
+    /// completes; see
+    /// [`Runtime::unregister_region`](crate::Runtime::unregister_region).
     fn region(&self) -> RegionId;
 }
 

@@ -24,9 +24,32 @@ pub(crate) const STREAM_INTEREST: mio::Interest = mio::Interest::READABLE
     .add(mio::Interest::WRITABLE)
     .add(mio::Interest::PRIORITY);
 /// What a connection's stream is registered for.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "hermit")))]
 pub(crate) const STREAM_INTEREST: mio::Interest =
     mio::Interest::READABLE.add(mio::Interest::WRITABLE);
+/// What a connection's stream is registered for. mio's poll selector, which
+/// Hermit uses, clears an interest when it fires and restores it after an
+/// operation through mio returns `WouldBlock`; a stream registered WRITABLE
+/// therefore reports writable again after every read that drains the
+/// socket, and the loop never blocks. So a stream starts writable
+/// ([`WRITABLE_ON_DEMAND`]) and has WRITABLE added only while a write waits
+/// for room ([`WAITING_INTEREST`]).
+#[cfg(target_os = "hermit")]
+pub(crate) const STREAM_INTEREST: mio::Interest = mio::Interest::READABLE;
+
+/// What a connecting stream is registered for: WRITABLE reports the end of
+/// the connect.
+pub(crate) const CONNECT_INTEREST: mio::Interest = STREAM_INTEREST.add(mio::Interest::WRITABLE);
+
+/// What a stream is registered for while a write waits for room, where
+/// [`WRITABLE_ON_DEMAND`] holds.
+pub(crate) const WAITING_INTEREST: mio::Interest = STREAM_INTEREST.add(mio::Interest::WRITABLE);
+
+/// Whether a stream is taken as writable from the start and registers
+/// WRITABLE only while a write waits for room (Hermit; see
+/// [`STREAM_INTEREST`]). Elsewhere WRITABLE stays registered and the first
+/// writable event sets `writable`.
+pub(crate) const WRITABLE_ON_DEMAND: bool = cfg!(target_os = "hermit");
 
 /// mio token 0 is reserved for the wake pipe.
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
@@ -162,6 +185,10 @@ pub(crate) struct Driver {
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_queues: Vec<ConnSendState>,
     pub(crate) accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
+    /// Where this worker counts the connections it takes from `accept_rx`.
+    pub(crate) accept_state: Option<Arc<crate::acceptor::AcceptState>>,
+    /// This worker's index into `accept_state`.
+    pub(crate) worker_index: usize,
     pub(crate) wake_handle: crate::wakeup::WakeFd,
     /// Set by a disk-I/O pool thread that wrote the wake pipe, cleared by
     /// `drain_channels` before it reads the responses, so a burst of
@@ -549,6 +576,8 @@ impl Driver {
             },
             send_queues: (0..max_conn).map(|_| ConnSendState::new()).collect(),
             accept_rx,
+            accept_state: config.accept_state.clone(),
+            worker_index: config.worker_index,
             // The pipe's WRITE end: handed to worker-pool threads (disk I/O,
             // resolver, spawner) so their completion wakes actually reach
             // this worker. `eventfd` is the READ end (polled by the loop) —
@@ -648,7 +677,7 @@ impl Driver {
             .tls_table
             .as_mut()
             .map(|t| t as *mut _)
-            .unwrap_or(std::ptr::null_mut());
+            .unwrap_or_default();
 
         DriverCtx {
             connections: &mut self.connections,
@@ -683,6 +712,7 @@ impl Driver {
             pending_fs_opens: &mut self.pending_fs_opens,
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,
+            ticket_waiting: false,
         }
     }
 
@@ -749,7 +779,7 @@ impl Driver {
         self.clear_pending_sends(idx, crate::handler::aborted_error);
         if let Some(stream) = &self.tcp_streams[idx] {
             use std::os::fd::AsRawFd;
-            let linger = libc::linger {
+            let linger = crate::sys::linger {
                 l_onoff: 1,
                 l_linger: 0,
             };
@@ -763,7 +793,7 @@ impl Driver {
                     libc::SOL_SOCKET,
                     libc::SO_LINGER,
                     (&raw const linger).cast(),
-                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    std::mem::size_of::<crate::sys::linger>() as libc::socklen_t,
                 );
             }
         }
@@ -1106,12 +1136,19 @@ impl Driver {
             }
 
             let fd = stream.as_raw_fd();
-            let result = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as i32) };
+            let result = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as _) };
 
             if result < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
+                    if WRITABLE_ON_DEMAND {
+                        let _ = self.poll.registry().reregister(
+                            stream,
+                            mio::Token(idx + 1),
+                            WAITING_INTEREST,
+                        );
+                    }
                     // Every awaited send queued now has bytes the full socket
                     // did not take (`SendCompletion::waited_for_room`).
                     for entry in self.pending_sends[idx].iter_mut() {
@@ -1211,7 +1248,9 @@ impl Driver {
         }
 
         // All sends flushed. Interest is registered once, as
-        // READABLE|WRITABLE, and never modified: dropping WRITABLE after each
+        // READABLE|WRITABLE, and never modified, except on Hermit
+        // (`WRITABLE_ON_DEMAND`), where `handle_writable` removes WRITABLE
+        // once the queue is written: dropping WRITABLE after each
         // drain and re-adding it on the next send cost two `epoll_ctl(MOD)`
         // per operation on an echo workload (#395), and a `reregister` here
         // re-reported EOF on a half-closed socket and spun the loop at 100%
@@ -1285,7 +1324,7 @@ fn bind_udp_with_reuseport(
     }
     #[cfg(not(target_os = "linux"))]
     unsafe {
-        let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+        let fd_flags = libc::fcntl(fd, libc::F_GETFD, 0);
         if fd_flags < 0 || libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0 {
             let err = io::Error::last_os_error();
             libc::close(fd);
@@ -1297,6 +1336,8 @@ fn bind_udp_with_reuseport(
     // a worker only when each worker should get its own port, and with the
     // option set the free-port search can return a port another
     // SO_REUSEPORT socket already holds, so it is left off then.
+    // Hermit has no SO_REUSEPORT, so only one worker can bind a port there.
+    #[cfg(not(target_os = "hermit"))]
     if addr.port() != 0 {
         let optval: libc::c_int = 1;
         let rc = unsafe {
@@ -1709,7 +1750,10 @@ pub(crate) mod tests {
         // Starve the pool down to exactly what was admitted.
         let mut held = Vec::new();
         while driver.send_copy_pool.free_count() > needed {
-            let (slot, _p, _l) = driver.send_copy_pool.copy_in(b"x").unwrap();
+            let (slot, _p, _l) = driver
+                .send_copy_pool
+                .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"x")
+                .unwrap();
             held.push(slot);
         }
         assert_eq!(driver.send_copy_pool.free_count(), needed);
@@ -2641,7 +2685,7 @@ pub(crate) mod tests {
 
         let permit = driver
             .send_copy_pool
-            .reserve_slots(1)
+            .reserve_slots(crate::buffer::send_copy::SlotOwner::NONE, 1)
             .expect("a free slot to promise");
         driver.pending_sends[idx].push_back(PendingSend::bounded(Vec::new(), id, 0, permit));
         assert_eq!(driver.send_copy_pool.free_count(), 3);

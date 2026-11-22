@@ -25,8 +25,6 @@ pub(crate) enum Fd {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Link {
     None,
-    /// `IOSQE_IO_LINK`: the next op runs only if this one succeeds.
-    Soft,
     /// `IOSQE_IO_HARDLINK`: the next op runs whatever this one's result.
     Hard,
 }
@@ -79,6 +77,25 @@ pub(crate) enum Op {
         fd: Fd,
         msg: *const libc::msghdr,
         flags: u32,
+    },
+    /// `SEND_ZC` with `IORING_RECVSEND_FIXED_BUF` (Linux 6.0): `buf..buf +
+    /// len` must lie inside registered buffer `buf_index`, or the send fails
+    /// with `EFAULT`.
+    SendZcFixed {
+        fd: Fd,
+        buf: *const u8,
+        len: u32,
+        flags: i32,
+        buf_index: u16,
+    },
+    /// `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF` (Linux 6.15): every
+    /// iovec of `msg` must lie inside registered buffer `buf_index`, or the
+    /// send fails with `EFAULT`.
+    SendMsgZcFixed {
+        fd: Fd,
+        msg: *const libc::msghdr,
+        flags: u32,
+        buf_index: u16,
     },
     Read {
         fd: Fd,
@@ -221,19 +238,6 @@ impl Sqe {
         )
     }
 
-    /// A stream send in a linked chain. See [`Sqe::chain_send_msg_zc`].
-    pub(crate) fn chain_send(index: u32, buf: *const u8, len: u32, user_data: u64) -> Self {
-        Sqe::new(
-            Op::Send {
-                fd: Fd::Fixed(index),
-                buf,
-                len,
-                flags: crate::completion::CHAIN_SEND_FLAGS,
-            },
-            user_data,
-        )
-    }
-
     /// A plain `sendmsg` on registered file `index`: the kernel copies the
     /// iovecs into the socket. For a socket that refuses `SENDMSG_ZC`, such as
     /// a Unix-domain one (#829).
@@ -243,19 +247,6 @@ impl Sqe {
                 fd: Fd::Fixed(index),
                 msg,
                 flags: crate::completion::STREAM_SEND_FLAGS as u32,
-            },
-            user_data,
-        )
-    }
-
-    /// A plain `sendmsg` in a linked chain. See [`Sqe::send_msg`] and
-    /// [`Sqe::chain_send_msg_zc`].
-    pub(crate) fn chain_send_msg(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
-        Sqe::new(
-            Op::SendMsg {
-                fd: Fd::Fixed(index),
-                msg,
-                flags: crate::completion::CHAIN_SEND_FLAGS as u32,
             },
             user_data,
         )
@@ -273,15 +264,43 @@ impl Sqe {
         )
     }
 
-    /// A zero-copy `sendmsg` in a linked chain. The kernel retries a short send
-    /// and fails the link if it cannot finish, because the next SQE of the
-    /// chain would otherwise follow a gap.
-    pub(crate) fn chain_send_msg_zc(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
+    /// A zero-copy stream send on registered file `index` of `len` bytes at
+    /// `buf`, which lie inside registered buffer `buf_index`, with
+    /// `MSG_DONTWAIT` (Domain Invariant 5).
+    pub(crate) fn send_zc_fixed(
+        index: u32,
+        buf: *const u8,
+        len: u32,
+        buf_index: u16,
+        user_data: u64,
+    ) -> Self {
         Sqe::new(
-            Op::SendMsgZc {
+            Op::SendZcFixed {
+                fd: Fd::Fixed(index),
+                buf,
+                len,
+                flags: crate::completion::STREAM_SEND_FLAGS,
+                buf_index,
+            },
+            user_data,
+        )
+    }
+
+    /// A zero-copy stream `sendmsg` on registered file `index` whose iovecs
+    /// all lie inside registered buffer `buf_index`, with `MSG_DONTWAIT`
+    /// (Domain Invariant 5).
+    pub(crate) fn send_msg_zc_fixed(
+        index: u32,
+        msg: *const libc::msghdr,
+        buf_index: u16,
+        user_data: u64,
+    ) -> Self {
+        Sqe::new(
+            Op::SendMsgZcFixed {
                 fd: Fd::Fixed(index),
                 msg,
-                flags: crate::completion::CHAIN_SEND_FLAGS as u32,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
+                buf_index,
             },
             user_data,
         )

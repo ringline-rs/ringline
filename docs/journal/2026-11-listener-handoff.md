@@ -1,6 +1,6 @@
 # 2026-11 — Handing a listening socket to the next process
 
-- **Status:** open — PR 1 (the acceptor) built and GO; PRs 2 to 4 not started
+- **Status:** closed — all four PRs merged: the acceptor (#971, GO), `bind_fd` (#972), `stop_accepting` (#982), `next_signal` and `signal::install` (#983)
 - **Span:** Nov 2026 · tree 911e0497 (`main`) · intent #970 · PR 1 · SystemsLab experiments listed under "What happened"
 
 ## Goal
@@ -230,6 +230,116 @@ The rate is lower than the 32,000 conns/s the queue-full poll entry measured
 at 4509097c with the same image. That run had a 16 vCPU guest on hv03; these
 ran in an 8 vCPU guest on hv01 (`nproc` in each log). They did not test which
 difference lowers the rate, and both arms share it.
+
+### PR 2: a listener from an fd
+
+Built as planned. Review added two refusals the plan did not have: a
+Unix-domain socket that is not bound, and any connected socket. Both passed
+the planned checks and failed later with a bare `EINVAL`, or, with
+`defer_listen()`, launched a listener whose gate then failed to open
+(measured on macOS for an unbound Unix socket; the rest from kernel and
+ringline source). The
+merged-mode refusal stays, without the reason the plan gave: a listener from
+an fd would take the acceptor path a Unix listener takes there, which is not
+tested for a listener from an fd.
+
+`launch()` applies `SO_REUSEADDR` and `listen(Config::backlog)` to every
+listener from an fd, not only when a deferred gate opens: an ungated
+listener's gate is opened by `launch()` itself. On a socket systemd created,
+that replaces its `Backlog=`.
+
+macOS keeps a listener listening after `SHUT_RD`, so there the test that a
+listener from an fd still accepts after shutdown passes with or without the
+change. `experiments/bind-fd-verify.toml` runs the tests on Linux with
+`experiments/bind-fd-verify-shut-rd.patch`, which puts `SHUT_RD` back. In
+SystemsLab experiment 01a1e6e8-1c6d-71b6-0573-50fc4794908f (Linux
+6.12.116, io_uring, at 4f6bd505) the eight tests passed, the merged-mode
+refusal test passed with `unstable-accept`, the patched tree failed
+`a_listener_from_an_fd_keeps_listening_after_shutdown`, and the full ringline
+suite, fmt, clippy and doc gates passed (measured). An earlier run,
+01a1e6db-2a09-71ef-8138-d4b6993fb743 at 260797da, passed every step but the
+mutation, whose patch no longer applied after that commit's doc edits; the
+patch was regenerated in 4f6bd505.
+
+### PR 3: stop accepting without shutting down
+
+Built as planned, with these differences:
+
+- A second call repeats the wait instead of returning at once, so a call
+  that follows a `TimedOut` waits again. It returns at once when nothing has
+  been placed since.
+- Review found that a worker stopped by `request_shutdown()` returns
+  `Ok(())` and is not recorded in `RuntimeShutdown::exited`, so
+  `stop_accepting` waited for its channel until the timeout. `AcceptState`
+  now records every worker thread that has ended, through a guard dropped
+  when the thread ends, and the wait skips those workers.
+- Review also found that `Duration::MAX` overflowed the deadline; a timeout
+  too long to add to the current time now means no deadline.
+- In merged mode, nothing waits for multishot-accept completions already
+  queued when the listeners are shut down, so a connection accepted before
+  the `SHUT_RD` can reach `on_accept` after the call returns. The doc says
+  so.
+
+`experiments/stop-accepting-verify.toml` runs `tests/stop_accepting.rs` on
+Linux io_uring three times, with `unstable-accept`, and on mio
+(`force-mio`), then with each of four patches that remove one part of the
+change, each of which must fail a named test: the wait for the workers'
+handled counts, the acceptor's `stopping` check, the merged-mode exemption
+from `ACCEPTOR_STOPPED`, and the skip of ended workers. The last runs on mio:
+in 01a1f539-3338-7100-a0a4-ce5c82d456fb (at ae3e118e) it passed on io_uring
+with the patch applied, because an io_uring worker drains its accept channel
+(the acceptor's wake is a completion) in the iteration that sees its
+shutdown request, before it checks for that request. There the ended-worker case
+needs a connection placed between the worker's last drain and the drop of
+its channel, which the test cannot arrange. Every other step of that run
+passed. In 01a1f540-cc39-711e-a2f1-15c26812667b (Linux 6.12.116, at 8e5f7f43,
+the reviewed code) every step passed: the tests three times on io_uring,
+with `unstable-accept` and on mio, each of the four patches failed its test,
+and the full ringline suite with and without `unstable-accept`, fmt, clippy
+and doc passed (measured). In SystemsLab experiment
+01a1f52f-bbe6-7100-8c6c-669ac5076993 (Linux 6.12.116, io_uring, at 124b7bf3,
+before the review fixes and the fourth patch) every test passed three times,
+the merged-mode test passed, each of the first three patches failed its test,
+and the full ringline suite with and without `unstable-accept`, fmt, clippy
+and doc passed (measured). The first two submissions failed outside the
+tests: 01a1f52c had Linux-only unit tests still calling
+`RuntimeShutdown::new` with three arguments, and 01a1f52e cloned before the
+fix was on the fork.
+
+The counts add one atomic increment per connection on the sender and one on
+the worker, each on its own cache line. The connect rate was not measured
+for this PR.
+
+No test here tells `handled` incremented before `install_accepted` from
+after it: the gap is a few instructions on the worker thread, so a test would
+depend on timing.
+
+### PR 4: a signal wait that does not shut down
+
+Built as planned. `next_signal` uses the poll `wait_on_signal` uses, and reads
+one byte from the panic or worker-exit pipe it returns for; another waiter
+that took the byte first makes it poll again. `wait_on_signal` still reads
+neither pipe, so an event `next_signal` returned is not returned by a later
+`wait_on_signal`; one already waiting returns it too.
+
+The planned test that "the next call waits" runs two `next_signal` callers
+for one worker stop: one returns, the other is still waiting 300 ms later and
+returns for a second stop, after which the exit pipe is not readable. While
+it waits, that caller shares the signal pipe with `signal::tests`, which
+writes a `SIGTERM` byte and waits for it; the existing
+`wait_on_signal_reports_a_worker_exit_and_shuts_down` has the same exposure.
+`tests/next_signal.rs`, its own binary with one test, sends real `SIGTERM`s:
+one after `install()` and before the runtime exists, which is returned
+without shutting the runtime down, and one after a task panic, which the next
+call returns in place of the panic. Three patches were seen to fail the tests
+on macOS: `next_signal` not reading the byte (both tests), `install()`
+doing nothing (the process ends on the first `SIGTERM`), and a caller that
+lost the byte to another returning anyway (the unit test, which waits 50 ms
+so both callers are in `poll` before the stop; caught in 97 of 100 runs on
+macOS, since the kernel re-checks readiness and the second caller may not
+wake).
+`experiments/next-signal-verify.toml` runs the tests and the first patch on
+Linux io_uring.
 
 ## Tests planned
 
