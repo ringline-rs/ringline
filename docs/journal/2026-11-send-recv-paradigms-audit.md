@@ -692,9 +692,9 @@ part on a Unix connection goes out as a plain `sendmsg` of the same iovecs
 instead of `SendMsgZc` (`handler.rs:3767–3769`, `3835`, `4504`, `4584`; the
 resubmit path at `uring/event_loop.rs:3192–3195`), so the guard is held
 until the CQE and there is no gather copy; the kernel copies the bytes.
-`ringline/tests/unix_guard_send.rs` covers mixed and guard-only `send_parts`
-and `send_chain` with a guard; `forward_recv_buf` to a Unix sink is not
-tested. The rustdoc of `SendGuard` and `SendBuilder::guard`, CLAUDE.md and
+At 146025cc, `ringline/tests/unix_guard_send.rs` covered mixed and
+guard-only `send_parts` and an io_uring `send_chain` with a guard;
+`forward_recv_buf` to a Unix sink was not tested. The rustdoc of `SendGuard` and `SendBuilder::guard`, CLAUDE.md and
 `docs/syscalls-and-copies.md` state the behaviour.
 
 ### F9 — A connected UDP socket on io_uring coalesces GRO segments, delivers a truncated datagram as a whole one, and drops empty datagrams (io_uring; U3a, U3b, U3c, UM11, UM17, UM19). Confirmed (run).
