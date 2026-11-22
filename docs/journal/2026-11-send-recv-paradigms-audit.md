@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send and receive paradigms
 
-- **Status:** open — 28 confirmed findings (F1 to F28), 10 plausible (PL1 to PL10), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18); the owner chose F1 then F2, fixed in #849 (merged) and #850 (open), and chose to bound the TLS handshake for L18, in #868 (merged); F27, F28, L18 and PL10 were found while reviewing those fixes; PL10 was then confirmed and fixed in #886 (merged); the invariant list was confirmed by three agents, not agreed line by line with the owner
-- **Span:** 2026-11-09 to 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2), #868 (L18), #886 (PL10)
+- **Status:** open — 28 confirmed findings (F1 to F28), 10 plausible (PL1 to PL10), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18). Fixed, chosen by the owner from this record: F1 (#849), F2 (#850), PL10 (#886; its trailing open item closed by #903), and L18 answered with a handshake timeout (#868); F27, F28, L18 and PL10 were found while reviewing those fixes. Fixed by PRs that did not cite this record: F5 (#928), F8 (#857), F14 (#921). Partly fixed: F15 (#921, #925), F26 and D19 (#952), PL6 (#954), D1 (#921, #925, #955). Reconciled against `main` at 146025cc on 2026-11-15, by reading; everything else is open and no owner decision on L1 to L17 is recorded. The invariant list was confirmed by three agents, not agreed line by line with the owner
+- **Span:** 2026-11-09 to 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2), #868 (L18), #886 (PL10); without citing this record: #857 (F8), #921 (F14; F15 and D1 in part), #925 (F15 and D1 in part), #955 (D1 in part), #928 (F5), #952 (F26 and D19 in part), #954 (PL6 in part), #903 (PL10's open item) · reconciled 2026-11-15 at 146025cc
 
 ## Goal
 
@@ -452,9 +452,10 @@ Long lists:
 Status: **confirmed** = a test or measurement at `6851de26` shows it, with
 the backend and the number of runs given, or (where marked "by reading") the
 quoted text is the whole finding; **plausible** = the code path is real and
-the trigger was not produced. F1 and PL10 are fixed; F2's fix is open;
-every other finding is open. Findings are ordered by
-consequence as the auditor judges it; the owner ranks.
+the trigger was not produced. F1, F2, F5, F8, F14 and PL10 are fixed; F15,
+F26 and PL6 in part; every other finding is open at 146025cc (the
+reconciliation section at the end says how that was checked). Findings are
+ordered by consequence as the auditor judges it; the owner ranks.
 
 ### F1 — A peer FIN before the TLS handshake completes leaves the connection with no task; an outbound `connect().tls()` never resolves (R6a, R10d). Confirmed (run, both backends).
 
@@ -526,7 +527,7 @@ returns. The reviewer's suggestion is a per-connection driver field next to
 `forward_zc_consumed`, cleared where `take_forward_zc_consumed` runs and in
 `close_connection`.
 
-Fixed in #850 (open).
+Fixed in #850, merged as bdcf1242 on 2026-11-11.
 The driver holds the detached bytes in `forward_zc_held` until a delivery
 path reads a non-zero forwarded count after the closure returns, or until
 `handle_close` releases the slot. It is not cleared in `close_connection`,
@@ -611,6 +612,14 @@ Proposed fix: add the `!Send` marker to both futures, as `RecvReadyFuture`
 has, with `compile_fail` doctests. This removes an auto trait from two
 public types, so it belongs in the next breaking release.
 
+Fixed in #928, merged as d1567241 on 2026-11-14, as part of the
+send-admission work (`docs/send-admission-design.md`); the PR does not cite
+this finding. `SendFuture` is now `SendCompletion` and
+`BackpressuredSendFuture` is `BackpressuredSend`; both carry
+`PhantomData<*const ()>` with a `compile_fail` doctest (`io.rs:4451–4459`
+and `4387–4392` at 146025cc), and `ForwardFuture` and `AsyncSendBuilder`
+are marked the same way. Recorded as a breaking change under Unreleased.
+
 ### F6 — The mio flush uses `writev`, so a write to a shut-down socket raises SIGPIPE (mio on Linux; A2a, A2b, SM7). Confirmed (run).
 
 `mio/driver.rs:917` calls `libc::writev`, which cannot carry
@@ -675,6 +684,18 @@ fails and aborts the connection. `ringline-redis` and `ringline-memcache`
 Proposed fix: decide at submission. Mark a connection whose socket is
 `AF_UNIX` at accept and in `connect_unix`, and route its guards through the
 copy path, in `send_parts` and in the chain builder.
+
+Fixed in #857, merged as 655e86a7 on 2026-11-10, for issue #829; the PR does
+not cite this finding. Not as proposed: the socket family is read at
+submission (`conn_is_unix`, `handler.rs:474–478` at 146025cc), and a guard
+part on a Unix connection goes out as a plain `sendmsg` of the same iovecs
+instead of `SendMsgZc` (`handler.rs:3767–3769`, `3835`, `4504`, `4584`; the
+resubmit path at `uring/event_loop.rs:3192–3195`), so the guard is held
+until the CQE and there is no gather copy; the kernel copies the bytes.
+At 146025cc, `ringline/tests/unix_guard_send.rs` covered mixed and
+guard-only `send_parts` and an io_uring `send_chain` with a guard;
+`forward_recv_buf` to a Unix sink was not tested. The rustdoc of `SendGuard` and `SendBuilder::guard`, CLAUDE.md and
+`docs/syscalls-and-copies.md` state the behaviour.
 
 ### F9 — A connected UDP socket on io_uring coalesces GRO segments, delivers a truncated datagram as a whole one, and drops empty datagrams (io_uring; U3a, U3b, U3c, UM11, UM17, UM19). Confirmed (run).
 
@@ -787,6 +808,15 @@ parked send is "never dropped" (D1).
 
 Proposed fix: call `abort_connection` there, as the other three do.
 
+Fixed in #921, merged as 1007e9d7 on 2026-11-13, for issue #830; the PR does
+not cite this finding. Not as proposed: the give-up is removed rather than
+made to abort. `drain_send_retries` re-parks a send whose push is refused,
+with no cap (`uring/event_loop.rs:4762–4800` at 146025cc); the same PR
+removed the cap from the three other retry drains. #955 (59dde742) then
+merged those three into `drain_resubmit_retries`, whose only abandon runs
+when the connection's identity no longer matches or its Close is submitted.
+CLAUDE.md's Domain Invariant 7 was reworded to match (D1).
+
 ### F15 — `may_block` ignores the send retry lists and a pending park drain (io_uring; R7c, RM24, liveness of O4 and O5). Confirmed for the state (unit tests); the live sequence was not produced.
 
 `may_block` (`uring/event_loop.rs:1101–1109`) checks the ready queue,
@@ -809,6 +839,22 @@ bounded by the tick, so the cost is latency, not a hang.
 
 Proposed fix: `may_block` returns false while any retry list or
 `park_drain_pending` is non-empty.
+
+Partly fixed. The retry lists: #921 (1007e9d7) made `may_block` false while
+a retry was owed, and #925 (e34d0015, 2026-11-14) replaced that with a
+deadline. `push_retries_pending` (`uring/driver.rs:1659–1667` at 146025cc)
+counts the retry lists, a refused submit and due re-arms; `next_deadline`
+(`:1625–1629`) includes the backoff deadline while that count is positive;
+`wait_bound` (`uring/event_loop.rs:1122–1132`) bounds the wait by it. So a
+parked send bounds the wait at `tick_timeout_us = 0`. The park drain is
+open: `may_block` (`:1177–1184`) still checks the ready queue,
+`pending_finalize_closes`, `deferred_recv_arms` and shutdown, and
+`park_drain_pending` is in neither it nor `next_deadline`. The default tick
+is 10 ms since #911, so at the default a drain of 64 iterations on an idle
+worker takes up to 640 ms (`config.rs:1351–1352` says a park drain lasts 64
+loop iterations, so 64 ticks on an idle worker). By reading,
+`config.rs:1347–1349` still says a send deferred by a full SQ waits one
+tick; since #925 it waits the push-retry backoff.
 
 ### F16 — `DirectPool` keeps a buffer larger than `recv_direct_pool_max` (io_uring; R9). Confirmed (unit test).
 
@@ -987,6 +1033,17 @@ returns.
   at `handler.rs:3756`, `4266`, `4483`, `4515` and `4849`. Not run. Proposed fix:
   `checked_add` with `InvalidInput`.
 
+The drop-order comments were fixed in #952, merged as a4e08f6a on
+2026-11-15, for issue #848, filed beside this audit on 2026-11-10 with the
+same observation. `uring/driver.rs:566–573` at 146025cc says the ring is
+declared first and drops first, and that `run_shutdown`, not the field
+order, makes the memory in-flight operations reference safe to free; no
+"drops last" remains in `ringline/src`, CLAUDE.md or `docs/` outside this
+entry's quotations of the old comments. The test is
+still named `ring_drops_after_buffer_pools` (`:3898`), the opposite of what
+it asserts (D19). The `total_len` adds are open: six unchecked `u32` adds at
+`handler.rs:3490`, `3522`, `4018`, `4229`, `4261` and `4613`.
+
 ### F27 — A forward followed by `close()` in the same closure makes the delivery path consume past the end of the accumulator (io_uring). Confirmed (run, by the F2 fix's reviewer, at `6851de26` and on the fix).
 
 In a `with_data` or `try_with_data` closure: `forward_recv_buf(data)` of
@@ -1002,6 +1059,14 @@ Proposed fix: zero the count in `handle_close`, next to the
 `forward_zc_held` clear, not in `close_connection`. The reviewer ran this
 change against the lib tests (840 passed), not the full suite. The F2
 fix's close test returns `NeedMore` to avoid this.
+
+Open at 146025cc: `close_connection` still zeroes the count
+(`uring/driver.rs:1837`) and `handle_close` (`uring/event_loop.rs:4111`)
+clears only `forward_zc_held`. #939 added `Driver::abort`
+(`uring/driver.rs:2251`), which zeroes the count as `close_connection`
+does, and a public `abort()` on `Connection` and `SendHalf`; by reading, a
+closure that forwards, calls `abort()` and returns `Consumed(len)` reaches
+the same assert. Not run.
 
 ### F28 — A whole-accumulator forward made outside a reader closure leaves a forwarded count the next read subtracts (io_uring). Mechanism confirmed (run against crate internals, by the F2 fix's reviewer); the public-API sequence was traced, not run.
 
@@ -1072,6 +1137,16 @@ The code path is real; the trigger was not produced.
   a gap in the stream. No trigger was found: a stream send of a non-empty
   buffer is not expected to return 0. Proposed fix: treat `result <= 0` as
   the failure at `:3587`, `:3943` and `:3952`.
+
+  The TLS-chunk half was fixed in #954, merged as 4509097c on 2026-11-15,
+  for issue #846, which does not cite this finding: `handle_tls_send` is
+  gone, `TlsSend` completes through `handle_send` (`uring/event_loop.rs:2949`
+  at 146025cc), which aborts on a result that is not positive and maps 0 to
+  `WriteZero` (`:3082`, `:3360–3366`); the test is
+  `handle_tls_send_zero_bytes_closes_connection`. The zero-copy half is open:
+  at `:3818–3828` a result of 0 settles the send `WriteZero`, and
+  `:3842–3845` then counts `total_len` as sent and submits the next queued
+  send.
 - **PL7** On mio a forward keeps reading its source into a sink whose
   write has failed until the close is processed at the end of the loop pass
   (`mio/driver.rs:767–771`; order at `mio/event_loop.rs:374–382`), so bytes
@@ -1125,9 +1200,13 @@ The code path is real; the trigger was not produced.
   bounds it: `close_connection` sets the close deadline
   (`CLOSE_NOTIFY_TIMEOUT`, 5 s) on a connection that is not established, on
   both backends, and mio's `finish_close` writes no close_notify while
-  sends remain queued. Open: on io_uring with `tick_timeout_us(0)` the
-  deadline is checked only when a worker timer wakes the loop; a stall with
-  no send waiting for room was not shown.
+  sends remain queued. One item was left open: on io_uring with
+  `tick_timeout_us(0)` the deadline was checked only when a worker timer
+  woke the loop. #903 (6552c751, 2026-11-12) closed it: `wait_bound` takes
+  the earliest of the next tick, the timer heap and `Driver::next_deadline`,
+  which includes every armed close deadline (`uring/event_loop.rs:1122–1132`
+  at 146025cc). #903's body says the stall was not produced and the change
+  has no failing test.
 
 ## Documentation findings
 
@@ -1136,8 +1215,11 @@ Each item compares a sentence in the rustdoc, a design doc, `CLAUDE.md`,
 each one, and a second reader, told to refute it, read it again. None was
 run unless the item cites a run. Where the second reader corrected the
 reviewer, the corrected form is given here and the correction is listed
-under Refuted and corrected. Every item is open. Together they are the
-breaks of A3 and most of the breaks of Q4.
+under Refuted and corrected. At 6851de26 every item was open; at 146025cc
+D1 (three statements of four) and D19 (the `Driver` doc) are fixed in part,
+and D23 item 5's premise has changed, as each item and the reconciliation
+section say. Together they are the breaks of A3 and most of the breaks of
+Q4.
 
 Send:
 
@@ -1148,6 +1230,16 @@ Send:
   `io.rs:3156–3159` state the give-up. Fix: reword the invariant to "retried
   twice, then the send fails and the connection closes". F14 is the code
   half.
+
+  Overtaken by the owner's decision on #830, recorded in #921: the cap is
+  removed (#921, #925, #955). At 146025cc three of the four statements are
+  reworded and true:
+  CLAUDE.md:261 ("retried, never dropped, with no cap on the attempts
+  (#830)"), `docs/send-completion-design.md:151–159` and
+  `uring/driver.rs:918–923`. The `SendHalf::send` rustdoc at
+  `io.rs:3272–3274` still says persistent submission-queue starvation
+  resolves the `SendCompletion` `Err` and closes the connection, which no
+  longer happens.
 - **D2** `io.rs:3313` says of `shutdown_write`: "Plain `send` is unaffected
   either way." `connection.rs:75–83` says such a send fails with `EPIPE`.
   Measured, 5 runs per backend: on io_uring a `send(b"x")` issued after
@@ -1243,6 +1335,14 @@ Send:
     the rename list at `docs/send-completion-slots-design.md:133–142` does
     not cover them. `docs/backpressured-sends-series-design.md:246` has
     the same kind of reference.
+  - At 146025cc all five lines are unchanged
+    (`half-closed-send-wait-design.md:241`,
+    `public-context-types-design.md:62–63`,
+    `copied-send-reservation-design.md:327`,
+    `send-backpressured-design.md:156`,
+    `backpressured-sends-series-design.md:247`), and the
+    `copied-send-reservation` paragraph also describes the retry cap #921
+    removed.
 
 Receive:
 
@@ -1358,7 +1458,12 @@ Receive:
   - The drop-order wording in F26 appears in five more places:
     `uring/driver.rs:3179`, `3197`, `3202`, the test name
     `ring_drops_after_buffer_pools` (`:3158`), and the doc at `:411`,
-    which names a test `driver_field_order` that does not exist.
+    which names a test `driver_field_order` that does not exist. The
+    `Driver` doc and the module comments were corrected in #952 (a4e08f6a),
+    and the doc names the test module `field_order_tests`
+    (`uring/driver.rs:575` at 146025cc); the test name
+    `ring_drops_after_buffer_pools` (`:3898`) still says the opposite of its
+    assertion. The other two bullets are unchanged.
 
 UDP:
 
@@ -1409,7 +1514,12 @@ Unix domain sockets:
   4. `config.rs:841` says `tcp_nodelay` applies to "all connections"; it is
      skipped for Unix (`worker.rs:1890–1891`).
   5. `config.rs:1065` (`send_zc_threshold`) is silent on Unix, where the
-     zero-copy path fails (F8).
+     zero-copy path fails (F8). Since #857 the path does not fail, and that
+     PR put the Unix behaviour on `SendGuard`, `SendBuilder::guard`,
+     CLAUDE.md and `docs/syscalls-and-copies.md`; the `send_zc_threshold`
+     rustdoc (`config.rs:1310` at 146025cc) is still one line and says
+     nothing of Unix, where the threshold chooses between a plain `sendmsg`
+     of the iovecs and a gather copy.
   6. A send waiting on a Unix peer that has shut down its read side is
      retried once a second on io_uring
      (`uring/event_loop.rs:3037–3040`). Only
@@ -1741,3 +1851,42 @@ The audit adds only this record and the lists file to the repository.
   of `--test <name>` for the unit tests, adding `--features force-mio` for
   mio. `-j 2` keeps
   the io_uring tests under `RLIMIT_MEMLOCK` on this kernel.
+
+## Reconciled against `main` at 146025cc (2026-11-15)
+
+Every finding was checked against `main` at 146025cc (0.7.0-alpha.140, 84
+commits after 6851de26) by five fresh agents, each given a group of
+findings and told to read the code, `git log -S`, `git blame` and the PR
+bodies. Nothing was built or run; the host was macOS, which cannot build the
+io_uring backend. The `file:line` references in the findings above stay at
+6851de26; where a paragraph gives a line at 146025cc it says so. Merge
+dates are UTC.
+
+| Disposition | Findings |
+|---|---|
+| Fixed, chosen by the owner from this record | F1 (#849), F2 (#850, merged 2026-11-11 as bdcf1242), PL10 (#886; its trailing open item closed by #903), L18 (#868) |
+| Fixed by a PR that did not cite this record | F5 (#928), F8 (#857, issue #829), F14 (#921, issue #830) |
+| Partly fixed | F15 (send retry lists bounded by #921 and #925; park drain open), F26 (drop-order comments by #952, issue #848; `total_len` adds open), PL6 (TLS half by #954, issue #846; zero-copy half open), D1 (three statements of four, by #921, #925 and #955), D19 (drop-order doc by #952; test name, example and copies doc open) |
+| Open; code or text unchanged, lines moved | F3, F4, F6, F7, F9 to F13, F16 to F25, F27, F28; PL1 to PL5, PL7 to PL9; D2 to D18, D20 to D23 (item 5's premise changed by #857; its rustdoc is unchanged) |
+| No owner decision recorded | L1 to L17 |
+
+The PRs that fixed or partly fixed a finding trace to issues filed beside
+the audit (#829 for #857, #830 for #921, #846 for #954, #848 for #952) or
+to a design doc (#927 for #928); none names a finding here, so a search of
+PR bodies for this record would have missed them. Changes near an open
+finding that do not close it: #939's
+`Driver::abort` zeroes `forward_zc_consumed` as `close_connection` does, so
+F27 has a second entry point, the public `abort()`; #939's mio
+`forward_push` refuses a sink the new `abort` API aborted, not one whose
+write failed (PL7); #890's `peer_closed` rustdoc states when a close_notify
+is seen and leaves the buffered-bytes difference of D15; #948 edited
+`docs/recv-direct-design.md` near but not on the lines D18 cites.
+`docs/recv-arrival-times-design.md`, `runtime/stream.rs`,
+`backend/sockaddr.rs`, `tls/unbuffered/mod.rs` and `tls/backend_mio.rs`
+have no commits since the audit, and no UDP line in `io.rs` or
+`runtime/mod.rs` changed.
+
+Not settled by this pass: whether the comment at
+`uring/event_loop.rs:1426–1428` (D18) is wrong at 146025cc, since
+`tls/mod.rs:905` constructs `UnexpectedEof` and its caller was not traced;
+and the ringline-tls claim in F1, since the fork is not in this tree.
