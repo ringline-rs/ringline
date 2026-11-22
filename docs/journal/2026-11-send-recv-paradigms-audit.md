@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send and receive paradigms
 
-- **Status:** open — 28 confirmed findings (F1 to F28), 10 plausible (PL1 to PL10), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18). Fixed, chosen by the owner from this record: F1 (#849), F2 (#850), PL10 (#886; its trailing open item closed by #903), and L18 answered with a handshake timeout (#868); F27, F28, L18 and PL10 were found while reviewing those fixes. Fixed by PRs that did not cite this record: F5 (#928), F8 (#857), F14 (#921). Partly fixed: F15 (#921, #925), F26 and D19 (#952), PL6 (#954), D1 (#921, #925, #955). Reconciled against `main` at 146025cc on 2026-11-15, by reading; everything else is open and no owner decision on L1 to L17 is recorded. The invariant list was confirmed by three agents, not agreed line by line with the owner
-- **Span:** 2026-11-09 to 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2), #868 (L18), #886 (PL10); without citing this record: #857 (F8), #921 (F14; F15 and D1 in part), #925 (F15 and D1 in part), #955 (D1 in part), #928 (F5), #952 (F26 and D19 in part), #954 (PL6 in part), #903 (PL10's open item) · reconciled 2026-11-15 at 146025cc
+- **Status:** open — 28 confirmed findings (F1 to F28), 10 plausible (PL1 to PL10), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18). Fixed, chosen by the owner from this record: F1 (#849), F2 (#850), PL10 (#886; its trailing open item closed by #903), and L18 answered with a handshake timeout (#868); F27, F28, L18 and PL10 were found while reviewing those fixes. Fixed by PRs that did not cite this record: F5 (#928), F8 (#857), F14 (#921), D4 (#965). No longer applies: D7 (`send_chain` removed, #986). Partly fixed or partly removed: F15 (#921, #925), F22 (#965, #986), F24 (#965), F26 (#952, #986), D19 (#952), PL6 (#954), D1 (#921, #925, #955), D5 (#986). Reconciled against `main` at 146025cc on 2026-11-15 and at 97597ea8 on 2026-11-22, by reading; everything else is open and no owner decision on L1 to L17 is recorded. The invariant list was confirmed by three agents, not agreed line by line with the owner
+- **Span:** 2026-11-09 to 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2), #868 (L18), #886 (PL10); without citing this record: #857 (F8), #921 (F14; F15 and D1 in part), #925 (F15 and D1 in part), #955 (D1 in part), #928 (F5), #952 (F26 and D19 in part), #954 (PL6 in part), #903 (PL10's open item), #965 (D4; F22 and F24 in part), #986 (D7; F22, F26 and D5 in part) · reconciled 2026-11-15 at 146025cc and 2026-11-22 at 97597ea8
 
 ## Goal
 
@@ -1890,3 +1890,170 @@ Not settled by this pass: whether the comment at
 `uring/event_loop.rs:1426–1428` (D18) is wrong at 146025cc, since
 `tls/mod.rs:905` constructs `UnexpectedEof` and its caller was not traced;
 and the ringline-tls claim in F1, since the fork is not in this tree.
+
+## Reconciled against `main` at 97597ea8 (2026-11-22)
+
+Every finding still open at 146025cc was checked against `main` at
+97597ea8 (0.7.0-alpha.177, 40 commits after 146025cc). Four fresh agents
+did the checking, one each for F3 to F13, F15 to F28, PL1 to PL9 with L1
+to L17, and D1 to D23. Each was told to read the code at 97597ea8 and to
+use `git log -S`, `git log -L` and the PR bodies, and to cite the code, not
+a PR title, for any claim that something was fixed or removed. I re-read
+the code for every disposition other than "unchanged" before writing it
+here. Nothing was built or run. Line references in this section are at
+97597ea8, and merge dates are UTC.
+
+Three commits in the range changed findings:
+
+- #965 (b9285189, merged 2026-11-16) removed the fire-and-forget sends, so
+  every send on a TCP or Unix connection returns a `SendCompletion`.
+- #986 (a4cd6a4e, 2026-11-20) removed `send_chain`, its builders and
+  `ConfigBuilder::max_chain_length`.
+- #999 (7e00bf09, 2026-11-21) built the mio backend for Hermit and added a
+  CHANGELOG line that D23 now covers.
+
+The fixed-buffer sends (#987, cebcbb29; #989, 2a81d0f3; #998, 8cf5d4a5)
+widen PL6 and touch F4 and L10. Apart from #962, the previous
+reconciliation, none of the 40 commits names a finding in this record.
+
+| Disposition at 97597ea8 | Findings |
+|---|---|
+| Fixed at 146025cc (not rechecked in this pass) | F1, F2, F5, F8, F14, PL10, L18 |
+| Fixed since 146025cc | D4 (#965) |
+| No longer applies since 146025cc | D7 (#986) |
+| Partly fixed or partly removed | F15 (park drain open), F22 (`build` fixed by #965, `send_chain` item gone with #986, part limit open), F24 (`send_nowait` gone with #965; `send` and `shutdown_write` open), F26 (four of six `total_len` adds gone with #986; two open), PL6 (zero-copy half open, and now covers fixed-buffer sends), D1 (one statement of four open, extended by #965), D5 (`max_chain_length` gone with #986; rest open), D19 (as at 146025cc) |
+| Open; code changed, finding stands | D3 |
+| Open; code or text unchanged, lines moved | F3, F4, F6, F7, F9 to F13, F16 to F21, F23, F25, F27, F28; PL1 to PL5, PL7 to PL9; D2, D6, D8 to D18, D20 to D23 |
+| No owner decision recorded | L1 to L17 (the code behind L1, L6, L7, L10 and L15 changed, below) |
+
+**D4 fixed by #965.** The zero-byte results D4 compared belonged to the
+fire-and-forget `build` and `submit_batch`. At 97597ea8, both backends'
+`submit_batch` and mio's `build` refuse a batch that carries no bytes with
+`InvalidInput` (`runtime/io.rs:1808`, `:2010`, `:2070`), and their rustdoc
+says so (`:1788`, `:1947`, `:1988`). io_uring's `build` checks the handle
+first and returns `NotConnected` for a stale or closing connection, as
+`SendBuilder::submit` states (`handler.rs:3874–3877`). The results still
+differ by entry point, and each rustdoc states its own, which was D4's
+alternative fix.
+
+**D7 no longer applies.** #986 removed `send_chain` and
+`max_chain_length`, and neither name appears in `ringline/src`,
+`CLAUDE.md` or `README.md`. Domain Invariant 7 in `CLAUDE.md` names connect
+and UDP sends as the operations that return the push error; it does not
+mention chains.
+
+**F15.** The send retry lists stay covered, as at 146025cc. `park_drain_pending`
+is still read by neither `may_block` (`uring/event_loop.rs:1207–1215`) nor
+`next_deadline` (`uring/driver.rs:1694–1719`). #969 added a
+`writable_close_wakes` check to `may_block`; it does not cover park drains.
+`config.rs:1500–1505` still says a send deferred by a full SQ waits one
+tick.
+
+**F22.** #965 gave mio's `MioSendBuilder` a `submitted` flag. On both
+backends, `build` now returns `InvalidInput` ("the build closure submitted
+no send") when the closure submitted nothing (`runtime/io.rs:1762–1768`
+io_uring, `:1962–1967` mio). That is stricter than the entry proposed,
+because io_uring also stopped returning `Ok` with nothing sent. The
+"Available on both backends" item went with `send_chain` in #986. The part
+limit is unchanged:
+
+- io_uring refuses a 33rd part (`handler.rs:3804–3809`);
+- mio's `submit_batch` concatenates any number of parts (`runtime/io.rs:1991–2025`);
+- the `send_parts` rustdoc gives the limit without naming a backend (`:3393–3394`).
+
+**F24.** `send_nowait` went with #965. `send` and `shutdown_write` still go
+through `with_state` (`runtime/io.rs:1434`, `:1505`), which panics with
+"called outside executor" (`:206`). So do `forward_recv_buf`,
+`send_parts().build` and `submit_batch`. `drop_tasks` still runs without
+driver state (`worker.rs:1842`). `WritableFuture`, `BatchAdmission` and
+`SendBufferSize`, added since 146025cc, tolerate a missing driver in their
+`Drop`, as `Admission` and `SendCompletion` already did.
+
+**F26.** The adds at 146025cc's `handler.rs:4018`, `4229`, `4261` and
+`4613` were in `SendChainBuilder` and `ChainPartsBuilder`, which #986
+removed. Two unchecked `u32` adds remain in `SendBuilder`: `handler.rs:3816`,
+which also casts `data.len()` to `u32`, and `:3848`. The test
+`ring_drops_after_buffer_pools` (`uring/driver.rs:4038`) still has a name
+opposite to what it asserts.
+
+**PL6.** In `handle_send_msg_zc` (`uring/event_loop.rs:3928`), a result of
+0 settles the send `WriteZero` (`:4075`). The `result >= 0` branch
+(`:4089–4092`) then counts `total_len` as sent and submits the next queued
+send. Since #987 and #989, a guard-only send whose guards lie in one
+registered region goes out as `SEND_ZC` or `SENDMSG_ZC` on that region's
+buffer, still tagged `OpTag::SendMsgZc` (`handler.rs:4206–4239`), so it
+completes through the same branch. I don't know whether the kernel ever
+completes a fixed-buffer `SEND_ZC` with 0.
+
+**D1.** The `SendHalf::send` rustdoc (`runtime/io.rs:3372–3376`) still says
+that persistent submission-queue starvation resolves the `SendCompletion`
+`Err` and closes the connection. Since #921, neither happens. #965 added
+the sentence "With the future dropped, it surfaces only as the connection
+closing" (`:3375`), which repeats the claim.
+
+**D3, open; its code changed.** #965 changed `ConnStream::poll_write`
+(`runtime/stream.rs:217–222`) to call `send` and drop the `SendCompletion`
+instead of calling `send_nowait`; the module doc's "does not wait"
+predates it. The module doc still names no error. A write returns
+whatever `send` refuses with: `Other` on io_uring when the pool is full,
+and, since #1001 (9215b52b), `Other` on both backends while a bounded send
+waits on the connection. `poll_flush` still returns `Ready(Ok(()))`.
+
+**D5.** `max_chain_length` went with #986. The `send_pool`,
+`send_zc_threshold` and `send_slab_slots` rustdocs (`config.rs:1359–1387`,
+`:1442`) still name no backend. mio plain sends take no pool slot
+(`handler.rs:2726`). The new `zero_copy_hold_cap` rustdoc (#980) does state
+its mio behaviour.
+
+**D18 settled.** The comment at `uring/event_loop.rs:1460–1462` says a FIN
+without a prior close_notify is "a truncation, which reads resolve to as
+`UnexpectedEof`", and it is wrong. The only `UnexpectedEof` on the TLS read
+path that reaches a caller is `tls::handshake_eof()` (`tls/mod.rs:888–893`), which is passed to
+`wake_connect` only before the handshake completes. An established
+connection's reads resolve `0`, with `eof_truncated()` true. Of the doc
+lines D18 cites, the end-of-stream, `segments`, TLS, `cancel` and
+`ForwardToFuture` lines moved with #964's and #967's edits, to
+`docs/recv-direct-design.md:371`, `493`, `679–681`, `696`, `703`, `766` and
+`928–932`; the multishot-path lines were not relocated in this pass.
+
+**D23, a second wrong statement.** #999 added a CHANGELOG `Unreleased` line
+(`CHANGELOG.md:23–24`) saying `connect_unix` "returns `Unsupported` as on
+every mio target". mio's `start_connect_unix` returns `io::Error::other`
+(`handler.rs:3049–3057`), and `ConnectFuture` wraps it in `io::Error::other`
+again (`runtime/io.rs:5785`), so the kind a caller sees is `Other`. Items 2
+to 7 are unchanged.
+
+**F4, near but not closed.** `build_with_guards` still reads `as_ptr_len()`
+before it moves the guards into the slab (`handler.rs:4074` then `:4095`;
+`:4158` then `:4189`). A guard that names a registered region does not
+reach the stale address, because `validate_region_ptr` rejects a pointer
+outside the region. A guard that returns `RegionId::UNREGISTERED` reaches
+it as before.
+
+**Design limitations whose code changed:**
+
+- **L1:** `poll_write` drops a `SendCompletion` instead of calling
+  `send_nowait`, so a waiting `poll_flush` could now be built on the
+  completions. Nothing builds one.
+- **L6:** `writable` (#969) and `submit_batch_admitted` (#978) refuse a send
+  after `shutdown_write` with `BrokenPipe`, as `send_backpressured` does.
+  Plain `send` and `send_parts` still accept it (`connection.rs:73–81`),
+  and the comment at `runtime/io.rs:4784–4786` still says that policy is
+  open.
+- **L7:** #969 added a second reader of the stored receive error,
+  `recorded_error` (`runtime/io.rs:4309`). Like `take_recv_error`, it
+  returns nothing once a later generation's error has overwritten the slot.
+- **L10:** since #987 a guard-only send from one region names that
+  region's registered buffer in the SQE (`handler.rs:4218–4240`); the
+  pointer check against the region (`:4160–4167`) predates the range.
+- **L15:** `docs/send-writer-design.md:311–315` now names `send` where it
+  named `send_nowait`, and still says nesting has not been checked.
+
+Not settled by this pass:
+
+- the io_uring path that resolves `ConnectionAborted` in F23;
+- whether F4's pre-move pointer read also occurs in the forward and
+  `submit_batch` paths;
+- whether a plaintext receive in flight still detaches the accumulator
+  after #964 (D13);
+- the ringline-tls claim in F1, as at 146025cc.
