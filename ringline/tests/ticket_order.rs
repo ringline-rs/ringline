@@ -202,7 +202,7 @@ fn a_plain_send_waits_its_turn_behind_a_waiting_bounded_send() {
         std::thread::sleep(Duration::from_millis(1));
     };
     assert_eq!(
-        seen.refused, "Other: a bounded send waits on this connection",
+        seen.refused, "Other: a send waits on this connection",
         "the plain send made while the bounded send waited"
     );
     assert_eq!(seen.tickets_waited, 1);

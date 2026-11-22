@@ -1575,7 +1575,10 @@ impl ConnCtx {
             "connection is closing",
         );
         #[cfg(has_io_uring)]
-        driver.close_connection_graceful(self.conn_index);
+        {
+            driver.close_connection_graceful(self.conn_index);
+            driver.sync_sealed(executor);
+        }
         #[cfg(not(has_io_uring))]
         driver.close_connection(self.conn_index);
         // A `writable` future fails once the close is requested; wake it,
@@ -4735,14 +4738,19 @@ impl Admission<'_> {
 }
 
 /// `driver.make_ctx()` for a non-waiting send on `conn_index`, marked when a
-/// bounded send waits on the connection (`DriverCtx::ticket_waiting`).
+/// bounded send or sealed TLS output waits on the connection
+/// (`DriverCtx::ticket_waiting`). Sealed output is read from the driver, so
+/// output held since the last `Driver::sync_sealed` counts.
 fn send_ctx<'d>(
     driver: &'d mut Driver,
     executor: &Executor,
     conn_index: u32,
 ) -> crate::handler::DriverCtx<'d> {
+    let waiting = executor.send_waiting_on(conn_index);
+    #[cfg(has_io_uring)]
+    let waiting = waiting || driver.sealed_waiting(conn_index);
     let mut ctx = driver.make_ctx();
-    ctx.ticket_waiting = executor.send_waiting_on(conn_index);
+    ctx.ticket_waiting = waiting;
     ctx
 }
 
@@ -4923,12 +4931,19 @@ impl Admission<'_> {
 /// decides, and under `Budget` [`admit`](Executor::send_capacity_admit) does.
 /// The caller submits a passing send between `SendCopyPool::begin_passing`
 /// and `end_passing`, then marks it with `Executor::mark_send_passed`.
+///
+/// On io_uring the queue's sealed tickets are brought up to date first
+/// (`Driver::sync_sealed`), so a send is never encrypted ahead of TLS
+/// output held since the last sync.
 fn admission_decision(
-    driver: &Driver,
+    driver: &mut Driver,
     executor: &mut Executor,
     id: SendId,
     first_poll: bool,
 ) -> Option<Option<usize>> {
+    #[cfg(has_io_uring)]
+    driver.sync_sealed(executor);
+    let driver = &*driver;
     let decision = if executor.send_admission_order() == SendAdmissionOrder::Strict {
         let free = driver.send_copy_pool.free_count();
         executor.send_capacity_turn(id, free).then_some(None)

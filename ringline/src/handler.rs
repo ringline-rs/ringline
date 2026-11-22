@@ -12,24 +12,64 @@ use crate::guard::GuardBox;
 /// was produced, kept in the order it was produced. Its records carry
 /// sequence numbers below those of any record encrypted after them, so they
 /// go on the wire first.
+///
+/// It waits in a sealed ticket in the worker's admission queue
+/// (`SendCompletions::push_sealed`), ahead of the connection's waiting
+/// bounded sends; while it waits, no other send on the connection is
+/// encrypted. The driver records changes on `Driver::sealed_dirty` and
+/// `Driver::sealed_gone`, and `Driver::sync_sealed` brings the queue up to
+/// date.
 #[cfg(has_io_uring)]
 #[derive(Debug)]
 pub(crate) struct SealedOutput {
     /// The ciphertext.
     pub bytes: Vec<u8>,
-    /// `bytes` ends with the connection's close_notify.
+    /// `bytes` includes the connection's close_notify.
     pub close_notify: bool,
+    /// `bytes` includes output from the receive path or the client's first
+    /// flight.
+    pub receive: bool,
+    /// The ticket in the admission queue, once `Driver::sync_sealed` has
+    /// pushed it.
+    pub ticket: Option<crate::runtime::send_completion::SendId>,
+    /// The connection is on `Driver::sealed_dirty`.
+    pub dirty: bool,
 }
 
+/// Append `bytes` to the sealed output in `state`, creating it if there is
+/// none, and put `conn_index` on `dirty` (`Driver::sealed_dirty`) if it is
+/// not there. Returns `false`, holding nothing, when the output would need
+/// more slots than `pool` has, so that it could never be placed.
 #[cfg(has_io_uring)]
-impl SealedOutput {
-    /// A close_notify, with anything rustls had queued ahead of it.
-    pub(crate) fn close_notify(bytes: Vec<u8>) -> Self {
-        Self {
-            bytes,
-            close_notify: true,
-        }
+pub(crate) fn hold_sealed(
+    state: &mut ConnSendState,
+    pool: &SendCopyPool,
+    dirty: &mut Vec<u32>,
+    conn_index: u32,
+    bytes: &[u8],
+    close_notify: bool,
+    receive: bool,
+) -> bool {
+    let slot_size = pool.slot_size() as usize;
+    let held = state.sealed.as_ref().map_or(0, |s| s.bytes.len());
+    if (held + bytes.len()).div_ceil(slot_size) > pool.slot_count() {
+        return false;
     }
+    let sealed = state.sealed.get_or_insert_with(|| SealedOutput {
+        bytes: Vec::new(),
+        close_notify: false,
+        receive: false,
+        ticket: None,
+        dirty: false,
+    });
+    sealed.bytes.extend_from_slice(bytes);
+    sealed.close_notify |= close_notify;
+    sealed.receive |= receive;
+    if !sealed.dirty {
+        sealed.dirty = true;
+        dirty.push(conn_index);
+    }
+    true
 }
 
 /// Per-connection send queue state.
@@ -363,13 +403,13 @@ impl ConnId {
     }
 }
 
-/// The message of a non-waiting send refused because a bounded send waits on
-/// its connection.
-pub(crate) const TICKET_WAITING_REFUSAL: &str = "a bounded send waits on this connection";
+/// The message of a non-waiting send refused because a bounded send, or TLS
+/// output the send pool had no slots for, waits on its connection.
+pub(crate) const TICKET_WAITING_REFUSAL: &str = "a send waits on this connection";
 
 /// The refusal of a non-waiting send that would take send-pool slots while a
-/// bounded send waits on its connection: kind `Other`, the kind of pool
-/// exhaustion.
+/// bounded send, or TLS output the send pool had no slots for, waits on its
+/// connection: kind `Other`, the kind of pool exhaustion.
 pub(crate) fn ticket_waiting_error() -> io::Error {
     io::Error::other(TICKET_WAITING_REFUSAL)
 }
@@ -605,13 +645,16 @@ pub(crate) struct DriverCtx<'a> {
     /// closure returns: a closure that returned `Ok` without a successful
     /// `submit` left the id with nothing to settle it.
     pub(crate) parts_id_carried: bool,
-    /// A bounded send waits on the connection this context is made for
-    /// (`docs/send-pool-partition-design.md`, section 2). A non-waiting send
-    /// that would take send-pool slots is then refused with
+    /// A bounded send, or TLS output the send pool had no slots for
+    /// (`ConnSendState::sealed`), waits on the connection this context is
+    /// made for (`docs/send-pool-partition-design.md`, section 2). A
+    /// non-waiting send that would take send-pool slots is then refused with
     /// [`ticket_waiting_error`], so it does not go out ahead of the waiting
-    /// send. Set by the entry points of the non-waiting sends; false
-    /// elsewhere.
+    /// send or output. Set by the entry points of the non-waiting sends;
+    /// false elsewhere.
     pub(crate) ticket_waiting: bool,
+    /// See `Driver::sealed_dirty`.
+    pub(crate) sealed_dirty: &'a mut Vec<u32>,
 }
 
 /// The refusal of a TLS send made after this side's close_notify was queued:
@@ -1285,18 +1328,37 @@ impl<'a> DriverCtx<'a> {
                 if tls_table.has(conn.index) {
                     if alert_allowed {
                         let mut sends = Vec::new();
-                        let retained = tls_table.send_close_notify_queued(
+                        let mut held = Vec::new();
+                        let hold = self.send_queues[conn.index as usize].sealed.is_some();
+                        tls_table.send_close_notify_queued(
                             conn.index,
                             conn.generation,
                             self.send_copy_pool,
-                            &mut sends,
+                            &mut crate::tls::TlsOutput {
+                                sends: &mut sends,
+                                held: &mut held,
+                                hold,
+                            },
                         );
                         if !sends.is_empty() {
                             self.queue_built_sends(conn.index, sends);
                         }
-                        if let Some(bytes) = retained {
-                            self.send_queues[conn.index as usize].sealed =
-                                Some(SealedOutput::close_notify(bytes));
+                        // Output the pool had no slots for, or that follows
+                        // sealed output already waiting, waits behind it.
+                        if !held.is_empty()
+                            && !hold_sealed(
+                                &mut self.send_queues[conn.index as usize],
+                                self.send_copy_pool,
+                                self.sealed_dirty,
+                                conn.index,
+                                &held,
+                                true,
+                                false,
+                            )
+                        {
+                            crate::metrics::POOL
+                                .increment(crate::metrics::pool::CLOSE_NOTIFY_DROPPED);
+                            tls_table.close_notify_dropped(conn.index);
                         }
                     }
                     // Arm the close_notify deadline so the event loop

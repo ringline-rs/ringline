@@ -831,6 +831,18 @@ pub(crate) struct Driver {
     pub(crate) close_notify_armed: Vec<u32>,
     /// Scratch for TLS output sends collected during CQE handling.
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
+    /// Scratch for TLS output collected during CQE handling that goes to the
+    /// connection's sealed output (`crate::tls::TlsOutput::held`).
+    pub(crate) tls_held_scratch: Vec<u8>,
+    /// Connections whose sealed output was created or grew since the last
+    /// [`sync_sealed`](Self::sync_sealed).
+    pub(crate) sealed_dirty: Vec<u32>,
+    /// Sealed tickets whose output the driver placed or dropped outside the
+    /// event loop's serve, for [`sync_sealed`](Self::sync_sealed) to remove.
+    pub(crate) sealed_gone: Vec<crate::runtime::send_completion::SendId>,
+    /// Closes that went ahead with a bare FIN while sealed output waited
+    /// (`SendAdmissionCounters::bare_fin_closes`).
+    pub(crate) bare_fin_closes: u64,
     /// Monotonic disk-I/O sequence (see DriverCtx::disk_op_id).
     pub(crate) next_disk_io_seq: u16,
     /// The fs writes in flight per file, and the fsyncs held
@@ -1395,6 +1407,10 @@ impl Driver {
             send_queues,
             close_notify_armed: Vec::new(),
             tls_out_scratch: Vec::new(),
+            tls_held_scratch: Vec::new(),
+            sealed_dirty: Vec::new(),
+            sealed_gone: Vec::new(),
+            bare_fin_closes: 0,
             next_disk_io_seq: 0,
             write_orders: crate::disk_order::WriteOrders::default(),
             direct_recvs: Vec::new(),
@@ -1568,6 +1584,7 @@ impl Driver {
             write_orders: &mut self.write_orders,
             parts_id_carried: false,
             ticket_waiting: false,
+            sealed_dirty: &mut self.sealed_dirty,
         }
     }
 
@@ -2224,10 +2241,10 @@ impl Driver {
         if !(state.close_pending && sends_drained && shutdown_drained && disconnect_drained) {
             return;
         }
-        // A close_notify the pool had no slot for at the close goes out now
-        // if it can; its completion registers the connection for the drain
-        // again, and the Close is committed then.
-        if self.place_retained_close_notify(conn_index) {
+        // Sealed output the pool had no slots for, the close_notify among it,
+        // goes out now if it can; its completion registers the connection
+        // for the drain again, and the Close is committed then.
+        if self.place_sealed_at_close(conn_index) {
             return;
         }
         let st = &mut self.send_queues[conn_index as usize];
@@ -2374,11 +2391,9 @@ impl Driver {
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
         self.send_queues[ci].aborted = true;
-        if self.send_queues[ci]
-            .sealed
-            .take()
-            .is_some_and(|s| s.close_notify)
-        {
+        // No close_notify follows an abort, so dropping the sealed output
+        // is not counted as a bare-FIN close.
+        if self.take_sealed(conn_index).is_some_and(|s| s.close_notify) {
             self.drop_retained_close_notify_flag(conn_index);
         }
         let state = &mut self.send_queues[ci];
@@ -2466,15 +2481,9 @@ impl Driver {
     /// commits it. The deadline is disarmed here, so this runs once per
     /// close.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
-        // The drain is stuck, so a retained alert would stall the same way:
+        // The drain is stuck, so sealed output would stall the same way:
         // drop it with the queued sends.
-        if self.send_queues[conn_index as usize]
-            .sealed
-            .take()
-            .is_some_and(|s| s.close_notify)
-        {
-            self.drop_retained_close_notify_flag(conn_index);
-        }
+        self.drop_sealed(conn_index);
         let state = &mut self.send_queues[conn_index as usize];
         let had_queue = !state.queue.is_empty();
         let settles = Self::release_queued_sends(
@@ -2697,60 +2706,165 @@ impl Driver {
         }
         let generation = self.connections.generation(conn_index);
         let mut sends = Vec::new();
-        let retained = match self.tls_table.as_mut() {
+        let mut held = Vec::new();
+        let hold = self.sealed_waiting(conn_index);
+        match self.tls_table.as_mut() {
             Some(tls) if tls.has(conn_index) => tls.send_close_notify_queued(
                 conn_index,
                 generation,
                 &mut self.send_copy_pool,
-                &mut sends,
+                &mut crate::tls::TlsOutput {
+                    sends: &mut sends,
+                    held: &mut held,
+                    hold,
+                },
             ),
             _ => return,
-        };
+        }
         if !sends.is_empty() {
             self.queue_built_sends(conn_index, &mut sends);
         }
-        // No slot for the alert now: `try_finalize_close` places it once this
-        // connection's own sends have drained and given their slots back.
-        if let Some(bytes) = retained {
-            self.send_queues[conn_index as usize].sealed =
-                Some(crate::handler::SealedOutput::close_notify(bytes));
+        // Output the pool had no slots for, or that follows sealed output
+        // already waiting, waits behind it; `try_finalize_close` places or
+        // drops what is left once this connection's own sends have drained.
+        if !held.is_empty() && !self.hold_sealed(conn_index, &held, true, false) {
+            self.drop_retained_close_notify_flag(conn_index);
         }
     }
 
-    /// Place the close_notify a close found no pool slot for, now that the
-    /// connection's own sends have drained. Returns `true` when the alert was
-    /// queued, so the Close must wait for its completion. When the pool is
-    /// still exhausted the alert is dropped: the Close goes ahead behind a
-    /// bare FIN, `pool::CLOSE_NOTIFY_DROPPED` counts it, and the connection
-    /// no longer records the alert as sent.
-    fn place_retained_close_notify(&mut self, conn_index: u32) -> bool {
-        let Some(sealed) = self.send_queues[conn_index as usize].sealed.take() else {
+    /// Whether `conn_index` has sealed output waiting.
+    pub(crate) fn sealed_waiting(&self, conn_index: u32) -> bool {
+        self.send_queues
+            .get(conn_index as usize)
+            .is_some_and(|s| s.sealed.is_some())
+    }
+
+    /// Append `bytes`, TLS output the pool had no slots for or that queues
+    /// behind output already waiting, to the connection's sealed output,
+    /// creating it if there is none, and record the change for
+    /// [`sync_sealed`](Self::sync_sealed). Returns `false`, holding nothing,
+    /// when the output would need more slots than the pool has, so that it
+    /// could never be placed.
+    pub(crate) fn hold_sealed(
+        &mut self,
+        conn_index: u32,
+        bytes: &[u8],
+        close_notify: bool,
+        receive: bool,
+    ) -> bool {
+        crate::handler::hold_sealed(
+            &mut self.send_queues[conn_index as usize],
+            &self.send_copy_pool,
+            &mut self.sealed_dirty,
+            conn_index,
+            bytes,
+            close_notify,
+            receive,
+        )
+    }
+
+    /// Take the connection's sealed output, recording its ticket for
+    /// [`sync_sealed`](Self::sync_sealed) to remove.
+    pub(crate) fn take_sealed(&mut self, conn_index: u32) -> Option<crate::handler::SealedOutput> {
+        let sealed = self.send_queues[conn_index as usize].sealed.take()?;
+        if let Some(ticket) = sealed.ticket {
+            self.sealed_gone.push(ticket);
+        }
+        Some(sealed)
+    }
+
+    /// Drop the connection's sealed output at a close that goes ahead
+    /// without it: the peer reads a bare FIN. Counted in `bare_fin_closes`,
+    /// and, when the output held the close_notify, in
+    /// `pool::CLOSE_NOTIFY_DROPPED`, clearing the connection's sent flag.
+    pub(crate) fn drop_sealed(&mut self, conn_index: u32) {
+        let Some(sealed) = self.take_sealed(conn_index) else {
+            return;
+        };
+        self.bare_fin_closes += 1;
+        if sealed.close_notify {
+            self.drop_retained_close_notify_flag(conn_index);
+        }
+    }
+
+    /// Queue the connection's sealed output as sends, all of it or none.
+    /// Returns `true` when it was queued; the caller removes its ticket.
+    pub(crate) fn serve_sealed(&mut self, conn_index: u32) -> bool {
+        let Some(sealed) = self.send_queues[conn_index as usize].sealed.as_ref() else {
             return false;
         };
-        let retained = sealed.bytes;
         let generation = self.connections.generation(conn_index);
-        let mut sends = Vec::new();
+        let mut sends = std::mem::take(&mut self.tls_out_scratch);
         let placed = match self.tls_table.as_mut() {
-            Some(tls) => tls.retry_close_notify_queued(
+            Some(tls) => tls.place_sealed(
                 conn_index,
                 generation,
                 &mut self.send_copy_pool,
-                &retained,
+                &sealed.bytes,
                 &mut sends,
             ),
             None => false,
         };
         if placed {
-            // `retained` is never empty, and non-empty bytes that are placed
-            // produce at least one send.
-            debug_assert!(
-                !sends.is_empty(),
-                "retained close_notify bytes produced no sends"
-            );
+            self.send_queues[conn_index as usize].sealed = None;
             self.queue_built_sends(conn_index, &mut sends);
+        }
+        self.tls_out_scratch = sends;
+        placed
+    }
+
+    /// Bring the executor's sealed tickets up to date with the connections'
+    /// sealed output: remove the tickets on `sealed_gone`, push a ticket for
+    /// new output and set what grown output needs.
+    pub(crate) fn sync_sealed(&mut self, executor: &mut crate::runtime::Executor) {
+        for ticket in self.sealed_gone.drain(..) {
+            executor.remove_sealed_ticket(ticket);
+        }
+        if self.sealed_dirty.is_empty() {
+            return;
+        }
+        let slot_size = self.send_copy_pool.slot_size() as usize;
+        let mut dirty = std::mem::take(&mut self.sealed_dirty);
+        for conn_index in dirty.drain(..) {
+            let generation = self.connections.generation(conn_index);
+            let Some(sealed) = self.send_queues[conn_index as usize].sealed.as_mut() else {
+                continue;
+            };
+            sealed.dirty = false;
+            let need = sealed.bytes.len().div_ceil(slot_size);
+            match sealed.ticket {
+                Some(ticket) => executor.set_sealed_need(ticket, need),
+                None => {
+                    sealed.ticket = Some(executor.push_sealed_ticket(
+                        conn_index,
+                        generation,
+                        need,
+                        sealed.receive,
+                    ));
+                }
+            }
+        }
+        self.sealed_dirty = dirty;
+    }
+
+    /// Place the connection's sealed output, the close_notify included,
+    /// now that the connection's own sends have drained, whatever its place
+    /// in the admission queue. Returns `true` when it was queued, so the
+    /// Close must wait for its completion. When the pool has no slots for it
+    /// the output is dropped ([`drop_sealed`](Self::drop_sealed)) and the
+    /// Close goes ahead behind a bare FIN.
+    fn place_sealed_at_close(&mut self, conn_index: u32) -> bool {
+        let Some(sealed) = self.send_queues[conn_index as usize].sealed.as_ref() else {
+            return false;
+        };
+        let ticket = sealed.ticket;
+        if self.serve_sealed(conn_index) {
+            if let Some(ticket) = ticket {
+                self.sealed_gone.push(ticket);
+            }
             return true;
         }
-        self.drop_retained_close_notify_flag(conn_index);
+        self.drop_sealed(conn_index);
         false
     }
 

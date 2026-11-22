@@ -154,9 +154,8 @@ fn buffered_mut(tls_conn: &mut TlsConn) -> &mut BufferedKind {
 }
 
 /// Feed received ciphertext into the TLS connection, decrypt plaintext into
-/// the accumulator, and flush any TLS output (handshake responses, alerts).
-/// Any TLS output produced (handshake responses, alerts) is appended to
-/// `out_sends`; the caller must route those through the per-connection send
+/// the accumulator, and place any TLS output (handshake responses, alerts)
+/// in `out`; the caller must route its sends through the per-connection send
 /// queue whatever the return value (dropping them leaks their pool slots).
 #[cfg(has_io_uring)]
 pub(super) fn feed_tls_recv_buffered(
@@ -166,7 +165,7 @@ pub(super) fn feed_tls_recv_buffered(
     conn_index: u32,
     generation: u32,
     ciphertext: &[u8],
-    out_sends: &mut Vec<crate::handler::BuiltSend>,
+    out: &mut super::backend_uring::TlsOutput<'_>,
 ) -> TlsRecvResult {
     let tls_conn = match tls_table.conns[conn_index as usize].as_mut() {
         Some(tc) => tc,
@@ -201,13 +200,8 @@ pub(super) fn feed_tls_recv_buffered(
             Ok(state) => state,
             Err(e) => {
                 if tls_conn.conn.wants_write() {
-                    let _ = take_tls_output_sends(
-                        tls_conn,
-                        send_copy_pool,
-                        conn_index,
-                        generation,
-                        out_sends,
-                    );
+                    let _ =
+                        take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out);
                 }
                 return TlsRecvResult::Error(super::record_layer_error(e));
             }
@@ -228,13 +222,7 @@ pub(super) fn feed_tls_recv_buffered(
         Ok(state) => state,
         Err(e) => {
             if tls_conn.conn.wants_write() {
-                let _ = take_tls_output_sends(
-                    tls_conn,
-                    send_copy_pool,
-                    conn_index,
-                    generation,
-                    out_sends,
-                );
+                let _ = take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out);
             }
             return TlsRecvResult::Error(super::record_layer_error(e));
         }
@@ -251,20 +239,29 @@ pub(super) fn feed_tls_recv_buffered(
 
     // Collect any TLS output (handshake messages, alerts, etc.). The count
     // from the last `process_new_packets` is exact here because nothing
-    // since has queued TLS output: draining plaintext only reads.
-    if tls_conn.conn.wants_write()
-        && !take_counted_tls_output_sends(
-            tls_conn,
-            send_copy_pool,
-            conn_index,
-            generation,
-            state.tls_bytes_to_write(),
-            out_sends,
-        )
-    {
-        return TlsRecvResult::Error(io::Error::other(
-            "send pool exhausted during TLS output flush",
-        ));
+    // since has queued TLS output: draining plaintext only reads. Output the
+    // pool has no slots for, or that queues behind sealed output already
+    // waiting, is drained into `out.held`.
+    if tls_conn.conn.wants_write() {
+        let placed = if out.holding() {
+            None
+        } else {
+            take_counted_tls_output_sends(
+                tls_conn,
+                send_copy_pool,
+                conn_index,
+                generation,
+                state.tls_bytes_to_write(),
+                out.sends,
+            )
+        };
+        let placed = match placed {
+            Some(placed) => placed,
+            None => take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out),
+        };
+        if !placed {
+            return TlsRecvResult::Error(io::Error::other("TLS output could not be written"));
+        }
     }
 
     let peer_closed = state.peer_has_closed();
@@ -286,19 +283,19 @@ pub(super) fn feed_tls_recv_buffered(
     TlsRecvResult::Ok
 }
 
-/// Collect pending TLS output as queueable sends. Public entry point takes
-/// `&mut TlsTable`. Returns `false` if pool exhaustion prevented draining
-/// all output; sends already appended must still be queued by the caller.
+/// Place pending TLS output in `out`. Public entry point takes
+/// `&mut TlsTable`. Returns `false` on a `write_tls` error; sends already in
+/// `out` must still be queued by the caller.
 #[cfg(has_io_uring)]
 pub(super) fn flush_tls_output_buffered(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
     generation: u32,
-    out_sends: &mut Vec<crate::handler::BuiltSend>,
+    out: &mut super::backend_uring::TlsOutput<'_>,
 ) -> bool {
     if let Some(tls_conn) = tls_table.get_mut(conn_index) {
-        take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out_sends)
+        take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out)
     } else {
         true
     }
@@ -432,32 +429,27 @@ pub(super) fn drain_tls_output(tls_conn: &mut TlsConn) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Drain rustls' pending TLS output into pool-backed sends appended to
-/// `out`, tagged `TlsSend`, all of it or none, through a `Vec`
-/// ([`drain_tls_output`]). The receive path, which knows the byte count,
-/// uses [`take_counted_tls_output_sends`] instead.
+/// Drain rustls' pending TLS output through a `Vec` ([`drain_tls_output`])
+/// and place it in `out`: as pool-backed sends tagged `TlsSend`, all of it
+/// or none, or in `out.held`. The receive path, which knows the byte count,
+/// tries [`take_counted_tls_output_sends`] first.
 ///
-/// Returns `false` on pool exhaustion or a `write_tls` error — the
-/// connection should be considered broken. Sends already appended to `out`
-/// by earlier calls must still be queued by the caller (their pool slots are
-/// otherwise leaked); queueing a prefix of the output ahead of a close is
-/// safe.
+/// Returns `false` on a `write_tls` error — the connection should be
+/// considered broken. Sends already in `out` by earlier calls must still be
+/// queued by the caller (their pool slots are otherwise leaked).
 #[cfg(has_io_uring)]
 pub(super) fn take_tls_output_sends(
     tls_conn: &mut TlsConn,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
     generation: u32,
-    out: &mut Vec<crate::handler::BuiltSend>,
+    out: &mut super::backend_uring::TlsOutput<'_>,
 ) -> bool {
     match drain_tls_output(tls_conn) {
-        Ok(bytes) => super::backend_uring::ciphertext_to_sends(
-            send_copy_pool,
-            conn_index,
-            generation,
-            &bytes,
-            out,
-        ),
+        Ok(bytes) => {
+            out.place(send_copy_pool, conn_index, generation, &bytes);
+            true
+        }
         Err(_) => false,
     }
 }
@@ -469,10 +461,11 @@ pub(super) fn take_tls_output_sends(
 /// directly. `PoolWriter` packs slots back to back, so `ceil(pending /
 /// slot_size)` slots hold the output exactly.
 ///
-/// Returns `false` when the pool cannot cover `pending`, on a `write_tls`
-/// error, and when rustls produced more than `pending` (a debug build
-/// panics); the connection should be considered broken. Sends appended to
-/// `out` by earlier calls are untouched.
+/// Returns `None`, having written nothing, when the pool cannot cover
+/// `pending`. Returns `Some(false)` on a `write_tls` error and when rustls
+/// produced more than `pending` (a debug build panics); the connection
+/// should be considered broken. Sends appended to `out` by earlier calls are
+/// untouched.
 #[cfg(has_io_uring)]
 fn take_counted_tls_output_sends(
     tls_conn: &mut TlsConn,
@@ -481,11 +474,11 @@ fn take_counted_tls_output_sends(
     generation: u32,
     pending: usize,
     out: &mut Vec<crate::handler::BuiltSend>,
-) -> bool {
+) -> Option<bool> {
     let slots = pending.div_ceil(send_copy_pool.slot_size() as usize);
     let owner = SlotOwner::conn(conn_index, generation);
     let Ok(mut permit) = send_copy_pool.reserve_slots(owner, slots) else {
-        return false;
+        return None;
     };
     let mut writer = PoolWriter::new(send_copy_pool, &mut permit);
     while tls_conn.conn.wants_write() {
@@ -493,7 +486,7 @@ fn take_counted_tls_output_sends(
             Ok(0) | Err(_) => {
                 writer.release_all();
                 send_copy_pool.release_reservation(permit);
-                return false;
+                return Some(false);
             }
             Ok(_) => {}
         }
@@ -511,7 +504,7 @@ fn take_counted_tls_output_sends(
             crate::completion::OpTag::TlsSend,
         ));
     }
-    true
+    Some(true)
 }
 
 #[cfg(has_io_uring)]

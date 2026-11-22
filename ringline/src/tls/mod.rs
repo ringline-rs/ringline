@@ -777,21 +777,21 @@ impl TlsTable {
     /// left, and a failure found on the send path leaves its alert in
     /// rustls.
     ///
-    /// Returns `None` when the alert was placed in `out`, or when there was
-    /// nothing to queue. Returns `Some(ciphertext)`, the encrypted alert and
-    /// anything rustls had queued ahead of it, when the pool had no slots for
-    /// it. The caller keeps it in `ConnSendState::sealed` and
-    /// passes it to
-    /// [`retry_close_notify_queued`](Self::retry_close_notify_queued).
+    /// The output goes to `out`: as sends when the pool takes it and the
+    /// connection has no sealed output waiting, and otherwise into
+    /// `out.held`, for the caller to append to the connection's sealed
+    /// output, behind the records already waiting there.
     #[cfg(has_io_uring)]
     pub fn send_close_notify_queued(
         &mut self,
         conn_index: u32,
         generation: u32,
         send_copy_pool: &mut SendCopyPool,
-        out: &mut Vec<crate::handler::BuiltSend>,
-    ) -> Option<Vec<u8>> {
-        let tls_conn = self.get_mut(conn_index)?;
+        out: &mut backend_uring::TlsOutput<'_>,
+    ) {
+        let Some(tls_conn) = self.get_mut(conn_index) else {
+            return;
+        };
         #[cfg(not(feature = "tls-buffered"))]
         {
             // `queue_close_notify` appends anything rustls had already queued
@@ -802,59 +802,35 @@ impl TlsTable {
             // the alert on the wire.
             let mut scratch = Vec::new();
             if unbuffered::queue_close_notify(tls_conn, &mut scratch).is_err() {
-                return None;
+                return;
             }
-            // Shared with the recv/flush paths rather than re-chunked here, so
-            // the all-or-nothing contract has one implementation: a truncated
-            // alert on the wire is worse than none.
-            if backend_uring::ciphertext_to_sends(
-                send_copy_pool,
-                conn_index,
-                generation,
-                &scratch,
-                out,
-            ) || scratch.is_empty()
-            {
-                None
-            } else {
-                Some(scratch)
-            }
+            out.place(send_copy_pool, conn_index, generation, &scratch);
         }
         // Bound as `b`, not `buffered`: the module of that name is used on the
         // next line, and a value/module name collision here reads as a bug.
         #[cfg(feature = "tls-buffered")]
         {
-            let b = tls_conn.conn.as_buffered_mut()?;
+            let Some(b) = tls_conn.conn.as_buffered_mut() else {
+                return;
+            };
             b.send_close_notify();
             tls_conn.close_notify_sent = true;
-            // The alert leaves rustls when it is drained, so when the pool
-            // has no slot for it the bytes are kept for the retry, as on the
-            // unbuffered engine.
-            let scratch = buffered::drain_tls_output(tls_conn).ok()?;
-            if backend_uring::ciphertext_to_sends(
-                send_copy_pool,
-                conn_index,
-                generation,
-                &scratch,
-                out,
-            ) || scratch.is_empty()
-            {
-                None
-            } else {
-                Some(scratch)
-            }
+            // The alert leaves rustls when it is drained, so output the pool
+            // has no slot for is kept in `out.held`, as on the unbuffered
+            // engine.
+            let Ok(scratch) = buffered::drain_tls_output(tls_conn) else {
+                return;
+            };
+            out.place(send_copy_pool, conn_index, generation, &scratch);
         }
     }
 
-    /// Place a close_notify that [`send_close_notify_queued`] could not:
-    /// `retained` is what it returned. Appends the sends to `out` and returns
-    /// `true`, or appends nothing and returns `false` if the pool still has
-    /// no slot. Called from `try_finalize_close` once the connection's own
-    /// sends have drained.
-    ///
-    /// [`send_close_notify_queued`]: Self::send_close_notify_queued
+    /// Place a connection's sealed output (`ConnSendState::sealed`):
+    /// appends the sends to `out` and returns `true`, or appends nothing and
+    /// returns `false` if the pool has no slots for all of it or the
+    /// connection has no TLS state.
     #[cfg(has_io_uring)]
-    pub fn retry_close_notify_queued(
+    pub fn place_sealed(
         &mut self,
         conn_index: u32,
         generation: u32,
