@@ -572,7 +572,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   first.
 - A plain send (`send`, `send_parts().build`, `submit_batch`,
   `forward_recv_buf`) made while a bounded send waits for send-pool slots on
-  the same connection is refused with `Other` ("a bounded send waits on this
+  the same connection is refused with `Other` ("a send waits on this
   connection"), on both backends; before, it went out ahead of the waiting
   send. Nothing is queued, so the same buffer can be sent once the waiting
   send is admitted. On io_uring a plaintext send of guards only at or above
@@ -587,6 +587,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection with `NotConnected` ("connection is closing"). Before, it stayed
   queued: it was sent ahead of the close once it won capacity, or failed when
   the connection was released.
+- On io_uring, TLS output produced while receiving (handshake flights,
+  session tickets, alerts) and an outbound connection's first flight wait for
+  send-pool slots when the pool has none. Before, the connection failed
+  ("send pool exhausted during TLS output flush"). While such output waits, a
+  plain send on the connection is refused as it is behind a waiting bounded
+  send, a bounded send on it waits behind the output, and the connection is
+  not moved to another worker. Output that would need more slots than the
+  pool has still fails the connection.
+- On io_uring, a TLS connection's close_notify and TLS output that waited for
+  send-pool slots go on the wire in the order they were encrypted. Before,
+  output produced after a close_notify that was waiting for a slot was sent
+  ahead of it, and the peer failed the connection with a record error instead
+  of reading the close.
 - `Runtime::shutdown` (and dropping the `Runtime`) returns once every
   pool-mode acceptor thread has exited, so a pool-mode listener's port is
   free when it returns. It may block for up to 10 ms while an acceptor

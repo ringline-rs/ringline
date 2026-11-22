@@ -28,6 +28,15 @@
 //! queue, and the reads of the head pop the entries at the front that are no
 //! longer live, so each entry is pushed once and leaves once, popped at the
 //! front or dropped by `compact`.
+//!
+//! On io_uring a connection can also have a sealed ticket
+//! ([`SendCompletions::push_sealed`]): TLS output the driver holds because
+//! the send pool had no slots for it. It goes at the front of its
+//! connection's queue, has no task and no future, and leaves through the
+//! driver: the event loop places its output when the capacity wake finds it
+//! servable ([`SendCompletions::take_sealed_serve`]), or the driver drops it
+//! (`remove_sealed`, `abort_connection`, `remove_connection`).
+//!
 //! Design:
 //! `docs/send-completion-slots-design.md`, `docs/send-admission-design.md`
 //! (section 2).
@@ -46,7 +55,7 @@
 //! ```
 //!
 //! **An entry leaves the table through its future, never through its
-//! owner.** The future's `Drop` cancels the entry (`cancel`): a waiting one
+//! owner.** (A sealed ticket has neither; see above.) The future's `Drop` cancels the entry (`cancel`): a waiting one
 //! goes, an in-flight one becomes `Abandoned` and its completion frees it,
 //! a resolved one goes with its result. The owning task's death changes no
 //! entry's state. A connection task is dropped with the driver state
