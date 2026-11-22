@@ -1,0 +1,105 @@
+# Checks DirectIoOpenOptions::dsync's doc claims (ringline/src/direct_io.rs,
+# dsync()) on a null_blk device with a configurable write cache and FUA:
+#   (1) io_uring sends each dsync write with FUA;
+#   (2) without FUA support the kernel follows the write with a cache flush;
+#   (3) the mio backend's pwrite(2) is followed by a cache flush;
+#   (4) a write-through cache gets neither FUA nor flush.
+# Method: block tracepoints around 64 sequential 4 KiB direct_io writes per arm;
+# a histogram of rwbs at block_bio_queue (what was submitted) and
+# block_rq_issue (what the device got), plus an io_uring_submit_req count that
+# shows which backend ran.
+#
+# Submit: systemslab submit experiments/dsync-fua-null-blk.toml [-p image=debian-13-7.1]
+# The probe is experiments/dsync-fua-probe.rs, built as a ringline example in
+# the guest.
+#
+# Predictions (from reading block/fops.c and blk-flush.c, before the first run):
+#   wb_fua dsync, uring: 64 W..F.. (FUA) writes, no flush requests.
+#   wb_fua dsync, mio:   64 FUA writes and about 64 flushes (generic_write_sync
+#                        after the synchronous direct write).
+#   wb_nofua dsync:      writes without FUA plus about one flush per write.
+#   wt and wb_fua_sysfs_wt dsync: no FUA, no flush.
+#   ctrl (wb_fua, no dsync): no FUA, no flush. A FUA or flush here means the
+#                        method counts something other than the probe.
+# Refuted if: uring sends no FUA on wb_fua; mio shows no flushes on wb_fua
+# (then the doc's pwrite claim is wrong); wt shows FUA or flushes.
+# Result (2026-11-15, SystemsLab 01a1e100-79d6 on 6.12, 01a1e100-7b31 on 7.1;
+# this committed form rerun on 6.12 as 01a1e2ff with the same counts):
+# every arm as predicted except wb_nofua on mio, which issued two flushes per
+# write (128 for 64), not one: by reading the kernel, one for the stripped FUA
+# and one from generic_write_sync. The same on both kernels.
+name = "ringline dsync FUA/flush probe ({image})"
+
+[params]
+branch = "main"
+repo   = "https://github.com/ringline-rs/ringline"
+image  = "debian-13-6.12"
+
+[[jobs]]
+name = "fua"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "{image}"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/fua.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json 2>/dev/null; echo
+  uname -srm; rustc --version
+  echo "io_uring_disabled=$(sysctl -n kernel.io_uring_disabled 2>/dev/null || echo unset)"
+  sudo -n true || { echo "NO SUDO"; exit 1; }
+  git clone -q {repo} src && git -C src checkout -q {branch} && cd src && git log --oneline -1
+  cp experiments/dsync-fua-probe.rs ringline/examples/fua_probe.rs
+  ulimit -Sn 65536
+  cargo build --locked --release -q -p ringline --example fua_probe || { echo "BUILD FAILED uring"; exit 1; }
+  cp target/release/examples/fua_probe /home/anvil/probe-uring
+  cargo build --locked --release -q -p ringline --example fua_probe --features force-mio --target-dir target-mio || { echo "BUILD FAILED mio"; exit 1; }
+  cp target-mio/release/examples/fua_probe /home/anvil/probe-mio
+  cd /home/anvil
+  /usr/sbin/modinfo -p null_blk | grep -E '^(fua|cache_size|memory_backed):' || echo "null_blk params missing"
+
+  cat > arm.sh <<'ARM'
+set -u
+name=$1; cache=$2; fua=$3; sysfs_wt=$4; dsync=$5
+T=/sys/kernel/tracing
+modprobe -r null_blk 2>/dev/null
+modprobe null_blk nr_devices=1 memory_backed=1 bs=4096 gb=1 cache_size=$cache fua=$fua || { echo "ARM $name: modprobe failed"; exit 1; }
+udevadm settle
+[ "$sysfs_wt" = 1 ] && echo "write through" > /sys/block/nullb0/queue/write_cache
+dev=$(( 0x$(stat -c %t /dev/nullb0) )),$(( 0x$(stat -c %T /dev/nullb0) ))
+echo "ARM $name cache=$cache fua=$fua sysfs_wt=$sysfs_wt dsync=$dsync dev=$dev write_cache=[$(cat /sys/block/nullb0/queue/write_cache)] queue_fua=$(cat /sys/block/nullb0/queue/fua)"
+for be in uring mio; do
+  echo 0 > $T/tracing_on; echo > $T/trace
+  echo 1 > $T/events/block/block_bio_queue/enable
+  echo 1 > $T/events/block/block_rq_issue/enable
+  echo 1 > $T/events/io_uring/io_uring_submit_req/enable
+  echo 1 > $T/tracing_on
+  /home/anvil/probe-$be /dev/nullb0 64 $dsync; rc=$?
+  echo 0 > $T/tracing_on
+  echo "RESULT $name $be probe_rc=$rc io_uring_submits=$(grep -c io_uring_submit_req: $T/trace)"
+  grep -E "block_(bio_queue|rq_issue): $dev " $T/trace | sed -E 's/.*(block_[a-z_]+): [0-9]+,[0-9]+ ([A-Z]+) .*/\1 \2/' | sort | uniq -c | sed "s/^/HIST $name $be /"
+done
+echo 0 > $T/events/enable
+modprobe -r null_blk
+ARM
+
+  sudo bash arm.sh wb_fua         64 1 0 1
+  sudo bash arm.sh wb_nofua       64 0 0 1
+  sudo bash arm.sh wt             0  1 0 1
+  sudo bash arm.sh wb_fua_sysfs_wt 64 1 1 1
+  sudo bash arm.sh ctrl           64 1 0 0
+  echo ALLDONE
+} 2>&1 | tee fua.log
+grep -q '^ALLDONE' fua.log || exit 1
+! grep -qE 'probe_rc=[1-9]|modprobe failed|BUILD FAILED' fua.log
+'''

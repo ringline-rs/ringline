@@ -1,0 +1,93 @@
+# Runs ringline's nvme_smoke example (NVMe passthrough over IORING_OP_URING_CMD:
+# open with Identify Namespace, reads of LBA 0, a write-and-restore at LBA 8,
+# flush) against an NVMe namespace served by the kernel's NVMe target over the
+# loop transport (nvmet + nvme-loop), backed by a 256 MiB file. It covers
+# ringline and the kernel's NVMe passthrough path; the target is software, so
+# it does not cover a physical controller's behaviour.
+#
+# Positive control: LBA 0 of the backing file holds a known marker, and the
+# smoke's printed LBA0 bytes must start with it. LBA 8 must read back unchanged
+# from the file after the run (write-and-restore restored it).
+# Submit: systemslab submit experiments/nvme-smoke-loop.toml [-p image=debian-13-7.1]
+#
+# Prediction: NVME SMOKE: PASS, block_size=4096 (nvmet file backend takes the
+# backing filesystem's block size), the marker in LBA0, LBA 8 unchanged.
+# Result (2026-11-15, SystemsLab 01a1e100-7abb on 6.12, 01a1e100-7bcb on 7.1):
+# as predicted on both.
+name = "ringline nvme_smoke over nvme-loop ({image})"
+
+[params]
+branch = "main"
+repo   = "https://github.com/ringline-rs/ringline"
+image  = "debian-13-6.12"
+
+[[jobs]]
+name = "nvme"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "{image}"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/nvme.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json 2>/dev/null; echo
+  uname -srm; rustc --version
+  sudo -n true || { echo "NO SUDO"; exit 1; }
+  git clone -q {repo} src && git -C src checkout -q {branch} && cd src && git log --oneline -1
+  ulimit -Sn 65536
+  cargo build --locked --release -q -p ringline --example nvme_smoke || { echo "BUILD FAILED"; exit 1; }
+  cd /home/anvil
+
+  truncate -s 256M nvme.img
+  printf 'RINGLINE-NVME-LBA0' | dd of=nvme.img conv=notrunc status=none
+  head -c 4096 /dev/urandom | dd of=nvme.img bs=4096 seek=8 conv=notrunc status=none
+  dd if=nvme.img bs=4096 skip=8 count=1 status=none > lba8.before
+  sync
+
+  sudo modprobe nvmet || { echo "SETUP FAILED: nvmet"; exit 1; }
+  sudo modprobe nvme-loop || { echo "SETUP FAILED: nvme-loop"; exit 1; }
+  before=$(ls /dev/ng* 2>/dev/null | sort)
+  sudo bash -s <<'SETUP' || { echo "SETUP FAILED: configfs"; exit 1; }
+set -e
+C=/sys/kernel/config/nvmet
+mkdir $C/subsystems/rl
+echo 1 > $C/subsystems/rl/attr_allow_any_host
+mkdir $C/subsystems/rl/namespaces/1
+echo -n /home/anvil/nvme.img > $C/subsystems/rl/namespaces/1/device_path
+echo 1 > $C/subsystems/rl/namespaces/1/enable
+mkdir $C/ports/1
+echo loop > $C/ports/1/addr_trtype
+ln -s $C/subsystems/rl $C/ports/1/subsystems/rl
+echo "transport=loop,nqn=rl" > /dev/nvme-fabrics
+SETUP
+  sleep 2; sudo udevadm settle
+  after=$(ls /dev/ng* 2>/dev/null | sort)
+  ng=$(comm -13 <(echo "$before") <(echo "$after") | head -1)
+  [ -n "$ng" ] || { echo "SETUP FAILED: no new /dev/ng*"; ls -l /dev/nvme* /dev/ng* 2>&1; exit 1; }
+  echo "namespace char device: $ng"; ls -l /dev/nvme* /dev/ng*
+
+  sudo ./src/target/release/examples/nvme_smoke "$ng" 1 8; echo "smoke_rc=$?"
+
+  sudo nvme disconnect -n rl >/dev/null 2>&1 || echo 1 | sudo tee /sys/class/nvme-fabrics/ctl/nvme*/delete_controller >/dev/null 2>&1
+  sync
+  dd if=nvme.img bs=4096 skip=8 count=1 status=none > lba8.after
+  cmp -s lba8.before lba8.after && echo "lba8_restored=1" || echo "lba8_restored=0"
+  echo ALLDONE
+} 2>&1 | tee nvme.log
+grep -q '^ALLDONE' nvme.log || exit 1
+grep -q '^NVME SMOKE: PASS' nvme.log || exit 1
+grep -q 'block_size=4096' nvme.log || exit 1
+grep -q '^lba8_restored=1' nvme.log || exit 1
+grep -q '^smoke_rc=0' nvme.log || exit 1
+grep -q 'LBA0\[0..32\] = \[52, 49, 4e, 47' nvme.log
+'''
