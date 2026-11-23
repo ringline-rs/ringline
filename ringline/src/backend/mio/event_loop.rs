@@ -585,6 +585,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Convert raw fd to mio TcpStream.
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
         std_stream.set_nonblocking(true).ok();
+        // Apple targets: the flush uses `writev`, which cannot carry
+        // `MSG_NOSIGNAL`, so set `SO_NOSIGPIPE`, as std and mio do. Without
+        // it a write after `shutdown_write` raises SIGPIPE (`write_iovecs`).
+        #[cfg(target_vendor = "apple")]
+        {
+            let on: libc::c_int = 1;
+            // SAFETY: `raw_fd` is the socket `std_stream` owns.
+            unsafe {
+                libc::setsockopt(
+                    raw_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
         if self.driver.tcp_nodelay {
             std_stream.set_nodelay(true).ok();
         }
@@ -1391,7 +1408,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Mark in the completion table the awaited sends a `writev` found the
+    /// Mark in the completion table the awaited sends a flush write found the
     /// socket full for (`Driver::room_waited_sends`), before any task reads
     /// `SendCompletion::waited_for_room`.
     fn mark_room_waited_sends(&mut self) {

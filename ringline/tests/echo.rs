@@ -7196,7 +7196,7 @@ fn response_after_peer_fin_is_delivered() {
     stream.write_all(b"request").unwrap();
     stream.shutdown(std::net::Shutdown::Write).unwrap();
 
-    // Let the server's writev hit WouldBlock at least once so the retained
+    // Let the server's flush write hit WouldBlock at least once so the retained
     // pending_closes path is exercised.
     std::thread::sleep(Duration::from_millis(100));
 

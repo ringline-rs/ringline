@@ -5622,7 +5622,7 @@ impl SendCompletion {
     /// connection found the socket full while the send was in flight, that
     /// is, admitted and not settled. On io_uring that is a send of the
     /// connection that came back short or with `EAGAIN`, including one
-    /// that took no byte; on mio a `writev` that returned `WouldBlock`.
+    /// that took no byte; on mio a flush write that returned `WouldBlock`.
     /// Once true it stays true, and it can be read before the send settles.
     ///
     /// The flag is per connection at the moment of the write: every awaited

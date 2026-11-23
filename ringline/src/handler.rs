@@ -169,9 +169,9 @@ pub(crate) struct ConnSendState {
     /// What counts as having waited follows how each backend writes. On
     /// io_uring a send waited if an SQE of it came back short or with
     /// `EAGAIN` (`wait_for_room`); the sends queued behind it had not been
-    /// submitted. On mio a send waited if it was queued when a `writev`
+    /// submitted. On mio a send waited if it was queued when a flush write
     /// returned `WouldBlock` (`waited_entries`): that write carried the
-    /// queued sends, up to the 1024 iovecs one `writev` takes, and mio counts
+    /// queued sends, up to the 1024 iovecs one flush write takes, and mio counts
     /// every queued send, those past the first 1024 too.
     pub room_waited: bool,
     /// A send since the last completion that settled an awaited send waited
@@ -181,7 +181,7 @@ pub(crate) struct ConnSendState {
     /// Kept only while the driver's `track_room_waits` is set.
     pub send_waited: bool,
     /// mio: how many sends at the front of the queue were queued when a
-    /// `writev` last returned `WouldBlock`, and so waited for room; each
+    /// flush write last returned `WouldBlock`, and so waited for room; each
     /// that completes counts one off. Kept only while the driver's
     /// `track_room_waits` is set.
     #[cfg(not(has_io_uring))]
