@@ -347,6 +347,11 @@ pub(crate) struct Driver {
     /// operation was still running at its bound. A pool thread can still use
     /// the operation's buffer, so the worker leaks its event loop (#856).
     pub(crate) disk_io_outstanding: bool,
+    /// Ringkern's completion ring, which takes the reads and writes on block
+    /// devices that would otherwise go to the disk-I/O pool; `None` when no
+    /// file subsystem is configured.
+    #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+    pub(crate) kernel_ring: Option<super::kernel_ring::KernelRing>,
 
     // ── Filesystem file management ──────────────────────────────────
     /// Filesystem file table (allocates file slots and generations).
@@ -373,13 +378,17 @@ pub(crate) struct Driver {
 }
 
 impl Driver {
-    /// At worker exit: tell the disk-I/O pool to answer the requests it has
+    /// At worker exit: with the `ringkern` feature on Hermit, first wait for
+    /// the ring operations in flight (`drain_kernel_ring_at_exit`, up to its
+    /// own bound). Then tell the disk-I/O pool to answer the requests it has
     /// not started with `-ECANCELED`, then wait up to [`DISK_IO_EXIT_BOUND`]
     /// for the started ones that use a caller's buffer (`disk_io_borrowing`).
     /// Any other request uses only memory its closure owns, which outlives
     /// the worker. Responses are dropped: no task is polled again. Sets
     /// `disk_io_outstanding` if one is still running at the bound.
     pub(crate) fn drain_disk_io_at_exit(&mut self) {
+        #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+        self.drain_kernel_ring_at_exit();
         let Some(pool) = self.disk_io_pool.as_ref() else {
             return;
         };
@@ -408,7 +417,33 @@ impl Driver {
                 }
             }
         }
-        self.disk_io_outstanding = !wait.is_empty();
+        self.disk_io_outstanding |= !wait.is_empty();
+    }
+
+    /// At worker exit: wait for the ring operations in flight, which read or
+    /// write a caller's buffer, until none is left or [`DISK_IO_EXIT_BOUND`]
+    /// has passed. The bound is checked between waits, and a wait returns
+    /// when at least one operation completes; Ringkern fails every ring
+    /// operation if one of its NVMe commands times out. Sets
+    /// `disk_io_outstanding` if one is still running.
+    #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+    fn drain_kernel_ring_at_exit(&mut self) {
+        let Some(ring) = self.kernel_ring.as_mut() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + DISK_IO_EXIT_BOUND;
+        let mut done = Vec::new();
+        while ring.has_in_flight() && std::time::Instant::now() < deadline {
+            done.clear();
+            if ring.reap(&mut done, true).is_err() {
+                break;
+            }
+            for (key, _) in &done {
+                self.disk_io_borrowing.remove(key);
+                self.disk_io_in_flight.remove(key);
+            }
+        }
+        self.disk_io_outstanding |= ring.has_in_flight();
     }
 
     /// Bytes the connection holds that no consumer has taken: the
@@ -649,6 +684,22 @@ impl Driver {
             disk_io_borrowing: std::collections::HashSet::new(),
             write_orders: crate::disk_order::WriteOrders::default(),
             disk_io_outstanding: false,
+            #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+            kernel_ring: {
+                let entries: u32 = [
+                    config.fs.as_ref().map(|f| f.max_commands_in_flight),
+                    config.direct_io.as_ref().map(|d| d.max_commands_in_flight),
+                ]
+                .into_iter()
+                .flatten()
+                .map(u32::from)
+                .sum();
+                if entries == 0 {
+                    None
+                } else {
+                    Some(super::kernel_ring::KernelRing::new(entries)?)
+                }
+            },
             fs_files: config
                 .fs
                 .as_ref()
@@ -713,6 +764,8 @@ impl Driver {
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,
             ticket_waiting: false,
+            #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+            kernel_ring: &mut self.kernel_ring,
         }
     }
 
