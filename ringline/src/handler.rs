@@ -2641,6 +2641,9 @@ pub(crate) struct DriverCtx<'a> {
     /// send. Set by the entry points of the non-waiting sends; false
     /// elsewhere.
     pub(crate) ticket_waiting: bool,
+    /// See `Driver::kernel_ring`.
+    #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+    pub(crate) kernel_ring: &'a mut Option<crate::backend::mio::kernel_ring::KernelRing>,
 }
 
 #[cfg(not(has_io_uring))]
@@ -3270,6 +3273,67 @@ impl<'a> DriverCtx<'a> {
         Ok(())
     }
 
+    /// Submit a read or write of `len` bytes at `offset` through `addr` on
+    /// Ringkern's completion ring as the operation `key`, if the file is a
+    /// block device; `None` if the ring does not take it, for the caller to
+    /// send it to the pool. Counted, bounded and ordered as a pool request
+    /// is, and completed in `drain_channels`.
+    ///
+    /// The ring finds the file by `fd` at submission and does not use the fd
+    /// afterwards, so a close while the operation runs does not affect it.
+    #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+    #[allow(clippy::too_many_arguments)]
+    fn submit_ring(
+        &mut self,
+        kind: FileKind,
+        index: u16,
+        generation: u32,
+        fd: std::os::fd::RawFd,
+        opcode: u8,
+        offset: u64,
+        addr: usize,
+        len: u32,
+        order: Option<DiskOrder>,
+        key: crate::runtime::DiskIoKey,
+    ) -> Option<io::Result<()>> {
+        let ring = self.kernel_ring.as_mut()?;
+        if len > crate::backend::mio::kernel_ring::MAX_LEN
+            || !ring.takes(kind, index, generation, fd)
+        {
+            return None;
+        }
+        let subsystem = kind.pool_subsystem();
+        let Some(limit) = self.disk_io_limits[subsystem as usize] else {
+            return Some(Err(subsystem.not_configured()));
+        };
+        if self.disk_io_counts[subsystem as usize] >= limit {
+            return Some(Err(subsystem.exhausted()));
+        }
+        let sqe = crate::sys::RingSqe {
+            opcode,
+            fd,
+            offset,
+            addr: addr as u64,
+            len: u64::from(len),
+            user_data: key,
+            ..Default::default()
+        };
+        if let Err(e) = ring.submit(sqe) {
+            // A full ring: the subsystems' bounds sum above its 4096 entries.
+            if e.raw_os_error() == Some(libc::EBUSY) {
+                return Some(Err(subsystem.exhausted()));
+            }
+            return Some(Err(e));
+        }
+        self.disk_io_in_flight.insert(key, subsystem);
+        self.disk_io_counts[subsystem as usize] += 1;
+        self.disk_io_borrowing.insert(key);
+        if let Some(DiskOrder::Write(file)) = order {
+            self.write_orders.begin_write(file, key);
+        }
+        Some(Ok(()))
+    }
+
     // ── fs and direct I/O files ───────────────────────────────────────
     //
     // fs files and direct I/O files run the same code, each kind with its own
@@ -3391,6 +3455,21 @@ impl<'a> DriverCtx<'a> {
     ) -> io::Result<u64> {
         let fd = self.validate_file(kind, index, generation)?;
         let buf_addr = buf as usize;
+        #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+        if let Some(submitted) = self.submit_ring(
+            kind,
+            index,
+            generation,
+            std::os::fd::AsRawFd::as_raw_fd(&*fd),
+            crate::sys::RING_OP_READ,
+            offset,
+            buf_addr,
+            len,
+            None,
+            key,
+        ) {
+            return submitted.map(|()| 0);
+        }
         let work = Box::new(move || {
             let r = match crate::sys::pread(
                 std::os::fd::AsRawFd::as_raw_fd(&*fd),
@@ -3427,6 +3506,25 @@ impl<'a> DriverCtx<'a> {
     ) -> io::Result<u64> {
         let fd = self.validate_file(kind, index, generation)?;
         let buf_addr = buf as usize;
+        #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+        if let Some(submitted) = self.submit_ring(
+            kind,
+            index,
+            generation,
+            std::os::fd::AsRawFd::as_raw_fd(&*fd),
+            crate::sys::RING_OP_WRITE,
+            offset,
+            buf_addr,
+            len,
+            Some(DiskOrder::Write(crate::disk_order::OrderKey {
+                kind,
+                index,
+                generation,
+            })),
+            key,
+        ) {
+            return submitted.map(|()| 0);
+        }
         let work = Box::new(move || {
             let r = match crate::sys::pwrite(
                 std::os::fd::AsRawFd::as_raw_fd(&*fd),
@@ -3492,6 +3590,10 @@ impl<'a> DriverCtx<'a> {
         generation: u32,
     ) -> io::Result<()> {
         self.validate_file(kind, index, generation)?;
+        #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+        if let Some(ring) = self.kernel_ring.as_mut() {
+            ring.forget(kind, index);
+        }
         self.file_fds_mut(kind)[index as usize] = None;
         if let Some(files) = self.file_table_mut(kind) {
             files.release(index);

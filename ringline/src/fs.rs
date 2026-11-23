@@ -4,7 +4,9 @@
 //! symlink_metadata, rename, remove, mkdir). Reads and writes that bypass the
 //! page cache are in [`crate::direct_io`]. File operations do not block the worker thread:
 //! on io_uring the kernel completes them inline or on its own threads (see
-//! below); on mio they run on a thread pool. On io_uring [`close`] does not
+//! below); on mio they run on a thread pool, except that with the `ringkern`
+//! feature on Hermit reads and writes on a block device go to Ringkern's
+//! completion ring. On io_uring [`close`] does not
 //! wait for the file to close; on mio it closes the fd on the worker unless
 //! an operation queued on it still holds it.
 //!

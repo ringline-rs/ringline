@@ -113,7 +113,88 @@ mod ringkern_sys {
     unsafe extern "C" {
         pub(super) fn sys_pread(fd: i32, buf: *mut u8, len: usize, offset: isize) -> isize;
         pub(super) fn sys_pwrite(fd: i32, buf: *const u8, len: usize, offset: isize) -> isize;
+        pub(super) fn sys_ring_setup(entries: u32) -> i32;
+        pub(super) fn sys_ring_enter(
+            fd: i32,
+            sqes: *const super::RingSqe,
+            nsqes: usize,
+            cqes: *mut super::RingCqe,
+            ncqes: usize,
+            min_complete: usize,
+        ) -> isize;
     }
+}
+
+/// A submission to Ringkern's completion ring, as its `sys_ring_enter`
+/// takes it.
+#[cfg(all(target_os = "hermit", feature = "ringkern"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RingSqe {
+    /// [`RING_OP_READ`] or [`RING_OP_WRITE`].
+    pub(crate) opcode: u8,
+    /// Must be zero.
+    pub(crate) reserved: [u8; 3],
+    pub(crate) fd: i32,
+    /// Byte offset in the file.
+    pub(crate) offset: u64,
+    /// Address of the buffer, which must stay valid until the completion is
+    /// reaped.
+    pub(crate) addr: u64,
+    pub(crate) len: u64,
+    /// Returned in the completion.
+    pub(crate) user_data: u64,
+}
+
+/// A completion from Ringkern's completion ring.
+#[cfg(all(target_os = "hermit", feature = "ringkern"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RingCqe {
+    /// The submission's `user_data`.
+    pub(crate) user_data: u64,
+    /// Bytes transferred, or a negative errno.
+    pub(crate) result: i64,
+}
+
+/// A read of `len` bytes at `offset` into `addr`.
+#[cfg(all(target_os = "hermit", feature = "ringkern"))]
+pub(crate) const RING_OP_READ: u8 = 1;
+/// A write of `len` bytes from `addr` at `offset`.
+#[cfg(all(target_os = "hermit", feature = "ringkern"))]
+pub(crate) const RING_OP_WRITE: u8 = 2;
+
+/// Ringkern's `sys_ring_setup`: a completion ring holding up to `entries`
+/// operations not yet reaped, as a descriptor that polls readable while
+/// completions wait.
+#[cfg(all(target_os = "hermit", feature = "ringkern"))]
+pub(crate) fn ring_setup(entries: u32) -> io::Result<std::os::fd::OwnedFd> {
+    let fd = unsafe { ringkern_sys::sys_ring_setup(entries) };
+    let fd = hermit_result(fd as isize)? as RawFd;
+    // SAFETY: the kernel returned a new descriptor that nothing else owns.
+    Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+}
+
+/// Ringkern's `sys_ring_enter`: submits `sqes`, waits until `min_complete`
+/// completions wait, and moves up to `cqes.len()` of them into `cqes`.
+/// Returns the number moved.
+#[cfg(all(target_os = "hermit", feature = "ringkern"))]
+pub(crate) fn ring_enter(
+    fd: RawFd,
+    sqes: &[RingSqe],
+    cqes: &mut [RingCqe],
+    min_complete: usize,
+) -> io::Result<usize> {
+    hermit_result(unsafe {
+        ringkern_sys::sys_ring_enter(
+            fd,
+            sqes.as_ptr(),
+            sqes.len(),
+            cqes.as_mut_ptr(),
+            cqes.len(),
+            min_complete,
+        )
+    })
 }
 
 /// A Hermit kernel call's return value: the value, or the negative errno it

@@ -14,9 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `sys_pwrite` calls of Ringkern, a Hermit fork, instead of a seek and a
   read or write under one process-wide lock, so the pool's threads run
   them in parallel. Files on file systems where Ringkern has no such calls
-  (it returns `ENOSYS`) keep the locked path. A build with the feature that
-  does file I/O needs a Ringkern kernel to link; without the feature,
-  nothing changes.
+  (it returns `ENOSYS`) keep the locked path. A build with the feature
+  needs a Ringkern kernel built with its `nvme` feature to link; without
+  the feature, nothing changes. Reads and writes on a block device go
+  instead to Ringkern's completion ring, submitted and reaped by the
+  worker's event loop, so they are not limited by the pool's thread count;
+  the ring's descriptor wakes the loop when completions wait. fsync stays
+  on the pool, held behind the writes before it as on every other file.
 
 - The mio backend builds for `x86_64-unknown-hermit` (Hermit unikernels), with
   `--features force-mio`. Building it needs `[patch.crates-io]` entries for
