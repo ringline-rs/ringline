@@ -41,17 +41,23 @@ pub(crate) struct SealedOutput {
 #[cfg(has_io_uring)]
 pub(crate) const SEALED_CONN_MAX: usize = 64 * 1024;
 
+/// The most close output (`close_notify` set) that is exempt from
+/// [`SEALED_CONN_MAX`] and the worker's bound: room for the alert and a
+/// record rustls had queued ahead of it, such as a `key_update`.
+#[cfg(has_io_uring)]
+pub(crate) const SEALED_CLOSE_EXEMPT: usize = 512;
+
 /// Append `bytes` to the sealed output in `state`, creating it if there is
 /// none, add them to `total` (`Driver::sealed_bytes`), and put `conn_index`
 /// on `dirty` (`Driver::sealed_dirty`) if it is not there.
 ///
 /// Returns `false`, holding nothing, when the connection's sealed output
-/// would then need more slots than `pool` has, or, unless `bytes` is a
-/// close_notify, when it would be over [`SEALED_CONN_MAX`] (or one slot, if
-/// larger) or the worker's sealed output would be over the pool's total
-/// bytes. A close_notify, with any records rustls had queued ahead of it, is
-/// exempt from the last two: there is one per connection, usually a few
-/// dozen bytes.
+/// would then need more slots than `pool` has, or when it would be over
+/// [`SEALED_CONN_MAX`] (or one slot, if larger) or the worker's sealed
+/// output would be over the pool's total bytes. Close output of at most
+/// [`SEALED_CLOSE_EXEMPT`] bytes is exempt from the last two; a connection
+/// produces close output at most once. Larger close output, such as the
+/// flight of a server closed before its handshake finished, is not.
 #[cfg(has_io_uring)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hold_sealed(
@@ -70,8 +76,8 @@ pub(crate) fn hold_sealed(
     if held.div_ceil(slot_size) > pool.slot_count() {
         return false;
     }
-    if !close_notify && (held > SEALED_CONN_MAX.max(slot_size) || *total + bytes.len() > pool_bytes)
-    {
+    let exempt = close_notify && bytes.len() <= SEALED_CLOSE_EXEMPT;
+    if !exempt && (held > SEALED_CONN_MAX.max(slot_size) || *total + bytes.len() > pool_bytes) {
         return false;
     }
     *total += bytes.len();

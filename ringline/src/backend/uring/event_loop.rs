@@ -21794,6 +21794,11 @@ mod tests {
             "the refused byte was not added"
         );
         assert!(el.driver.hold_sealed(conn_index, b"alert", true, false));
+        let flight = vec![0; crate::handler::SEALED_CLOSE_EXEMPT + 1];
+        assert!(
+            !el.driver.hold_sealed(conn_index, &flight, true, false),
+            "close output over the exemption is bounded"
+        );
         assert_eq!(el.driver.sealed_bytes, max + 5);
     }
 
@@ -21819,8 +21824,14 @@ mod tests {
             !el.driver.hold_sealed(last, b"x", false, true),
             "over the worker's bound"
         );
+        let closing = accept_connection(&mut el);
+        let flight = vec![0; crate::handler::SEALED_CLOSE_EXEMPT + 1];
         assert!(
-            el.driver.hold_sealed(last, b"alert", true, false),
+            !el.driver.hold_sealed(closing, &flight, true, false),
+            "close output over the exemption is bounded"
+        );
+        assert!(
+            el.driver.hold_sealed(closing, b"alert", true, false),
             "a close_notify is exempt"
         );
 
