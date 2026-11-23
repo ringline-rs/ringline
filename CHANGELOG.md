@@ -1575,6 +1575,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- mio: a send on a connection whose write side was shut down raised SIGPIPE,
+  which kills a process that has not set SIGPIPE to ignored (a binary that
+  restores the default disposition, or a C program embedding ringline; Rust
+  binaries ignore it by default). The send now fails with `BrokenPipe`.
+  Releases from 0.1.0 have this. On Linux and Android the flush wrote with
+  `writev`, which cannot carry `MSG_NOSIGNAL`, and now uses `sendmsg` with
+  it (Android is not tested). On macOS the flush still uses `writev`;
+  accepted connections did not have `SO_NOSIGPIPE`, and now do, and
+  outbound connections already had it.
 - Linux: `physical_core_count()`, and so the default worker count, counted
   only the cores below the lowest-numbered offline CPU (#974). Releases from
   0.2.0 have this. On a host booted with `nosmt` that numbers SMT siblings
