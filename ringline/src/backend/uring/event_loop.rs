@@ -21545,16 +21545,18 @@ mod tests {
         assert!(el.executor.send_capacity_turn(bounded, 1), "the send is the head");
     }
 
-    /// A close while output waits appends the close_notify behind it, and
-    /// the close drain sends both, in that order, once slots are free.
+    /// A close while output waits appends the close_notify behind it, even
+    /// when a slot is free for the alert, and the close drain sends both, in
+    /// that order, once slots are free.
     #[test]
     fn a_close_notify_waits_behind_held_tls_output() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let idx = conn_index as usize;
         let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
-        let held = exhaust_send_pool(&mut el);
+        let mut held = exhaust_send_pool(&mut el);
         assert!(el.driver.hold_sealed(conn_index, HELD, false, true));
+        el.driver.send_copy_pool.release(held.pop().unwrap());
         el.driver.close_connection_graceful(conn_index);
         let sealed = el.driver.send_queues[idx].sealed.as_ref().unwrap();
         assert!(sealed.close_notify && sealed.receive);
