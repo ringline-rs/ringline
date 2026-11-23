@@ -1,6 +1,6 @@
 [package]
 name = "ringline"
-version = "0.7.0-alpha.182"
+version = "0.7.0-alpha.183"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -17,6 +17,12 @@ check-cfg = ["cfg(has_io_uring)", "cfg(uring_engine)"]
 
 [features]
 force-mio = []
+# On Hermit, positional file reads and writes use the `sys_pread` and
+# `sys_pwrite` calls of Ringkern, a Hermit fork, instead of a seek and a read
+# or write under a process-wide lock; files on file systems without them
+# keep the locked path. A build with it that does file I/O needs a Ringkern
+# kernel to link. No effect on other targets.
+ringkern = []
 testing = []
 # Selects rustls' buffered API (`ServerConnection`/`ClientConnection`,
 # `writer()`/`write_tls()`) for the TLS record layer. Without it the
