@@ -6,8 +6,9 @@
 //! sends the result back via a per-worker crossbeam channel + `WakeFd`,
 //! matching the pattern used by [`BlockingPool`](crate::blocking::BlockingPool).
 //!
-//! Unlike the blocking pool, these threads do NOT use `SCHED_IDLE` — disk I/O
-//! is latency-sensitive and should not be deprioritized.
+//! These threads keep the scheduling policy of the worker that starts them,
+//! which is the launching thread's (`SCHED_OTHER` by default); the blocking
+//! pool's threads run at `SCHED_BATCH` on Linux.
 
 use std::thread;
 

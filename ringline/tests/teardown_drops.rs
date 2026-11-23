@@ -394,8 +394,7 @@ fn a_blocking_handle_dropped_with_its_connection_drops_the_result() {
         .expect("launch");
     connect_and_reset(runtime.bound_addr().unwrap());
 
-    // The blocking pool runs at `SCHED_IDLE`, so on a loaded host its result
-    // can take seconds to arrive.
+    // On a loaded host the blocking pool's result can take seconds to arrive.
     let deadline = Instant::now() + Duration::from_secs(30);
     while BLOCKING_RESULTS_DROPPED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));

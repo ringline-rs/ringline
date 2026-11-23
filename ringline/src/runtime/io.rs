@@ -498,8 +498,8 @@ pub fn spawn_with_handle<T: 'static>(
 
 /// Offload a blocking closure to the dedicated blocking thread pool.
 ///
-/// The closure runs on a low-priority background thread (`SCHED_IDLE`),
-/// keeping the io_uring event loop unblocked. Returns a future that resolves
+/// The closure runs on a background thread, `SCHED_BATCH` on Linux, keeping
+/// the io_uring event loop unblocked. Returns a future that resolves
 /// to `Ok` with the closure's return value, or to `Err` with a
 /// [`JoinError`](crate::JoinError) if the closure panicked. A panic does not
 /// end the pool thread, and is handled under the runtime's

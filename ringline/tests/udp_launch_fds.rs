@@ -97,9 +97,9 @@ fn thread_ids() -> BTreeSet<OsString> {
 }
 
 /// Waits up to 30 s until the only threads left are those in `before`. Every
-/// pool thread holds each worker's wake fd until it exits. Blocking-pool
-/// threads run at `SCHED_IDLE`; on a busy host they can exit seconds after the
-/// workers join.
+/// pool thread holds each worker's wake fd until it exits. The pools' threads
+/// are not joined, so on a busy host they can exit seconds after the workers
+/// join.
 fn wait_for_runtime_threads_to_exit(before: &BTreeSet<OsString>) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

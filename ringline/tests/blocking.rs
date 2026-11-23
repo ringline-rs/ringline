@@ -306,8 +306,7 @@ fn a_result_whose_handle_was_dropped_is_dropped_on_arrival() {
         .launch::<DropsHandleEarly>()
         .expect("launch failed");
 
-    // The blocking pool runs at `SCHED_IDLE`, so on a loaded host its result
-    // can take seconds to arrive.
+    // On a loaded host the blocking pool's result can take seconds to arrive.
     let deadline = Instant::now() + Duration::from_secs(30);
     while RESULTS_DROPPED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
@@ -322,4 +321,58 @@ fn a_result_whose_handle_was_dropped_is_dropped_on_arrival() {
         "the closure finished before the timeout"
     );
     assert_eq!(dropped, 1, "the worker held the result of a dropped handle");
+}
+
+// ── Scheduling policy of the pool's threads ─────────────────────────
+
+/// The policy `sched_getscheduler` reported on a pool thread; -2 until then.
+#[cfg(target_os = "linux")]
+static POOL_POLICY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-2);
+
+#[cfg(target_os = "linux")]
+struct PoolPolicyHandler;
+
+#[cfg(target_os = "linux")]
+impl AsyncEventHandler for PoolPolicyHandler {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            // SAFETY: reads the calling thread's policy.
+            let policy = ringline::spawn_blocking(|| unsafe { libc::sched_getscheduler(0) })
+                .unwrap()
+                .await
+                .expect("closure returned");
+            POOL_POLICY.store(policy, Ordering::SeqCst);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        PoolPolicyHandler
+    }
+}
+
+/// A blocking-pool thread runs at `SCHED_BATCH`, not `SCHED_IDLE`, which gets
+/// almost no CPU on a busy host and which a thread cannot leave at the default
+/// `RLIMIT_NICE`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_blocking_pool_thread_runs_at_sched_batch() {
+    // SAFETY: reads the calling thread's policy.
+    if unsafe { libc::sched_getscheduler(0) } == libc::SCHED_IDLE {
+        // Started under `chrt -i`: the pool threads inherit SCHED_IDLE and,
+        // at the default `RLIMIT_NICE`, cannot leave it.
+        eprintln!("skipping: the test process runs at SCHED_IDLE");
+        return;
+    }
+    POOL_POLICY.store(-2, Ordering::SeqCst);
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .launch::<PoolPolicyHandler>()
+        .expect("launch failed");
+
+    common::join_workers(&shutdown, handles);
+    assert_eq!(POOL_POLICY.load(Ordering::SeqCst), libc::SCHED_BATCH);
 }

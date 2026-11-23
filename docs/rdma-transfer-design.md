@@ -189,8 +189,9 @@ revoked. Two ways to get that:
 
 Either way, re-registration runs on a `ringline::spawn_blocking` thread,
 which is a fabric caller like the worker, so the domain needs
-`FI_THREAD_SAFE` or a lock shared with the worker. The blocking pool runs at
-`SCHED_IDLE`, so a busy core can delay the re-registration.
+`FI_THREAD_SAFE` or a lock shared with the worker. The blocking pool's
+threads share the CPUs with the workers, so a busy host can delay the
+re-registration.
 
 Not known: the per-region cost, the region-count limit on EFA, and whether an
 rkey value can be reused (above). The choice depends on them.
