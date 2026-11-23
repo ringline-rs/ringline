@@ -1264,8 +1264,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
         self.driver.direct_recv_free.push(slot as u32);
         let conn_index = entry.conn_index;
+        // A connection closing after a failed send still takes the bytes of
+        // the receives that read its socket (`abort_connection`).
+        let draining = self.driver.abort_drain_pending(conn_index);
         let live = self.driver.connections.get(conn_index).is_some_and(|c| {
-            c.generation == entry.generation && matches!(c.lifecycle, Lifecycle::Open)
+            c.generation == entry.generation && (matches!(c.lifecycle, Lifecycle::Open) || draining)
         });
         if let Some(cs) = self.driver.connections.get_mut(conn_index)
             && cs.generation == entry.generation
@@ -1318,6 +1321,38 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_direct_held = 0;
+        }
+        if draining {
+            if result > 0 {
+                metrics::BYTES.add(metrics::bytes::RECEIVED, received as u64);
+                metrics::RECV_DIRECT.add(metrics::recv_direct::BYTES, received as u64);
+            }
+            // Receive again, without waiting, after a receive that returned
+            // bytes, until one returns `-EAGAIN`, the end or an error, or
+            // `ABORT_DRAIN_BUDGET` bytes have been read. `SOCK_NONEMPTY` is
+            // not used: a Unix-domain socket does not report it before Linux
+            // 6.17. After a failure of the receive in flight at the abort (its
+            // cancel, or a `POLL_FIRST` receive's `-EAGAIN`), which read
+            // nothing, receive once more.
+            let (dontwait_armed, remaining) =
+                match self.driver.abort_drains[conn_index as usize].as_mut() {
+                    Some(d) => {
+                        d.remaining = d.remaining.saturating_sub(received);
+                        (d.dontwait_armed, d.remaining)
+                    }
+                    None => (true, 0),
+                };
+            let again = !self.close_submitted(conn_index)
+                && remaining > 0
+                && (result > 0 || (result < 0 && !dontwait_armed));
+            if again && self.driver.begin_abort_drain(conn_index) {
+                if let Some(d) = self.driver.abort_drains[conn_index as usize].as_mut() {
+                    d.dontwait_armed = true;
+                }
+                return;
+            }
+            self.finish_abort_drain(conn_index);
+            return;
         }
         if result > 0 {
             metrics::BYTES.add(metrics::bytes::RECEIVED, received as u64);
@@ -3635,17 +3670,76 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// A connection whose close is already requested is left as that close
     /// left it: the close's lead cancelled this send, or the receive that
     /// took the socket's error recorded it first.
+    ///
+    /// For a plaintext connection whose read half is open, the socket is
+    /// read first: a receive arms only when a read parks, so bytes the peer
+    /// sent before it reset may still be queued there. The connection moves
+    /// to `Closing` now, so later sends fail, and `begin_abort_drain`
+    /// cancels the receive in flight or arms a `MSG_DONTWAIT` one; more
+    /// `MSG_DONTWAIT` receives follow while they return bytes, up to
+    /// `ABORT_DRAIN_BUDGET` bytes in all. The read half
+    /// ends with `err` when the reading ends (`finish_abort_drain`), and the
+    /// Close waits for that. The read half ends at once if a park of the
+    /// connection is pending or no receive can be cancelled or armed.
     fn abort_connection(&mut self, conn_index: u32, err: io::Error) {
-        let Some(cs) = self.driver.connections.get_mut(conn_index) else {
+        let Some(cs) = self.driver.connections.get(conn_index) else {
             return;
         };
         if cs.close_requested() {
             return;
         }
-        cs.read = ReadHalf::Error;
         let generation = cs.generation;
+        // With no receive in flight, `begin_abort_drain` arms a
+        // `MSG_DONTWAIT` one.
+        let dontwait_armed = !cs.recv_direct_armed;
+        if cs.recv_direct
+            && !cs.recv_finished()
+            && !self.driver.park_pending(conn_index)
+            && self.driver.begin_abort_drain(conn_index)
+        {
+            self.driver.abort_drains[conn_index as usize] =
+                Some(crate::backend::uring::driver::AbortDrain {
+                    generation,
+                    err,
+                    dontwait_armed,
+                    remaining: crate::backend::uring::driver::ABORT_DRAIN_BUDGET,
+                });
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.abort_draining = true;
+            }
+            self.driver.close_connection(conn_index);
+            return;
+        }
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.read = ReadHalf::Error;
+        }
         self.executor.fail_recv(conn_index, generation, err);
         self.driver.close_connection(conn_index);
+    }
+
+    /// End the read half of a connection that read its socket before the
+    /// close a failed send requested: record the send's error for the
+    /// reader, which sees the bytes the receives attached first, and let the
+    /// Close go ahead.
+    fn finish_abort_drain(&mut self, conn_index: u32) {
+        let Some(cs) = self.driver.connections.get_mut(conn_index) else {
+            return;
+        };
+        if !std::mem::replace(&mut cs.abort_draining, false) {
+            return;
+        }
+        cs.read = ReadHalf::Error;
+        let Some(drain) = self.driver.abort_drains[conn_index as usize].take() else {
+            debug_assert!(
+                false,
+                "a draining connection without its abort_drains entry"
+            );
+            self.driver.defer_finalize_close(conn_index);
+            return;
+        };
+        let (generation, err) = (drain.generation, drain.err);
+        self.executor.fail_recv(conn_index, generation, err);
+        self.driver.defer_finalize_close(conn_index);
     }
 
     /// Return a copy-pool slot and note that send capacity came back.
@@ -13343,15 +13437,44 @@ mod tests {
         );
     }
 
+    /// The `MSG_DONTWAIT` receive a failed send armed to read the socket
+    /// (`begin_abort_drain`): its user_data and buffer. Panics if the last
+    /// SQE the ring took is not one on `conn_index`.
+    fn abort_drain_receive(
+        el: &AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+    ) -> (UserData, *mut u8) {
+        let sqe = el.driver.ring.last_pushed.expect("an SQE was pushed");
+        let ud = UserData(sqe.user_data);
+        assert_eq!(ud.tag(), Some(OpTag::RecvDirect), "{:?}", sqe.op);
+        assert_eq!(ud.conn_index(), conn_index);
+        match sqe.op {
+            crate::backend::uring::sqe::Op::Recv {
+                buf,
+                flags,
+                poll_first,
+                ..
+            } => {
+                assert_eq!(flags, libc::MSG_DONTWAIT, "the receive does not wait");
+                assert!(!poll_first);
+                (ud, buf)
+            }
+            op => panic!("a direct receive is a Recv, not {op:?}"),
+        }
+    }
+
     /// What every failed send leaves for the reader: the read half records
     /// the failure, the reader parked on `with_data_result` is handed the
-    /// send's error, and the connection is closing.
+    /// send's error, and the connection is closing. The receive that reads
+    /// the socket first is completed here with `-EAGAIN`, an empty socket.
     fn assert_send_error_aborted(
         el: &mut AsyncEventLoop<NoopHandler>,
         conn_index: u32,
         generation: u32,
         errno: i32,
     ) {
+        let (ud, _buf) = abort_drain_receive(el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
         let cs = el
             .driver
             .connections
@@ -13498,6 +13621,290 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
 
         assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
+    }
+
+    /// A failed send's connection is closing, so later sends fail, but its
+    /// read half stays open, no error is recorded and the Close waits until
+    /// the receive that reads the socket completes.
+    fn assert_abort_draining(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(cs.close_requested(), "later sends fail");
+        assert_eq!(
+            cs.read,
+            ReadHalf::Open,
+            "the read half waits for the receive"
+        );
+        assert!(cs.recv_direct_armed);
+        assert!(el.driver.abort_drain_pending(conn_index));
+        assert!(
+            el.executor.recv_errors[conn_index as usize].is_none(),
+            "the error waits for the receive"
+        );
+        el.driver.try_finalize_close(conn_index);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_submitted,
+            "the Close waits for the receive"
+        );
+    }
+
+    /// A plaintext send error on `conn_index`, through `handle_send`.
+    fn fail_a_plaintext_send(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32, errno: i32) {
+        let generation = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el
+            .driver
+            .send_copy_pool
+            .copy_in(crate::buffer::send_copy::SlotOwner::NONE, b"reply")
+            .unwrap();
+        let ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, generation),
+        );
+        el.test_dispatch_cqe(ud.raw(), -errno, 0);
+    }
+
+    /// Bytes the peer sent before it reset, still queued in the socket when
+    /// a send fails, reach the reader before the send's error
+    /// (send-recv paradigms audit F3).
+    #[test]
+    fn a_send_error_delivers_the_bytes_queued_in_the_socket_first() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        fail_a_plaintext_send(&mut el, conn_index, libc::ECONNRESET);
+        assert_abort_draining(&mut el, conn_index);
+
+        let (ud, buf) = abort_drain_receive(&el, conn_index);
+        // SAFETY: the receive's buffer has room for `recv_direct_region` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(b"ping".as_ptr(), buf, 4) };
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(ud.raw(), 4, 0);
+        // Bytes are followed by another receive; `-EAGAIN` ends the reading.
+        assert_abort_draining(&mut el, conn_index);
+        let (ud, _buf) = abort_drain_receive(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+
+        assert_eq!(el.driver.accumulators.data(conn_index), b"ping");
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(cs.read, ReadHalf::Error);
+        assert!(!el.driver.abort_drain_pending(conn_index));
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader is handed the send's error");
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+        assert!(
+            el.driver.pending_finalize_closes.contains(&conn_index),
+            "the Close goes ahead"
+        );
+    }
+
+    /// A receive that returns bytes is followed by another, with or without
+    /// `SOCK_NONEMPTY` (a Unix-domain socket does not report it before Linux
+    /// 6.17); the read half ends when one returns `-EAGAIN`.
+    #[test]
+    fn a_send_error_reads_the_socket_until_a_receive_finds_it_empty() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        fail_a_plaintext_send(&mut el, conn_index, libc::ECONNRESET);
+
+        let (ud, buf) = abort_drain_receive(&el, conn_index);
+        // SAFETY: as above.
+        unsafe { std::ptr::copy_nonoverlapping(b"ab".as_ptr(), buf, 2) };
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(ud.raw(), 2, 0);
+        assert_abort_draining(&mut el, conn_index);
+
+        let (ud, buf) = abort_drain_receive(&el, conn_index);
+        // SAFETY: as above.
+        unsafe { std::ptr::copy_nonoverlapping(b"cd".as_ptr(), buf, 2) };
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(ud.raw(), 2, 0);
+        assert_abort_draining(&mut el, conn_index);
+        let (ud, _buf) = abort_drain_receive(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+
+        assert_eq!(el.driver.accumulators.data(conn_index), b"abcd");
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader is handed the send's error");
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+    }
+
+    /// A receive in flight when the send fails is cancelled, since it may
+    /// wait for bytes that never come. If it read before the cancel, its
+    /// bytes reach the reader.
+    #[test]
+    fn a_send_error_cancels_the_receive_in_flight_and_keeps_its_bytes() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let sqe = el.driver.ring.last_pushed.unwrap();
+        let recv_ud = UserData(sqe.user_data);
+        let buf = match sqe.op {
+            crate::backend::uring::sqe::Op::Recv { buf, .. } => buf,
+            op => panic!("{op:?}"),
+        };
+
+        fail_a_plaintext_send(&mut el, conn_index, libc::ECONNRESET);
+        match el.driver.ring.last_pushed.unwrap().op {
+            crate::backend::uring::sqe::Op::Cancel { target } => {
+                assert_eq!(target, recv_ud.raw(), "the receive in flight is cancelled")
+            }
+            op => panic!("expected a cancel, not {op:?}"),
+        }
+        assert_abort_draining(&mut el, conn_index);
+
+        // SAFETY: as above.
+        unsafe { std::ptr::copy_nonoverlapping(b"ping".as_ptr(), buf, 4) };
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(recv_ud.raw(), 4, 0);
+        let (ud, _buf) = abort_drain_receive(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+
+        assert_eq!(el.driver.accumulators.data(conn_index), b"ping");
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader is handed the send's error");
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+    }
+
+    /// A receive the cancel ended before it read is followed by one
+    /// `MSG_DONTWAIT` receive, for bytes that arrived with the reset. A
+    /// failure of that one ends the read half rather than arming another.
+    #[test]
+    fn a_cancelled_receive_is_followed_by_one_receive_that_does_not_wait() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let recv_ud = UserData(el.driver.ring.last_pushed.unwrap().user_data);
+        fail_a_plaintext_send(&mut el, conn_index, libc::EPIPE);
+
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
+        assert_abort_draining(&mut el, conn_index);
+        let (ud, _buf) = abort_drain_receive(&el, conn_index);
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+
+        assert!(el.driver.ring.last_pushed.is_none(), "no third receive");
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader is handed the send's error");
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
+    }
+
+    /// A peer that is still sending fills every receive; the reading ends
+    /// once `ABORT_DRAIN_BUDGET` bytes have been read, and the Close goes
+    /// ahead.
+    #[test]
+    fn a_send_error_reads_at_most_the_budget() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .recv_accumulator_max(64 << 20)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        fail_a_plaintext_send(&mut el, conn_index, libc::EPIPE);
+
+        let mut read = 0usize;
+        let mut receives = 0usize;
+        let mut largest = 0usize;
+        while el.driver.abort_drain_pending(conn_index) {
+            let (ud, buf) = abort_drain_receive(&el, conn_index);
+            let len = match el.driver.ring.last_pushed.unwrap().op {
+                crate::backend::uring::sqe::Op::Recv { len, .. } => len as usize,
+                op => panic!("{op:?}"),
+            };
+            // SAFETY: the receive's buffer has room for `len` bytes.
+            unsafe { std::ptr::write_bytes(buf, 0, len) };
+            el.driver.ring.last_pushed = None;
+            el.test_dispatch_cqe(ud.raw(), len as i32, 0);
+            read += len;
+            largest = largest.max(len);
+            receives += 1;
+            assert!(receives < 10_000, "the reading did not end");
+        }
+
+        let budget = crate::backend::uring::driver::ABORT_DRAIN_BUDGET;
+        assert!(read >= budget, "read {read} of a {budget} budget");
+        assert!(
+            read < budget + largest,
+            "read {read}: the receive that crossed the {budget} budget was not the last"
+        );
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "nothing more is armed"
+        );
+        assert_eq!(el.driver.accumulators.data(conn_index).len(), read);
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader is handed the send's error");
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+    }
+
+    /// An abort during the reading ends it: the Close is committed, so a
+    /// drain receive that completes afterwards is stale, arms nothing and
+    /// records nothing over the abort's error.
+    #[test]
+    fn an_abort_during_the_reading_ends_it() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        fail_a_plaintext_send(&mut el, conn_index, libc::ECONNRESET);
+        let (ud, _buf) = abort_drain_receive(&el, conn_index);
+
+        el.driver.abort(conn_index);
+        assert!(!el.driver.abort_drain_pending(conn_index));
+        assert!(el.driver.abort_drains[conn_index as usize].is_none());
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "no receive follows the committed Close"
+        );
+        assert!(
+            el.executor
+                .take_recv_error(conn_index, generation)
+                .is_none(),
+            "the send's error is not recorded over the abort"
+        );
+    }
+
+    /// A connection whose read half has finished has nothing queued to
+    /// read: the send's error ends it at once, as before.
+    #[test]
+    fn a_send_error_after_the_peer_fin_aborts_at_once() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .note_eof(false);
+        el.driver.ring.last_pushed = None;
+
+        fail_a_plaintext_send(&mut el, conn_index, libc::EPIPE);
+
+        assert!(el.driver.ring.last_pushed.is_none(), "nothing is armed");
+        assert!(!el.driver.abort_drain_pending(conn_index));
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader is handed the send's error");
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
     }
 
     /// A send the close's lead cancelled is not a failure of the connection:
@@ -13709,15 +14116,13 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
         assert_waits_on_poll(&el, conn_index, false);
 
-        let pushed_before = el.driver.ring.last_pushed.as_ref().map(|e| e.user_data);
         let poll = pollout_ud(&el, conn_index);
+        el.driver.ring.last_pushed = None;
         el.test_dispatch_cqe(poll, -libc::EBADF, 0);
         assert!(!el.driver.send_slab.in_use(0), "the entry is released");
-        assert_eq!(
-            el.driver.ring.last_pushed.as_ref().map(|e| e.user_data),
-            pushed_before,
-            "nothing is resubmitted after an error"
-        );
+        // Nothing is resubmitted after an error: the only SQE is the receive
+        // that reads the socket before the close (`begin_abort_drain`).
+        abort_drain_receive(&el, conn_index);
         assert!(!el.driver.send_queues[conn_index as usize].in_flight);
     }
 
@@ -14384,10 +14789,9 @@ mod tests {
         el.driver.ring.last_pushed = None;
         let drain = UserData::encode(OpTag::SendMsgZcDrain, conn_index, slab_idx as u32);
         el.test_dispatch_cqe(drain.raw(), -libc::ENOMEM, 0);
-        assert!(
-            el.driver.ring.last_pushed.is_none(),
-            "a failed drain is not resubmitted"
-        );
+        // The only SQE is the receive that reads the socket before the
+        // close (`begin_abort_drain`).
+        abort_drain_receive(&el, conn_index);
         assert!(
             !el.driver.send_slab.in_use(slab_idx),
             "the entry is released"
