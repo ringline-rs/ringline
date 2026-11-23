@@ -482,7 +482,7 @@ one. Out of scope.
 | `BlockedHandshake` | Need more ciphertext — return, wait for the next recv completion. |
 | `WriteTraffic` | Handshake complete. `TlsInfo` becomes available; fire the existing on-connect path. Steady state for `encrypt`. |
 | `ReadTraffic` | Drain plaintext into `RecvAccumulator`, wake the task. |
-| `PeerClosed` | Peer sent close_notify. Maps to the existing clean-EOF path; `eof_truncated()` must keep distinguishing this from a mid-message FIN. |
+| `PeerClosed` | Peer sent close_notify. Maps to the existing clean-EOF path; `eof_truncated()` must keep distinguishing this from a FIN without close_notify. |
 | `Closed` | Terminal — close the connection. |
 | `ReadEarlyData` | Not supported. Ringline exposes no 0-RTT API; treated as a protocol error rather than silently ignored. |
 

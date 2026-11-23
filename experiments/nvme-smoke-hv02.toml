@@ -1,0 +1,108 @@
+# ringline's NVMe passthrough and direct_io dsync on hv02's spare NVMe
+# (Samsung SSD 960 EVO 1TB), passed through to the guest with pci_roles. The
+# guest boots from virtio; the spare is the guest's only NVMe, and other specs
+# overwrite it whole. The guard refuses to run unless exactly one NVMe
+# controller is present, its model is the 960 EVO, and nothing on it is
+# mounted.
+#
+# 1. nvme_smoke on /dev/ng0n1: Identify Namespace, two reads of LBA 0 that must
+#    match, write-and-restore at LBA 2048, flush.
+# 2. The dsync probe of the null_blk runs (dsync-fua-null-blk.toml), on
+#    /dev/nvme0n1: 64 sequential 4 KiB direct_io writes per arm, block
+#    tracepoints counting what reaches the device, both backends, dsync on and
+#    off.
+# Submit: systemslab submit experiments/nvme-smoke-hv02.toml (queues behind
+# hv02's measurement work). The probe is experiments/dsync-fua-probe.rs.
+#
+# Predictions: smoke PASS. If the drive reports a write-back cache with FUA:
+# io_uring dsync = 64 FUA writes, no flushes; mio dsync = 64 FUA writes and
+# 64 flushes; dsync off = plain writes. If it reports no FUA: one flush per
+# write on io_uring, two on mio. Refuted by any other count.
+# Result (2026-11-15, SystemsLab 01a1e109-4726-715e-de70-536a4567f949): smoke
+# PASS; 512-byte blocks, write back, FUA; counts as predicted for a FUA drive.
+# A few R/RA reads per arm were not issued by the probe (probably udev).
+# That run used an earlier form of this spec that carried the probe inline as
+# base64; the committed form has not been run.
+name = "ringline NVMe passthrough and dsync on hv02's spare NVMe"
+
+[params]
+branch = "main"
+repo   = "https://github.com/ringline-rs/ringline"
+
+[[jobs]]
+name = "nvme-hw"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z1.c"
+image = "debian-13-6.12"
+gpu = false
+ports = 0
+pci_roles = ["nvme"]
+boot_timeout = 600
+payload_timeout = 3600
+artifacts = ["/home/anvil/nvme-hw.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json 2>/dev/null; echo
+  uname -srm; rustc --version
+  sudo -n true || { echo "NO SUDO"; exit 1; }
+
+  # Guard: exactly one NVMe controller, the 960 EVO, nothing mounted from it,
+  # root not on it.
+  n=$(ls -d /sys/class/nvme/nvme* 2>/dev/null | wc -l)
+  model=$(cat /sys/class/nvme/nvme0/model 2>/dev/null | sed 's/ *$//')
+  echo "nvme controllers=$n model=[$model] fw=$(cat /sys/class/nvme/nvme0/firmware_rev 2>/dev/null)"
+  [ "$n" = 1 ] || { echo "GUARD: expected one NVMe controller"; exit 1; }
+  [ "$model" = "Samsung SSD 960 EVO 1TB" ] || { echo "GUARD: unexpected model"; exit 1; }
+  [ -b /dev/nvme0n1 ] && [ -c /dev/ng0n1 ] || { echo "GUARD: no nvme0n1 / ng0n1"; exit 1; }
+  if lsblk -no MOUNTPOINT /dev/nvme0n1 | grep -q .; then echo "GUARD: mounted"; exit 1; fi
+  if findmnt -no SOURCE / | grep -q nvme; then echo "GUARD: root on nvme"; exit 1; fi
+  echo "GUARD ok"
+  q=/sys/block/nvme0n1/queue
+  echo "logical_block_size=$(cat $q/logical_block_size) write_cache=[$(cat $q/write_cache)] fua=$(cat $q/fua)"
+
+  git clone -q {repo} src && git -C src checkout -q {branch} && cd src && git log --oneline -1
+  cp experiments/dsync-fua-probe.rs ringline/examples/fua_probe.rs
+  ulimit -Sn 65536
+  cargo build --locked --release -q -p ringline --example nvme_smoke --example fua_probe || { echo "BUILD FAILED uring"; exit 1; }
+  cp target/release/examples/fua_probe /home/anvil/probe-uring
+  cp target/release/examples/nvme_smoke /home/anvil/nvme_smoke
+  cargo build --locked --release -q -p ringline --example fua_probe --features force-mio --target-dir target-mio || { echo "BUILD FAILED mio"; exit 1; }
+  cp target-mio/release/examples/fua_probe /home/anvil/probe-mio
+  cd /home/anvil
+
+  sudo ./nvme_smoke /dev/ng0n1 1 2048; echo "smoke_rc=$?"
+
+  cat > arm.sh <<'ARM'
+set -u
+name=$1; dsync=$2
+T=/sys/kernel/tracing
+dev=$(( 0x$(stat -c %t /dev/nvme0n1) )),$(( 0x$(stat -c %T /dev/nvme0n1) ))
+echo "ARM $name dsync=$dsync dev=$dev"
+for be in uring mio; do
+  echo 0 > $T/tracing_on; echo > $T/trace
+  echo 1 > $T/events/block/block_bio_queue/enable
+  echo 1 > $T/events/block/block_rq_issue/enable
+  echo 1 > $T/events/io_uring/io_uring_submit_req/enable
+  echo 1 > $T/tracing_on
+  /home/anvil/probe-$be /dev/nvme0n1 64 $dsync; rc=$?
+  echo 0 > $T/tracing_on
+  echo "RESULT $name $be probe_rc=$rc io_uring_submits=$(grep -c io_uring_submit_req: $T/trace)"
+  grep -E "block_(bio_queue|rq_issue): $dev " $T/trace | sed -E 's/.*(block_[a-z_]+): [0-9]+,[0-9]+ ([A-Z]+) .*/\1 \2/' | sort | uniq -c | sed "s/^/HIST $name $be /"
+done
+echo 0 > $T/events/enable
+ARM
+  sudo bash arm.sh dsync 1
+  sudo bash arm.sh ctrl 0
+  echo ALLDONE
+} 2>&1 | tee nvme-hw.log
+grep -q '^ALLDONE' nvme-hw.log || exit 1
+grep -q '^NVME SMOKE: PASS' nvme-hw.log || exit 1
+grep -q '^smoke_rc=0' nvme-hw.log || exit 1
+! grep -qE 'probe_rc=[1-9]|BUILD FAILED|GUARD:' nvme-hw.log
+'''

@@ -1462,9 +1462,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 crate::tls::tls_recv_cancel(t, conn_index, buf);
             }
             if result == 0 {
-                // TCP FIN. Only a clean end of stream if the peer's
-                // close_notify was processed first; otherwise a truncation,
-                // which reads resolve to as `UnexpectedEof`.
+                // TCP FIN. A clean end of stream if the peer's close_notify
+                // was processed first; otherwise a truncation: reads resolve
+                // `0` and `eof_truncated()` returns true.
                 let close_notify_seen = self
                     .driver
                     .tls_table

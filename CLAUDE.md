@@ -199,7 +199,7 @@ The mio loop is epoll-shaped (poll with timer-heap-derived timeout → readable/
 
 **`AsyncEventHandler` trait** — Users implement this. `on_accept(Connection)` returns a future that runs for the connection's lifetime. Uses RPITIT (`-> impl Future + 'static`), so implementations must use `async move {}` blocks (not `async fn`, which would borrow `&self`).
 
-**`Connection`** — An owned connection, from `on_accept` or `connect`; `split()` gives a `SendHalf` and a `RecvHalf`, neither `Copy`. `with_data(|&[u8]| -> ParseResult)` / `with_bytes(|Bytes| -> ParseResult)` for recv (`with_data_result` is the `io::Result` form that separates a clean close from a transport error); `send()`/`send_parts()` for send; `eof_truncated()` distinguishes a peer FIN mid-message from a clean close. Internally indexes into the driver's connection table via `(conn_index, generation)`, in the `pub(crate)` `ConnCtx`.
+**`Connection`** — An owned connection, from `on_accept` or `connect`; `split()` gives a `SendHalf` and a `RecvHalf`, neither `Copy`. `with_data(|&[u8]| -> ParseResult)` / `with_bytes(|Bytes| -> ParseResult)` for recv (`with_data_result` is the `io::Result` form that separates a clean close from a transport error); `send()`/`send_parts()` for send; `eof_truncated()` reports a TLS peer FIN that arrived without close_notify (false on plaintext). Internally indexes into the driver's connection table via `(conn_index, generation)`, in the `pub(crate)` `ConnCtx`.
 
 **`Driver`** — Owns all I/O state: the ring (or mio poll), `ConnectionTable`, buffer pools (the UDP `ProvidedBufRing`, `SendCopyPool`, `InFlightSendSlab`), `AccumulatorTable`.
 
