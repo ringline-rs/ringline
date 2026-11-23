@@ -111,7 +111,7 @@ impl Drop for DriverStateGuard {
 // `offer_for_park` declines an offer made from inside the connection's own
 // reader callback, while it is the innermost one running. `with_bytes` takes
 // the request out of the driver before its callback runs. A
-// `forward_recv_buf` that sends the whole accumulator takes it out during the
+// `forward_recv_buf` that detaches the accumulator takes it out during the
 // callback. `holds_unread` returns false
 // for a request taken out either way (#669).
 #[cfg(has_io_uring)]
@@ -146,6 +146,14 @@ impl Drop for ReaderCallback {
 #[cfg(has_io_uring)]
 pub(crate) fn in_reader_callback(conn_index: u32) -> bool {
     READER_CALLBACK_CONN.with(|c| c.get() == Some(conn_index))
+}
+
+/// Runs `f` as if inside `conn_index`'s reader callback, for unit tests that
+/// call `forward_recv_buf` directly.
+#[cfg(all(has_io_uring, test))]
+pub(crate) fn as_reader_callback<R>(conn_index: u32, f: impl FnOnce() -> R) -> R {
+    let _cb = ReaderCallback::enter(conn_index);
+    f()
 }
 
 /// Set the thread-local driver pointer, returning a guard that clears it
@@ -490,8 +498,8 @@ pub fn spawn_with_handle<T: 'static>(
 
 /// Offload a blocking closure to the dedicated blocking thread pool.
 ///
-/// The closure runs on a low-priority background thread (`SCHED_IDLE`),
-/// keeping the io_uring event loop unblocked. Returns a future that resolves
+/// The closure runs on a background thread, `SCHED_BATCH` on Linux, keeping
+/// the io_uring event loop unblocked. Returns a future that resolves
 /// to `Ok` with the closure's return value, or to `Err` with a
 /// [`JoinError`](crate::JoinError) if the closure panicked. A panic does not
 /// end the pool thread, and is handled under the runtime's
@@ -1231,8 +1239,16 @@ impl ConnCtx {
             // detach is a single `take_frozen` with no remainder to put back,
             // and "forwarded" and "consumed" cannot disagree about which bytes
             // went out. Anything else keeps the copy path.
+            //
+            // And only inside this connection's reader closure, whose
+            // delivery path reads `forward_zc_consumed` when it returns. A
+            // slice kept from a `with_bytes` callback can have the range
+            // `put_back` gave the accumulator, so it matches the check below
+            // after the callback has returned; detaching then would leave a
+            // count that makes the next read consume less than its closure
+            // reports, so the read after it delivers those bytes again.
             #[cfg(has_io_uring)]
-            if !closing {
+            if !closing && in_reader_callback(conn_index) {
                 let whole = {
                     let acc = driver.accumulators.data(conn_index);
                     !acc.is_empty()
@@ -1272,7 +1288,8 @@ impl ConnCtx {
                 }
             }
 
-            // Not the whole accumulator, or mio: copy send, as `send`.
+            // Not the whole accumulator, outside the connection's reader
+            // closure, a submitted Close, or mio: copy send, as `send`.
             let id = executor.register_send(conn_index);
             let mut ctx = send_ctx(driver, executor, conn_index);
             if let Err(e) = ctx.send_awaited(self.id(), data, id) {
@@ -3142,7 +3159,7 @@ impl Connection {
     /// inside a callback on connection B, itself inside A's callback, is
     /// declined only while the runtime still holds A's bytes. It does not
     /// hold them in a `with_bytes` callback, or after a `forward_recv_buf`
-    /// that sent the whole accumulator.
+    /// that detached the accumulator.
     /// `metrics::park_diag::OFFER_DECLINED` counts offers ignored because of
     /// a running reader callback or held bytes.
     ///
@@ -3690,14 +3707,17 @@ impl SendHalf {
     /// [`send`](Self::send), dropping it does not cancel the send.
     ///
     /// On io_uring, if `data` is exactly the connection's whole recv
-    /// accumulator, the accumulator is detached and sent under a guard
-    /// (copied into the send pool below `send_zc_threshold`). Otherwise
-    /// `data` is copied as by [`send`](Self::send).
+    /// accumulator and the call is made inside a `with_data`,
+    /// `with_data_result` or `try_with_data` closure on this connection, and
+    /// not inside a reader closure on another connection nested in it, the
+    /// accumulator is detached and sent under a guard (copied into the send
+    /// pool below `send_zc_threshold`). Otherwise `data` is copied as by
+    /// [`send`](Self::send).
     ///
     /// On mio, `data` is always copied as by `send`, encrypted first
     /// on a TLS connection. On io_uring a TLS connection is always encrypted
-    /// into the send pool; when `data` is the whole accumulator, the
-    /// accumulator is detached first and gathered into a temporary buffer.
+    /// into the send pool; a detached accumulator is first gathered into a
+    /// temporary buffer.
     ///
     /// On io_uring, a connection holding
     /// [`forward_hold_cap`](crate::ConfigBuilder::forward_hold_cap) send slab
@@ -3711,13 +3731,12 @@ impl SendHalf {
     /// # Errors
     ///
     /// `NotConnected` if this handle is stale: its connection closed and the
-    /// slot now holds another. Otherwise the errors of
-    /// [`send`](Self::send), and, when `data` is the whole
-    /// accumulator, `Other` if the zero-copy send slab is full. On a plaintext
-    /// io_uring connection a forward of the whole accumulator at or above
-    /// `send_zc_threshold` takes no send-pool slot and is not refused while a
-    /// bounded send waits. Nothing is
-    /// sent or consumed on `Err`.
+    /// slot now holds another. Otherwise the errors of [`send`](Self::send),
+    /// and, when the accumulator is detached, `Other` if the zero-copy send
+    /// slab is full. On a plaintext io_uring connection a forward that
+    /// detaches the accumulator, at or above `send_zc_threshold`, takes no
+    /// send-pool slot and is not refused while a bounded send waits. Nothing
+    /// is sent or consumed on `Err`.
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.conn.forward_recv_buf(data)
     }

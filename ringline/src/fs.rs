@@ -98,8 +98,8 @@
 //!   io_uring. A ringline [`File`] cannot be used there. That pool is shared
 //!   by all workers, has 4 threads by default
 //!   ([`ConfigBuilder::blocking_threads`](crate::ConfigBuilder::blocking_threads)),
-//!   and runs at `SCHED_IDLE`, so on a busy host its work waits until a CPU
-//!   is idle.
+//!   and runs at `SCHED_BATCH` on Linux, sharing the CPUs with the
+//!   workers.
 //!
 //! On every kernel, `shutdown_write` (on
 //! [`Connection`](crate::Connection::shutdown_write) or

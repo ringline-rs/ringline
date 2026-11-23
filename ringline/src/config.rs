@@ -433,8 +433,8 @@ pub struct Config {
     /// will return an error). Default: 1.
     pub(crate) spawner_threads: usize,
     /// Number of dedicated blocking threads. The blocking pool runs
-    /// user-provided closures on low-priority (`SCHED_IDLE`) background threads,
-    /// keeping CPU-bound or blocking work isolated from the io_uring event loop.
+    /// user-provided closures on background threads, `SCHED_BATCH` on Linux,
+    /// keeping CPU-bound or blocking work off the io_uring event loop.
     ///
     /// 0 = disabled (no blocking pool; [`spawn_blocking()`](crate::spawn_blocking)
     /// will return an error). Default: 4.

@@ -74,8 +74,8 @@ together with the length the send reports on success.
 
 TLS handshake and alert records carry no id, and their completions settle
 nothing. From 0.7.0-alpha.141 every send through `SendHalf` carries one.
-`forward_recv_buf`'s is carried as a zero-copy batch's when it forwards the
-whole accumulator on io_uring, and as a copy send's otherwise.
+`forward_recv_buf`'s is carried as a zero-copy batch's when it detaches the
+accumulator on io_uring, and as a copy send's otherwise.
 
 ## The reported length
 
