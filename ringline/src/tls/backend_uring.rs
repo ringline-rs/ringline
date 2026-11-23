@@ -58,16 +58,16 @@ use super::unbuffered;
 /// session tickets and alerts, which never complete a logical application
 /// send.
 ///
-/// **All-or-nothing.** The slots the whole blob needs are reserved before
-/// the first byte is copied; if the pool cannot cover them, nothing is taken
-/// or appended and this returns `false`. Appending a prefix would put a
-/// truncated TLS record on the wire — half a Certificate message is strictly
-/// worse for the peer than none of it — and the callers tear the connection
-/// down on `false`, except a close_notify, which keeps the bytes and tries
-/// again (`TlsTable::send_close_notify_queued`). Sends appended to `out` by
+/// **All-or-nothing.** The slots the whole blob needs are reserved before the
+/// first byte is copied; if the pool cannot cover them, nothing is taken or
+/// appended and this returns `false`. Appending a prefix would put a truncated
+/// TLS record on the wire — half a Certificate message is strictly worse for
+/// the peer than none of it. When `TlsOutput::place` gets `false`, it appends
+/// the bytes to `TlsOutput::held`; when `TlsTable::place_sealed` gets it, the
+/// bytes stay in the connection's sealed output. Sends appended to `out` by
 /// *earlier* calls are untouched. The unbuffered engine's handshake and alert
-/// output comes through here, as does the buffered engine's output that has
-/// no `IoState` to size it (close_notify, `process_new_packets` errors, the
+/// output comes through here, as does the buffered engine's output that has no
+/// `IoState` to size it (close_notify, `process_new_packets` errors, the
 /// client's first flight); the buffered receive path writes through
 /// `PoolWriter` (`buffered::take_counted_tls_output_sends`).
 ///
@@ -104,8 +104,48 @@ pub(super) fn ciphertext_to_sends(
     true
 }
 
-/// Map an unbuffered drive's outcome to the backend result, after turning its
-/// output into sends.
+/// Where TLS output produced outside a send goes: the receive path's
+/// handshake flights, session tickets and alerts, and the client's first
+/// flight. Output is queued as sends while the pool takes it and nothing
+/// before it waits. From the first output the pool has no slots for, and
+/// from the start when the connection already has sealed output waiting
+/// (`hold`), every byte is appended to `held` instead, in order, for the
+/// connection's sealed ticket (`docs/send-pool-partition-design.md`,
+/// section 2).
+pub struct TlsOutput<'a> {
+    /// Sends for the connection's send queue.
+    pub sends: &'a mut Vec<BuiltSend>,
+    /// Bytes for the connection's sealed ticket.
+    pub held: &'a mut Vec<u8>,
+    /// The connection has sealed output waiting.
+    pub hold: bool,
+}
+
+impl TlsOutput<'_> {
+    /// Whether output goes to `held`.
+    pub(super) fn holding(&self) -> bool {
+        self.hold || !self.held.is_empty()
+    }
+
+    /// Queue `bytes` as sends, all or nothing, or append them to `held`.
+    pub(super) fn place(
+        &mut self,
+        pool: &mut SendCopyPool,
+        conn_index: u32,
+        generation: u32,
+        bytes: &[u8],
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.holding() || !ciphertext_to_sends(pool, conn_index, generation, bytes, self.sends) {
+            self.held.extend_from_slice(bytes);
+        }
+    }
+}
+
+/// Map an unbuffered drive's outcome to the backend result, after placing
+/// its output.
 #[cfg(not(feature = "tls-buffered"))]
 fn finish_unbuffered_feed(
     peer_sent_close_notify: bool,
@@ -114,13 +154,9 @@ fn finish_unbuffered_feed(
     conn_index: u32,
     generation: u32,
     scratch: &[u8],
-    out_sends: &mut Vec<BuiltSend>,
+    out: &mut TlsOutput<'_>,
 ) -> TlsRecvResult {
-    if !ciphertext_to_sends(send_copy_pool, conn_index, generation, scratch, out_sends) {
-        return TlsRecvResult::Error(io::Error::other(
-            "send pool exhausted during TLS output flush",
-        ));
-    }
+    out.place(send_copy_pool, conn_index, generation, scratch);
     match outcome {
         unbuffered::DriveOutcome::Ok => TlsRecvResult::Ok,
         unbuffered::DriveOutcome::HandshakeJustCompleted => TlsRecvResult::HandshakeJustCompleted {
@@ -238,11 +274,11 @@ pub fn tls_take_recv_allocation(tls_table: &mut TlsTable, conn_index: u32) -> Op
 
 /// Feed the `received` bytes a receive from [`tls_recv_arm`] wrote to the
 /// TLS connection: decrypted plaintext goes to the accumulator, and TLS
-/// output (handshake responses, alerts) is appended to `out_sends`. The
-/// output is appended whatever the outcome, since an alert generated on the
-/// way to a fatal error still has to reach the peer, and the caller must
-/// queue it whatever the result, or the pool slots leak. `buf` is the
-/// target's `buf`.
+/// output (handshake responses, alerts) goes to `out`. The output is placed
+/// whatever the outcome, since an alert generated on the way to a fatal
+/// error still has to reach the peer, and the caller must queue its sends
+/// whatever the result, or the pool slots leak. `buf` is the target's
+/// `buf`.
 ///
 /// # Safety
 ///
@@ -258,7 +294,7 @@ pub unsafe fn feed_tls_received(
     generation: u32,
     buf: Option<Vec<u8>>,
     received: usize,
-    out_sends: &mut Vec<BuiltSend>,
+    out: &mut TlsOutput<'_>,
 ) -> TlsRecvResult {
     #[cfg(not(feature = "tls-buffered"))]
     {
@@ -280,7 +316,7 @@ pub unsafe fn feed_tls_received(
             conn_index,
             generation,
             &scratch,
-            out_sends,
+            out,
         )
     }
     #[cfg(feature = "tls-buffered")]
@@ -298,7 +334,7 @@ pub unsafe fn feed_tls_received(
             conn_index,
             generation,
             &buf,
-            out_sends,
+            out,
         );
         buf.clear();
         tls_table.recv_buffers.push(buf);
@@ -306,17 +342,17 @@ pub unsafe fn feed_tls_received(
     }
 }
 
-/// Collect pending TLS output as queueable sends. Used on the client path to
-/// push the ClientHello once the connect CQE lands.
+/// Place pending TLS output in `out`. Used on the client path to push the
+/// ClientHello once the connect CQE lands.
 ///
-/// Returns `false` if the output could not be produced or drained in full;
-/// sends already appended must still be queued by the caller.
+/// Returns `false` if rustls failed to produce its output; sends already in
+/// `out` must still be queued by the caller.
 pub fn flush_tls_output(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
     generation: u32,
-    out_sends: &mut Vec<BuiltSend>,
+    out: &mut TlsOutput<'_>,
 ) -> bool {
     #[cfg(not(feature = "tls-buffered"))]
     {
@@ -333,16 +369,11 @@ pub fn flush_tls_output(
         ) {
             return false;
         }
-        ciphertext_to_sends(send_copy_pool, conn_index, generation, &scratch, out_sends)
+        out.place(send_copy_pool, conn_index, generation, &scratch);
+        true
     }
     #[cfg(feature = "tls-buffered")]
-    buffered::flush_tls_output_buffered(
-        tls_table,
-        send_copy_pool,
-        conn_index,
-        generation,
-        out_sends,
-    )
+    buffered::flush_tls_output_buffered(tls_table, send_copy_pool, conn_index, generation, out)
 }
 
 /// Encrypt application data into pool-backed sends for the per-connection send

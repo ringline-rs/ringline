@@ -8,6 +8,99 @@ use crate::buffer::send_slab::{InFlightSendSlab, MAX_GUARDS, MAX_IOVECS};
 use crate::fs::FileKind;
 use crate::guard::GuardBox;
 
+/// TLS output rustls has sealed that the send pool had no slots for when it
+/// was produced, kept in the order it was produced. Its records carry
+/// sequence numbers below those of any record encrypted after them, so they
+/// go on the wire first.
+///
+/// It waits in a sealed ticket in the worker's admission queue
+/// (`SendCompletions::push_sealed`), ahead of the connection's waiting
+/// bounded sends; while it waits, no other send on the connection is
+/// encrypted. The driver records changes on `Driver::sealed_dirty` and
+/// `Driver::sealed_gone`, and `Driver::sync_sealed` brings the queue up to
+/// date. [`hold_sealed`] bounds how much a connection, and the worker, holds.
+#[cfg(has_io_uring)]
+#[derive(Debug)]
+pub(crate) struct SealedOutput {
+    /// The ciphertext.
+    pub bytes: Vec<u8>,
+    /// `bytes` includes the connection's close_notify.
+    pub close_notify: bool,
+    /// `bytes` includes output from the receive path or the client's first
+    /// flight.
+    pub receive: bool,
+    /// The ticket in the admission queue, once `Driver::sync_sealed` has
+    /// pushed it.
+    pub ticket: Option<crate::runtime::send_completion::SendId>,
+    /// The connection is on `Driver::sealed_dirty`.
+    pub dirty: bool,
+}
+
+/// The most sealed output one connection holds, unless one send-pool slot is
+/// larger: then one slot's worth.
+#[cfg(has_io_uring)]
+pub(crate) const SEALED_CONN_MAX: usize = 64 * 1024;
+
+/// The most close output ending in the close_notify (`close_notify` set)
+/// that is exempt from [`SEALED_CONN_MAX`] and the worker's bound: room for
+/// the alert and a record rustls had queued ahead of it, such as a
+/// `key_update`.
+#[cfg(has_io_uring)]
+pub(crate) const SEALED_CLOSE_EXEMPT: usize = 512;
+
+/// Append `bytes` to the sealed output in `state`, creating it if there is
+/// none, add them to `total` (`Driver::sealed_bytes`), and put `conn_index`
+/// on `dirty` (`Driver::sealed_dirty`) if it is not there.
+///
+/// Returns `false`, holding nothing, when the connection's sealed output
+/// would then need more slots than `pool` has, or when it would be over
+/// [`SEALED_CONN_MAX`] (or one slot, if larger) or the worker's sealed
+/// output would be over the pool's total bytes. Close output that ends in
+/// the close_notify and is at most [`SEALED_CLOSE_EXEMPT`] bytes is exempt
+/// from the last two; a connection produces close output at most once.
+/// Other close output, such as the flight the unbuffered engine encodes for
+/// a server closed before its handshake finished, which has no alert, is
+/// not.
+#[cfg(has_io_uring)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hold_sealed(
+    state: &mut ConnSendState,
+    pool: &SendCopyPool,
+    dirty: &mut Vec<u32>,
+    total: &mut usize,
+    conn_index: u32,
+    bytes: &[u8],
+    close_notify: bool,
+    receive: bool,
+) -> bool {
+    let slot_size = pool.slot_size() as usize;
+    let pool_bytes = pool.slot_count() * slot_size;
+    let held = state.sealed.as_ref().map_or(0, |s| s.bytes.len()) + bytes.len();
+    if held.div_ceil(slot_size) > pool.slot_count() {
+        return false;
+    }
+    let exempt = close_notify && bytes.len() <= SEALED_CLOSE_EXEMPT;
+    if !exempt && (held > SEALED_CONN_MAX.max(slot_size) || *total + bytes.len() > pool_bytes) {
+        return false;
+    }
+    *total += bytes.len();
+    let sealed = state.sealed.get_or_insert_with(|| SealedOutput {
+        bytes: Vec::new(),
+        close_notify: false,
+        receive: false,
+        ticket: None,
+        dirty: false,
+    });
+    sealed.bytes.extend_from_slice(bytes);
+    sealed.close_notify |= close_notify;
+    sealed.receive |= receive;
+    if !sealed.dirty {
+        sealed.dirty = true;
+        dirty.push(conn_index);
+    }
+    true
+}
+
 /// Per-connection send queue state.
 ///
 /// At most one stream send operation is in the kernel per connection: one SQE
@@ -96,13 +189,11 @@ pub(crate) struct ConnSendState {
     /// The connection is on `Driver::send_backstop_list`.
     #[cfg(has_io_uring)]
     pub on_send_backstop: bool,
-    /// A close_notify the send pool had no slot for when the close was
-    /// requested: its ciphertext, and anything rustls had queued ahead of
-    /// it. `try_finalize_close` places it once
-    /// the connection's own sends have drained, or drops it and clears the
-    /// connection's `close_notify_sent`.
+    /// TLS output rustls has sealed that the send pool had no slots for
+    /// when it was produced ([`SealedOutput`]). `try_finalize_close` places
+    /// it once the connection's own sends have drained, or drops it.
     #[cfg(has_io_uring)]
-    pub close_notify_pending: Option<Vec<u8>>,
+    pub sealed: Option<SealedOutput>,
     /// `abort` ran for the current occupant (`SendHalf::abort`). Every send
     /// started afterwards is refused with `ConnectionAborted`
     /// ([`closing_refusal`](Self::closing_refusal)), and on mio the close
@@ -268,7 +359,7 @@ impl ConnSendState {
             #[cfg(has_io_uring)]
             on_send_backstop: false,
             #[cfg(has_io_uring)]
-            close_notify_pending: None,
+            sealed: None,
             aborted: false,
             #[cfg(has_io_uring)]
             disconnect: Disconnect::None,
@@ -341,13 +432,13 @@ impl ConnId {
     }
 }
 
-/// The message of a non-waiting send refused because a bounded send waits on
-/// its connection.
-pub(crate) const TICKET_WAITING_REFUSAL: &str = "a bounded send waits on this connection";
+/// The message of a non-waiting send refused because a bounded send, or TLS
+/// output the send pool had no slots for, waits on its connection.
+pub(crate) const TICKET_WAITING_REFUSAL: &str = "a send waits on this connection";
 
 /// The refusal of a non-waiting send that would take send-pool slots while a
-/// bounded send waits on its connection: kind `Other`, the kind of pool
-/// exhaustion.
+/// bounded send, or TLS output the send pool had no slots for, waits on its
+/// connection: kind `Other`, the kind of pool exhaustion.
 pub(crate) fn ticket_waiting_error() -> io::Error {
     io::Error::other(TICKET_WAITING_REFUSAL)
 }
@@ -583,13 +674,18 @@ pub(crate) struct DriverCtx<'a> {
     /// closure returns: a closure that returned `Ok` without a successful
     /// `submit` left the id with nothing to settle it.
     pub(crate) parts_id_carried: bool,
-    /// A bounded send waits on the connection this context is made for
-    /// (`docs/send-pool-partition-design.md`, section 2). A non-waiting send
-    /// that would take send-pool slots is then refused with
+    /// A bounded send, or TLS output the send pool had no slots for
+    /// (`ConnSendState::sealed`), waits on the connection this context is
+    /// made for (`docs/send-pool-partition-design.md`, section 2). A
+    /// non-waiting send that would take send-pool slots is then refused with
     /// [`ticket_waiting_error`], so it does not go out ahead of the waiting
-    /// send. Set by the entry points of the non-waiting sends; false
-    /// elsewhere.
+    /// send or output. Set by the entry points of the non-waiting sends;
+    /// false elsewhere.
     pub(crate) ticket_waiting: bool,
+    /// See `Driver::sealed_dirty`.
+    pub(crate) sealed_dirty: &'a mut Vec<u32>,
+    /// See `Driver::sealed_bytes`.
+    pub(crate) sealed_bytes: &'a mut usize,
 }
 
 /// The refusal of a TLS send made after this side's close_notify was queued:
@@ -1263,16 +1359,42 @@ impl<'a> DriverCtx<'a> {
                 if tls_table.has(conn.index) {
                     if alert_allowed {
                         let mut sends = Vec::new();
-                        let retained = tls_table.send_close_notify_queued(
+                        let mut held = Vec::new();
+                        let hold = self.send_queues[conn.index as usize].sealed.is_some();
+                        tls_table.send_close_notify_queued(
                             conn.index,
                             conn.generation,
                             self.send_copy_pool,
-                            &mut sends,
+                            &mut crate::tls::TlsOutput {
+                                sends: &mut sends,
+                                held: &mut held,
+                                hold,
+                            },
                         );
                         if !sends.is_empty() {
                             self.queue_built_sends(conn.index, sends);
                         }
-                        self.send_queues[conn.index as usize].close_notify_pending = retained;
+                        // Output the pool had no slots for, or that follows
+                        // sealed output already waiting, waits behind it.
+                        // It ends in the alert when the engine queued one.
+                        let alert = tls_table.close_notify_sent(conn.index);
+                        if !held.is_empty()
+                            && !hold_sealed(
+                                &mut self.send_queues[conn.index as usize],
+                                self.send_copy_pool,
+                                self.sealed_dirty,
+                                self.sealed_bytes,
+                                conn.index,
+                                &held,
+                                alert,
+                                false,
+                            )
+                            && alert
+                        {
+                            crate::metrics::POOL
+                                .increment(crate::metrics::pool::CLOSE_NOTIFY_DROPPED);
+                            tls_table.close_notify_dropped(conn.index);
+                        }
                     }
                     // Arm the close_notify deadline so the event loop
                     // force-closes if the deferred Close never fires (peer
@@ -1300,10 +1422,11 @@ impl<'a> DriverCtx<'a> {
 
     /// Shutdown the write side of a connection.
     ///
-    /// If a send is in flight or queued, the shutdown is deferred until the
-    /// send queue drains (`submit_next_queued_inner`'s empty-queue arm
-    /// submits it): io_uring does not order an
-    /// independent Shutdown SQE behind those sends.
+    /// If a send is in flight or queued, or TLS output waits in the
+    /// connection's sealed output, the shutdown is deferred until the send
+    /// queue drains with no sealed output left (`submit_next_queued_inner`'s
+    /// empty-queue arm submits it): io_uring does not order an independent
+    /// Shutdown SQE behind those sends.
     pub fn shutdown_write(&mut self, conn: ConnId) {
         let Some(cs) = self.connections.get_mut(conn.index) else {
             return;
@@ -1322,7 +1445,8 @@ impl<'a> DriverCtx<'a> {
         if self.send_queues[idx].close_submitted {
             return;
         }
-        if self.send_queues[idx].in_flight || !self.send_queues[idx].queue.is_empty() {
+        let state = &self.send_queues[idx];
+        if state.in_flight || !state.queue.is_empty() || state.sealed.is_some() {
             // Defer until the send queue drains (submit_next_queued issues it).
             cs.write = crate::connection::WriteHalf::ShutdownPending;
         } else {

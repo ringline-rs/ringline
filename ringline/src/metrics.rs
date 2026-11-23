@@ -481,13 +481,17 @@ pub mod pool {
     /// `spawn_with_handle` return `WouldBlock`, and an `on_start` or
     /// `on_udp_bind` task is dropped.
     pub const STANDALONE_TASKS_EXHAUSTED: usize = 5;
-    /// io_uring: a TLS connection closed without its close_notify because the
-    /// send pool had no slot for the alert when the close was requested and
-    /// still had none once the connection's own sends had drained, or the
-    /// close_notify deadline forced the close first. The peer reads the
-    /// stream as truncated (`eof_truncated`). `abort` also counts a retained
-    /// alert it drops; that peer reads a reset. The alert needs one slot. A
-    /// sustained count means the pool was full at the close drain;
+    /// io_uring: a TLS connection closed without its close_notify. The send
+    /// pool had no slot for the alert when the close was requested and still
+    /// had none once the connection's own sends had drained; the
+    /// close_notify deadline forced the close first; or the alert had to wait
+    /// and could not be held, because the close output was over
+    /// `handler::SEALED_CLOSE_EXEMPT` bytes and would have put the
+    /// connection's or the worker's sealed output over its bound, or needed
+    /// more slots than the pool has (`handler::hold_sealed`). The peer reads
+    /// the stream as truncated (`eof_truncated`). `abort` also counts a
+    /// retained alert it drops; that peer reads a reset. The alert needs one
+    /// slot. A sustained count means the pool was full at the close drain;
     /// `ConfigBuilder::send_pool` sets its size.
     pub const CLOSE_NOTIFY_DROPPED: usize = 6;
 }

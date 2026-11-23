@@ -5,8 +5,8 @@ Status: proposal. Experiment stage 0 has run
 the held count per connection (order of work step 2), taking slots before
 the work and returning the excess (step 3), the removal of `send_chain`, and,
 of the rest of step 4, the ticket queue and the worker queue for bounded and
-non-waiting sends, are implemented. Receive-path TLS output and
-`close_notify` do not yet take tickets. A non-waiting send that would take
+non-waiting sends, and on io_uring the ticket of receive-path TLS output and
+`close_notify`, are implemented. A non-waiting send that would take
 slots behind a waiting ticket is refused, including `forward_to_conn`'s copy
 on io_uring, where section 2 says it waits; on mio `forward_to_conn` is not yet
 checked against the ticket queue. The held count
@@ -64,16 +64,15 @@ reach most callers as a refusal, which they handle as an error:
   (`take_pending_send`, `h2_conn.rs`) before `send`, so a refusal loses
   frames that the HPACK state has already counted.
 
-Two related gaps are in the TLS paths:
+Before the sealed tickets of section 2, the TLS paths on io_uring had two
+related gaps:
 
 - TLS output produced while receiving (handshake flights, session tickets,
-  alerts) takes its slots before it is written into them (section 4). If
-  the pool is short the connection is failed ("send pool exhausted during
-  TLS output flush"; on the connect path "send pool exhausted during TLS
-  flush", `backend/uring/event_loop.rs`).
-- Nothing orders TLS output produced on the receive path against the
-  connection's later sends except that both are queued on the connection in the
-  order they are made. Any change that holds such output back has to keep it
+  alerts) takes its slots before it is written into them (section 4). When
+  the pool was short the connection was failed.
+- Nothing ordered TLS output produced on the receive path against the
+  connection's later sends except that both were queued on the connection
+  in the order they were made. Holding such output back has to keep it
   ahead of every record sealed after it.
 
 ## Goal and criterion
@@ -197,13 +196,29 @@ connection's tickets in queue order.
   is served (section 4), so every record goes on the wire in sequence-number
   order. The peer fails a connection whose records arrive out of order
   (`bad_record_mac`). A connection has at most one receive-path ticket:
-  output produced while one waits joins it. With the unbuffered engine the
-  ticket owns the bytes `unbuffered::drive` wrote into its scratch buffer
-  (`tls/backend_uring.rs`). With the buffered engine the bytes stay in
-  rustls's `sendable_tls`, which any later `write_tls` drains in full
-  (`tls/buffered.rs`), so the ticket records only that output is pending,
-  and its size is read from rustls when it is served.
-- `close_notify` takes a ticket after the connection's other tickets.
+  output produced while one waits joins it. The ticket owns its bytes
+  (`ConnSendState::sealed`, `handler.rs`): with the unbuffered engine the
+  bytes `unbuffered::drive` wrote into its scratch buffer
+  (`tls/backend_uring.rs`), and with the buffered engine the bytes drained
+  from rustls's `sendable_tls` when the ticket is made and when output joins
+  it (`tls/buffered.rs`).
+- A connection's ticket holds at most 64 KiB, or one slot if a slot is
+  larger, and the worker's tickets together hold at most the pool's total
+  bytes (`handler::hold_sealed`). Output that would go past either bound, or
+  need more slots than the pool has, fails the connection. A handshake
+  flight over the bound, such as a certificate chain over 64 KiB that the
+  pool cannot take whole when it is produced, fails its connection. Once the
+  worker's total is reached, any connection whose output would wait fails,
+  whichever connections hold the bytes. Close output that ends in
+  `close_notify` and is at most 512 bytes (the alert and a record rustls had
+  queued ahead of it) is exempt from the two bounds; a connection produces
+  close output at most once. Other close output, such as the flight the
+  unbuffered engine encodes for a server closed before its handshake
+  finished, which has no alert, is dropped when over a bound, and the close
+  goes ahead.
+- `close_notify` joins the receive-path ticket when one waits, behind the
+  output in it; otherwise it takes a ticket of its own if the pool cannot
+  take it. Either way it goes after the connection's earlier tickets.
 
 When a ticket is placed ahead of a connection's front ticket, it takes that
 ticket's place in the worker queue (section 3).
@@ -492,9 +507,11 @@ the connection's state that follows once its sends have drained or failed.
   failed with `NotConnected`, and `close_notify` takes its ticket.
   A waiting receive-path ticket stays, so the records it holds still go
   ahead of `close_notify`.
-- `close_notify` keeps today's fallback: if it finds no slot once the
-  connection's other sends have drained, it is dropped and the connection
-  ends with a bare FIN (`place_retained_close_notify`,
+- Once the connection's other sends have drained, a ticket still waiting
+  (with `close_notify` in it, if the close queued one) is placed, whatever
+  its place in the worker queue, if the pool has slots for all of it.
+  Otherwise it is dropped, the receive-path records with any alert, and the
+  connection ends with a bare FIN (`place_sealed_at_close`,
   `backend/uring/driver.rs`). A closing connection therefore never waits on
   slots for `close_notify` beyond that point.
 - At teardown, a receive-path ticket still waiting is dropped and its worker
@@ -503,7 +520,7 @@ the connection's state that follows once its sends have drained or failed.
   failure; the connection ends with a bare FIN.
 - A connection with tickets waiting is not parked onto another worker until
   they are served or failed; waiting tickets are a park blocker
-  (`park_blocker`, `backend/uring/driver.rs`).
+  (`park_blocker`, `backend/uring/event_loop.rs`).
 
 ## Counters
 

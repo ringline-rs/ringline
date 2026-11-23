@@ -598,7 +598,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   first.
 - A plain send (`send`, `send_parts().build`, `submit_batch`,
   `forward_recv_buf`) made while a bounded send waits for send-pool slots on
-  the same connection is refused with `Other` ("a bounded send waits on this
+  the same connection is refused with `Other` ("a send waits on this
   connection"), on both backends; before, it went out ahead of the waiting
   send. Nothing is queued, so the same buffer can be sent once the waiting
   send is admitted. On io_uring a plaintext send of guards only at or above
@@ -613,6 +613,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection with `NotConnected` ("connection is closing"). Before, it stayed
   queued: it was sent ahead of the close once it won capacity, or failed when
   the connection was released.
+- On io_uring, TLS output produced while receiving (handshake flights,
+  session tickets, alerts) and an outbound connection's first flight wait for
+  send-pool slots when the pool has none. Before, the connection failed
+  ("send pool exhausted during TLS output flush", or "send pool exhausted
+  during TLS flush" for an outbound connection's first flight). While such
+  output waits, a plain send on the connection is refused as it is behind a
+  waiting bounded send, a bounded send on it waits behind the output, a
+  `shutdown_write` is deferred until it has been sent, and the connection is
+  not moved to another worker. Output still fails the connection when it
+  would need more slots than the pool has, put more than 64 KiB (or one
+  slot, if larger) waiting on the connection, or put more than the pool's
+  total bytes waiting on the worker.
 - `Runtime::shutdown` (and dropping the `Runtime`) returns once every
   pool-mode acceptor thread has exited, so a pool-mode listener's port is
   free when it returns. It may block for up to 10 ms while an acceptor
@@ -2080,14 +2092,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   when the pool had none at the close, the connection closed behind a bare
   FIN, the peer read the stream as truncated, and `close_notify_sent` said
   the alert had gone out. The alert's ciphertext is now kept on the
-  connection and queued from the close drain once the connection's own
-  sends have drained and given their slots back, with the Close waiting
-  behind it. If the pool is still exhausted then, or the close_notify
-  deadline forces the close first, the alert is dropped, the new
-  `ringline/pool` counter `close_notify_dropped` counts it, and the
-  connection does not record it as sent. A retained alert is also dropped,
-  uncounted, at worker exit. Found by the send-path audit
-  (`docs/journal/2026-11-send-path-audit.md`, F5).
+  connection, behind any TLS output also waiting for slots, and queued from
+  the close drain once the connection's own sends have drained and given
+  their slots back, with the Close waiting behind it. If the pool is still
+  exhausted then, or the close_notify deadline forces the close first, the
+  alert is dropped, the new `ringline/pool` counter `close_notify_dropped`
+  counts it, and the connection does not record it as sent. A retained
+  alert is also dropped, uncounted, at worker exit. Found by the send-path
+  audit (`docs/journal/2026-11-send-path-audit.md`, F5).
 
 - mio: a TLS encryption failure in `send`, `send_nowait` or
   `send_backpressured` closes the connection, as it did on io_uring. The
