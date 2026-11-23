@@ -46,8 +46,8 @@ fn expected_payload() -> Vec<u8> {
 struct VecGuard(Vec<u8>);
 
 impl SendGuard for VecGuard {
-    fn as_ptr_len(&self) -> (*const u8, u32) {
-        (self.0.as_ptr(), self.0.len() as u32)
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
     fn region(&self) -> RegionId {
         RegionId::UNREGISTERED

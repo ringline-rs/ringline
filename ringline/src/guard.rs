@@ -4,24 +4,46 @@ use crate::buffer::fixed::RegionId;
 
 /// Trait for user-provided zero-copy send guards.
 ///
-/// The guard keeps registered memory alive until the kernel ZC notification
+/// The guard owns, or keeps alive, the bytes a send transmits without copying
+/// them. The runtime holds it until the kernel's zero-copy notification
 /// arrives, or, on a Unix-domain connection (io_uring) and on the mio backend,
-/// until the send has copied it. Implement this for your cache/storage types (e.g., ValueRef).
+/// until the send has copied the bytes. Implement this for cache or storage
+/// types whose values are sent in place.
+///
+/// The runtime reads [`as_bytes`](Self::as_bytes) for the kernel after the
+/// guard is stored where it stays until it is dropped, and does not move the
+/// guard, call it again, or give out `&mut` access to it until then. A guard
+/// whose bytes are inside the guard value itself, or that is moved between
+/// calls, is therefore sent from where it lives at the send.
+///
+/// `as_bytes` must return the same bytes on every call. The runtime may call
+/// it more than once for one send, and the protocol clients encode the length
+/// into a request header before the send reads the bytes. A guard that
+/// returns different bytes produces a wrong send or a malformed request; it
+/// does not make the runtime read memory the guard does not own.
+///
+/// A guard over memory that Rust does not track, such as a value in a
+/// registered region kept alive by a reference count, builds the slice with
+/// `unsafe { std::slice::from_raw_parts(..) }` inside `as_bytes`, and that
+/// `unsafe` block is where it states why the memory stays valid and unwritten
+/// while the guard is alive.
 pub trait SendGuard: Send + 'static {
-    /// Pointer and length of the data to send.
-    fn as_ptr_len(&self) -> (*const u8, u32);
+    /// The bytes to send. At most `u32::MAX` bytes; a send refuses a longer
+    /// slice with `InvalidInput`.
+    fn as_bytes(&self) -> &[u8];
     /// The registered memory region this data belongs to, or
     /// [`RegionId::UNREGISTERED`]. When every guard of a send names the same
     /// registered region, the send may reference the region's slot until it
     /// completes; see
-    /// [`Runtime::unregister_region`](crate::Runtime::unregister_region).
+    /// [`Runtime::unregister_region`](crate::Runtime::unregister_region). A
+    /// send refuses a guard whose bytes are not inside the region it names.
     fn region(&self) -> RegionId;
 }
 
 /// VTable for type-erased GuardBox.
 struct GuardVTable {
     drop_fn: unsafe fn(*mut u8),
-    as_ptr_len_fn: unsafe fn(*const u8) -> (*const u8, u32),
+    as_bytes_fn: unsafe fn(*const u8) -> *const [u8],
     region_fn: unsafe fn(*const u8) -> RegionId,
 }
 
@@ -69,9 +91,12 @@ impl GuardBox {
         }
     }
 
-    /// Get the pointer and length of the guarded data.
-    pub fn as_ptr_len(&self) -> (*const u8, u32) {
-        unsafe { (self.vtable.as_ptr_len_fn)(self.storage.as_ptr() as *const u8) }
+    /// The guarded bytes: [`SendGuard::as_bytes`] of the boxed guard.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `storage` holds a live `G` (written in `new`, dropped only
+        // in `Drop`), and the slice `as_bytes_fn` returns borrows that `G`, so
+        // it lives as long as `&self`.
+        unsafe { &*(self.vtable.as_bytes_fn)(self.storage.as_ptr() as *const u8) }
     }
 
     /// Get the region ID of the guarded data.
@@ -102,9 +127,9 @@ unsafe fn guard_drop<G: SendGuard>(ptr: *mut u8) {
     unsafe { std::ptr::drop_in_place(ptr as *mut G) };
 }
 
-unsafe fn guard_as_ptr_len<G: SendGuard>(ptr: *const u8) -> (*const u8, u32) {
+unsafe fn guard_as_bytes<G: SendGuard>(ptr: *const u8) -> *const [u8] {
     let guard = unsafe { &*(ptr as *const G) };
-    guard.as_ptr_len()
+    guard.as_bytes()
 }
 
 unsafe fn guard_region<G: SendGuard>(ptr: *const u8) -> RegionId {
@@ -119,7 +144,7 @@ fn vtable_for<G: SendGuard>() -> &'static GuardVTable {
     impl<G: SendGuard> HasVTable for G {
         const VTABLE: GuardVTable = GuardVTable {
             drop_fn: guard_drop::<G>,
-            as_ptr_len_fn: guard_as_ptr_len::<G>,
+            as_bytes_fn: guard_as_bytes::<G>,
             region_fn: guard_region::<G>,
         };
     }
@@ -133,17 +158,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct TestGuard {
-        ptr: *const u8,
-        len: u32,
+        data: Arc<[u8]>,
         region: RegionId,
         dropped: Arc<AtomicBool>,
     }
 
-    unsafe impl Send for TestGuard {}
-
     impl SendGuard for TestGuard {
-        fn as_ptr_len(&self) -> (*const u8, u32) {
-            (self.ptr, self.len)
+        fn as_bytes(&self) -> &[u8] {
+            &self.data
         }
         fn region(&self) -> RegionId {
             self.region
@@ -157,20 +179,18 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_ptr_len_region() {
-        let data = [1u8, 2, 3, 4, 5];
+    fn round_trip_bytes_region() {
+        let data: Arc<[u8]> = Arc::from(&[1u8, 2, 3, 4, 5][..]);
         let dropped = Arc::new(AtomicBool::new(false));
         let guard = TestGuard {
-            ptr: data.as_ptr(),
-            len: 5,
+            data: data.clone(),
             region: RegionId(42),
             dropped: dropped.clone(),
         };
 
         let boxed = GuardBox::new(guard);
-        let (ptr, len) = boxed.as_ptr_len();
-        assert_eq!(ptr, data.as_ptr());
-        assert_eq!(len, 5);
+        assert_eq!(boxed.as_bytes().as_ptr(), data.as_ptr());
+        assert_eq!(boxed.as_bytes(), &[1, 2, 3, 4, 5]);
         assert_eq!(boxed.region(), RegionId(42));
         assert!(!dropped.load(Ordering::SeqCst));
     }
@@ -178,11 +198,9 @@ mod tests {
     #[test]
     fn drop_runs() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let data = [0u8; 10];
         {
             let guard = TestGuard {
-                ptr: data.as_ptr(),
-                len: 10,
+                data: Arc::from(&[0u8; 10][..]),
                 region: RegionId(0),
                 dropped: dropped.clone(),
             };
@@ -196,8 +214,8 @@ mod tests {
     struct ZeroSizeGuard;
 
     impl SendGuard for ZeroSizeGuard {
-        fn as_ptr_len(&self) -> (*const u8, u32) {
-            (std::ptr::null(), 0)
+        fn as_bytes(&self) -> &[u8] {
+            &[]
         }
         fn region(&self) -> RegionId {
             RegionId(99)
@@ -208,21 +226,19 @@ mod tests {
     fn zero_size_guard() {
         assert_eq!(std::mem::size_of::<ZeroSizeGuard>(), 0);
         let boxed = GuardBox::new(ZeroSizeGuard);
-        let (ptr, len) = boxed.as_ptr_len();
-        assert!(ptr.is_null());
-        assert_eq!(len, 0);
+        assert!(boxed.as_bytes().is_empty());
         assert_eq!(boxed.region(), RegionId(99));
     }
 
-    /// Guard that uses the full 64 bytes.
+    /// Guard that uses the full 64 bytes and holds its bytes inline.
     #[repr(C)]
     struct MaxSizeGuard {
-        _data: [u8; 64],
+        data: [u8; 64],
     }
 
     impl SendGuard for MaxSizeGuard {
-        fn as_ptr_len(&self) -> (*const u8, u32) {
-            (self._data.as_ptr(), 64)
+        fn as_bytes(&self) -> &[u8] {
+            &self.data
         }
         fn region(&self) -> RegionId {
             RegionId(1)
@@ -230,12 +246,12 @@ mod tests {
     }
 
     #[test]
-    fn max_size_guard() {
-        let guard = MaxSizeGuard { _data: [0xAB; 64] };
-        let boxed = GuardBox::new(guard);
-        let (ptr, len) = boxed.as_ptr_len();
-        assert_eq!(len, 64);
-        let slice = unsafe { std::slice::from_raw_parts(ptr, 64) };
-        assert!(slice.iter().all(|&b| b == 0xAB));
+    fn max_size_guard_reads_its_inline_bytes_where_it_is_stored() {
+        let boxed = GuardBox::new(MaxSizeGuard { data: [0xAB; 64] });
+        let bytes = boxed.as_bytes();
+        assert_eq!(bytes.len(), 64);
+        assert!(bytes.iter().all(|&b| b == 0xAB));
+        let storage = boxed.storage.as_ptr() as *const u8;
+        assert_eq!(bytes.as_ptr(), storage);
     }
 }

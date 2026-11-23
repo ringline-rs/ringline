@@ -7529,8 +7529,10 @@ mod tests {
         // Safety: the memory is leaked and never written while sent.
         unsafe impl Send for RegionGuard {}
         impl crate::SendGuard for RegionGuard {
-            fn as_ptr_len(&self) -> (*const u8, u32) {
-                (self.ptr, self.len)
+            fn as_bytes(&self) -> &[u8] {
+                // SAFETY: the memory is leaked, so valid for the life of the
+                // process, and never written while sent.
+                unsafe { std::slice::from_raw_parts(self.ptr, self.len as usize) }
             }
             fn region(&self) -> RegionId {
                 self.region
@@ -17660,13 +17662,14 @@ mod tests {
     }
 
     /// A `submit_batch` whose guard panics while the batch is built leaves no
-    /// entry: the id was registered before the guard's code ran.
+    /// entry: the id was registered before the guard's code ran, and the
+    /// slab entry the guard was moved into is released.
     #[test]
     fn a_panicking_guard_in_submit_batch_leaves_no_entry() {
         struct PanickingRegion(Vec<u8>);
         impl crate::SendGuard for PanickingRegion {
-            fn as_ptr_len(&self) -> (*const u8, u32) {
-                (self.0.as_ptr(), self.0.len() as u32)
+            fn as_bytes(&self) -> &[u8] {
+                &self.0
             }
             fn region(&self) -> crate::RegionId {
                 panic!("a guard's region panics")
@@ -17675,6 +17678,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let slab_free = el.driver.send_slab.free_count();
         for _ in 0..10 {
             let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 with_driver_state(&mut el, || {
@@ -17688,6 +17692,113 @@ mod tests {
             assert!(submitted.is_err(), "the panic reached the caller");
         }
         assert_eq!(el.executor.send_completions.live(), 0);
+        assert_eq!(
+            el.driver.send_slab.free_count(),
+            slab_free,
+            "the panic released the slab entry it ran in"
+        );
+    }
+
+    /// A guard of 48 bytes held inside the guard value, in no registered
+    /// region.
+    struct InlineGuard([u8; 48]);
+
+    impl crate::SendGuard for InlineGuard {
+        fn as_bytes(&self) -> &[u8] {
+            &self.0
+        }
+        fn region(&self) -> crate::RegionId {
+            crate::RegionId::UNREGISTERED
+        }
+    }
+
+    /// A zero-copy send of a guard whose bytes are inside the guard value
+    /// names the bytes where the slab entry stores the guard, which it holds
+    /// until the notification arrives, not where the guard was before it was
+    /// moved there (F4).
+    #[test]
+    fn an_inline_guard_is_sent_from_where_the_slab_entry_stores_it() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_zc_threshold(16)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let sent = with_driver_state(&mut el, || {
+            let guard = crate::GuardBox::new(InlineGuard([0xAB; 48]));
+            conn.send_parts()
+                .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+        });
+        assert!(sent.is_ok(), "{:?}", sent.err());
+        let ud = el
+            .driver
+            .ring
+            .last_pushed
+            .as_ref()
+            .expect("the send was pushed")
+            .user_data;
+        let ud = crate::completion::UserData(ud);
+        assert_eq!(ud.tag(), Some(crate::completion::OpTag::SendMsgZc));
+        let slab_idx = ud.payload() as u16;
+        let stored = el
+            .driver
+            .send_slab
+            .guard(slab_idx, 0)
+            .expect("the entry holds the guard")
+            .as_bytes();
+        let iov = el.driver.send_slab.iovec(slab_idx, 0);
+        assert_eq!(iov.iov_base as *const u8, stored.as_ptr());
+        assert_eq!(iov.iov_len, 48);
+        assert_eq!(el.driver.send_slab.total_len(slab_idx), 48);
+    }
+
+    /// A guard whose `as_bytes` panics on its third call. A `submit_batch`
+    /// of one guard at or above `send_zc_threshold` calls it in
+    /// `total_part_len`, in `SendBuilder::guard`, and then in
+    /// `build_with_guards`, after the guard was moved into a slab entry.
+    struct PanicsInItsEntry(std::cell::Cell<u32>, Vec<u8>);
+
+    impl crate::SendGuard for PanicsInItsEntry {
+        fn as_bytes(&self) -> &[u8] {
+            let calls = self.0.get() + 1;
+            self.0.set(calls);
+            if calls == 3 {
+                panic!("a guard's as_bytes panics in its slab entry");
+            }
+            &self.1
+        }
+        fn region(&self) -> crate::RegionId {
+            crate::RegionId::UNREGISTERED
+        }
+    }
+
+    /// A guard whose `as_bytes` panics when the slab entry reads it releases
+    /// the entry: the panic reaches the caller and the slab has as many free
+    /// entries as before.
+    #[test]
+    fn a_guard_that_panics_in_its_slab_entry_releases_the_entry() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let slab_free = el.driver.send_slab.free_count();
+        let len = el.driver.send_zc_threshold as usize;
+        for _ in 0..slab_free + 2 {
+            let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_driver_state(&mut el, || {
+                    let guard = crate::GuardBox::new(PanicsInItsEntry(
+                        std::cell::Cell::new(0),
+                        vec![7; len],
+                    ));
+                    conn.send_parts()
+                        .submit_batch(vec![crate::handler::SendPart::Guard(guard)])
+                })
+            }));
+            assert!(submitted.is_err(), "the panic reached the caller");
+        }
+        assert_eq!(el.executor.send_completions.live(), 0);
+        assert_eq!(el.driver.send_slab.free_count(), slab_free);
     }
 
     /// A `build` closure that panics after its send was submitted leaves no
@@ -21839,8 +21950,8 @@ mod tests {
     struct PlainGuard(Vec<u8>);
 
     impl crate::SendGuard for PlainGuard {
-        fn as_ptr_len(&self) -> (*const u8, u32) {
-            (self.0.as_ptr(), self.0.len() as u32)
+        fn as_bytes(&self) -> &[u8] {
+            &self.0
         }
         fn region(&self) -> crate::RegionId {
             crate::RegionId::UNREGISTERED

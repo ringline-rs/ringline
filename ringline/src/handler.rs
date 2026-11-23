@@ -1206,12 +1206,18 @@ impl<'a> DriverCtx<'a> {
                 }
                 SendPart::Guard(guard) => {
                     guards += 1;
-                    let (ptr, len) = guard.as_ptr_len();
-                    total += u64::from(len);
+                    let bytes = guard.as_bytes();
+                    total += bytes.len() as u64;
                     let region = guard.region();
                     if region != crate::buffer::fixed::RegionId::UNREGISTERED {
+                        let len = u32::try_from(bytes.len()).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "send batch longer than u32::MAX bytes",
+                            )
+                        })?;
                         self.fixed_buffers
-                            .validate_region_ptr(region, ptr, len)
+                            .validate_region_ptr(region, bytes.as_ptr(), len)
                             .map_err(|e| {
                                 io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
                             })?;
@@ -1273,7 +1279,7 @@ impl<'a> DriverCtx<'a> {
                 .iter()
                 .map(|p| match p {
                     SendPart::Copy(d) => d.len(),
-                    SendPart::Guard(g) => g.as_ptr_len().1 as usize,
+                    SendPart::Guard(g) => g.as_bytes().len(),
                 })
                 .sum();
             // `submit_small_gather` takes one slot when one is free and the
@@ -4065,13 +4071,22 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             ));
             return self;
         }
-        let (_, len) = guard.as_ptr_len();
+        let Some(total_len) = u32::try_from(guard.as_bytes().len())
+            .ok()
+            .and_then(|len| self.total_len.checked_add(len))
+        else {
+            self.error = Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send batch longer than u32::MAX bytes",
+            ));
+            return self;
+        };
         let gidx = self.guard_count;
         self.guards[gidx as usize] = Some(guard);
         self.guard_count += 1;
         self.parts[self.part_count as usize] = PartSlot::Guard { guard_idx: gidx };
         self.part_count += 1;
-        self.total_len += len;
+        self.total_len = total_len;
         self
     }
 
@@ -4197,9 +4212,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 }
                 PartSlot::Guard { guard_idx } => {
                     if let Some(ref g) = self.guards[guard_idx as usize] {
-                        let (ptr, len) = g.as_ptr_len();
-                        let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-                        plaintext.extend_from_slice(data);
+                        plaintext.extend_from_slice(g.as_bytes());
                     }
                 }
                 PartSlot::Empty => {}
@@ -4257,6 +4270,10 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     }
 
     /// Mixed copy+guard path: allocate pool slot + slab entry, return built SQE.
+    ///
+    /// The guards are moved into the slab entry before their bytes are read
+    /// (`place_guards`), so the iovecs name the bytes where the entry keeps
+    /// them until the send's notifications arrive.
     #[allow(clippy::needless_range_loop)]
     fn build_with_guards(&mut self) -> io::Result<BuiltSend> {
         let slot_size = self.ctx.send_copy_pool.slot_size() as usize;
@@ -4267,7 +4284,8 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             ));
         }
 
-        if self.total_copy_len > 0 {
+        // Copy parts into one pool slot, when there are any.
+        let (slot, pool_ptr) = if self.total_copy_len > 0 {
             let (slot, pool_ptr, _pool_len) = unsafe {
                 self.ctx.send_copy_pool.copy_in_gather(
                     crate::buffer::send_copy::SlotOwner::conn(
@@ -4279,204 +4297,205 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 )
             }
             .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
+            (slot, pool_ptr)
+        } else {
+            (u16::MAX, std::ptr::null())
+        };
 
-            let mut iovecs = [libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            }; MAX_IOVECS];
-            let mut copy_offset: usize = 0;
-            for i in 0..self.part_count as usize {
-                match self.parts[i] {
-                    PartSlot::Copy { slice_idx } => {
-                        let (_src_ptr, src_len) = self.copy_slices[slice_idx as usize];
-                        iovecs[i] = libc::iovec {
-                            iov_base: pool_ptr.wrapping_add(copy_offset) as *mut _,
-                            iov_len: src_len,
-                        };
-                        copy_offset += src_len;
-                    }
-                    PartSlot::Guard { guard_idx } => {
-                        let g = self.guards[guard_idx as usize].as_ref().unwrap();
-                        let (gptr, glen) = g.as_ptr_len();
-                        let region = g.region();
-                        if region != crate::buffer::fixed::RegionId::UNREGISTERED {
-                            self.ctx
-                                .fixed_buffers
-                                .validate_region_ptr(region, gptr, glen)
-                                .map_err(|e| {
-                                    self.ctx.send_copy_pool.release(slot);
-                                    io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
-                                })?;
-                        }
-                        iovecs[i] = libc::iovec {
-                            iov_base: gptr as *mut _,
-                            iov_len: glen as usize,
-                        };
-                    }
-                    PartSlot::Empty => {}
+        // Copy parts' iovecs name their pool subranges; each guard part's
+        // iovec is left empty for `place_guards`, which `guard_iov` tells
+        // where guard `k` goes.
+        let mut iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; MAX_IOVECS];
+        let mut guard_iov = [u8::MAX; MAX_GUARDS];
+        let mut copy_offset: usize = 0;
+        for i in 0..self.part_count as usize {
+            match self.parts[i] {
+                PartSlot::Copy { slice_idx } => {
+                    let (_src_ptr, src_len) = self.copy_slices[slice_idx as usize];
+                    iovecs[i] = libc::iovec {
+                        iov_base: pool_ptr.wrapping_add(copy_offset) as *mut _,
+                        iov_len: src_len,
+                    };
+                    copy_offset += src_len;
                 }
+                PartSlot::Guard { guard_idx } => guard_iov[guard_idx as usize] = i as u8,
+                PartSlot::Empty => {}
             }
+        }
 
-            // Take guards out of self (moved into slab).
-            let guards = std::mem::take(&mut self.guards);
-            let iov_slice = &iovecs[..self.part_count as usize];
-            let total_len = self.total_len;
-            let (slab_idx, msg_ptr) = self
-                .ctx
-                .send_slab
-                .allocate(
-                    self.conn.index,
-                    self.conn.generation,
-                    iov_slice,
-                    slot,
-                    guards,
-                    self.guard_count,
-                    total_len,
-                )
-                .ok_or_else(|| {
-                    self.ctx.send_copy_pool.release(slot);
-                    io::Error::other("send slab exhausted")
-                })?;
-
-            let user_data = crate::completion::UserData::encode(
-                crate::completion::OpTag::SendMsgZc,
+        let guards = std::mem::take(&mut self.guards);
+        let (slab_idx, msg_ptr) = self
+            .ctx
+            .send_slab
+            .allocate(
                 self.conn.index,
-                slab_idx as u32,
-            );
-            // A Unix socket refuses `SENDMSG_ZC`: send the entry with a plain
-            // `sendmsg`, and mark it so a partial send is resent the same way.
-            // The completion is handled as a zero-copy send that owes no
-            // notification.
-            let entry = if self.ctx.conn_is_unix(self.conn.index) {
-                self.ctx.send_slab.set_plain_msg(slab_idx);
-                crate::backend::uring::sqe::Sqe::send_msg(self.conn.index, msg_ptr, user_data.raw())
-            } else {
-                crate::backend::uring::sqe::Sqe::send_msg_zc(
-                    self.conn.index,
-                    msg_ptr,
-                    user_data.raw(),
-                )
-            };
+                self.conn.generation,
+                &iovecs[..self.part_count as usize],
+                slot,
+                guards,
+                self.guard_count,
+                0,
+            )
+            .ok_or_else(|| {
+                if slot != u16::MAX {
+                    self.ctx.send_copy_pool.release(slot);
+                }
+                io::Error::other("send slab exhausted")
+            })?;
 
-            Ok(BuiltSend {
+        // The guards' code runs from here on, and the entry is allocated: a
+        // refusal or a panic releases the entry and the slot.
+        let placed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.place_guards(slab_idx, &guard_iov)
+        }));
+        let buf_region = match placed {
+            Ok(Ok(region)) => region,
+            Ok(Err(e)) => {
+                self.release_unsent(slab_idx);
+                return Err(e);
+            }
+            Err(panic) => {
+                self.release_unsent(slab_idx);
+                std::panic::resume_unwind(panic);
+            }
+        };
+
+        let user_data = crate::completion::UserData::encode(
+            crate::completion::OpTag::SendMsgZc,
+            self.conn.index,
+            slab_idx as u32,
+        );
+        // A Unix socket refuses `SENDMSG_ZC`: send the entry with a plain
+        // `sendmsg`, and mark it so a partial send is resent the same way.
+        // The completion is handled as a zero-copy send that owes no
+        // notification.
+        if self.ctx.conn_is_unix(self.conn.index) {
+            self.ctx.send_slab.set_plain_msg(slab_idx);
+            let entry = crate::backend::uring::sqe::Sqe::send_msg(
+                self.conn.index,
+                msg_ptr,
+                user_data.raw(),
+            );
+            return Ok(BuiltSend {
                 entry,
                 pool_slot: slot,
                 slab_idx,
-            })
-        } else {
-            // No copy data, only guards.
-            let mut iovecs = [libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            }; MAX_IOVECS];
-            // The registered buffer every guard lies in, when there is one and
-            // this send's kind may name it: one guard goes out as `SEND_ZC`,
-            // several as `SENDMSG_ZC`.
-            let allowed = self.ctx.fixed_buffer_sends;
-            let single = self.part_count == 1;
-            let kind = |m: crate::backend::uring::fixed_send::Modes| {
-                if single { m.single } else { m.multi }
-            };
-            let mut buf_index = (kind(allowed.huge) || kind(allowed.base)).then_some(None);
-            for i in 0..self.part_count as usize {
-                if let PartSlot::Guard { guard_idx } = self.parts[i] {
-                    let g = self.guards[guard_idx as usize].as_ref().unwrap();
-                    let (gptr, glen) = g.as_ptr_len();
-                    let region = g.region();
-                    if region != crate::buffer::fixed::RegionId::UNREGISTERED {
-                        self.ctx
-                            .fixed_buffers
-                            .validate_region_ptr(region, gptr, glen)
-                            .map_err(|e| {
-                                io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
-                            })?;
-                    }
-                    buf_index = match buf_index {
-                        Some(None) if region != crate::buffer::fixed::RegionId::UNREGISTERED => {
-                            Some(Some(region.0))
-                        }
-                        Some(Some(index)) if index == region.0 => Some(Some(index)),
-                        _ => None,
-                    };
-                    iovecs[i] = libc::iovec {
-                        iov_base: gptr as *mut _,
-                        iov_len: glen as usize,
-                    };
-                }
-            }
+            });
+        }
 
-            // Whether this kind of send may name the buffer depends on whether
-            // the region is in base pages only.
-            if let Some(Some(index)) = buf_index
-                && !kind(allowed.for_region(self.ctx.fixed_buffers.base_pages(index)))
-            {
-                buf_index = None;
-            }
-            let guards = std::mem::take(&mut self.guards);
-            let iov_slice = &iovecs[..self.part_count as usize];
-            let total_len = self.total_len;
-            let (slab_idx, msg_ptr) = self
-                .ctx
-                .send_slab
-                .allocate(
-                    self.conn.index,
-                    self.conn.generation,
-                    iov_slice,
-                    u16::MAX,
-                    guards,
-                    self.guard_count,
-                    total_len,
-                )
-                .ok_or_else(|| io::Error::other("send slab exhausted"))?;
+        // The registered buffer every guard lies in, when the send has no
+        // copy part, there is one, and this send's kind may name it: one
+        // guard goes out as `SEND_ZC`, several as `SENDMSG_ZC`. Whether a
+        // kind may name the buffer depends on whether the region is in base
+        // pages only.
+        let allowed = self.ctx.fixed_buffer_sends;
+        let single = self.part_count == 1;
+        let kind = |m: crate::backend::uring::fixed_send::Modes| {
+            if single { m.single } else { m.multi }
+        };
+        let buf_index = buf_region
+            .filter(|_| slot == u16::MAX)
+            .filter(|&index| kind(allowed.for_region(self.ctx.fixed_buffers.base_pages(index))));
 
-            let user_data = crate::completion::UserData::encode(
-                crate::completion::OpTag::SendMsgZc,
-                self.conn.index,
-                slab_idx as u32,
-            );
-            // A Unix socket refuses `SENDMSG_ZC`: send the entry with a plain
-            // `sendmsg`, and mark it so a partial send is resent the same way.
-            // The completion is handled as a zero-copy send that owes no
-            // notification.
-            let entry = if self.ctx.conn_is_unix(self.conn.index) {
-                self.ctx.send_slab.set_plain_msg(slab_idx);
-                crate::backend::uring::sqe::Sqe::send_msg(self.conn.index, msg_ptr, user_data.raw())
-            } else if let Some(Some(buf_index)) = buf_index {
-                // Every iovec lies in registered buffer `buf_index` (checked
-                // above), so the kernel takes the pages from the buffer
-                // instead of looking them up and pinning them. The completion
-                // is handled as the `SENDMSG_ZC` the entry describes, which a
-                // short send's rest is resent as.
-                crate::metrics::RING.increment(crate::metrics::ring::SEND_FIXED_BUFFER);
-                if single {
-                    crate::backend::uring::sqe::Sqe::send_zc_fixed(
-                        self.conn.index,
-                        iovecs[0].iov_base as *const u8,
-                        iovecs[0].iov_len as u32,
-                        buf_index,
-                        user_data.raw(),
-                    )
-                } else {
-                    crate::backend::uring::sqe::Sqe::send_msg_zc_fixed(
-                        self.conn.index,
-                        msg_ptr,
-                        buf_index,
-                        user_data.raw(),
-                    )
-                }
-            } else {
-                crate::backend::uring::sqe::Sqe::send_msg_zc(
+        let entry = if let Some(buf_index) = buf_index {
+            // Every iovec lies in registered buffer `buf_index` (checked by
+            // `place_guards`), so the kernel takes the pages from the buffer
+            // instead of looking them up and pinning them. The completion is
+            // handled as the `SENDMSG_ZC` the entry describes, which a short
+            // send's rest is resent as.
+            crate::metrics::RING.increment(crate::metrics::ring::SEND_FIXED_BUFFER);
+            if single {
+                let iov = self.ctx.send_slab.iovec(slab_idx, 0);
+                crate::backend::uring::sqe::Sqe::send_zc_fixed(
                     self.conn.index,
-                    msg_ptr,
+                    iov.iov_base as *const u8,
+                    iov.iov_len as u32,
+                    buf_index,
                     user_data.raw(),
                 )
-            };
+            } else {
+                crate::backend::uring::sqe::Sqe::send_msg_zc_fixed(
+                    self.conn.index,
+                    msg_ptr,
+                    buf_index,
+                    user_data.raw(),
+                )
+            }
+        } else {
+            crate::backend::uring::sqe::Sqe::send_msg_zc(self.conn.index, msg_ptr, user_data.raw())
+        };
 
-            Ok(BuiltSend {
-                entry,
-                pool_slot: u16::MAX,
-                slab_idx,
-            })
+        Ok(BuiltSend {
+            entry,
+            pool_slot: slot,
+            slab_idx,
+        })
+    }
+
+    /// Read the guards of slab entry `slab_idx` where the entry stores them:
+    /// point their iovecs at their bytes, check each guard that names a
+    /// registered region lies inside it, and set the entry's and the
+    /// builder's total length from the bytes read. Returns the registered
+    /// region every guard lies in, if there is one. Runs the guards' code.
+    fn place_guards(
+        &mut self,
+        slab_idx: u16,
+        guard_iov: &[u8; MAX_GUARDS],
+    ) -> io::Result<Option<u16>> {
+        let guard_bytes = self.ctx.send_slab.place_guards(slab_idx, guard_iov);
+        let too_long = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send batch longer than u32::MAX bytes",
+            )
+        };
+        let total =
+            u32::try_from(guard_bytes + self.total_copy_len as u64).map_err(|_| too_long())?;
+
+        // `Some(None)`: no guard read yet; `Some(Some(r))`: every guard so far
+        // lies in region `r`; `None`: no single region.
+        let mut common: Option<Option<u16>> = Some(None);
+        for (k, &iov) in guard_iov.iter().enumerate() {
+            if iov == u8::MAX {
+                continue;
+            }
+            let region = self
+                .ctx
+                .send_slab
+                .guard(slab_idx, k)
+                .expect("a guard is stored for each placed iovec")
+                .region();
+            if region == crate::buffer::fixed::RegionId::UNREGISTERED {
+                common = None;
+                continue;
+            }
+            let placed = self.ctx.send_slab.iovec(slab_idx, iov as usize);
+            let len = u32::try_from(placed.iov_len).map_err(|_| too_long())?;
+            self.ctx
+                .fixed_buffers
+                .validate_region_ptr(region, placed.iov_base as *const u8, len)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            common = match common {
+                Some(None) => Some(Some(region.0)),
+                Some(Some(index)) if index == region.0 => Some(Some(index)),
+                _ => None,
+            };
+        }
+
+        self.ctx.send_slab.set_total_len(slab_idx, total);
+        self.total_len = total;
+        Ok(common.flatten())
+    }
+
+    /// Release slab entry `slab_idx`, which was never submitted, and its
+    /// pool slot.
+    fn release_unsent(&mut self, slab_idx: u16) {
+        let slot = self.ctx.send_slab.release(slab_idx);
+        if slot != u16::MAX {
+            self.ctx.send_copy_pool.release(slot);
         }
     }
 
@@ -4509,24 +4528,27 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                     let g = self.guards[guard_idx as usize]
                         .as_ref()
                         .expect("guard slot must be Some in submit_small_gather");
-                    let (ptr, len) = g.as_ptr_len();
-                    slices[n] = (ptr, len as usize);
+                    let bytes = g.as_bytes();
+                    slices[n] = (bytes.as_ptr(), bytes.len());
                     n += 1;
                 }
                 PartSlot::Empty => {}
             }
         }
 
+        // The guards' lengths as read now, which a guard that returns different
+        // bytes on each call makes differ from `total_len`.
+        let gathered: usize = slices[..n].iter().map(|&(_, len)| len).sum();
         // SAFETY: every (ptr, len) in `slices[..n]` is live — copy slices borrow
-        // caller data that outlives the builder, guard memory is owned by
-        // `self.guards` until this method returns.
-        // `self.total_len` equals the sum of all gathered part lengths, so the
-        // slot's `remaining` accounting matches the bytes actually copied in.
+        // caller data that outlives the builder, and each guard slice borrows a
+        // guard in `self.guards`, which is not touched until this method
+        // returns. `gathered` is the sum of the slices' lengths, so the slot's
+        // `remaining` accounting matches the bytes copied in.
         let Some((slot, ptr, len)) = (unsafe {
             self.ctx.send_copy_pool.copy_in_gather(
                 crate::buffer::send_copy::SlotOwner::conn(self.conn.index, self.conn.generation),
                 &slices[..n],
-                self.total_len as usize,
+                gathered,
             )
         }) else {
             // Pool exhausted or gather exceeds slot size: keep guards, use ZC path.
@@ -4545,6 +4567,8 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             user_data.raw(),
         );
 
+        // At most the slot size, which is a `u32`.
+        self.total_len = len;
         let built = BuiltSend {
             entry,
             pool_slot: slot,
