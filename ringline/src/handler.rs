@@ -18,7 +18,7 @@ use crate::guard::GuardBox;
 /// bounded sends; while it waits, no other send on the connection is
 /// encrypted. The driver records changes on `Driver::sealed_dirty` and
 /// `Driver::sealed_gone`, and `Driver::sync_sealed` brings the queue up to
-/// date.
+/// date. [`hold_sealed`] bounds how much a connection, and the worker, holds.
 #[cfg(has_io_uring)]
 #[derive(Debug)]
 pub(crate) struct SealedOutput {
@@ -36,25 +36,44 @@ pub(crate) struct SealedOutput {
     pub dirty: bool,
 }
 
-/// Append `bytes` to the sealed output in `state`, creating it if there is
-/// none, and put `conn_index` on `dirty` (`Driver::sealed_dirty`) if it is
-/// not there. Returns `false`, holding nothing, when the output would need
-/// more slots than `pool` has, so that it could never be placed.
+/// The most sealed output one connection holds, unless one send-pool slot is
+/// larger: then one slot's worth.
 #[cfg(has_io_uring)]
+pub(crate) const SEALED_CONN_MAX: usize = 64 * 1024;
+
+/// Append `bytes` to the sealed output in `state`, creating it if there is
+/// none, add them to `total` (`Driver::sealed_bytes`), and put `conn_index`
+/// on `dirty` (`Driver::sealed_dirty`) if it is not there.
+///
+/// Returns `false`, holding nothing, when the connection's sealed output
+/// would then need more slots than `pool` has, or, unless `bytes` is a
+/// close_notify, when it would be over [`SEALED_CONN_MAX`] (or one slot, if
+/// larger) or the worker's sealed output would be over the pool's total
+/// bytes. A close_notify is exempt from the last two: there is at most one
+/// per connection and it is a few dozen bytes.
+#[cfg(has_io_uring)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hold_sealed(
     state: &mut ConnSendState,
     pool: &SendCopyPool,
     dirty: &mut Vec<u32>,
+    total: &mut usize,
     conn_index: u32,
     bytes: &[u8],
     close_notify: bool,
     receive: bool,
 ) -> bool {
     let slot_size = pool.slot_size() as usize;
-    let held = state.sealed.as_ref().map_or(0, |s| s.bytes.len());
-    if (held + bytes.len()).div_ceil(slot_size) > pool.slot_count() {
+    let pool_bytes = pool.slot_count() * slot_size;
+    let held = state.sealed.as_ref().map_or(0, |s| s.bytes.len()) + bytes.len();
+    if held.div_ceil(slot_size) > pool.slot_count() {
         return false;
     }
+    if !close_notify && (held > SEALED_CONN_MAX.max(slot_size) || *total + bytes.len() > pool_bytes)
+    {
+        return false;
+    }
+    *total += bytes.len();
     let sealed = state.sealed.get_or_insert_with(|| SealedOutput {
         bytes: Vec::new(),
         close_notify: false,
@@ -655,6 +674,8 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) ticket_waiting: bool,
     /// See `Driver::sealed_dirty`.
     pub(crate) sealed_dirty: &'a mut Vec<u32>,
+    /// See `Driver::sealed_bytes`.
+    pub(crate) sealed_bytes: &'a mut usize,
 }
 
 /// The refusal of a TLS send made after this side's close_notify was queued:
@@ -1350,6 +1371,7 @@ impl<'a> DriverCtx<'a> {
                                 &mut self.send_queues[conn.index as usize],
                                 self.send_copy_pool,
                                 self.sealed_dirty,
+                                self.sealed_bytes,
                                 conn.index,
                                 &held,
                                 true,

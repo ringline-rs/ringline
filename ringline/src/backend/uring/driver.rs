@@ -837,6 +837,9 @@ pub(crate) struct Driver {
     /// Connections whose sealed output was created or grew since the last
     /// [`sync_sealed`](Self::sync_sealed).
     pub(crate) sealed_dirty: Vec<u32>,
+    /// Bytes held in sealed output across the worker's connections, bounded
+    /// by the pool's total bytes (`handler::hold_sealed`).
+    pub(crate) sealed_bytes: usize,
     /// Sealed tickets whose output the driver placed or dropped outside the
     /// event loop's serve, for [`sync_sealed`](Self::sync_sealed) to remove.
     pub(crate) sealed_gone: Vec<crate::runtime::send_completion::SendId>,
@@ -1409,6 +1412,7 @@ impl Driver {
             tls_out_scratch: Vec::new(),
             tls_held_scratch: Vec::new(),
             sealed_dirty: Vec::new(),
+            sealed_bytes: 0,
             sealed_gone: Vec::new(),
             bare_fin_closes: 0,
             next_disk_io_seq: 0,
@@ -1585,6 +1589,7 @@ impl Driver {
             parts_id_carried: false,
             ticket_waiting: false,
             sealed_dirty: &mut self.sealed_dirty,
+            sealed_bytes: &mut self.sealed_bytes,
         }
     }
 
@@ -1616,7 +1621,9 @@ impl Driver {
         // reactivated with a Shutdown still outstanding. If the gate ever leaks,
         // the next occupant must not inherit the block.
         state.shutdown_inflight = false;
-        state.sealed = None;
+        if let Some(sealed) = state.sealed.take() {
+            self.sealed_bytes -= sealed.bytes.len();
+        }
         state.aborted = false;
         state.disconnect = Disconnect::None;
         state.waiting_send = None;
@@ -2746,8 +2753,9 @@ impl Driver {
     /// behind output already waiting, to the connection's sealed output,
     /// creating it if there is none, and record the change for
     /// [`sync_sealed`](Self::sync_sealed). Returns `false`, holding nothing,
-    /// when the output would need more slots than the pool has, so that it
-    /// could never be placed.
+    /// when the output would need more slots than the pool has, or would be
+    /// over the connection's or the worker's bound
+    /// ([`hold_sealed`](crate::handler::hold_sealed)).
     pub(crate) fn hold_sealed(
         &mut self,
         conn_index: u32,
@@ -2759,6 +2767,7 @@ impl Driver {
             &mut self.send_queues[conn_index as usize],
             &self.send_copy_pool,
             &mut self.sealed_dirty,
+            &mut self.sealed_bytes,
             conn_index,
             bytes,
             close_notify,
@@ -2770,6 +2779,7 @@ impl Driver {
     /// [`sync_sealed`](Self::sync_sealed) to remove.
     pub(crate) fn take_sealed(&mut self, conn_index: u32) -> Option<crate::handler::SealedOutput> {
         let sealed = self.send_queues[conn_index as usize].sealed.take()?;
+        self.sealed_bytes -= sealed.bytes.len();
         if let Some(ticket) = sealed.ticket {
             self.sealed_gone.push(ticket);
         }
@@ -2809,6 +2819,7 @@ impl Driver {
             None => false,
         };
         if placed {
+            self.sealed_bytes -= sealed.bytes.len();
             self.send_queues[conn_index as usize].sealed = None;
             self.queue_built_sends(conn_index, &mut sends);
         }

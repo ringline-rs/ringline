@@ -154,10 +154,12 @@ fn choose_placement(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -> 
     }
 }
 
-/// The error a connection fails with when its sealed TLS output would need
-/// more send-pool slots than the pool has.
+/// The error a connection fails with when TLS output cannot wait for
+/// send-pool slots: the connection's sealed output would be over its bound
+/// or need more slots than the pool has, or the worker's would be over its
+/// bound (`handler::hold_sealed`).
 fn sealed_output_too_large() -> io::Error {
-    io::Error::other("TLS output needs more send-pool slots than the pool has")
+    io::Error::other("TLS output waiting for send-pool slots is over its limit")
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
@@ -21545,6 +21547,7 @@ mod tests {
             "the output was queued"
         );
         assert!(!el.executor.send_waiting_on(conn_index), "the ticket left");
+        assert_eq!(el.driver.sealed_bytes, 0, "the served bytes left the total");
     }
 
     /// A bounded send on the connection waits behind held output, which is
@@ -21771,6 +21774,56 @@ mod tests {
                 .hold_sealed(conn_index, &vec![0; len], false, true)
         );
         assert!(!el.driver.sealed_waiting(conn_index));
+    }
+
+    /// A connection holds at most `SEALED_CONN_MAX` of sealed output; past
+    /// it, output is not held. A close_notify appended behind it still is.
+    #[test]
+    fn a_connection_holds_at_most_its_bound_of_sealed_output() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let max = crate::handler::SEALED_CONN_MAX;
+        assert!(el.driver.send_copy_pool.slot_size() as usize <= max);
+        assert!(
+            el.driver
+                .hold_sealed(conn_index, &vec![0; max], false, true)
+        );
+        assert!(!el.driver.hold_sealed(conn_index, b"x", false, true));
+        assert_eq!(
+            el.driver.sealed_bytes, max,
+            "the refused byte was not added"
+        );
+        assert!(el.driver.hold_sealed(conn_index, b"alert", true, false));
+        assert_eq!(el.driver.sealed_bytes, max + 5);
+    }
+
+    /// The worker's connections together hold at most the pool's total bytes
+    /// of sealed output, and output that leaves (dropped or reset) makes room
+    /// again.
+    #[test]
+    fn the_worker_holds_at_most_the_pool_s_bytes_of_sealed_output() {
+        let mut el = make_test_loop();
+        let pool = &el.driver.send_copy_pool;
+        let pool_bytes = pool.slot_count() * pool.slot_size() as usize;
+        let max = crate::handler::SEALED_CONN_MAX;
+        assert_eq!(pool_bytes % max, 0, "the pool fills with whole connections");
+        let conns: Vec<u32> = (0..pool_bytes / max)
+            .map(|_| accept_connection(&mut el))
+            .collect();
+        for &c in &conns {
+            assert!(el.driver.hold_sealed(c, &vec![0; max], false, true));
+        }
+        assert_eq!(el.driver.sealed_bytes, pool_bytes);
+        let last = accept_connection(&mut el);
+        assert!(
+            !el.driver.hold_sealed(last, b"x", false, true),
+            "over the worker's bound"
+        );
+
+        el.driver.drop_sealed(conns[0]);
+        assert!(el.driver.hold_sealed(last, b"x", false, true));
+        el.driver.reset_send_state(conns[1]);
+        assert_eq!(el.driver.sealed_bytes, pool_bytes - 2 * max + 1);
     }
 }
 

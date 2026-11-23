@@ -595,8 +595,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   output waits, a plain send on the connection is refused as it is behind a
   waiting bounded send, a bounded send on it waits behind the output, a
   `shutdown_write` is deferred until it has been sent, and the connection is
-  not moved to another worker. Output that would need more slots than the
-  pool has still fails the connection.
+  not moved to another worker. Output still fails the connection when it
+  would need more slots than the pool has, put more than 64 KiB (or one
+  slot, if larger) waiting on the connection, or put more than the pool's
+  total bytes waiting on the worker.
 - `Runtime::shutdown` (and dropping the `Runtime`) returns once every
   pool-mode acceptor thread has exited, so a pool-mode listener's port is
   free when it returns. It may block for up to 10 ms while an acceptor
