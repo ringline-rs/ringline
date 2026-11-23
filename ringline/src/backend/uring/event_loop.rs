@@ -21810,7 +21810,14 @@ mod tests {
             el.driver.hold_sealed(other, &vec![0; exempt], true, false),
             "close output at the exemption is held"
         );
-        assert_eq!(el.driver.sealed_bytes, 2 * max + 5 + exempt);
+        let flight = accept_connection(&mut el);
+        assert!(el.driver.hold_sealed(flight, &vec![0; max], false, true));
+        assert!(
+            !el.driver
+                .hold_sealed(flight, &vec![0; exempt], false, false),
+            "close output without the alert is not exempt"
+        );
+        assert_eq!(el.driver.sealed_bytes, 3 * max + 5 + exempt);
     }
 
     /// The worker's connections together hold at most the pool's total bytes

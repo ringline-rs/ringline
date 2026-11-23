@@ -209,11 +209,13 @@ connection's tickets in queue order.
   flight over the bound, such as a certificate chain over 64 KiB that the
   pool cannot take whole when it is produced, fails its connection. Once the
   worker's total is reached, any connection whose output would wait fails,
-  whichever connections hold the bytes. Close output of at most 512 bytes
-  (`close_notify` and a record rustls had queued ahead of it) is exempt from
-  the two bounds; a connection produces close output at most once. Larger
-  close output, such as the flight of a server closed before its handshake
-  finished, is dropped when over a bound, and the close goes ahead.
+  whichever connections hold the bytes. Close output that ends in
+  `close_notify` and is at most 512 bytes (the alert and a record rustls had
+  queued ahead of it) is exempt from the two bounds; a connection produces
+  close output at most once. Other close output, such as the flight the
+  unbuffered engine encodes for a server closed before its handshake
+  finished, which has no alert, is dropped when over a bound, and the close
+  goes ahead.
 - `close_notify` joins the receive-path ticket when one waits, behind the
   output in it; otherwise it takes a ticket of its own if the pool cannot
   take it. Either way it goes after the connection's earlier tickets.

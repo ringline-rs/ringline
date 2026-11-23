@@ -58,8 +58,9 @@ pub(crate) const SEALED_CLOSE_EXEMPT: usize = 512;
 /// output would be over the pool's total bytes. Close output that ends in
 /// the close_notify and is at most [`SEALED_CLOSE_EXEMPT`] bytes is exempt
 /// from the last two; a connection produces close output at most once.
-/// Other close output, such as the flight of a server closed before its
-/// handshake finished, which has no alert, is not.
+/// Other close output, such as the flight the unbuffered engine encodes for
+/// a server closed before its handshake finished, which has no alert, is
+/// not.
 #[cfg(has_io_uring)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hold_sealed(
