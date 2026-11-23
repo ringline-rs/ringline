@@ -590,16 +590,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - On io_uring, TLS output produced while receiving (handshake flights,
   session tickets, alerts) and an outbound connection's first flight wait for
   send-pool slots when the pool has none. Before, the connection failed
-  ("send pool exhausted during TLS output flush"). While such output waits, a
-  plain send on the connection is refused as it is behind a waiting bounded
-  send, a bounded send on it waits behind the output, and the connection is
+  ("send pool exhausted during TLS output flush", or "send pool exhausted
+  during TLS flush" for an outbound connection's first flight). While such
+  output waits, a plain send on the connection is refused as it is behind a
+  waiting bounded send, a bounded send on it waits behind the output, a
+  `shutdown_write` is deferred until it has been sent, and the connection is
   not moved to another worker. Output that would need more slots than the
   pool has still fails the connection.
-- On io_uring, a TLS connection's close_notify and TLS output that waited for
-  send-pool slots go on the wire in the order they were encrypted. Before,
-  output produced after a close_notify that was waiting for a slot was sent
-  ahead of it, and the peer failed the connection with a record error instead
-  of reading the close.
 - `Runtime::shutdown` (and dropping the `Runtime`) returns once every
   pool-mode acceptor thread has exited, so a pool-mode listener's port is
   free when it returns. It may block for up to 10 ms while an acceptor
@@ -2039,7 +2036,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   when the pool had none at the close, the connection closed behind a bare
   FIN, the peer read the stream as truncated, and `close_notify_sent` said
   the alert had gone out. The alert's ciphertext is now kept on the
-  connection and queued from the close drain once the connection's own
+  connection, behind any TLS output also waiting for slots, and queued
+  from the close drain once the connection's own
   sends have drained and given their slots back, with the Close waiting
   behind it. If the pool is still exhausted then, or the close_notify
   deadline forces the close first, the alert is dropped, the new

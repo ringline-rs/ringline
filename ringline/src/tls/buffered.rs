@@ -200,8 +200,13 @@ pub(super) fn feed_tls_recv_buffered(
             Ok(state) => state,
             Err(e) => {
                 if tls_conn.conn.wants_write() {
-                    let _ =
-                        take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out);
+                    let _ = take_tls_output_sends(
+                        tls_conn,
+                        send_copy_pool,
+                        conn_index,
+                        generation,
+                        out,
+                    );
                 }
                 return TlsRecvResult::Error(super::record_layer_error(e));
             }
@@ -222,7 +227,8 @@ pub(super) fn feed_tls_recv_buffered(
         Ok(state) => state,
         Err(e) => {
             if tls_conn.conn.wants_write() {
-                let _ = take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out);
+                let _ =
+                    take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out);
             }
             return TlsRecvResult::Error(super::record_layer_error(e));
         }
@@ -431,7 +437,7 @@ pub(super) fn drain_tls_output(tls_conn: &mut TlsConn) -> io::Result<Vec<u8>> {
 
 /// Drain rustls' pending TLS output through a `Vec` ([`drain_tls_output`])
 /// and place it in `out`: as pool-backed sends tagged `TlsSend`, all of it
-/// or none, or in `out.held`. The receive path, which knows the byte count,
+/// or none, or in `out.held`. The receive path, which has the byte count,
 /// tries [`take_counted_tls_output_sends`] first.
 ///
 /// Returns `false` on a `write_tls` error — the connection should be

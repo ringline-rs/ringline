@@ -62,9 +62,9 @@ use super::unbuffered;
 /// the first byte is copied; if the pool cannot cover them, nothing is taken
 /// or appended and this returns `false`. Appending a prefix would put a
 /// truncated TLS record on the wire — half a Certificate message is strictly
-/// worse for the peer than none of it — and the callers tear the connection
-/// down on `false`, except a close_notify, which keeps the bytes and tries
-/// again (`TlsTable::send_close_notify_queued`). Sends appended to `out` by
+/// worse for the peer than none of it. On `false`, `TlsOutput::place` appends
+/// the bytes to `TlsOutput::held`, and `TlsTable::place_sealed` places them
+/// later from the connection's sealed output. Sends appended to `out` by
 /// *earlier* calls are untouched. The unbuffered engine's handshake and alert
 /// output comes through here, as does the buffered engine's output that has
 /// no `IoState` to size it (close_notify, `process_new_packets` errors, the
@@ -138,8 +138,7 @@ impl TlsOutput<'_> {
         if bytes.is_empty() {
             return;
         }
-        if self.holding() || !ciphertext_to_sends(pool, conn_index, generation, bytes, self.sends)
-        {
+        if self.holding() || !ciphertext_to_sends(pool, conn_index, generation, bytes, self.sends) {
             self.held.extend_from_slice(bytes);
         }
     }

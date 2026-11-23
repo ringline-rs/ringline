@@ -76,6 +76,8 @@ Two related gaps are in the TLS paths:
   order they are made. Any change that holds such output back has to keep it
   ahead of every record sealed after it.
 
+On io_uring, the sealed tickets of section 2 close both gaps.
+
 ## Goal and criterion
 
 - A connection holds a bounded share of its worker's send pool.

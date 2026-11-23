@@ -835,13 +835,13 @@ impl TlsTable {
         conn_index: u32,
         generation: u32,
         send_copy_pool: &mut SendCopyPool,
-        retained: &[u8],
+        sealed: &[u8],
         out: &mut Vec<crate::handler::BuiltSend>,
     ) -> bool {
         if !self.has(conn_index) {
             return false;
         }
-        backend_uring::ciphertext_to_sends(send_copy_pool, conn_index, generation, retained, out)
+        backend_uring::ciphertext_to_sends(send_copy_pool, conn_index, generation, sealed, out)
     }
 
     /// Record that a connection's close_notify was dropped: the peer will

@@ -1387,10 +1387,11 @@ impl<'a> DriverCtx<'a> {
 
     /// Shutdown the write side of a connection.
     ///
-    /// If a send is in flight or queued, the shutdown is deferred until the
-    /// send queue drains (`submit_next_queued_inner`'s empty-queue arm
-    /// submits it): io_uring does not order an
-    /// independent Shutdown SQE behind those sends.
+    /// If a send is in flight or queued, or TLS output waits in the
+    /// connection's sealed output, the shutdown is deferred until the send
+    /// queue drains with no sealed output left (`submit_next_queued_inner`'s
+    /// empty-queue arm submits it): io_uring does not order an independent
+    /// Shutdown SQE behind those sends.
     pub fn shutdown_write(&mut self, conn: ConnId) {
         let Some(cs) = self.connections.get_mut(conn.index) else {
             return;
@@ -1409,7 +1410,8 @@ impl<'a> DriverCtx<'a> {
         if self.send_queues[idx].close_submitted {
             return;
         }
-        if self.send_queues[idx].in_flight || !self.send_queues[idx].queue.is_empty() {
+        let state = &self.send_queues[idx];
+        if state.in_flight || !state.queue.is_empty() || state.sealed.is_some() {
             // Defer until the send queue drains (submit_next_queued issues it).
             cs.write = crate::connection::WriteHalf::ShutdownPending;
         } else {

@@ -54,7 +54,14 @@ impl AsyncEventHandler for Server {
             if first == b'h' {
                 *WAITED.lock().unwrap() =
                     Some(ringline::send_admission_counters().tls_output_waited);
-                conn.send(b"ok").expect("send").await.expect("sent");
+                // The session tickets, produced with the handshake's last
+                // flight, may still wait for slots: a bounded send waits
+                // behind them where a plain send would be refused.
+                conn.send_admitted(b"ok")
+                    .await
+                    .expect("admitted")
+                    .await
+                    .expect("sent");
                 return;
             }
             // Send until a send is refused, and again after a pause in which

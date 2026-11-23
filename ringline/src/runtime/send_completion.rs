@@ -55,7 +55,8 @@
 //! ```
 //!
 //! **An entry leaves the table through its future, never through its
-//! owner.** (A sealed ticket has neither; see above.) The future's `Drop` cancels the entry (`cancel`): a waiting one
+//! owner.** A sealed ticket has neither (see above). The future's `Drop`
+//! cancels the entry (`cancel`): a waiting one
 //! goes, an in-flight one becomes `Abandoned` and its completion frees it,
 //! a resolved one goes with its result. The owning task's death changes no
 //! entry's state. A connection task is dropped with the driver state
@@ -263,13 +264,15 @@ pub struct SendAdmissionCounters {
     /// The most bounded sends queued on one connection at once, counting a
     /// send admitted on its first poll, which is queued for that poll.
     pub conn_tickets_max: u64,
-    /// TLS output produced on the receive path that the send pool had no
-    /// slots for, so that it waited in a sealed ticket. Output that joined
-    /// a ticket already waiting is not counted again.
+    /// TLS output produced on the receive path, or an outbound connection's
+    /// first flight, that the send pool had no slots for, so that it waited
+    /// in a sealed ticket. Output that joined a ticket already waiting is not
+    /// counted again.
     pub tls_output_waited: u64,
     /// io_uring: connections whose close went ahead with a bare FIN while
-    /// sealed TLS output still waited, either at the close's drain, when the
-    /// pool still had no slots for it, or at teardown.
+    /// sealed TLS output still waited: at the close's drain, when the pool
+    /// still had no slots for it, when the close deadline forced the close,
+    /// or at teardown.
     pub bare_fin_closes: u64,
 }
 
@@ -868,6 +871,22 @@ impl SendCompletions {
         if was_head { self.head_task() } else { None }
     }
 
+    /// The sealed ticket `id`, served behind the head under `Budget`, left:
+    /// count the pass as [`mark_passed`](Self::mark_passed) does, then
+    /// [`remove_sealed`](Self::remove_sealed).
+    pub(crate) fn mark_sealed_passed(&mut self, id: SendId) -> Option<u32> {
+        if let Some(&Entry {
+            state: Completion::Waiting { required_slots, .. },
+            sealed: true,
+            ..
+        }) = self.entry(id)
+        {
+            self.counters.passing_admissions += 1;
+            self.counters.passing_slots += required_slots as u64;
+        }
+        self.remove_sealed(id)
+    }
+
     /// The connection a live sealed ticket is for.
     pub(crate) fn sealed_conn(&self, id: SendId) -> Option<u32> {
         self.entry(id).filter(|e| e.sealed).map(|e| e.conn_index)
@@ -1280,9 +1299,10 @@ impl SendCompletions {
     /// If `id`, a connection's front send, is a waiter with an owner that
     /// could pass a head of `head_needs` with `left`, its `required_slots`
     /// and owner. The test the scan applies to each waiter it might wake, and
-    /// that an admission applies to the waiters older than itself. A waiter with no owner ([`NO_OWNER`]) is
-    /// left out: no task would poll it, and its holder's first poll checks
-    /// it.
+    /// that an admission applies to the waiters older than itself. A waiter
+    /// with no owner ([`NO_OWNER`]) is left out: no task would poll it, and
+    /// its holder's first poll checks it. A sealed ticket, which also has no
+    /// owner, is included: the event loop serves it.
     ///
     /// So is a waiter a scan before the latest one woke that has not polled
     /// since. An admission still counts one the latest scan woke, which
@@ -1368,9 +1388,10 @@ impl SendCompletions {
     ///
     /// Each waiter woken is counted against the free slots and the budget as
     /// if it had passed, so that the waiters woken together fit together. It
-    /// reads `idle` for the waiter's connection. A waiter with no owner ([`NO_OWNER`]) is skipped
-    /// and not counted: no task would poll it, and its holder's first poll
-    /// checks it. The wakes may still be more than can pass, when the pool
+    /// reads `idle` for the waiter's connection. A waiter with no owner
+    /// ([`NO_OWNER`]) is skipped and not counted: no task would poll it, and
+    /// its holder's first poll checks it. A sealed ticket that can pass is
+    /// counted and put on `serve` for the event loop. The wakes may still be more than can pass, when the pool
     /// changes before the woken tasks poll; each poll checks again
     /// ([`admit`](Self::admit)).
     ///
@@ -1884,6 +1905,14 @@ impl Executor {
         if let Some(next) = self.send_completions.remove_sealed(id) {
             let _ = self.wake_task(next);
         }
+    }
+
+    /// [`SendCompletions::mark_sealed_passed`]. The io_uring event loop,
+    /// after serving a sealed ticket behind the head.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn mark_sealed_ticket_passed(&mut self, id: SendId) {
+        let next = self.send_completions.mark_sealed_passed(id);
+        debug_assert!(next.is_none(), "a sealed ticket that passed was the head");
     }
 
     /// [`SendCompletions::sealed_conn`].
@@ -3555,7 +3584,10 @@ mod tests {
         let sealed = q.push_sealed(1, 0, 1, true);
         q.serve_due = false;
         assert_eq!(q.head_ready(2), None);
-        assert!(served(&mut q).is_empty(), "B's send is the head and does not fit");
+        assert!(
+            served(&mut q).is_empty(),
+            "B's send is the head and does not fit"
+        );
         assert!(q.turn(b1, 4));
         assert_eq!(q.mark_submitted(b1), None);
         assert!(q.scan_due(), "the sealed head needs the capacity wake");
@@ -3590,6 +3622,20 @@ mod tests {
         q.scan(pool(3, 0, 16), idle, &mut wakes);
         assert_eq!(served(&mut q), vec![sealed]);
         assert!(wakes.is_empty(), "the sealed ticket took the room");
+    }
+
+    /// A sealed ticket that passed the head counts as a pass, with its slots.
+    #[test]
+    fn a_sealed_ticket_that_passes_is_counted() {
+        let mut q = SendCompletions::with_order(UNBOUNDED);
+        q.enqueue(2, 0, 8, task(2));
+        let sealed = q.push_sealed(1, 0, 2, true);
+        assert_eq!(q.mark_sealed_passed(sealed), None);
+        assert_eq!(q.sealed_conn(sealed), None);
+        assert_eq!(
+            (q.counters.passing_admissions, q.counters.passing_slots),
+            (1, 2)
+        );
     }
 
     /// A close fails the waiting bounded sends and leaves the sealed ticket,

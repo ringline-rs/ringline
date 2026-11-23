@@ -3708,8 +3708,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// or become the head.
     ///
     /// The sealed tickets the wake finds servable are placed here, oldest
-    /// first. When one was the head, the head has moved, so the wake runs
-    /// again for the new head.
+    /// first. One served behind the head under `Budget` is a passing send:
+    /// its slots are marked in B (`SendCopyPool::begin_passing`) and the pass
+    /// is counted. When one was the head, the head has moved, so the wake
+    /// runs again for the new head.
     fn wake_capacity_if_released(&mut self) {
         self.driver.sync_sealed(&mut self.executor);
         if !(self.driver.capacity_released || self.executor.send_scan_due()) {
@@ -3731,8 +3733,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     continue;
                 };
                 let was_head = self.executor.is_send_head(ticket);
-                if self.driver.serve_sealed(conn_index) {
-                    self.executor.remove_sealed_ticket(ticket);
+                let passing = !was_head
+                    && matches!(
+                        self.executor.send_admission_order(),
+                        crate::SendAdmissionOrder::Budget { .. }
+                    );
+                if passing {
+                    self.driver.send_copy_pool.begin_passing();
+                }
+                let served = self.driver.serve_sealed(conn_index);
+                if passing {
+                    self.driver.send_copy_pool.end_passing();
+                }
+                if served {
+                    if passing {
+                        self.executor.mark_sealed_ticket_passed(ticket);
+                    } else {
+                        self.executor.remove_sealed_ticket(ticket);
+                    }
                     head_served |= was_head;
                 }
             }
@@ -4261,9 +4279,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.connections.generation(conn_index),
                 &mut out,
             );
-            let flushed = self.place_tls_output(conn_index) && flushed;
-            if !flushed {
-                let err = std::io::Error::other("TLS output could not be written");
+            let placed = self.place_tls_output(conn_index);
+            if !(placed && flushed) {
+                let err = if placed {
+                    std::io::Error::other("TLS output could not be written")
+                } else {
+                    sealed_output_too_large()
+                };
                 self.executor.wake_connect(conn_index, Err(err));
                 self.driver.close_connection(conn_index);
                 return;
@@ -21518,7 +21540,10 @@ mod tests {
         el.driver.capacity_released = true;
         el.wake_capacity_if_released();
         assert!(!el.driver.sealed_waiting(conn_index));
-        assert!(el.driver.send_queues[idx].in_flight, "the output was queued");
+        assert!(
+            el.driver.send_queues[idx].in_flight,
+            "the output was queued"
+        );
         assert!(!el.executor.send_waiting_on(conn_index), "the ticket left");
     }
 
@@ -21541,8 +21566,14 @@ mod tests {
         el.driver.send_copy_pool.release(held.pop().unwrap());
         el.driver.capacity_released = true;
         el.wake_capacity_if_released();
-        assert!(!el.driver.sealed_waiting(conn_index), "the output took the slot");
-        assert!(el.executor.send_capacity_turn(bounded, 1), "the send is the head");
+        assert!(
+            !el.driver.sealed_waiting(conn_index),
+            "the output took the slot"
+        );
+        assert!(
+            el.executor.send_capacity_turn(bounded, 1),
+            "the send is the head"
+        );
     }
 
     /// A close while output waits appends the close_notify behind it, even
@@ -21569,8 +21600,14 @@ mod tests {
         }
         el.finalize_pending_closes();
         assert!(!el.driver.sealed_waiting(conn_index));
-        assert!(el.driver.send_queues[idx].in_flight, "output and alert queued");
-        assert!(!el.driver.send_queues[idx].close_submitted, "the Close waits");
+        assert!(
+            el.driver.send_queues[idx].in_flight,
+            "output and alert queued"
+        );
+        assert!(
+            !el.driver.send_queues[idx].close_submitted,
+            "the Close waits"
+        );
     }
 
     /// Output still waiting when the close drain finds no slot is dropped
@@ -21601,6 +21638,116 @@ mod tests {
         assert!(!el.executor.send_waiting_on(conn_index), "the ticket left");
     }
 
+    /// Under `Budget`, held output served behind a waiting head is a passing
+    /// send: the pool marks its slot in B and the pass is counted.
+    #[test]
+    fn held_tls_output_that_passes_the_head_counts_in_the_budget() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_admission_order(crate::SendAdmissionOrder::Budget { slots: 8 })
+                .build()
+                .expect("valid config"),
+        );
+        let head_conn = accept_connection(&mut el);
+        let conn_index = accept_connection(&mut el);
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        let mut held = exhaust_send_pool(&mut el);
+        let task_id = parked_standalone(&mut el.executor);
+        let generation = el.driver.connections.generation(head_conn);
+        let _head = el
+            .executor
+            .enqueue_send_capacity(head_conn, generation, 4, task_id);
+        assert!(el.driver.hold_sealed(conn_index, HELD, false, true));
+        el.driver.send_copy_pool.release(held.pop().unwrap());
+        el.driver.capacity_released = true;
+        el.wake_capacity_if_released();
+        assert!(
+            !el.driver.sealed_waiting(conn_index),
+            "the output passed the head"
+        );
+        assert_eq!(el.driver.send_copy_pool.passing_held(), 1);
+        let counters = el
+            .executor
+            .send_admission_counters(&el.driver.send_copy_pool);
+        assert_eq!(
+            (counters.passing_admissions, counters.passing_slots),
+            (1, 1)
+        );
+    }
+
+    /// A write shutdown while output waits is deferred behind it: the FIN is
+    /// submitted once the served output has been sent.
+    #[test]
+    fn a_write_shutdown_waits_behind_held_tls_output() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let token =
+            crate::handler::ConnId::new(conn_index, el.driver.connections.generation(conn_index));
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        let mut held = exhaust_send_pool(&mut el);
+        assert!(el.driver.hold_sealed(conn_index, HELD, false, true));
+        el.driver.make_ctx().shutdown_write(token);
+        assert!(matches!(
+            el.driver.connections.get(conn_index).unwrap().write,
+            crate::connection::WriteHalf::ShutdownPending
+        ));
+        assert!(
+            !el.driver.send_queues[idx].shutdown_inflight,
+            "the FIN waits"
+        );
+
+        el.driver.send_copy_pool.release(held.pop().unwrap());
+        el.driver.capacity_released = true;
+        el.wake_capacity_if_released();
+        assert!(
+            el.driver.send_queues[idx].in_flight,
+            "the output was queued"
+        );
+        assert!(!el.driver.send_queues[idx].shutdown_inflight);
+        for _ in 0..8 {
+            if !el.driver.send_queues[idx].in_flight {
+                break;
+            }
+            complete_one_cqe(&mut el);
+        }
+        assert!(
+            el.driver.send_queues[idx].shutdown_inflight,
+            "the FIN went out after the output"
+        );
+    }
+
+    /// A deferred write shutdown is not submitted when the connection's
+    /// queue drains while sealed output still waits.
+    #[test]
+    fn a_drained_queue_does_not_submit_the_shutdown_while_output_waits() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let token =
+            crate::handler::ConnId::new(conn_index, el.driver.connections.generation(conn_index));
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        el.driver
+            .make_ctx()
+            .send(token, b"in flight")
+            .expect("send");
+        assert!(el.driver.send_queues[idx].in_flight);
+        let _held = exhaust_send_pool(&mut el);
+        assert!(el.driver.hold_sealed(conn_index, HELD, false, true));
+        el.driver.make_ctx().shutdown_write(token);
+        for _ in 0..8 {
+            if !el.driver.send_queues[idx].in_flight {
+                break;
+            }
+            complete_one_cqe(&mut el);
+        }
+        assert!(!el.driver.send_queues[idx].in_flight, "the send completed");
+        assert!(
+            !el.driver.send_queues[idx].shutdown_inflight,
+            "the FIN waits for the sealed output"
+        );
+    }
+
     /// Output that would need more slots than the pool has is not held: it
     /// could never be placed.
     #[test]
@@ -21609,7 +21756,10 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let pool = &el.driver.send_copy_pool;
         let len = pool.slot_count() * pool.slot_size() as usize + 1;
-        assert!(!el.driver.hold_sealed(conn_index, &vec![0; len], false, true));
+        assert!(
+            !el.driver
+                .hold_sealed(conn_index, &vec![0; len], false, true)
+        );
         assert!(!el.driver.sealed_waiting(conn_index));
     }
 }

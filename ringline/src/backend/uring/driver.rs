@@ -2357,7 +2357,7 @@ impl Driver {
     /// The caller (`ConnCtx::abort`) has failed the reader and the sends
     /// waiting for capacity or in flight. Here, as `close_connection` and
     /// `force_finalize_close` do: the connection is marked closing, its queued
-    /// sends are failed and released, and a retained close_notify is dropped.
+    /// sends are failed and released, and its sealed output is dropped.
     /// On TCP the `Close` is preceded by a disconnect
     /// (`Ring::submit_abort_close`), which resets the socket and purges its
     /// write queue, so the zero-copy notifications of the sends the kernel
@@ -2613,8 +2613,11 @@ impl Driver {
         if self.track_room_waits {
             self.capacity_released = true;
         }
-        // Submit a deferred shutdown_write now that the queue is drained.
-        if let Some(cs) = self.connections.get_mut(conn_index)
+        // Submit a deferred shutdown_write now that the queue is drained,
+        // unless sealed output still waits: its sends, once served, come
+        // back here.
+        if self.send_queues[conn_index as usize].sealed.is_none()
+            && let Some(cs) = self.connections.get_mut(conn_index)
             && matches!(cs.write, WriteHalf::ShutdownPending)
         {
             let generation = cs.generation;
