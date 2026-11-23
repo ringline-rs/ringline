@@ -21722,7 +21722,7 @@ mod tests {
     /// queue drains while sealed output still waits.
     #[test]
     fn a_drained_queue_does_not_submit_the_shutdown_while_output_waits() {
-        let mut el = make_test_loop();
+        let mut el = tls_bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let idx = conn_index as usize;
         let token =
