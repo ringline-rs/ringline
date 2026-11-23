@@ -49,8 +49,9 @@ pub(crate) const SEALED_CONN_MAX: usize = 64 * 1024;
 /// would then need more slots than `pool` has, or, unless `bytes` is a
 /// close_notify, when it would be over [`SEALED_CONN_MAX`] (or one slot, if
 /// larger) or the worker's sealed output would be over the pool's total
-/// bytes. A close_notify is exempt from the last two: there is at most one
-/// per connection and it is a few dozen bytes.
+/// bytes. A close_notify, with any records rustls had queued ahead of it, is
+/// exempt from the last two: there is one per connection, usually a few
+/// dozen bytes.
 #[cfg(has_io_uring)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hold_sealed(

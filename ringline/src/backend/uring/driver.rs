@@ -838,7 +838,8 @@ pub(crate) struct Driver {
     /// [`sync_sealed`](Self::sync_sealed).
     pub(crate) sealed_dirty: Vec<u32>,
     /// Bytes held in sealed output across the worker's connections, bounded
-    /// by the pool's total bytes (`handler::hold_sealed`).
+    /// by the pool's total bytes plus exempt close_notify output
+    /// (`handler::hold_sealed`).
     pub(crate) sealed_bytes: usize,
     /// Sealed tickets whose output the driver placed or dropped outside the
     /// event loop's serve, for [`sync_sealed`](Self::sync_sealed) to remove.

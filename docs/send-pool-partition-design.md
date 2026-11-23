@@ -205,10 +205,13 @@ connection's tickets in queue order.
 - A connection's ticket holds at most 64 KiB, or one slot if a slot is
   larger, and the worker's tickets together hold at most the pool's total
   bytes (`handler::hold_sealed`). Output that would go past either bound, or
-  need more slots than the pool has, fails the connection. A peer that stops
-  reading and keeps provoking output (KeyUpdate requests, for example)
-  reaches the bound and loses the connection. `close_notify` is exempt from
-  the two bounds; it is a few dozen bytes, once per connection.
+  need more slots than the pool has, fails the connection. A handshake
+  flight over the bound, such as a certificate chain over 64 KiB sent while
+  the pool has no free slots, fails its connection. Once the worker's total
+  is reached, any connection whose output would wait fails, whichever
+  connections hold the bytes. `close_notify`, with any records rustls had
+  queued ahead of it, is exempt from the two bounds: once per connection,
+  usually a few dozen bytes.
 - `close_notify` joins the receive-path ticket when one waits, behind the
   output in it; otherwise it takes a ticket of its own if the pool cannot
   take it. Either way it goes after the connection's earlier tickets.

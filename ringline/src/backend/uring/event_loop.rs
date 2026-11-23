@@ -1584,8 +1584,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// the connection's sealed output (`Driver::hold_sealed`), whose ticket
     /// the admission queue gets now (`Driver::sync_sealed`), so that no send
     /// polled before the end of the iteration is encrypted ahead of it.
-    /// Returns `false` when the held bytes would need more slots than the
-    /// pool has; they are discarded.
+    /// Returns `false`, discarding the held bytes, when `Driver::hold_sealed`
+    /// refuses them (see `handler::hold_sealed`).
     fn place_tls_output(&mut self, conn_index: u32) -> bool {
         if !self.driver.tls_out_scratch.is_empty() {
             let mut sends = std::mem::take(&mut self.driver.tls_out_scratch);
@@ -21819,11 +21819,34 @@ mod tests {
             !el.driver.hold_sealed(last, b"x", false, true),
             "over the worker's bound"
         );
+        assert!(
+            el.driver.hold_sealed(last, b"alert", true, false),
+            "a close_notify is exempt"
+        );
 
         el.driver.drop_sealed(conns[0]);
         assert!(el.driver.hold_sealed(last, b"x", false, true));
         el.driver.reset_send_state(conns[1]);
-        assert_eq!(el.driver.sealed_bytes, pool_bytes - 2 * max + 1);
+        assert_eq!(el.driver.sealed_bytes, pool_bytes - 2 * max + 6);
+    }
+
+    /// With slots larger than `SEALED_CONN_MAX`, a connection holds one
+    /// slot's worth.
+    #[test]
+    fn a_slot_larger_than_the_bound_raises_it_to_one_slot() {
+        let slot = 2 * crate::handler::SEALED_CONN_MAX;
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(4, slot as u32)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        assert!(
+            el.driver
+                .hold_sealed(conn_index, &vec![0; slot], false, true)
+        );
+        assert!(!el.driver.hold_sealed(conn_index, b"x", false, true));
     }
 }
 
