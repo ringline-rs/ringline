@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The `ringkern` feature: on Hermit, positional reads and writes (file and
+  direct I/O on the mio backend's disk-I/O pool) use the `sys_pread` and
+  `sys_pwrite` calls of Ringkern, a Hermit fork, instead of a seek and a
+  read or write under one process-wide lock, so the pool's threads run
+  them in parallel. Files on file systems where Ringkern has no such calls
+  (it returns `ENOSYS`) keep the locked path. A build with the feature that
+  does file I/O needs a Ringkern kernel to link; without the feature,
+  nothing changes.
+
 - The mio backend builds for `x86_64-unknown-hermit` (Hermit unikernels), with
   `--features force-mio`. Building it needs `[patch.crates-io]` entries for
   `ring` and `linkme-impl` with Hermit support: stock `ring` 0.17 does not
@@ -25,9 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - File and direct I/O work on files in Hermit's file systems. Hermit has no
     `pread` or `pwrite`, so each positional read or write seeks and then reads
     or writes under one process-wide lock. Positional reads and writes do
-    not run in parallel. `O_DSYNC` and `O_DIRECT` are not passed;
-    `fs::rename` returns `ENOSYS`. Hermit's RAM file system ignores
-    `O_TRUNC`, so `fs::create` on an existing file keeps its old bytes.
+    not run in parallel, except, with the `ringkern` feature (above), on
+    files whose file system has Ringkern's calls. `O_DSYNC` and `O_DIRECT`
+    are not passed; `fs::rename` returns `ENOSYS`. Hermit's RAM file system
+    ignores `O_TRUNC`, so `fs::create` on an existing file keeps its old
+    bytes.
   - `SO_REUSEPORT` is not set, so a UDP address serves one worker. TCP
     listeners, accepted on one thread by the mio backend, take any worker
     count. `RLIMIT_NOFILE` is not checked or raised.

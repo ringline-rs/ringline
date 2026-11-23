@@ -104,6 +104,18 @@ mod hermit_sys {
     }
 }
 
+/// Ringkern's positional calls, which stock Hermit does not have: a build
+/// with the `ringkern` feature that does file I/O needs a Ringkern kernel to
+/// link. Each returns the count or a negative errno (`ENOSYS` for a file
+/// system without them), and neither uses nor moves the file position.
+#[cfg(all(target_os = "hermit", feature = "ringkern"))]
+mod ringkern_sys {
+    unsafe extern "C" {
+        pub(super) fn sys_pread(fd: i32, buf: *mut u8, len: usize, offset: isize) -> isize;
+        pub(super) fn sys_pwrite(fd: i32, buf: *const u8, len: usize, offset: isize) -> isize;
+    }
+}
+
 /// A Hermit kernel call's return value: the value, or the negative errno it
 /// carries as an error.
 #[cfg(target_os = "hermit")]
@@ -115,11 +127,12 @@ fn hermit_result(ret: isize) -> io::Result<usize> {
     }
 }
 
-/// Hermit has no `pread` or `pwrite`. Each positional call seeks and then
+/// Stock Hermit has no `pread` or `pwrite`, and Ringkern has none for some
+/// file systems. Each positional call made without them seeks and then
 /// reads or writes while holding this lock, so no other positional call
-/// moves the file position in between. Every positional call in the process
-/// takes it; a `read`, `write` or `lseek` made outside these functions on
-/// the same fd can still move the position.
+/// moves the file position in between. Every positional call that takes the
+/// seek path takes it; a `read`, `write` or `lseek` made outside these
+/// functions on the same fd can still move the position.
 #[cfg(target_os = "hermit")]
 static POSITIONED: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -153,12 +166,24 @@ fn file_len(fd: RawFd) -> io::Result<u64> {
 
 /// `pread(2)`.
 ///
-/// On Hermit, a seek and a read under a process-wide lock. A read at or past
-/// the end returns 0 without seeking to `offset`, since a Hermit RAM file
-/// grows when its position is set past its end.
+/// On Hermit with the `ringkern` feature, Ringkern's `sys_pread`, which
+/// neither uses nor moves the file position, without Ringline's
+/// process-wide lock. A file whose file system has no `sys_pread` (Ringkern
+/// returns `ENOSYS`), or an offset above `isize::MAX`, takes the path below.
+///
+/// On Hermit otherwise, a seek and a read under a process-wide lock. A read
+/// at or past the end returns 0 without seeking to `offset`, since a Hermit
+/// RAM file grows when its position is set past its end.
 pub(crate) fn pread(fd: RawFd, buf: *mut u8, len: usize, offset: u64) -> io::Result<usize> {
     #[cfg(target_os = "hermit")]
     {
+        #[cfg(feature = "ringkern")]
+        if let Ok(at) = isize::try_from(offset) {
+            match hermit_result(unsafe { ringkern_sys::sys_pread(fd, buf, len, at) }) {
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
+                result => return result,
+            }
+        }
         let _guard = POSITIONED.lock().unwrap_or_else(|e| e.into_inner());
         if len == 0 || offset >= file_len(fd)? {
             return Ok(0);
@@ -179,12 +204,22 @@ pub(crate) fn pread(fd: RawFd, buf: *mut u8, len: usize, offset: u64) -> io::Res
 
 /// `pwrite(2)`.
 ///
-/// On Hermit, a seek and a write under a process-wide lock (see [`pread`]).
-/// A zero-length write returns 0 without seeking, so it does not extend the
-/// file.
+/// On Hermit with the `ringkern` feature, Ringkern's `sys_pwrite`, with the
+/// same fallback as [`pread`].
+///
+/// On Hermit otherwise, a seek and a write under a process-wide lock (see
+/// [`pread`]). A zero-length write returns 0 without seeking, so it does not
+/// extend the file.
 pub(crate) fn pwrite(fd: RawFd, buf: *const u8, len: usize, offset: u64) -> io::Result<usize> {
     #[cfg(target_os = "hermit")]
     {
+        #[cfg(feature = "ringkern")]
+        if let Ok(at) = isize::try_from(offset) {
+            match hermit_result(unsafe { ringkern_sys::sys_pwrite(fd, buf, len, at) }) {
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
+                result => return result,
+            }
+        }
         if len == 0 {
             return Ok(0);
         }
