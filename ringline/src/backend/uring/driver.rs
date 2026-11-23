@@ -2738,7 +2738,12 @@ impl Driver {
         // Output the pool had no slots for, or that follows sealed output
         // already waiting, waits behind it; `try_finalize_close` places or
         // drops what is left once this connection's own sends have drained.
-        if !held.is_empty() && !self.hold_sealed(conn_index, &held, true, false) {
+        // It ends in the alert when the engine queued one.
+        let alert = self
+            .tls_table
+            .as_ref()
+            .is_some_and(|t| t.close_notify_sent(conn_index));
+        if !held.is_empty() && !self.hold_sealed(conn_index, &held, alert, false) && alert {
             self.drop_retained_close_notify_flag(conn_index);
         }
     }

@@ -41,9 +41,10 @@ pub(crate) struct SealedOutput {
 #[cfg(has_io_uring)]
 pub(crate) const SEALED_CONN_MAX: usize = 64 * 1024;
 
-/// The most close output (`close_notify` set) that is exempt from
-/// [`SEALED_CONN_MAX`] and the worker's bound: room for the alert and a
-/// record rustls had queued ahead of it, such as a `key_update`.
+/// The most close output ending in the close_notify (`close_notify` set)
+/// that is exempt from [`SEALED_CONN_MAX`] and the worker's bound: room for
+/// the alert and a record rustls had queued ahead of it, such as a
+/// `key_update`.
 #[cfg(has_io_uring)]
 pub(crate) const SEALED_CLOSE_EXEMPT: usize = 512;
 
@@ -54,10 +55,11 @@ pub(crate) const SEALED_CLOSE_EXEMPT: usize = 512;
 /// Returns `false`, holding nothing, when the connection's sealed output
 /// would then need more slots than `pool` has, or when it would be over
 /// [`SEALED_CONN_MAX`] (or one slot, if larger) or the worker's sealed
-/// output would be over the pool's total bytes. Close output of at most
-/// [`SEALED_CLOSE_EXEMPT`] bytes is exempt from the last two; a connection
-/// produces close output at most once. Larger close output, such as the
-/// flight of a server closed before its handshake finished, is not.
+/// output would be over the pool's total bytes. Close output that ends in
+/// the close_notify and is at most [`SEALED_CLOSE_EXEMPT`] bytes is exempt
+/// from the last two; a connection produces close output at most once.
+/// Other close output, such as the flight of a server closed before its
+/// handshake finished, which has no alert, is not.
 #[cfg(has_io_uring)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hold_sealed(
@@ -1373,6 +1375,8 @@ impl<'a> DriverCtx<'a> {
                         }
                         // Output the pool had no slots for, or that follows
                         // sealed output already waiting, waits behind it.
+                        // It ends in the alert when the engine queued one.
+                        let alert = tls_table.close_notify_sent(conn.index);
                         if !held.is_empty()
                             && !hold_sealed(
                                 &mut self.send_queues[conn.index as usize],
@@ -1381,9 +1385,10 @@ impl<'a> DriverCtx<'a> {
                                 self.sealed_bytes,
                                 conn.index,
                                 &held,
-                                true,
+                                alert,
                                 false,
                             )
+                            && alert
                         {
                             crate::metrics::POOL
                                 .increment(crate::metrics::pool::CLOSE_NOTIFY_DROPPED);

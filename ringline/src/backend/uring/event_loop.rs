@@ -21794,12 +21794,23 @@ mod tests {
             "the refused byte was not added"
         );
         assert!(el.driver.hold_sealed(conn_index, b"alert", true, false));
-        let flight = vec![0; crate::handler::SEALED_CLOSE_EXEMPT + 1];
+        assert_eq!(el.driver.sealed_bytes, max + 5);
+
+        // Another connection at its bound: close output up to the exemption
+        // is held, and one byte more is not.
+        let exempt = crate::handler::SEALED_CLOSE_EXEMPT;
+        let other = accept_connection(&mut el);
+        assert!(el.driver.hold_sealed(other, &vec![0; max], false, true));
         assert!(
-            !el.driver.hold_sealed(conn_index, &flight, true, false),
+            !el.driver
+                .hold_sealed(other, &vec![0; exempt + 1], true, false),
             "close output over the exemption is bounded"
         );
-        assert_eq!(el.driver.sealed_bytes, max + 5);
+        assert!(
+            el.driver.hold_sealed(other, &vec![0; exempt], true, false),
+            "close output at the exemption is held"
+        );
+        assert_eq!(el.driver.sealed_bytes, 2 * max + 5 + exempt);
     }
 
     /// The worker's connections together hold at most the pool's total bytes
@@ -21824,21 +21835,24 @@ mod tests {
             !el.driver.hold_sealed(last, b"x", false, true),
             "over the worker's bound"
         );
-        let closing = accept_connection(&mut el);
-        let flight = vec![0; crate::handler::SEALED_CLOSE_EXEMPT + 1];
+        let exempt = crate::handler::SEALED_CLOSE_EXEMPT;
+        let flight = accept_connection(&mut el);
         assert!(
-            !el.driver.hold_sealed(closing, &flight, true, false),
+            !el.driver
+                .hold_sealed(flight, &vec![0; exempt + 1], true, false),
             "close output over the exemption is bounded"
         );
+        let closing = accept_connection(&mut el);
         assert!(
-            el.driver.hold_sealed(closing, b"alert", true, false),
-            "a close_notify is exempt"
+            el.driver
+                .hold_sealed(closing, &vec![0; exempt], true, false),
+            "close output at the exemption is held"
         );
 
         el.driver.drop_sealed(conns[0]);
         assert!(el.driver.hold_sealed(last, b"x", false, true));
         el.driver.reset_send_state(conns[1]);
-        assert_eq!(el.driver.sealed_bytes, pool_bytes - 2 * max + 6);
+        assert_eq!(el.driver.sealed_bytes, pool_bytes - 2 * max + exempt + 1);
     }
 
     /// With slots larger than `SEALED_CONN_MAX`, a connection holds one
