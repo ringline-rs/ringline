@@ -4460,6 +4460,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // is reused, or the next occupant inherits them.
         self.driver.clear_conn_claims(conn_index);
         self.driver.accumulators.release(conn_index);
+        self.driver.forward_zc_consumed[conn_index as usize] = 0;
         self.driver.forward_zc_held[conn_index as usize] = None;
         self.driver.arrival[conn_index as usize].release();
         self.driver.connections.release(conn_index);
@@ -12426,8 +12427,10 @@ mod tests {
         // below, so the slice stays valid.
         let view = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-        let err = with_driver_state(&mut el, || stale.forward_recv_buf(view))
-            .expect_err("a stale handle must be refused");
+        let err = with_driver_state(&mut el, || {
+            crate::runtime::io::as_reader_callback(conn_index, || stale.forward_recv_buf(view))
+        })
+        .expect_err("a stale handle must be refused");
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         assert_eq!(
             el.driver.accumulators.data(conn_index),
@@ -12437,8 +12440,12 @@ mod tests {
         assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
 
         let current = ConnCtx::new(conn_index, generation);
-        with_driver_state(&mut el, || current.forward_recv_buf(view).map(drop))
-            .expect("the current handle forwards its accumulator");
+        with_driver_state(&mut el, || {
+            crate::runtime::io::as_reader_callback(conn_index, || {
+                current.forward_recv_buf(view).map(drop)
+            })
+        })
+        .expect("the current handle forwards its accumulator");
         assert!(el.driver.accumulators.data(conn_index).is_empty());
         assert_eq!(
             el.driver.forward_zc_consumed[conn_index as usize],
@@ -12460,7 +12467,14 @@ mod tests {
         let data = el.driver.accumulators.data(conn_index);
         // SAFETY: the accumulator is not touched before the call below.
         let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-        assert!(with_driver_state(&mut el, || current.forward_recv_buf(view)).is_err());
+        assert!(
+            with_driver_state(&mut el, || {
+                crate::runtime::io::as_reader_callback(conn_index, || {
+                    current.forward_recv_buf(view)
+                })
+            })
+            .is_err()
+        );
         assert_eq!(
             el.driver.accumulators.data(conn_index),
             b"buffered bytes",
@@ -12485,8 +12499,11 @@ mod tests {
             let data = el.driver.accumulators.data(conn_index);
             // SAFETY: the accumulator is not touched before the call below.
             let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-            if let Err(e) = with_driver_state(&mut el, || current.forward_recv_buf(view).map(drop))
-            {
+            if let Err(e) = with_driver_state(&mut el, || {
+                crate::runtime::io::as_reader_callback(conn_index, || {
+                    current.forward_recv_buf(view).map(drop)
+                })
+            }) {
                 refused = Some((attempt, e));
                 break;
             }
@@ -12576,11 +12593,13 @@ mod tests {
         assert_eq!(forward_a_put_back_remainder(5000, true), (false, true));
     }
 
-    /// A closure that forwards its slice and then calls `close()` still holds
-    /// the slice. `close_connection` leaves the bytes held; they are freed
-    /// when the Close completes and `handle_close` releases the slot.
-    #[test]
-    fn a_copied_forward_then_close_keeps_the_bytes_until_the_slot_is_released() {
+    /// A closure that forwards the whole accumulator, then closes or aborts
+    /// the connection, then reports consuming what it forwarded. The
+    /// forwarded count survives the close, so the delivery path consumes
+    /// nothing more from the empty accumulator. The bytes stay allocated
+    /// while the closure holds the slice and are freed when it returns (the
+    /// forward is below `send_zc_threshold`, so it copied them).
+    fn forward_then_end_in_the_closure(abort: bool) {
         use std::sync::atomic::Ordering;
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
@@ -12588,22 +12607,65 @@ mod tests {
         let (remainder, freed) = drop_flagged_bytes(99);
         el.driver.accumulators.put_back(conn_index, remainder);
         let mut freed_in_closure = None;
-        with_driver_state(&mut el, || {
+        let result = with_driver_state(&mut el, || {
             current.try_with_data(|data| {
                 current.forward_recv_buf(data).expect("forward");
-                current.close();
+                if abort {
+                    current.abort();
+                } else {
+                    current.close();
+                }
                 freed_in_closure = Some(freed.load(Ordering::SeqCst));
-                // Not `Consumed(data.len())`: `close_connection` zeroes the
-                // forwarded count, so the delivery path would consume past
-                // the end of the empty accumulator.
-                crate::ParseResult::NeedMore
+                crate::ParseResult::Consumed(data.len())
             })
         });
+        assert_eq!(result, Some(crate::ParseResult::Consumed(99)));
+        assert!(el.driver.accumulators.data(conn_index).is_empty());
+        assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
         assert_eq!(freed_in_closure, Some(false));
-        assert!(!freed.load(Ordering::SeqCst));
-        let ud = UserData::encode(OpTag::Close, conn_index, 0);
-        el.test_dispatch_cqe(ud.raw(), 0, 0);
         assert!(freed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_forward_then_close_in_the_closure_consumes_only_what_it_forwarded() {
+        forward_then_end_in_the_closure(false);
+    }
+
+    #[test]
+    fn a_forward_then_abort_in_the_closure_consumes_only_what_it_forwarded() {
+        forward_then_end_in_the_closure(true);
+    }
+
+    /// A slice kept from a `with_bytes` callback has the range `put_back`
+    /// gave the accumulator. Forwarding it after the callback returned copies
+    /// it and leaves the accumulator and the forwarded count alone, so the
+    /// next read consumes what it reports and delivers no byte twice.
+    #[test]
+    fn a_forward_outside_a_reader_closure_copies_and_leaves_no_count() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let current = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let message: Vec<u8> = (0..100u8).collect();
+        let frozen = bytes::Bytes::from(message.clone());
+        let rest = frozen.slice(1..);
+        el.driver
+            .accumulators
+            .put_back(conn_index, frozen.slice(1..));
+        assert_eq!(
+            el.driver.accumulators.data(conn_index).as_ptr(),
+            rest.as_ptr(),
+            "the test needs the kept slice to match the accumulator"
+        );
+
+        with_driver_state(&mut el, || current.forward_recv_buf(&rest).map(drop)).expect("forward");
+        assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
+        assert_eq!(el.driver.accumulators.data(conn_index), &message[1..]);
+
+        let result = with_driver_state(&mut el, || {
+            current.try_with_data(|_| crate::ParseResult::Consumed(6))
+        });
+        assert_eq!(result, Some(crate::ParseResult::Consumed(6)));
+        assert_eq!(el.driver.accumulators.data(conn_index), &message[7..]);
     }
 
     /// Control: at `send_zc_threshold` and above the send slab holds the
@@ -12632,8 +12694,10 @@ mod tests {
         let data = el.driver.accumulators.data(conn_index);
         // SAFETY: the accumulator is not touched before the call below.
         let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-        let err = with_driver_state(&mut el, || old.forward_recv_buf(view))
-            .expect_err("a stale handle must be refused");
+        let err = with_driver_state(&mut el, || {
+            crate::runtime::io::as_reader_callback(conn_index, || old.forward_recv_buf(view))
+        })
+        .expect_err("a stale handle must be refused");
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         assert_eq!(
             el.driver.accumulators.data(conn_index),
@@ -17471,7 +17535,11 @@ mod tests {
         let data = el.driver.accumulators.data(conn_index);
         // SAFETY: the accumulator is not touched before the call below.
         let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-        let refused = with_driver_state(&mut el, || conn.forward_recv_buf(view).map(drop));
+        let refused = with_driver_state(&mut el, || {
+            crate::runtime::io::as_reader_callback(conn_index, || {
+                conn.forward_recv_buf(view).map(drop)
+            })
+        });
         assert_eq!(
             refused.err().map(|e| e.kind()),
             Some(io::ErrorKind::Other),
@@ -21786,7 +21854,11 @@ mod tests {
         // SAFETY: the accumulator is not touched before the call below
         // returns, except by the refused forward, which puts it back.
         let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-        let refused = with_driver_state(&mut el, || conn.forward_recv_buf(view).map(drop));
+        let refused = with_driver_state(&mut el, || {
+            crate::runtime::io::as_reader_callback(conn_index, || {
+                conn.forward_recv_buf(view).map(drop)
+            })
+        });
         assert!(is_ticket_refusal(&refused), "{refused:?}");
         assert_eq!(el.driver.accumulators.data(conn_index), b"message");
         assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
