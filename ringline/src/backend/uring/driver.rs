@@ -111,6 +111,29 @@ pub(crate) enum DirectRecvBuf {
     Tls(Option<Vec<u8>>),
 }
 
+/// A failed send's connection reading its socket before it closes
+/// (`Driver::abort_drains`).
+pub(crate) struct AbortDrain {
+    pub(crate) generation: u32,
+    /// The send's error, which the reader gets once the reading ends.
+    pub(crate) err: io::Error,
+    /// A `MSG_DONTWAIT` receive has been armed. Until one has, a failure of
+    /// the receive in flight at the abort (after its cancel or a
+    /// `POLL_FIRST` `-EAGAIN`) is followed by one; after, a failed receive
+    /// ends the reading.
+    pub(crate) dontwait_armed: bool,
+    /// Bytes the reading may still take before it ends
+    /// ([`ABORT_DRAIN_BUDGET`] at the abort).
+    pub(crate) remaining: usize,
+}
+
+/// The most a failed send's reading of the socket takes before the reader
+/// gets the error and the Close goes ahead. After a peer reset nothing more
+/// arrives, so the reading ends within what the socket held; a peer that is
+/// still sending would otherwise keep it going up to
+/// `recv_accumulator_max` while the Close waits.
+pub(crate) const ABORT_DRAIN_BUDGET: usize = 1 << 20;
+
 /// How long worker exit gives a peer to take the data of a zero-copy send
 /// before it closes the connection with an RST (#607).
 const ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
@@ -243,7 +266,7 @@ impl Driver {
         };
         if self
             .ring
-            .submit_recv_direct(conn_index, ptr, len as u32, slot, poll_first)
+            .submit_recv_direct(conn_index, ptr, len as u32, slot, poll_first, false)
             .is_err()
         {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
@@ -390,6 +413,77 @@ impl Driver {
     /// since the last call, for the caller to hand to `Executor::fail_recv`.
     pub(crate) fn take_recv_aborts(&mut self) -> VecDeque<(u32, u32, io::Error)> {
         std::mem::take(&mut self.recv_aborts)
+    }
+
+    /// Whether `conn_index` is reading its socket before the close a failed
+    /// send requested (`abort_drains`, `ConnectionState::abort_draining`).
+    pub(crate) fn abort_drain_pending(&self, conn_index: u32) -> bool {
+        self.connections
+            .get(conn_index)
+            .is_some_and(|cs| cs.abort_draining)
+    }
+
+    /// Start or continue reading `conn_index`'s socket before the close a
+    /// failed send requested. A receive in flight, which may be waiting for
+    /// bytes that never come, is cancelled; its completion returns whatever
+    /// it read. With none in flight, a `MSG_DONTWAIT` receive into the
+    /// accumulator returns what the socket has queued, or `-EAGAIN`.
+    ///
+    /// Returns `false`, having changed nothing, when no receive was
+    /// cancelled or armed: the cancel or the receive could not be pushed, or
+    /// the accumulator is at `recv_accumulator_max`. The caller then ends
+    /// the read at once.
+    pub(crate) fn begin_abort_drain(&mut self, conn_index: u32) -> bool {
+        let Some(cs) = self.connections.get(conn_index) else {
+            return false;
+        };
+        if !cs.recv_direct {
+            return false;
+        }
+        let generation = cs.generation;
+        if cs.recv_direct_armed {
+            let target = UserData::encode(OpTag::RecvDirect, conn_index, cs.recv_direct_slot).raw();
+            return self.ring.submit_async_cancel(target, conn_index).is_ok();
+        }
+        let Some((mut buf, len, _known)) =
+            self.accumulators
+                .detach_for_recv(conn_index, self.recv_direct_region, None)
+        else {
+            return false;
+        };
+        let held = buf.len();
+        // SAFETY: `len` bytes are reserved behind the buffer's length.
+        let ptr = unsafe { buf.as_mut_ptr().add(held) };
+        let slot = match self.direct_recv_free.pop() {
+            Some(slot) => slot,
+            None => {
+                self.direct_recvs.push(None);
+                (self.direct_recvs.len() - 1) as u32
+            }
+        };
+        if self
+            .ring
+            .submit_recv_direct(conn_index, ptr, len as u32, slot, false, true)
+            .is_err()
+        {
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+            // SAFETY: nothing was submitted, so nothing was written.
+            unsafe { self.accumulators.attach_received(conn_index, buf, 0) };
+            self.direct_recv_free.push(slot);
+            return false;
+        }
+        self.direct_recvs[slot as usize] = Some(DirectRecv {
+            conn_index,
+            generation,
+            buf: DirectRecvBuf::Accumulator(buf),
+        });
+        if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.recv_direct_armed = true;
+            cs.recv_direct_held = held;
+            cs.recv_direct_slot = slot;
+        }
+        metrics::RECV_DIRECT.increment(metrics::recv_direct::ARMED);
+        true
     }
 
     /// Whether a TLS connection's receive that completed should be re-armed
@@ -1001,6 +1095,12 @@ pub(crate) struct Driver {
     /// caller into `Executor::fail_recv` before the woken reader is polled;
     /// the driver never touches the `Executor` itself.
     pub(crate) recv_aborts: VecDeque<(u32, u32, io::Error)>,
+    /// Per connection index: a failed send whose connection is closing while
+    /// its socket is read (`AsyncEventLoop::abort_connection`). The reader
+    /// gets the error once the receive that reads the socket completes, and
+    /// the Close waits for it (`try_finalize_close`). An entry whose
+    /// generation is not the connection's is stale.
+    pub(crate) abort_drains: Vec<Option<AbortDrain>>,
     /// Set whenever a copy-pool slot goes back to the pool, so the event
     /// loop can call `Executor::wake_send_capacity` once per iteration
     /// instead of once per released slot. The event loop clears it.
@@ -1454,6 +1554,7 @@ impl Driver {
             pending_send_retries: Vec::new(),
             settled_sends: VecDeque::new(),
             recv_aborts: VecDeque::new(),
+            abort_drains: (0..config.max_connections).map(|_| None).collect(),
             capacity_released: false,
             track_room_waits: config.send_admission_order.lets_pass(),
             pending_finalize_closes: Vec::new(),
@@ -2233,6 +2334,12 @@ impl Driver {
     /// lands in the same batch as a read error, the Close is committed after
     /// the task woken by the error has been polled.
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
+        // A failed send's connection reads its socket before it closes;
+        // `finish_abort_drain` puts it on `pending_finalize_closes` when the
+        // reading ends.
+        if self.abort_drain_pending(conn_index) {
+            return;
+        }
         let state = &self.send_queues[conn_index as usize];
         let sends_drained = !state.in_flight && state.queue.is_empty();
         // A `Shutdown` SQE still in the kernel names this slot as
@@ -2392,6 +2499,12 @@ impl Driver {
             return false;
         }
         conn.lifecycle = Lifecycle::Closing;
+        // An abort ends a failed send's reading of the socket: the Close is
+        // committed below, so no receive may follow it, and the reader gets
+        // the abort's error, not the send's. A drain receive that completes
+        // later is stale.
+        conn.abort_draining = false;
+        self.abort_drains[ci] = None;
         // Released here for the reasons `close_connection` gives.
         self.forward_zc_consumed[ci] = 0;
         self.park_offered.remove(conn_index);

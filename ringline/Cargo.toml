@@ -1,6 +1,6 @@
 [package]
 name = "ringline"
-version = "0.7.0-alpha.181"
+version = "0.7.0-alpha.185"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -17,6 +17,14 @@ check-cfg = ["cfg(has_io_uring)", "cfg(uring_engine)"]
 
 [features]
 force-mio = []
+# On Hermit, uses Ringkern, a Hermit fork: reads and writes on block
+# devices go to Ringkern's completion ring from the event loop, and other
+# positional file reads and writes use its `sys_pread` and `sys_pwrite`
+# calls instead of a seek and a read or write under a process-wide lock
+# (files on file systems without them keep the locked path). A build with
+# it needs a Ringkern kernel built with its `nvme` feature to link. No effect
+# on other targets.
+ringkern = []
 testing = []
 # Selects rustls' buffered API (`ServerConnection`/`ClientConnection`,
 # `writer()`/`write_tls()`) for the TLS record layer. Without it the

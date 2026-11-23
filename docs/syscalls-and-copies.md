@@ -26,14 +26,14 @@ follow):
 |---|---|---|
 | Learn the request arrived | share of one `epoll_wait` | share of one `io_uring_enter` — the CQE is already in the completion ring when it returns |
 | Read the request bytes | 1 `read()` | **0** — the recv CQE *delivers a filled buffer*; no read call exists |
-| Send the response | 1 `writev()` | **0 dedicated** — a send SQE rides the iteration's shared enter |
-| Confirm the send completed | (return value of `writev`) | **0** — send CQE, drained in the same iteration |
+| Send the response | 1 `sendmsg()` (`writev()` off Linux and Android) | **0 dedicated** — a send SQE rides the iteration's shared enter |
+| Confirm the send completed | (its return value) | **0** — send CQE, drained in the same iteration |
 | Arm/fire a timeout | folded into the `epoll_wait` timeout | **0** — folded into the `io_uring_enter` timeout |
 | **Total, idle connection** | **~3 syscalls, every request** | **~2 enters** |
 | **Total, under load** | ~2 per request — the reads and writes never amortize, only the `epoll_wait` does | **(1–3 enters) ÷ requests in the batch** — *every* step amortizes |
 
 That last row is the whole argument. In the epoll loop, only the wait is
-shared; each request still owns its `read` and `writev`, so the floor is ~2
+shared; each request still owns its read and write, so the floor is ~2
 syscalls per request no matter the load. In the io_uring loop *no step owns a
 syscall* — requests ride the ring as SQEs and CQEs, and the per-iteration
 enters divide across everything serviced that iteration. Load makes the
@@ -110,15 +110,15 @@ loop can apply:
 |---|---:|---|
 | Wait | 1 per iteration | `poll.poll()` (`epoll_wait`/`kevent`) with a timer-heap-derived timeout. Amortizes over every ready connection in the batch. |
 | Drain a readable connection | N per wake on Linux TCP when the last read is short; otherwise N+1 | mio registrations are edge-triggered, so `handle_readable` drains the socket. On Linux TCP a read that leaves its 8192-byte buffer unfilled ends the drain, and a later FIN or urgent mark raises its own event. The reads run on to `WouldBlock` or `0` when the event reports either of those, on TLS, on a Unix socket, on other platforms, and when the last read fills the buffer. Pipelined requests arriving together share one read. |
-| Flush sends | ≥1 per dirty connection per pass | `Driver::flush_sends` gathers the connection's whole pending queue into one `writev()` (up to 1024 iovecs), looping only if the queue didn't fit or until `WouldBlock`. |
+| Flush sends | ≥1 per dirty connection per pass | `Driver::flush_sends` gathers the connection's whole pending queue into one `sendmsg()` on Linux and Android or `writev()` elsewhere (up to 1024 iovecs), looping only if the queue didn't fit or until `WouldBlock`. |
 | Accept | 1 per connection on Linux (`accept4()`), 5 on macOS (`accept()` and four `fcntl()`), plus a failing accept and a `poll` each time the backlog empties | Same acceptor thread, which accepts until `EAGAIN`, then one `poll`; the wake pipe's read end is registered in the poll, so the worker pays a `read()` to drain it per wake (coalescing any number of pending accepts). |
 
 A request-response exchange on an otherwise idle Linux TCP connection therefore
-costs 3 syscalls: a read, a writev and an `epoll_wait`, measured on Linux 7.2
+costs 3 syscalls: a read, a write and an `epoll_wait`, measured on Linux 7.2
 arm64 at one connection with 256 B messages. That is the primer's `2R + ceil(R/B)`
 shape. TLS, Unix sockets and other platforms have its `3R + ceil(R/B)` shape, one
 `EAGAIN` read more. Batching helps here too (one read
-can carry many pipelined requests, one writev many responses), but the floor is
+can carry many pipelined requests, one write many responses), but the floor is
 different: every wake is a read and every flush is at least one syscall, whereas
 the io_uring loop's floor is the one blocking enter per iteration.
 

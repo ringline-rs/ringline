@@ -156,6 +156,11 @@ pub struct ConnectionState {
     /// `IORING_RECVSEND_POLL_FIRST` (#840).
     #[cfg(has_io_uring)]
     pub recv_direct_drained: bool,
+    /// The connection is closing after a failed send and reads its socket
+    /// first (`Driver::abort_drains`): its read half has not finished, so a
+    /// reader parks until that reading ends instead of resolving.
+    #[cfg(has_io_uring)]
+    pub abort_draining: bool,
     /// A `forward_to_conn` from this connection is running; another gets
     /// `EBUSY`.
     #[cfg(has_io_uring)]
@@ -235,6 +240,8 @@ impl ConnectionState {
             #[cfg(has_io_uring)]
             recv_direct_drained: false,
             #[cfg(has_io_uring)]
+            abort_draining: false,
+            #[cfg(has_io_uring)]
             direct_forwarding: false,
             #[cfg(has_io_uring)]
             hangup_poll_armed: false,
@@ -279,9 +286,16 @@ impl ConnectionState {
     }
 
     /// A recv future must resolve to EOF instead of parking: the peer
-    /// closed, the read failed, or a close was requested.
+    /// closed, the read failed, or a close was requested. On io_uring a
+    /// connection closing after a failed send has not finished while it
+    /// reads its socket (`abort_draining`).
     pub fn recv_finished(&self) -> bool {
-        !matches!(self.read, ReadHalf::Open) || matches!(self.lifecycle, Lifecycle::Closing)
+        #[cfg(has_io_uring)]
+        let draining = self.abort_draining;
+        #[cfg(not(has_io_uring))]
+        let draining = false;
+        !matches!(self.read, ReadHalf::Open)
+            || (matches!(self.lifecycle, Lifecycle::Closing) && !draining)
     }
 
     /// A close has already been requested; a second request is a no-op.
@@ -318,6 +332,7 @@ impl ConnectionState {
             self.recv_direct_held = 0;
             self.recv_direct_slot = 0;
             self.recv_direct_drained = false;
+            self.abort_draining = false;
             self.direct_forwarding = false;
             self.hangup_poll_armed = false;
             self.hangup_peek_armed = false;

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The `ringkern` feature: on Hermit, positional reads and writes (file and
+  direct I/O on the mio backend's disk-I/O pool) use the `sys_pread` and
+  `sys_pwrite` calls of Ringkern, a Hermit fork, instead of a seek and a
+  read or write under one process-wide lock, so the pool's threads run
+  them in parallel. Files on file systems where Ringkern has no such calls
+  (it returns `ENOSYS`) keep the locked path. A build with the feature
+  needs a Ringkern kernel built with its `nvme` feature to link; without
+  the feature, nothing changes. Reads and writes on a block device go
+  instead to Ringkern's completion ring, submitted and reaped by the
+  worker's event loop, so they are not limited by the pool's thread count;
+  the ring's descriptor wakes the loop when completions wait. fsync stays
+  on the pool, held behind the writes before it as on every other file.
+
 - The mio backend builds for `x86_64-unknown-hermit` (Hermit unikernels), with
   `--features force-mio`. Building it needs `[patch.crates-io]` entries for
   `ring` and `linkme-impl` with Hermit support: stock `ring` 0.17 does not
@@ -25,9 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - File and direct I/O work on files in Hermit's file systems. Hermit has no
     `pread` or `pwrite`, so each positional read or write seeks and then reads
     or writes under one process-wide lock. Positional reads and writes do
-    not run in parallel. `O_DSYNC` and `O_DIRECT` are not passed;
-    `fs::rename` returns `ENOSYS`. Hermit's RAM file system ignores
-    `O_TRUNC`, so `fs::create` on an existing file keeps its old bytes.
+    not run in parallel, except, with the `ringkern` feature (above), on
+    files whose file system has Ringkern's calls. `O_DSYNC` and `O_DIRECT`
+    are not passed; `fs::rename` returns `ENOSYS`. Hermit's RAM file system
+    ignores `O_TRUNC`, so `fs::create` on an existing file keeps its old
+    bytes.
   - `SO_REUSEPORT` is not set, so a UDP address serves one worker. TCP
     listeners, accepted on one thread by the mio backend, take any worker
     count. `RLIMIT_NOFILE` is not checked or raised.
@@ -1587,6 +1602,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- mio: a send on a connection whose write side was shut down raised SIGPIPE,
+  which kills a process that has not set SIGPIPE to ignored (a binary that
+  restores the default disposition, or a C program embedding ringline; Rust
+  binaries ignore it by default). The send now fails with `BrokenPipe`.
+  Releases from 0.1.0 have this. On Linux and Android the flush wrote with
+  `writev`, which cannot carry `MSG_NOSIGNAL`, and now uses `sendmsg` with
+  it (Android is not tested). On macOS the flush still uses `writev`;
+  accepted connections did not have `SO_NOSIGPIPE`, and now do, and
+  outbound connections already had it.
 - Linux: `physical_core_count()`, and so the default worker count, counted
   only the cores below the lowest-numbered offline CPU (#974). Releases from
   0.2.0 have this. On a host booted with `nosmt` that numbers SMT siblings
@@ -1933,7 +1957,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   end of stream, so a reader whose connection's send took the error
   resolved `Ok(0)`, documented as a clean peer close. Found by the
   connection-close audit (`docs/journal/2026-11-connection-close-audit.md`,
-  F13).
+  F13). On a plaintext connection the socket is read before the reader gets
+  the error: a receive in flight is cancelled, the bytes of one that
+  completes are kept, and `MSG_DONTWAIT` receives then read what is queued,
+  stopping after 1 MiB. So bytes the peer sent before it reset reach the
+  reader first. Found by the send-recv paradigms audit
+  (`docs/journal/2026-11-send-recv-paradigms-audit.md`, F3).
 - io_uring, merged accept mode: a park install CQE for a slot's previous
   occupant no longer takes the current occupant's park. `handle_park_install`
   checked the generation after it had taken the slot's `park_in_flight`

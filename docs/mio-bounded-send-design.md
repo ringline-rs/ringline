@@ -14,11 +14,11 @@ machine and simpler than the io_uring CQE paths (PR 7).
 ## What a bounded send is on mio
 
 mio sends are `Vec`-backed: `DriverCtx::send` copies into a `Vec<u8>` and
-queues it on `pending_sends[idx]`; `flush_sends` writes with `writev` when
-the socket is writable. There is no per-connection SQE queue and no pool
-slot per send. In fact **`SendCopyPool` is never used at all on mio**: the
-driver allocates one per worker and hands it to `DriverCtx`, but every
-caller (`SendBuilder`, `SendChainBuilder`, the UDP send paths) is
+queues it on `pending_sends[idx]`; `flush_sends` writes with `sendmsg`
+(`writev` off Linux and Android) when the socket is writable. There is no
+per-connection SQE queue and no pool slot per send. In fact
+**`SendCopyPool` is never used at all on mio**: the driver allocates one
+per worker and hands it to `DriverCtx`, but every caller (`SendBuilder`, `SendChainBuilder`, the UDP send paths) is
 `#[cfg(has_io_uring)]` and nothing under `backend/mio/` touches it.
 
 For `send_backpressured` the pool is therefore the *admission budget* and

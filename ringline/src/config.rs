@@ -1612,7 +1612,8 @@ impl ConfigBuilder {
     /// Enable direct I/O ([`crate::direct_io`]), with its own file table and
     /// command slab sized by `config`. On io_uring each worker reserves
     /// `max_files` fixed-file slots for it; on mio its operations run on the
-    /// disk-I/O pool.
+    /// disk-I/O pool (with the `ringkern` feature on Hermit, reads and writes
+    /// on a block device run on Ringkern's completion ring).
     pub fn direct_io(mut self, config: crate::direct_io::DirectIoConfig) -> Self {
         self.config.direct_io = Some(config);
         self
@@ -1621,7 +1622,9 @@ impl ConfigBuilder {
     /// Configure filesystem I/O, which is on by default with
     /// `FsConfig::default()`. On io_uring each worker reserves `max_files`
     /// fixed-file slots and allocates its file table and command slab; on
-    /// mio the operations run on the disk-I/O pool, at most
+    /// mio the operations run on the disk-I/O pool (with the `ringkern`
+    /// feature on Hermit, reads and writes on a block device on Ringkern's
+    /// completion ring), at most
     /// [`max_commands_in_flight`](crate::fs::FsConfig::max_commands_in_flight)
     /// in flight. [`no_fs`](Self::no_fs) turns it off.
     pub fn fs(mut self, config: crate::fs::FsConfig) -> Self {

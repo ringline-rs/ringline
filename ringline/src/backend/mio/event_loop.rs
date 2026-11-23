@@ -70,16 +70,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.count_out_open_connections();
     }
 
-    /// Whether exit left a read or write (`disk_io_borrowing`)
-    /// running on a pool thread, which can still use memory the event loop and
-    /// its tasks own; the caller must then leak the event loop (#856).
+    /// Whether exit left a read or write (`disk_io_borrowing`) running on a
+    /// pool thread or, with the `ringkern` feature on Hermit, in Ringkern's
+    /// completion ring, which can still use memory the event loop and its
+    /// tasks own; the caller must then leak the event loop (#856).
     pub(crate) fn memory_in_use_at_exit(&self) -> bool {
         self.driver.disk_io_outstanding
     }
 
     /// Release what a leaked event loop would otherwise hold for the life of
-    /// the process. The mio backend has no ring; the name matches the io_uring
-    /// backend.
+    /// the process. The name matches the io_uring backend; the mio backend's
+    /// Ringkern ring, if any, closes when the driver drops.
     ///
     /// # Safety
     /// No requirement; the signature matches the io_uring backend.
@@ -213,6 +214,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             WAKE_TOKEN,
             mio::Interest::READABLE,
         )?;
+        // Ringkern's completion ring polls readable while completions wait;
+        // `drain_channels` reaps them.
+        #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+        if let Some(ring) = self.driver.kernel_ring.as_mut() {
+            self.driver.poll.registry().register(
+                &mut super::SourceFd(&ring.fd()),
+                super::kernel_ring::RING_TOKEN,
+                mio::Interest::READABLE,
+            )?;
+            ring.armed = true;
+        }
 
         Ok(())
     }
@@ -337,6 +349,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     WAKE_TOKEN => {
                         if readable {
                             self.drain_wake_pipe();
+                        }
+                    }
+                    // Reaped, and the ring re-registered, in `drain_channels`.
+                    #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+                    super::kernel_ring::RING_TOKEN => {
+                        if let Some(ring) = self.driver.kernel_ring.as_mut() {
+                            ring.armed = false;
                         }
                     }
                     tok if tok.0 >= self.driver.udp_token_base
@@ -585,6 +604,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Convert raw fd to mio TcpStream.
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
         std_stream.set_nonblocking(true).ok();
+        // Apple targets: the flush uses `writev`, which cannot carry
+        // `MSG_NOSIGNAL`, so set `SO_NOSIGPIPE`, as std and mio do. Without
+        // it a write after `shutdown_write` raises SIGPIPE (`write_iovecs`).
+        #[cfg(target_vendor = "apple")]
+        {
+            let on: libc::c_int = 1;
+            // SAFETY: `raw_fd` is the socket `std_stream` owns.
+            unsafe {
+                libc::setsockopt(
+                    raw_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
         if self.driver.tcp_nodelay {
             std_stream.set_nodelay(true).ok();
         }
@@ -781,6 +817,39 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // A stat's metadata travels with the result.
                 self.executor
                     .wake_disk_io_with(response.key, response.result, response.metadata);
+            }
+        }
+        // Ringkern's ring completions: reads and writes, which the pool
+        // responses above would otherwise carry.
+        #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+        if let Some(ring) = self.driver.kernel_ring.as_mut()
+            && (ring.has_in_flight() || !ring.armed)
+        {
+            let mut done = Vec::new();
+            // `reap` fails only for arguments this call never passes.
+            if ring.has_in_flight() {
+                let _ = ring.reap(&mut done, false);
+            }
+            let fd = ring.fd();
+            let rearm = !ring.armed;
+            ring.armed = true;
+            for (key, result) in done {
+                if let Some(subsystem) = self.driver.disk_io_in_flight.remove(&key) {
+                    self.driver.disk_io_counts[subsystem as usize] -= 1;
+                }
+                self.driver.disk_io_borrowing.remove(&key);
+                released.extend(self.driver.write_orders.end_write(key));
+                self.executor.wake_disk_io_with(key, result, None);
+            }
+            // mio's poll selector drops a descriptor's interest once it
+            // reports it. The reap above came first, and the descriptor stays
+            // readable while completions wait, so none is missed.
+            if rearm {
+                let _ = self.driver.poll.registry().reregister(
+                    &mut super::SourceFd(&fd),
+                    super::kernel_ring::RING_TOKEN,
+                    mio::Interest::READABLE,
+                );
             }
         }
         for (key, work) in released {
@@ -1391,7 +1460,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Mark in the completion table the awaited sends a `writev` found the
+    /// Mark in the completion table the awaited sends a flush write found the
     /// socket full for (`Driver::room_waited_sends`), before any task reads
     /// `SendCompletion::waited_for_room`.
     fn mark_room_waited_sends(&mut self) {

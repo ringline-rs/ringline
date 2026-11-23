@@ -945,7 +945,7 @@ impl SendCompletions {
 
     /// Mark the send `id` names as having waited for room, if it is in
     /// flight, or settled with its result not yet taken. mio marks the sends
-    /// a `writev` that returned `WouldBlock` carried one by one, by the ids
+    /// a flush write that returned `WouldBlock` carried one by one, by the ids
     /// their queued entries carry.
     #[cfg_attr(has_io_uring, allow(dead_code))]
     pub(crate) fn mark_send_waited_for_room(&mut self, id: SendId) {

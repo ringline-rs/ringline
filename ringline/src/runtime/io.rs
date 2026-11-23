@@ -2992,7 +2992,10 @@ impl Connection {
     ///   error), a message ran past `recv_accumulator_max`
     ///   (`QuotaExceeded`), or on io_uring a receive
     ///   could not be armed. Buffered bytes are always delivered before the
-    ///   error is surfaced.
+    ///   error is surfaced. On io_uring, when a send on a plaintext
+    ///   connection fails, the runtime reads what the socket holds before it
+    ///   reports the send's error, stopping after 1 MiB, and within
+    ///   `recv_accumulator_max`; bytes it reads count as buffered.
     ///
     /// The error is reported once: a later `with_data_result` on the same
     /// connection resolves to `Ok(0)`. And `Ok(n)` echoes whatever the
@@ -4306,27 +4309,38 @@ fn writable_refusal(
 }
 
 /// The error the connection recorded for its reader, copied and left in
-/// place: on io_uring the error a hangup peek took from the socket, and on
-/// both backends the receive error `fail_recv` stored for this generation,
-/// which outlives the slot's release (`Executor::recv_errors`).
+/// place: on io_uring the error a hangup peek took from the socket, or the
+/// failed send's error while the connection reads its socket before closing
+/// (`Driver::abort_drains`), and on both backends the receive error
+/// `fail_recv` stored for this generation, which outlives the slot's release
+/// (`Executor::recv_errors`).
 fn recorded_error(
     #[allow(unused_variables)] driver: &Driver,
     executor: &Executor,
     conn_index: u32,
     generation: u32,
 ) -> Option<io::Error> {
+    fn copy(e: &io::Error) -> io::Error {
+        match e.raw_os_error() {
+            Some(code) => io::Error::from_raw_os_error(code),
+            None => io::Error::new(e.kind(), e.to_string()),
+        }
+    }
     #[cfg(has_io_uring)]
     if let Some(conn) = driver.connections.get(conn_index)
         && conn.generation == generation
-        && conn.hangup_error != 0
     {
-        return Some(io::Error::from_raw_os_error(conn.hangup_error));
+        if conn.hangup_error != 0 {
+            return Some(io::Error::from_raw_os_error(conn.hangup_error));
+        }
+        if conn.abort_draining
+            && let Some(Some(drain)) = driver.abort_drains.get(conn_index as usize)
+        {
+            return Some(copy(&drain.err));
+        }
     }
     match executor.recv_errors.get(conn_index as usize) {
-        Some(Some((g, e))) if *g == generation => Some(match e.raw_os_error() {
-            Some(code) => io::Error::from_raw_os_error(code),
-            None => io::Error::new(e.kind(), e.to_string()),
-        }),
+        Some(Some((g, e))) if *g == generation => Some(copy(e)),
         _ => None,
     }
 }
@@ -5637,7 +5651,7 @@ impl SendCompletion {
     /// connection found the socket full while the send was in flight, that
     /// is, admitted and not settled. On io_uring that is a send of the
     /// connection that came back short or with `EAGAIN`, including one
-    /// that took no byte; on mio a `writev` that returned `WouldBlock`.
+    /// that took no byte; on mio a flush write that returned `WouldBlock`.
     /// Once true it stays true, and it can be read before the send settles.
     ///
     /// The flag is per connection at the moment of the write: every awaited

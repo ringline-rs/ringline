@@ -296,7 +296,9 @@ impl Ring {
     /// Submit a direct receive: a one-shot recv of `len` bytes into `ptr`,
     /// the spare capacity of a connection's accumulator buffer held by
     /// `Driver::direct_recvs[slot]` until the CQE. `poll_first` sets
-    /// `IORING_RECVSEND_POLL_FIRST` (`Op::Recv`).
+    /// `IORING_RECVSEND_POLL_FIRST` (`Op::Recv`). `dontwait` sets
+    /// `MSG_DONTWAIT`: the receive completes with `-EAGAIN` at once if the
+    /// socket has nothing queued, instead of waiting for bytes.
     pub fn submit_recv_direct(
         &mut self,
         conn_index: u32,
@@ -304,6 +306,7 @@ impl Ring {
         len: u32,
         slot: u32,
         poll_first: bool,
+        dontwait: bool,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvDirect, conn_index, slot);
         let entry = Sqe::new(
@@ -311,7 +314,7 @@ impl Ring {
                 fd: sqe::Fd::Fixed(conn_index),
                 buf: ptr,
                 len,
-                flags: 0,
+                flags: if dontwait { libc::MSG_DONTWAIT } else { 0 },
                 poll_first,
             },
             user_data.raw(),

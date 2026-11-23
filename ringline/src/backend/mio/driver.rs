@@ -55,7 +55,7 @@ pub(crate) const WRITABLE_ON_DEMAND: bool = cfg!(target_os = "hermit");
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
 
 /// Per-connection pending send: the bytes plus how far into them the socket
-/// has got, so a partial `writev` can resume where it stopped.
+/// has got, so a partial write can resume where it stopped.
 ///
 /// `send_id` names the awaited send this entry settles once its last byte
 /// reaches the socket, with the length that send reports: the length its
@@ -71,7 +71,7 @@ pub(crate) struct PendingSend {
     pub(crate) offset: usize,
     pub(crate) send_id: Option<(SendId, u32)>,
     pub(crate) permit: Option<SlotReservation>,
-    /// A `writev` that carried this entry returned `WouldBlock`, and its id
+    /// A flush write that carried this entry returned `WouldBlock`, and its id
     /// went on `Driver::room_waited_sends`.
     pub(crate) waited_for_room: bool,
 }
@@ -289,7 +289,7 @@ pub(crate) struct Driver {
     /// `drain_send_completions`. The driver never touches the `Executor`
     /// itself.
     pub(crate) settled_sends: VecDeque<(SendId, io::Result<u32>)>,
-    /// Awaited sends whose entry a `writev` carried when it returned
+    /// Awaited sends whose entry a flush write carried when it returned
     /// `WouldBlock`, for the event loop to mark in the executor's completion
     /// table before it next polls a task (`SendCompletion::waited_for_room`).
     pub(crate) room_waited_sends: Vec<SendId>,
@@ -347,6 +347,11 @@ pub(crate) struct Driver {
     /// operation was still running at its bound. A pool thread can still use
     /// the operation's buffer, so the worker leaks its event loop (#856).
     pub(crate) disk_io_outstanding: bool,
+    /// Ringkern's completion ring, which takes the reads and writes on block
+    /// devices that would otherwise go to the disk-I/O pool; `None` when no
+    /// file subsystem is configured.
+    #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+    pub(crate) kernel_ring: Option<super::kernel_ring::KernelRing>,
 
     // ── Filesystem file management ──────────────────────────────────
     /// Filesystem file table (allocates file slots and generations).
@@ -373,13 +378,17 @@ pub(crate) struct Driver {
 }
 
 impl Driver {
-    /// At worker exit: tell the disk-I/O pool to answer the requests it has
+    /// At worker exit: with the `ringkern` feature on Hermit, first wait for
+    /// the ring operations in flight (`drain_kernel_ring_at_exit`, up to its
+    /// own bound). Then tell the disk-I/O pool to answer the requests it has
     /// not started with `-ECANCELED`, then wait up to [`DISK_IO_EXIT_BOUND`]
     /// for the started ones that use a caller's buffer (`disk_io_borrowing`).
     /// Any other request uses only memory its closure owns, which outlives
     /// the worker. Responses are dropped: no task is polled again. Sets
     /// `disk_io_outstanding` if one is still running at the bound.
     pub(crate) fn drain_disk_io_at_exit(&mut self) {
+        #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+        self.drain_kernel_ring_at_exit();
         let Some(pool) = self.disk_io_pool.as_ref() else {
             return;
         };
@@ -408,7 +417,33 @@ impl Driver {
                 }
             }
         }
-        self.disk_io_outstanding = !wait.is_empty();
+        self.disk_io_outstanding |= !wait.is_empty();
+    }
+
+    /// At worker exit: wait for the ring operations in flight, which read or
+    /// write a caller's buffer, until none is left or [`DISK_IO_EXIT_BOUND`]
+    /// has passed. The bound is checked between waits, and a wait returns
+    /// when at least one operation completes; Ringkern fails every ring
+    /// operation if one of its NVMe commands times out. Sets
+    /// `disk_io_outstanding` if one is still running.
+    #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+    fn drain_kernel_ring_at_exit(&mut self) {
+        let Some(ring) = self.kernel_ring.as_mut() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + DISK_IO_EXIT_BOUND;
+        let mut done = Vec::new();
+        while ring.has_in_flight() && std::time::Instant::now() < deadline {
+            done.clear();
+            if ring.reap(&mut done, true).is_err() {
+                break;
+            }
+            for (key, _) in &done {
+                self.disk_io_borrowing.remove(key);
+                self.disk_io_in_flight.remove(key);
+            }
+        }
+        self.disk_io_outstanding |= ring.has_in_flight();
     }
 
     /// Bytes the connection holds that no consumer has taken: the
@@ -649,6 +684,22 @@ impl Driver {
             disk_io_borrowing: std::collections::HashSet::new(),
             write_orders: crate::disk_order::WriteOrders::default(),
             disk_io_outstanding: false,
+            #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+            kernel_ring: {
+                let entries: u32 = [
+                    config.fs.as_ref().map(|f| f.max_commands_in_flight),
+                    config.direct_io.as_ref().map(|d| d.max_commands_in_flight),
+                ]
+                .into_iter()
+                .flatten()
+                .map(u32::from)
+                .sum();
+                if entries == 0 {
+                    None
+                } else {
+                    Some(super::kernel_ring::KernelRing::new(entries)?)
+                }
+            },
             fs_files: config
                 .fs
                 .as_ref()
@@ -713,6 +764,8 @@ impl Driver {
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,
             ticket_waiting: false,
+            #[cfg(all(target_os = "hermit", feature = "ringkern"))]
+            kernel_ring: &mut self.kernel_ring,
         }
     }
 
@@ -1078,7 +1131,7 @@ impl Driver {
     /// all pending data was flushed (or there was nothing to flush), false
     /// if we got WouldBlock mid-flush. A hard write error is returned as
     /// `Err` — the caller must fail the connection (the previous code
-    /// swallowed it, kept the queue, and retried the failing writev every
+    /// swallowed it, kept the queue, and retried the failing write every
     /// loop iteration forever while awaited sends reported success).
     ///
     /// An entry carrying an awaited send settles it when the entry's last
@@ -1097,8 +1150,8 @@ impl Driver {
         // busy queue.
         let had_sends = self.track_room_waits && !self.pending_sends[idx].is_empty();
 
-        // Use writev() to coalesce multiple pending sends into a single
-        // syscall, reducing TCP segment count under pipelining.
+        // Write every pending send in one syscall (`write_iovecs`),
+        // reducing TCP segment count under pipelining.
         while !self.pending_sends[idx].is_empty() {
             let mut iovecs: Vec<libc::iovec> =
                 Vec::with_capacity(self.pending_sends[idx].len().min(1024));
@@ -1136,7 +1189,7 @@ impl Driver {
             }
 
             let fd = stream.as_raw_fd();
-            let result = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as _) };
+            let result = write_iovecs(fd, &iovecs);
 
             if result < 0 {
                 let err = io::Error::last_os_error();
@@ -1399,6 +1452,33 @@ fn set_udp_gro(fd: &std::os::fd::OwnedFd, udp_gro: bool) -> io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     let _ = (fd, udp_gro);
     Ok(())
+}
+
+/// Write `iovecs` to the socket `fd` in one call, without raising SIGPIPE when
+/// the socket's write side is shut down or the peer has reset it.
+///
+/// On Linux and Android this is `sendmsg` with `MSG_NOSIGNAL`, so the write
+/// fails with `EPIPE` instead. `writev` cannot carry the flag. Elsewhere it is
+/// `writev`. std and mio protect Apple sockets with `SO_NOSIGPIPE`, and the mio
+/// driver does the same: `mio::net::TcpStream::connect` sets it on outbound
+/// sockets and `install_accepted` on accepted ones. Hermit has neither
+/// `sendmsg` nor signals. Other Unix targets are not protected.
+fn write_iovecs(fd: std::os::fd::RawFd, iovecs: &[libc::iovec]) -> isize {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: a zeroed `msghdr` is valid (no name, no control data).
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = iovecs.as_ptr() as *mut libc::iovec;
+        msg.msg_iovlen = iovecs.len() as _;
+        // SAFETY: every iovec points into a pending send's buffer, which
+        // outlives the call.
+        unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // SAFETY: as above.
+        unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as _) }
+    }
 }
 
 #[cfg(test)]
@@ -2139,7 +2219,7 @@ pub(crate) mod tests {
             .expect("a short write is not an error");
         assert!(
             !all_flushed,
-            "no socket buffer takes a 1 MiB message in one writev"
+            "no socket buffer takes a 1 MiB message in one write"
         );
         assert!(
             (written as usize) < PAYLOAD,
@@ -2553,7 +2633,7 @@ pub(crate) mod tests {
         let conn = token(&driver, conn_index);
         let id = bounded_ids(1)[0];
 
-        // A socket whose write side is shut down refuses `writev` with
+        // A socket whose write side is shut down refuses a write with
         // `EPIPE` at once, and `send_bounded` writes nothing itself, so the
         // flush in `finish_close` is the first and only write attempt.
         driver.tcp_streams[idx]
