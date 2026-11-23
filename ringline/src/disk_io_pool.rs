@@ -6,8 +6,9 @@
 //! sends the result back via a per-worker crossbeam channel + `WakeFd`,
 //! matching the pattern used by [`BlockingPool`](crate::blocking::BlockingPool).
 //!
-//! These threads keep the default scheduling policy, `SCHED_OTHER`; the
-//! blocking pool's threads run at `SCHED_BATCH` on Linux.
+//! These threads keep the scheduling policy of the thread that launched the
+//! runtime (`SCHED_OTHER` by default); the blocking pool's threads run at
+//! `SCHED_BATCH` on Linux.
 
 use std::thread;
 

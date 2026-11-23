@@ -52,8 +52,9 @@ impl BlockingPool {
                 .name(format!("rl-blok-{i}"))
                 .spawn(move || {
                     // Not SCHED_IDLE: on a busy host a SCHED_IDLE thread gets
-                    // almost no CPU, and an unprivileged thread cannot leave
-                    // that policy. When such a thread is the last of the
+                    // almost no CPU, and it cannot leave that policy without
+                    // CAP_SYS_NICE or an RLIMIT_NICE of at least 20 (the
+                    // default is 0). When such a thread is the last of the
                     // process to exit, it unmaps the address space and closes
                     // the files at that priority, which can take seconds.
                     #[cfg(target_os = "linux")]

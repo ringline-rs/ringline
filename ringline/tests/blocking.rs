@@ -354,12 +354,19 @@ impl AsyncEventHandler for PoolPolicyHandler {
     }
 }
 
-/// A blocking-pool thread runs at `SCHED_BATCH`, not `SCHED_IDLE`, which an
-/// unprivileged thread cannot leave and which gets almost no CPU on a busy
-/// host.
+/// A blocking-pool thread runs at `SCHED_BATCH`, not `SCHED_IDLE`, which gets
+/// almost no CPU on a busy host and which a thread cannot leave at the default
+/// `RLIMIT_NICE`.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_blocking_pool_thread_runs_at_sched_batch() {
+    // SAFETY: reads the calling thread's policy.
+    if unsafe { libc::sched_getscheduler(0) } == libc::SCHED_IDLE {
+        // Started under `chrt -i`: the pool threads inherit SCHED_IDLE and
+        // cannot leave it, so the policy under test cannot be set.
+        eprintln!("skipped: the test process runs at SCHED_IDLE");
+        return;
+    }
     POOL_POLICY.store(-2, Ordering::SeqCst);
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())

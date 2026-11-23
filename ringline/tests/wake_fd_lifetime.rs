@@ -36,8 +36,8 @@ static BLOCKING_STARTED: AtomicBool = AtomicBool::new(false);
 static BLOCKING_RELEASED: AtomicBool = AtomicBool::new(false);
 static BLOCKING_FINISHED: AtomicBool = AtomicBool::new(false);
 
-/// How long a test waits for a thread that may be starved: on a loaded host
-/// the blocking pool's thread can wait seconds for a CPU.
+/// How long a test waits for a pool thread, which on a loaded host can wait
+/// seconds for a CPU.
 const STARVED: Duration = Duration::from_secs(30);
 
 /// How long a held task or worker waits for the test to release it before it

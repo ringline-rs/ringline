@@ -568,12 +568,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - On Linux, the blocking pool's threads (`spawn_blocking`) run at
   `SCHED_BATCH` instead of `SCHED_IDLE`. On a host whose CPUs are busy,
-  `SCHED_IDLE` work waited for an idle CPU: blocking closures, and the
-  `shutdown` that `shutdown_write` runs on the pool. A process could also
-  take seconds to exit when a pool thread was its last thread to exit,
-  because that thread unmaps the address space and closes the files.
-  `SCHED_BATCH` threads get the same CPU share as other threads, and a pool
-  thread that wakes does not preempt the thread running on its CPU.
+  `SCHED_IDLE` closures got almost no CPU, and a process could take seconds
+  to exit when a pool thread was its last thread to exit, because that
+  thread unmaps the address space and closes the files. `SCHED_BATCH`
+  threads get the same CPU share as other threads at the same nice value,
+  and a pool thread that wakes does not preempt the thread running on its
+  CPU. CPU-bound closures now take CPU time from the workers on a busy
+  host. Threads and processes started from a closure inherit `SCHED_BATCH`
+  where they inherited `SCHED_IDLE`.
 
 - **Breaking:** ringline writes its messages through the `log` crate instead
   of to stderr, so nothing appears unless the application installs a logger
