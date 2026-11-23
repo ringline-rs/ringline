@@ -591,9 +591,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection"), on both backends; before, it went out ahead of the waiting
   send. Nothing is queued, so the same buffer can be sent once the waiting
   send is admitted. On io_uring a plaintext send of guards only at or above
-  `send_zc_threshold` (a batch, `forward_recv_buf` of the whole accumulator,
-  or a `forward_to_conn` chunk sent zero-copy) takes no send-pool slot, is
-  not refused, and goes out ahead of the waiting send. On io_uring a
+  `send_zc_threshold` (a batch, a `forward_recv_buf` that detaches the
+  accumulator, or a `forward_to_conn` chunk sent zero-copy) takes no
+  send-pool slot, is not refused, and goes out ahead of the waiting send. On io_uring a
   `forward_to_conn` chunk below `send_zc_threshold`, or copied at
   `zero_copy_hold_cap`, is refused the same way: the forward resolves `Other`
   and the chunk stays on the source. On mio `forward_to_conn` is not refused
@@ -1854,7 +1854,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `send_zc_threshold`, or any send on a TLS connection. A closure that read
   the slice after the call read freed memory. The runtime now keeps the bytes
   allocated until the closure returns. The zero-copy forward of the receive
-  buffer is in no release (#850).
+  buffer is in no release (#850). On io_uring the zero-copy forward is taken
+  only inside the connection's own `with_data`, `with_data_result` or
+  `try_with_data` closure; elsewhere `forward_recv_buf` copies. Found by the
+  send-recv paradigms audit
+  (`docs/journal/2026-11-send-recv-paradigms-audit.md`, F27 and F28).
 - io_uring: a worker that stops on an error or a panic, and whose exit drain
   then panics, closes the fds its multishot accept, or a park's install,
   delivered but it never handled. They are ordinary descriptors the kernel

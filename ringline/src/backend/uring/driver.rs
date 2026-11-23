@@ -696,10 +696,14 @@ pub(crate) struct Driver {
     pub(crate) send_slab: InFlightSendSlab,
     pub(crate) accumulators: AccumulatorTable,
     /// Bytes already detached from the accumulator by a zero-copy
-    /// `forward_recv_buf` during the current `with_data` / `with_bytes`
-    /// closure. The delivery future subtracts this from what the closure
-    /// reports consuming, because the forward already removed those bytes
-    /// (see `ConnCtx::forward_recv_buf`).
+    /// `forward_recv_buf` during the current `with_data`, `with_data_result`
+    /// or `try_with_data` closure. The delivery path subtracts this from what
+    /// the closure reports consuming, because the forward already removed
+    /// those bytes, and clears it (see `ConnCtx::forward_recv_buf`). Only a
+    /// forward made inside the connection's own reader closure sets it, so it
+    /// is zero outside one, unless that closure unwound. A close or abort
+    /// inside the closure leaves it for the delivery path; `handle_close`
+    /// clears it with the slot.
     pub(crate) forward_zc_consumed: Vec<u32>,
     /// Per-connection: the bytes the last whole-accumulator
     /// `forward_recv_buf` detached. The slice the reader closure was given
@@ -2000,7 +2004,6 @@ impl Driver {
         } else {
             return;
         };
-        self.forward_zc_consumed[conn_index as usize] = 0;
         // Every close request except `abort`, which wakes the future itself,
         // comes through here, an error's or a peer's as much as the
         // handler's: a `writable` future waiting on it, blocked or armed, is
@@ -2481,7 +2484,6 @@ impl Driver {
         conn.abort_draining = false;
         self.abort_drains[ci] = None;
         // Released here for the reasons `close_connection` gives.
-        self.forward_zc_consumed[ci] = 0;
         self.park_offered.remove(conn_index);
         self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
