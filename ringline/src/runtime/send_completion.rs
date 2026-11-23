@@ -1298,12 +1298,12 @@ impl SendCompletions {
     }
 
     /// If `id`, a connection's front send, is a waiter with an owner, or a
-    /// sealed ticket, that could pass a head of `head_needs` with `left`, its `required_slots`
-    /// and owner. The test the scan applies to each waiter it might wake, and
-    /// that an admission applies to the waiters older than itself. A waiter
-    /// with no owner ([`NO_OWNER`]) is left out: no task would poll it, and
-    /// its holder's first poll checks it. A sealed ticket, which also has no
-    /// owner, is included: the event loop serves it.
+    /// sealed ticket, that could pass a head of `head_needs` with `left`, its
+    /// `required_slots` and owner. The test the scan applies to each waiter it
+    /// might wake, and that an admission applies to the waiters older than
+    /// itself. A waiter with no owner ([`NO_OWNER`]) is left out: no task
+    /// would poll it, and its holder's first poll checks it. A sealed ticket
+    /// is included because the event loop serves it.
     ///
     /// So is a waiter a scan before the latest one woke that has not polled
     /// since. An admission still counts one the latest scan woke, which

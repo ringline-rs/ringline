@@ -21748,7 +21748,8 @@ mod tests {
             el.driver
                 .connections
                 .get(conn_index)
-                .is_some_and(|c| matches!(c.write, crate::connection::WriteHalf::ShutdownPending)),
+                .is_some_and(|c| !c.close_requested()
+                    && matches!(c.write, crate::connection::WriteHalf::ShutdownPending)),
             "the send succeeded and the connection stayed open"
         );
         assert!(

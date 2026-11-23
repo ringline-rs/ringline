@@ -58,16 +58,16 @@ use super::unbuffered;
 /// session tickets and alerts, which never complete a logical application
 /// send.
 ///
-/// **All-or-nothing.** The slots the whole blob needs are reserved before
-/// the first byte is copied; if the pool cannot cover them, nothing is taken
-/// or appended and this returns `false`. Appending a prefix would put a
-/// truncated TLS record on the wire — half a Certificate message is strictly
-/// worse for the peer than none of it. When `TlsOutput::place` gets `false`,
-/// it appends the bytes to `TlsOutput::held`; when `TlsTable::place_sealed`
-/// gets it, the bytes stay in the connection's sealed output. Sends appended to `out` by
+/// **All-or-nothing.** The slots the whole blob needs are reserved before the
+/// first byte is copied; if the pool cannot cover them, nothing is taken or
+/// appended and this returns `false`. Appending a prefix would put a truncated
+/// TLS record on the wire — half a Certificate message is strictly worse for
+/// the peer than none of it. When `TlsOutput::place` gets `false`, it appends
+/// the bytes to `TlsOutput::held`; when `TlsTable::place_sealed` gets it, the
+/// bytes stay in the connection's sealed output. Sends appended to `out` by
 /// *earlier* calls are untouched. The unbuffered engine's handshake and alert
-/// output comes through here, as does the buffered engine's output that has
-/// no `IoState` to size it (close_notify, `process_new_packets` errors, the
+/// output comes through here, as does the buffered engine's output that has no
+/// `IoState` to size it (close_notify, `process_new_packets` errors, the
 /// client's first flight); the buffered receive path writes through
 /// `PoolWriter` (`buffered::take_counted_tls_output_sends`).
 ///

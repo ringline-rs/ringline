@@ -497,9 +497,9 @@ the connection's state that follows once its sends have drained or failed.
   (with `close_notify` in it, if the close queued one) is placed, whatever
   its place in the worker queue, if the pool has slots for all of it.
   Otherwise it is dropped, the receive-path records with any alert, and the
-  connection ends with a bare FIN (`place_sealed_at_close`, `backend/uring/driver.rs`). A closing
-  connection therefore never waits on slots for `close_notify` beyond that
-  point.
+  connection ends with a bare FIN (`place_sealed_at_close`,
+  `backend/uring/driver.rs`). A closing connection therefore never waits on
+  slots for `close_notify` beyond that point.
 - At teardown, a receive-path ticket still waiting is dropped and its worker
   queue entry removed. `close_notify` is then not sent, because the peer
   would find the dropped records' sequence numbers missing and report a MAC

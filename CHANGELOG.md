@@ -2038,12 +2038,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the alert had gone out. The alert's ciphertext is now kept on the
   connection, behind any TLS output also waiting for slots, and queued from
   the close drain once the connection's own sends have drained and given
-  their slots back, with the Close waiting behind it. If the pool is still exhausted then, or the close_notify
-  deadline forces the close first, the alert is dropped, the new
-  `ringline/pool` counter `close_notify_dropped` counts it, and the
-  connection does not record it as sent. A retained alert is also dropped,
-  uncounted, at worker exit. Found by the send-path audit
-  (`docs/journal/2026-11-send-path-audit.md`, F5).
+  their slots back, with the Close waiting behind it. If the pool is still
+  exhausted then, or the close_notify deadline forces the close first, the
+  alert is dropped, the new `ringline/pool` counter `close_notify_dropped`
+  counts it, and the connection does not record it as sent. A retained
+  alert is also dropped, uncounted, at worker exit. Found by the send-path
+  audit (`docs/journal/2026-11-send-path-audit.md`, F5).
 
 - mio: a TLS encryption failure in `send`, `send_nowait` or
   `send_backpressured` closes the connection, as it did on io_uring. The
