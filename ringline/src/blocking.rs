@@ -1,7 +1,9 @@
 //! User-facing blocking thread pool.
 //!
 //! Offloads blocking or CPU-bound work from io_uring worker threads.
-//! Threads run at `SCHED_IDLE` priority so the kernel prefers async workers.
+//! On Linux the threads run at `SCHED_BATCH`: they get the same CPU share as
+//! other threads, and a pool thread that wakes does not preempt the thread
+//! running on its CPU, such as a worker's event loop.
 
 use std::any::Any;
 use std::thread;
@@ -49,12 +51,20 @@ impl BlockingPool {
             let handle = thread::Builder::new()
                 .name(format!("rl-blok-{i}"))
                 .spawn(move || {
-                    // Set SCHED_IDLE priority — lowest possible (Linux only).
+                    // Not SCHED_IDLE: on a busy host a SCHED_IDLE thread gets
+                    // almost no CPU, and an unprivileged thread cannot leave
+                    // that policy. When such a thread is the last of the
+                    // process to exit, it unmaps the address space and closes
+                    // the files at that priority, which can take seconds.
                     #[cfg(target_os = "linux")]
                     {
+                        // SAFETY: an all-zero `sched_param` (priority 0) is
+                        // the value SCHED_BATCH requires.
                         let param: libc::sched_param = unsafe { std::mem::zeroed() };
+                        // SAFETY: sets this thread's policy; `param` outlives
+                        // the call.
                         unsafe {
-                            libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+                            libc::sched_setscheduler(0, libc::SCHED_BATCH, &param);
                         }
                     }
                     // Holds every worker's wake fd open while this thread
