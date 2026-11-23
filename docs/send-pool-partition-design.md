@@ -64,19 +64,16 @@ reach most callers as a refusal, which they handle as an error:
   (`take_pending_send`, `h2_conn.rs`) before `send`, so a refusal loses
   frames that the HPACK state has already counted.
 
-Two related gaps are in the TLS paths:
+Before the sealed tickets of section 2, the TLS paths on io_uring had two
+related gaps:
 
 - TLS output produced while receiving (handshake flights, session tickets,
-  alerts) takes its slots before it is written into them (section 4). If
-  the pool is short the connection is failed ("send pool exhausted during
-  TLS output flush"; on the connect path "send pool exhausted during TLS
-  flush", `backend/uring/event_loop.rs`).
-- Nothing orders TLS output produced on the receive path against the
-  connection's later sends except that both are queued on the connection in the
-  order they are made. Any change that holds such output back has to keep it
+  alerts) takes its slots before it is written into them (section 4). When
+  the pool was short the connection was failed.
+- Nothing ordered TLS output produced on the receive path against the
+  connection's later sends except that both were queued on the connection
+  in the order they were made. Holding such output back has to keep it
   ahead of every record sealed after it.
-
-On io_uring, the sealed tickets of section 2 close both gaps.
 
 ## Goal and criterion
 
@@ -497,10 +494,10 @@ the connection's state that follows once its sends have drained or failed.
   A waiting receive-path ticket stays, so the records it holds still go
   ahead of `close_notify`.
 - Once the connection's other sends have drained, a ticket still waiting
-  with `close_notify` in it is placed, whatever its place in the worker
-  queue, if the pool has slots for all of it. Otherwise it is dropped, the
-  receive-path records with the alert, and the connection ends with a bare
-  FIN (`place_sealed_at_close`, `backend/uring/driver.rs`). A closing
+  (with `close_notify` in it, if the close queued one) is placed, whatever
+  its place in the worker queue, if the pool has slots for all of it.
+  Otherwise it is dropped, the receive-path records with any alert, and the
+  connection ends with a bare FIN (`place_sealed_at_close`, `backend/uring/driver.rs`). A closing
   connection therefore never waits on slots for `close_notify` beyond that
   point.
 - At teardown, a receive-path ticket still waiting is dropped and its worker

@@ -4281,10 +4281,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             );
             let placed = self.place_tls_output(conn_index);
             if !(placed && flushed) {
-                let err = if placed {
-                    std::io::Error::other("TLS output could not be written")
-                } else {
+                let err = if flushed {
                     sealed_output_too_large()
+                } else {
+                    std::io::Error::other("TLS output could not be written")
                 };
                 self.executor.wake_connect(conn_index, Err(err));
                 self.driver.close_connection(conn_index);
@@ -21684,6 +21684,7 @@ mod tests {
         let idx = conn_index as usize;
         let token =
             crate::handler::ConnId::new(conn_index, el.driver.connections.generation(conn_index));
+        let (_ours, _sock) = attach_socketpair(&mut el, conn_index);
         let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
         let mut held = exhaust_send_pool(&mut el);
         assert!(el.driver.hold_sealed(conn_index, HELD, false, true));
@@ -21726,6 +21727,7 @@ mod tests {
         let idx = conn_index as usize;
         let token =
             crate::handler::ConnId::new(conn_index, el.driver.connections.generation(conn_index));
+        let (_ours, _sock) = attach_socketpair(&mut el, conn_index);
         let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
         el.driver
             .make_ctx()
@@ -21742,6 +21744,13 @@ mod tests {
             complete_one_cqe(&mut el);
         }
         assert!(!el.driver.send_queues[idx].in_flight, "the send completed");
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| matches!(c.write, crate::connection::WriteHalf::ShutdownPending)),
+            "the send succeeded and the connection stayed open"
+        );
         assert!(
             !el.driver.send_queues[idx].shutdown_inflight,
             "the FIN waits for the sealed output"

@@ -54,9 +54,10 @@
 //!              └─ take_result ─▶ gone
 //! ```
 //!
-//! **An entry leaves the table through its future, never through its
-//! owner.** A sealed ticket has neither (see above). The future's `Drop`
-//! cancels the entry (`cancel`): a waiting one
+//! **An entry other than a sealed ticket leaves the table through its
+//! future, never through its owner.** A sealed ticket has neither and
+//! leaves when the driver places or drops its output (see above). The
+//! future's `Drop` cancels the entry (`cancel`): a waiting one
 //! goes, an in-flight one becomes `Abandoned` and its completion frees it,
 //! a resolved one goes with its result. The owning task's death changes no
 //! entry's state. A connection task is dropped with the driver state
@@ -1296,8 +1297,8 @@ impl SendCompletions {
         left
     }
 
-    /// If `id`, a connection's front send, is a waiter with an owner that
-    /// could pass a head of `head_needs` with `left`, its `required_slots`
+    /// If `id`, a connection's front send, is a waiter with an owner, or a
+    /// sealed ticket, that could pass a head of `head_needs` with `left`, its `required_slots`
     /// and owner. The test the scan applies to each waiter it might wake, and
     /// that an admission applies to the waiters older than itself. A waiter
     /// with no owner ([`NO_OWNER`]) is left out: no task would poll it, and
