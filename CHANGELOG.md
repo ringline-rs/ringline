@@ -1930,7 +1930,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   end of stream, so a reader whose connection's send took the error
   resolved `Ok(0)`, documented as a clean peer close. Found by the
   connection-close audit (`docs/journal/2026-11-connection-close-audit.md`,
-  F13).
+  F13). On a plaintext connection the socket is read before the reader gets
+  the error: a receive in flight is cancelled, the bytes of one that
+  completes are kept, and `MSG_DONTWAIT` receives then read what is queued,
+  stopping after 1 MiB. So bytes the peer sent before it reset reach the
+  reader first. Found by the send-recv paradigms audit
+  (`docs/journal/2026-11-send-recv-paradigms-audit.md`, F3).
 - io_uring, merged accept mode: a park install CQE for a slot's previous
   occupant no longer takes the current occupant's park. `handle_park_install`
   checked the generation after it had taken the slot's `park_in_flight`
