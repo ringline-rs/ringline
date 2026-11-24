@@ -56,6 +56,11 @@ struct GuardVTable {
 ///
 /// `Send` but not `Sync`: a `SendGuard` need not be `Sync`, and `as_bytes`
 /// and `region` take `&self`.
+///
+/// ```compile_fail
+/// fn shared<T: Sync>() {}
+/// shared::<ringline::GuardBox>();
+/// ```
 pub struct GuardBox {
     storage: [MaybeUninit<u64>; 8], // 64 bytes, 8-byte aligned
     vtable: &'static GuardVTable,

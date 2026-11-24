@@ -119,11 +119,10 @@ pub enum Error {
     /// Guard bytes not within the registered memory region.
     ///
     /// The bytes `SendGuard::as_bytes` returns must be strictly within the
-    /// bounds of the region `SendGuard::region` names. This check prevents:
-    /// - Use-after-free (pointer to freed memory)
-    /// - Buffer overflows (pointer past region end)
+    /// bounds of the region `SendGuard::region` names, since a zero-copy send
+    /// that names the region's registered buffer reads the bytes through it.
     ///
-    /// Debug by printing the pointer and region bounds when registering.
+    /// Debug by printing the slice's address and the region bounds.
     #[error("pointer not within registered region")]
     PointerOutOfRegion,
 

@@ -600,10 +600,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   exits before the notification leaks the entry with the guard. A guard's
   bytes must not be written while the guard is alive, as for any `&[u8]`. A
   send, a `send_parts` batch or a guard longer than `u32::MAX` bytes is
-  refused with `InvalidInput`; before, the length was truncated. `GuardBox` is
-  no longer `Sync`, since `SendGuard` does not require `Sync` and safe code
-  could call a guard's `&self` methods from two threads at once. Found by the
-  send-recv paradigms audit
+  refused with `InvalidInput`; before, the length was truncated. `GuardBox`,
+  and so `SendPart`, are no longer `Sync`, since `SendGuard` does not require
+  `Sync` and safe code could call a guard's `&self` methods from two threads
+  at once. Found by the send-recv paradigms audit
   (`docs/journal/2026-11-send-recv-paradigms-audit.md`, F4 and L10).
 
 - Bounded sends (`send_admitted`, `send_backpressured`) are admitted under

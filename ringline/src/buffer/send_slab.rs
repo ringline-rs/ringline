@@ -887,6 +887,7 @@ mod tests {
         slab.leak_in_flight();
         assert!(slab.entries.is_empty());
         assert!(!slab.has_in_flight());
+        assert!(!slab.has_free());
         drop(slab);
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);

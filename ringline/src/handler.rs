@@ -401,7 +401,6 @@ impl ConnSendState {
     }
 }
 
-/// The error of a send or receive that `abort` ended.
 /// `len` as the `u32` a send completion reports, or `InvalidInput` when it
 /// does not fit.
 pub(crate) fn send_len(len: usize) -> io::Result<u32> {
@@ -413,6 +412,7 @@ pub(crate) fn send_len(len: usize) -> io::Result<u32> {
     })
 }
 
+/// The error of a send or receive that `abort` ended.
 pub(crate) fn aborted_error() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, "connection aborted")
 }
@@ -876,6 +876,8 @@ impl<'a> DriverCtx<'a> {
         id: Option<crate::runtime::send_completion::SendId>,
         bounded: bool,
     ) -> io::Result<()> {
+        // A completion reports the length as `u32`.
+        let total = send_len(data.len())?;
         let conn_state = self
             .connections
             .get(conn.index)
@@ -908,7 +910,7 @@ impl<'a> DriverCtx<'a> {
             }
             let sends = self.encrypt_tls_send(conn, data)?;
             if let Some(id) = id {
-                self.attach_send_id(sends.last(), id, data.len() as u32);
+                self.attach_send_id(sends.last(), id, total);
             }
             // Route every ciphertext chunk through the per-connection
             // send queue: io_uring doesn't order independent SQEs, and
@@ -971,7 +973,7 @@ impl<'a> DriverCtx<'a> {
                 .copy_in_reserved(&mut reservation, chunk);
             let end_of_send = chunks.peek().is_none();
             if end_of_send && let Some(id) = id {
-                self.send_copy_pool.set_send_id(slot, id, data.len() as u32);
+                self.send_copy_pool.set_send_id(slot, id, total);
             }
 
             let user_data = crate::completion::UserData::encode(
@@ -2914,6 +2916,8 @@ impl<'a> DriverCtx<'a> {
         data: &[u8],
         id: crate::runtime::send_completion::SendId,
     ) -> io::Result<()> {
+        // A completion reports the length as `u32`.
+        let len = send_len(data.len())?;
         let conn_state = self
             .connections
             .get(conn.index)
@@ -3003,7 +3007,7 @@ impl<'a> DriverCtx<'a> {
                 // Nothing to queue and therefore nothing that could ever
                 // complete the id: settle it here.
                 self.release_permit(permit);
-                self.settled_sends.push_back((id, Ok(data.len() as u32)));
+                self.settled_sends.push_back((id, Ok(len)));
                 return Ok(());
             }
             // `.min(needed)` cannot normally bind — the tripwire above fires
@@ -3017,10 +3021,7 @@ impl<'a> DriverCtx<'a> {
                 *self.capacity_released = true;
             }
             self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
-                ciphertext,
-                id,
-                data.len() as u32,
-                permit,
+                ciphertext, id, len, permit,
             ));
             self.mark_send_dirty(idx);
             return Ok(());
@@ -3038,7 +3039,7 @@ impl<'a> DriverCtx<'a> {
         self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
             data.to_vec(),
             id,
-            data.len() as u32,
+            len,
             permit,
         ));
         self.mark_send_dirty(idx);
