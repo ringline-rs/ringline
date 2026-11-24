@@ -242,8 +242,8 @@ pub mod guard;
 pub mod handler;
 pub mod signal;
 
-/// Number of physical CPU cores — the right default for worker thread count.
-/// See [`topology::physical_core_count`] for details.
+/// Number of physical CPU cores the process may run on — the default worker
+/// thread count. See [`topology::physical_core_count`] for details.
 pub use topology::physical_core_count;
 
 // ── Re-exports: Handler types ─────────────────────────────────────────

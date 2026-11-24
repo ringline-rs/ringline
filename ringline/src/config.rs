@@ -867,7 +867,8 @@ pub(crate) struct WorkerConfig {
     /// Number of worker threads.
     ///
     /// `0` (the default) auto-detects and uses the number of **physical CPU
-    /// cores** — not logical CPUs. On SMT/hyperthreaded hardware this is half
+    /// cores** the process may run on (see
+    /// [`physical_core_count`](crate::physical_core_count)) — not logical CPUs. On SMT/hyperthreaded hardware this is half
     /// the value returned by `nproc` or `available_parallelism()`. Ringline's
     /// io_uring event loops are CPU-bound; two hyperthreads on the same
     /// physical core share execution units and caches, so spawning one worker
@@ -922,13 +923,17 @@ impl ConfigBuilder {
 
     // ── Worker settings ──────────────────────────────────────────────
 
-    /// Set the number of worker threads. 0 = number of CPUs.
+    /// Set the number of worker threads. 0, the default, starts one per
+    /// physical core the process may run on
+    /// ([`physical_core_count`](crate::physical_core_count)).
     pub fn workers(mut self, n: usize) -> Self {
         self.config.worker.threads = n;
         self
     }
 
-    /// Enable or disable CPU core pinning.
+    /// Pin worker `i` to the CPU that [`core_offset`](Self::core_offset)
+    /// `+ i` selects from the CPUs in the process's affinity mask. Default
+    /// on. Off, workers keep the launching thread's mask.
     pub fn pin_to_core(mut self, enable: bool) -> Self {
         self.config.worker.pin_to_core = enable;
         self
@@ -936,12 +941,19 @@ impl ConfigBuilder {
 
     /// Set the starting CPU core index for pinning.
     ///
-    /// When `core_offset + worker_threads` fits within the machine's
-    /// physical core count, this indexes *physical* cores and each
-    /// worker is pinned to a distinct physical core's first SMT sibling
-    /// (so hyperthread-adjacent CPU enumerations don't stack two workers
-    /// on one core). Larger offsets are treated as raw logical CPU ids,
-    /// which keeps deliberate hyperthread layouts expressible.
+    /// Indexes count only the CPUs in the process's affinity mask (the main
+    /// thread's, which `taskset`, a cpuset cgroup and `isolcpus` restrict):
+    /// under `taskset -c 8-15` on a machine without SMT, `core_offset(0)`
+    /// pins worker 0 to CPU 8. When `core_offset + worker_threads` fits
+    /// within the physical cores the process may run on, this indexes those
+    /// *physical* cores and each worker is pinned to a distinct core's first
+    /// allowed SMT sibling (so hyperthread-adjacent CPU enumerations don't
+    /// stack two workers on one core). Otherwise it indexes the allowed
+    /// logical CPUs, which keeps deliberate hyperthread layouts expressible,
+    /// and [`launch`](crate::RinglineBuilder::launch) fails with
+    /// `InvalidInput` when `core_offset + worker_threads` exceeds them. When
+    /// the mask cannot be read, every online CPU counts, and a range past the
+    /// physical cores indexes logical CPU ids from 0 without that check.
     pub fn core_offset(mut self, offset: usize) -> Self {
         self.config.worker.core_offset = offset;
         self
