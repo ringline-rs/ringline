@@ -27,7 +27,6 @@ pub mod pool;
 pub use pool::{Pool, PoolConfig, PooledClient};
 
 use std::io;
-use std::time::Instant;
 
 use ping_proto::{Request as PingRequest, Response as PingResponse};
 use ringline::{Connection, ParseResult, RecvArrival, RecvHalf, SendHalf};
@@ -364,7 +363,7 @@ impl Client {
         }
 
         let tx_bytes = len as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (response, rx_bytes, arrival) = self.execute(&buf[..len]).await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), start);
@@ -391,17 +390,17 @@ impl Client {
 
 /// Nanoseconds elapsed since `start`.
 #[inline]
-fn elapsed_ns(start: Instant) -> u64 {
-    start.elapsed().as_nanos() as u64
+fn elapsed_ns(start: u64) -> u64 {
+    ringline::monotonic_ns().saturating_sub(start)
 }
 
 /// Nanoseconds from `start` to the arrival of the first and of the last
 /// response byte. `None` when there is no arrival, or for a time before
 /// `start`.
-fn arrival_ns(arrival: Option<&RecvArrival>, start: Instant) -> (Option<u64>, Option<u64>) {
-    let since = |t: Instant| t.checked_duration_since(start).map(|d| d.as_nanos() as u64);
+fn arrival_ns(arrival: Option<&RecvArrival>, start: u64) -> (Option<u64>, Option<u64>) {
+    let since = |t: u64| t.checked_sub(start);
     match arrival {
-        Some(a) => (since(a.first()), since(a.last())),
+        Some(a) => (since(a.first_ns()), since(a.last_ns())),
         None => (None, None),
     }
 }

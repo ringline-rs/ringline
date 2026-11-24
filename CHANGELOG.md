@@ -433,25 +433,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resolves. Returns `Error::NoPending` with nothing in flight. See
   `docs/send-while-receiving-design.md`, Option A.
 - `Connection::recv_arrival` and `RecvHalf::recv_arrival` return a
-  `RecvArrival`: when the first and the last byte consumed by the
-  connection's most recent reader call arrived. The reader calls are
-  `with_data`, `with_data_result`, `with_bytes` and `try_with_data`. An
-  arrival time is the
-  time of the batch in which the worker handled the receive that delivered
-  the byte: one pass over the reaped completions on io_uring, or over the
-  readable sockets on mio. Each TCP connection keeps a log of arrival times
-  against stream offsets, of at most 1024 entries of 24 bytes. The
-  `ringline/recv_arrival` metric group counts lookups outside the log and
-  merges at the cap. The log is always on, at an estimated 1–3% of server
-  CPU per request: in an A/B of a 64-byte echo server with an earlier
-  version of the lookup, the median paired rise in server CPU per request
-  was 1.3% to 3.0% in three of four closed-loop cells, at 4,096 connections
-  through lower throughput at about the same server CPU time. In the
-  open-loop 4,096-connection cell, where that difference would have read as
-  about +2%, it measured +0.2%. With the current lookup, paired runs at one
+  `RecvArrival`: when the first and the last byte consumed by the connection's
+  most recent reader call arrived, as `first_ns()` and `last_ns()`:
+  nanoseconds on the clock `std::time::Instant` reads (`CLOCK_MONOTONIC` on
+  Linux and Hermit, `CLOCK_UPTIME_RAW` on macOS), as plain `u64`s that cannot
+  be converted to an `Instant`. `ringline::monotonic_ns()` reads the same
+  clock, so a duration from a start stamped with it is one subtraction. The
+  reader calls are `with_data`, `with_data_result`, `with_bytes` and
+  `try_with_data`. An arrival time is the time of the batch in which the
+  worker handled the receive that delivered the byte: one pass over the reaped
+  completions on io_uring, or over the readable sockets on mio. Each TCP
+  connection keeps a log of arrival times against stream offsets, of at most
+  1024 entries of 16 bytes. The `ringline/recv_arrival` metric group counts
+  lookups outside the log and merges at the cap. The log is always on, at an
+  estimated 1–3% of server CPU per request: in an A/B of a 64-byte echo server
+  with an earlier version of the lookup, the median paired rise in server CPU
+  per request was 1.3% to 3.0% in three of four closed-loop cells, at 4,096
+  connections through lower throughput at about the same server CPU time. In
+  the open-loop 4,096-connection cell, where that difference would have read
+  as about +2%, it measured +0.2%. With the current lookup, paired runs at one
   cell gave a median of +0.4%, too spread to exclude 2.5%, and a profile
-  attributes 0.3–0.4% of the server's samples to the log's own functions.
-  See `docs/recv-arrival-times-design.md`.
+  attributes 0.3–0.4% of the server's samples to the log's own functions. On a
+  generator-limited memcache client that reads every reply's times, recording
+  arrivals in the log costs about 2.7% of the client's user instructions per
+  response and 0.5% to 2.1% of its throughput in two runs. See
+  `docs/recv-arrival-times-design.md`.
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::ttlb_ns`, the time from the operation's start to the
   arrival of the response's last byte.

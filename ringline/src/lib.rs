@@ -264,6 +264,8 @@ pub use handler::SendPart;
 pub use park::ParkState;
 /// When the bytes a connection's most recent reader call consumed arrived.
 pub use recv::arrival::RecvArrival;
+/// Nanoseconds on the clock of [`RecvArrival`]'s times.
+pub use recv::arrival::monotonic_ns;
 
 // ── Re-exports: Async API ───────────────────────────────────────────────
 

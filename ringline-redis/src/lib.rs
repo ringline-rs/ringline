@@ -160,7 +160,6 @@ pub use sharded::{ShardedClient, ShardedConfig};
 
 use std::collections::VecDeque;
 use std::io;
-use std::time::Instant;
 
 use bytes::Bytes;
 use resp_proto::{Request, Value};
@@ -394,7 +393,7 @@ enum PendingOpKind {
 
 struct PendingOp {
     kind: PendingOpKind,
-    start: Option<Instant>,
+    start: Option<u64>,
     user_data: u64,
     tx_bytes: u32,
 }
@@ -862,10 +861,10 @@ impl Client {
     // ── Fire/recv pipelining API ─────────────────────────────────────────
 
     #[inline]
-    fn timing_start(&self) -> Option<Instant> {
+    fn timing_start(&self) -> Option<u64> {
         // Only read the clock if callbacks or metrics are configured.
         if self.is_instrumented() {
-            Some(Instant::now())
+            Some(ringline::monotonic_ns())
         } else {
             None
         }
@@ -876,7 +875,7 @@ impl Client {
     /// start time from `flush()`, which stamps every op it sends, so a clock
     /// read here would be discarded.
     #[inline]
-    fn timing_start_buffered(&self) -> Option<Instant> {
+    fn timing_start_buffered(&self) -> Option<u64> {
         if self.buffered_ops >= 1 {
             None
         } else {
@@ -1826,7 +1825,7 @@ impl Client {
             return self.execute_bulk_encoded().await.0;
         }
         let tx_bytes = self.encode_buf.len() as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (result, rx_bytes, arrival) = self.execute_bulk_encoded().await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
@@ -1865,7 +1864,7 @@ impl Client {
             };
         }
         let tx_bytes = set_encoded_len(self.command_names.as_deref(), key, value, opt) as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (result, rx_bytes, arrival) = self.execute_set(key, value, opt).await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
@@ -1906,7 +1905,7 @@ impl Client {
             };
         }
         let tx_bytes = set_encoded_len(self.command_names.as_deref(), key, value, opt) as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (result, rx_bytes, arrival) = self.execute_set(key, value, opt).await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
@@ -1970,7 +1969,7 @@ impl Client {
             return self.execute_int_encoded().await.0.map(|n| n as u64);
         }
         let tx_bytes = self.encode_buf.len() as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (result, rx_bytes, arrival) = self.execute_int_encoded().await;
         let result = result.map(|n| n as u64);
         let latency_ns = elapsed_ns(start);
@@ -2628,7 +2627,7 @@ impl Client {
             };
         }
         let tx_bytes = self.encode_buf.len() as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (result, rx_bytes, arrival) = self.execute_encoded().await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
@@ -2764,7 +2763,7 @@ impl Client {
         let opt = SetOpt::Plain;
         append_set_prefix(&mut self.encode_buf, set_name, key, value_len as usize, opt);
         let tx_bytes = (self.encode_buf.len() + value_len as usize + 2) as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let prefix: &[u8] = &self.encode_buf;
         let sent = send_guarded(&mut self.tx, prefix, GuardBox::new(guard), b"\r\n").await;
         // A send error is recorded too, with nothing read.
@@ -2828,7 +2827,7 @@ impl Client {
         let split = self.encode_buf.len();
         append_set_suffix(&mut self.encode_buf, opt);
         let tx_bytes = (self.encode_buf.len() + value_len as usize) as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (prefix, suffix) = self.encode_buf.split_at(split);
         let sent = send_guarded(&mut self.tx, prefix, GuardBox::new(guard), suffix).await;
         // A send error is recorded too, with nothing read.
@@ -3053,8 +3052,8 @@ fn parse_get_header(buf: &[u8]) -> Result<Option<GetHeader>, Error> {
 
 /// Nanoseconds elapsed since `start`.
 #[inline]
-fn elapsed_ns(start: Instant) -> u64 {
-    start.elapsed().as_nanos() as u64
+fn elapsed_ns(start: u64) -> u64 {
+    ringline::monotonic_ns().saturating_sub(start)
 }
 
 /// A reply read from the connection: the result, the bytes read, and, on an
@@ -3081,8 +3080,8 @@ fn redis_error(value: Value) -> Result<Value, Error> {
 /// last.
 #[derive(Default)]
 struct ArrivalSpan {
-    first: Option<Instant>,
-    last: Option<Instant>,
+    first: Option<u64>,
+    last: Option<u64>,
 }
 
 impl ArrivalSpan {
@@ -3094,19 +3093,15 @@ impl ArrivalSpan {
 
     fn extend(&mut self, arrival: Option<&RecvArrival>) {
         if let Some(a) = arrival {
-            self.first.get_or_insert(a.first());
-            self.last = Some(a.last());
+            self.first.get_or_insert(a.first_ns());
+            self.last = Some(a.last_ns());
         }
     }
 
     /// Nanoseconds from `start` to the first and last byte's arrival, for
     /// [`CommandResult::ttfb_ns`] and [`CommandResult::ttlb_ns`].
-    fn ns(&self, start: Option<Instant>) -> (Option<u64>, Option<u64>) {
-        let since = |t: Option<Instant>| {
-            t.zip(start)
-                .and_then(|(t, start)| t.checked_duration_since(start))
-                .map(|d| d.as_nanos() as u64)
-        };
+    fn ns(&self, start: Option<u64>) -> (Option<u64>, Option<u64>) {
+        let since = |t: Option<u64>| t.zip(start).and_then(|(t, start)| t.checked_sub(start));
         (since(self.first), since(self.last))
     }
 }

@@ -128,7 +128,6 @@ pub use sharded::{ShardedClient, ShardedConfig};
 
 use std::collections::VecDeque;
 use std::io;
-use std::time::Instant;
 
 use bytes::Bytes;
 use memcache_proto::binary::BinaryRequest;
@@ -371,7 +370,7 @@ enum PendingOpKind {
 
 struct PendingOp {
     kind: PendingOpKind,
-    start: Option<Instant>,
+    start: Option<u64>,
     user_data: u64,
     tx_bytes: u32,
 }
@@ -676,10 +675,10 @@ impl Client {
     // ── Fire/recv pipelining API ─────────────────────────────────────────
 
     #[inline]
-    fn timing_start(&self) -> Option<Instant> {
+    fn timing_start(&self) -> Option<u64> {
         // Only read the clock if callbacks or metrics are configured.
         if self.is_instrumented() {
-            Some(Instant::now())
+            Some(ringline::monotonic_ns())
         } else {
             None
         }
@@ -690,7 +689,7 @@ impl Client {
     /// start time from `flush()`, which stamps every op it sends, so a clock
     /// read here would be discarded.
     #[inline]
-    fn timing_start_buffered(&self) -> Option<Instant> {
+    fn timing_start_buffered(&self) -> Option<u64> {
         if self.buffered_ops >= 1 {
             None
         } else {
@@ -1282,7 +1281,7 @@ impl Client {
         }
 
         let tx_bytes = self.encode_buf.len() as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (response, rx_bytes, arrival) = self.execute_encoded().await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), Some(start));
@@ -1381,7 +1380,7 @@ impl Client {
         }
 
         let tx_bytes = self.encode_buf.len() as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (response, rx_bytes, arrival) = self.execute_encoded().await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), Some(start));
@@ -1544,7 +1543,7 @@ impl Client {
         }
 
         let tx_bytes = self.encode_buf.len() as u32;
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
         let (response, rx_bytes, arrival) = self.execute_encoded().await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), Some(start));
@@ -1636,7 +1635,7 @@ impl Client {
         )?;
         let tx_bytes = (self.encode_buf.len() + value_len as usize + 2) as u32;
 
-        let start = Instant::now();
+        let start = ringline::monotonic_ns();
 
         let prefix: &[u8] = &self.encode_buf;
         let sent = send_guarded(&mut self.tx, prefix, GuardBox::new(guard), b"\r\n").await;
@@ -2229,8 +2228,8 @@ pub(crate) fn check_error_bytes(response: &McResponseBytes) -> Result<(), Error>
 
 /// Nanoseconds elapsed since `start`.
 #[inline]
-fn elapsed_ns(start: Instant) -> u64 {
-    start.elapsed().as_nanos() as u64
+fn elapsed_ns(start: u64) -> u64 {
+    ringline::monotonic_ns().saturating_sub(start)
 }
 
 /// A reply read from the connection: the result, the bytes read, and, on an
@@ -2242,14 +2241,10 @@ type Reply<T> = (Result<T, Error>, u32, Option<RecvArrival>);
 /// response byte, for [`CommandResult::ttfb_ns`] and
 /// [`CommandResult::ttlb_ns`]. `None` when there is no arrival or no start,
 /// or for a time before the start.
-fn arrival_ns(arrival: Option<&RecvArrival>, start: Option<Instant>) -> (Option<u64>, Option<u64>) {
-    let since = |t: Instant| {
-        start
-            .and_then(|start| t.checked_duration_since(start))
-            .map(|d| d.as_nanos() as u64)
-    };
+fn arrival_ns(arrival: Option<&RecvArrival>, start: Option<u64>) -> (Option<u64>, Option<u64>) {
+    let since = |t: u64| start.and_then(|start| t.checked_sub(start));
     match arrival {
-        Some(a) => (since(a.first()), since(a.last())),
+        Some(a) => (since(a.first_ns()), since(a.last_ns())),
         None => (None, None),
     }
 }

@@ -418,7 +418,7 @@ Two `ClientBuilder` knobs control batching of fired requests:
 
 - `user_data: u64` lets callers correlate responses without tracking send order themselves.
 - `recv()` returns `Err(Error::NoPending)` if called with no in-flight requests (no panic).
-- Timing (`Instant::now()`) is skipped when no callbacks or metrics are configured — zero overhead in the uninstrumented path.
+- Timing (`ringline::monotonic_ns()`) is skipped when no callbacks or metrics are configured — zero overhead in the uninstrumented path.
 - Responses must be consumed in FIFO order (matching the protocol's response ordering guarantee).
 - Distinct from `Pipeline` (redis batch API), which accumulates commands into a single buffer and sends them atomically.
 

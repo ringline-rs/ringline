@@ -11,7 +11,6 @@
 //! connection holds that no consumer has taken.
 
 use std::collections::VecDeque;
-use std::time::Instant;
 
 /// When the bytes consumed by the most recent reader call on a connection
 /// arrived.
@@ -24,23 +23,53 @@ use std::time::Instant;
 /// late in the batch. For TLS, a byte arrives when the record that contains
 /// it is decrypted.
 ///
+/// Times are nanoseconds on the clock [`monotonic_ns`] reads, so the time
+/// from a start stamped with it is one subtraction.
+///
 /// Returned by `Connection::recv_arrival` and `RecvHalf::recv_arrival`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecvArrival {
-    first: Instant,
-    last: Instant,
+    first: u64,
+    last: u64,
 }
 
 impl RecvArrival {
-    /// Arrival time of the first byte the call consumed.
-    pub fn first(&self) -> Instant {
+    /// Arrival time of the first byte the call consumed, in [`monotonic_ns`]
+    /// nanoseconds.
+    pub fn first_ns(&self) -> u64 {
         self.first
     }
 
-    /// Arrival time of the last byte the call consumed.
-    pub fn last(&self) -> Instant {
+    /// Arrival time of the last byte the call consumed, in [`monotonic_ns`]
+    /// nanoseconds.
+    pub fn last_ns(&self) -> u64 {
         self.last
     }
+}
+
+/// Nanoseconds on the clock `std::time::Instant` reads, the clock of
+/// [`RecvArrival`]'s times: `CLOCK_MONOTONIC` on Linux and Hermit,
+/// `CLOCK_UPTIME_RAW` on macOS.
+///
+/// Values are comparable with other reads of the same clock on the same
+/// host. They cannot be converted to an `Instant`.
+#[inline]
+pub fn monotonic_ns() -> u64 {
+    #[cfg(target_vendor = "apple")]
+    const CLOCK: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
+    #[cfg(not(target_vendor = "apple"))]
+    const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec. `CLOCK` is supported on
+    // the platform it is selected for, so the call cannot fail with EINVAL,
+    // and EFAULT is excluded by the valid pointer.
+    unsafe { libc::clock_gettime(CLOCK, &mut ts) };
+    (ts.tv_sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(ts.tv_nsec as u64)
 }
 
 /// Entries a log holds before a push merges its two oldest.
@@ -55,7 +84,7 @@ const SHRINK_ABOVE: usize = 256;
 /// begins, and the batch time, read at the first record in the batch.
 pub(crate) struct BatchClock {
     seq: u64,
-    time: Option<Instant>,
+    time: Option<u64>,
 }
 
 impl BatchClock {
@@ -71,15 +100,15 @@ impl BatchClock {
 
     /// Start a batch whose time is `time`.
     #[cfg(test)]
-    pub(crate) fn begin_at(&mut self, time: Instant) {
+    pub(crate) fn begin_at(&mut self, time: u64) {
         self.seq = self.seq.wrapping_add(1);
         self.time = Some(time);
     }
 
     /// The batch's sequence number and time, reading the clock if no record
     /// in this batch has read it yet.
-    fn now(&mut self) -> (u64, Instant) {
-        let time = *self.time.get_or_insert_with(Instant::now);
+    fn now(&mut self) -> (u64, u64) {
+        let time = *self.time.get_or_insert_with(monotonic_ns);
         (self.seq, time)
     }
 }
@@ -96,7 +125,7 @@ pub(crate) struct ArrivalLog {
     delivered: u64,
     /// End offset of the last entry dropped. Offsets below it have no entry.
     base: u64,
-    entries: VecDeque<(u64, Instant)>,
+    entries: VecDeque<(u64, u64)>,
     /// Batch sequence number of the newest entry.
     newest_batch: u64,
     /// Entry count after the previous trim.
@@ -253,10 +282,9 @@ impl ArrivalLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    fn t(base: Instant, ms: u64) -> Instant {
-        base + Duration::from_millis(ms)
+    fn t(base: u64, ms: u64) -> u64 {
+        base + ms * 1_000_000
     }
 
     /// A `RECV_ARRIVAL` slot's total. The counters are process-wide; nextest
@@ -269,7 +297,7 @@ mod tests {
 
     #[test]
     fn records_in_one_batch_extend_one_entry() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         clock.begin_at(t(base, 1));
@@ -284,11 +312,11 @@ mod tests {
         // Read bytes 0..12: first from batch 1, last from batch 1.
         log.settle_read(20, 8, true);
         let a = log.latest().unwrap();
-        assert_eq!((a.first(), a.last()), (t(base, 1), t(base, 1)));
+        assert_eq!((a.first_ns(), a.last_ns()), (t(base, 1), t(base, 1)));
         // Read 12..20: first from batch 1, last from batch 2.
         log.settle_read(8, 0, true);
         let a = log.latest().unwrap();
-        assert_eq!((a.first(), a.last()), (t(base, 1), t(base, 2)));
+        assert_eq!((a.first_ns(), a.last_ns()), (t(base, 1), t(base, 2)));
         assert_eq!(log.len(), 0);
         assert_eq!(log.clamped, 0, "reads inside the log are not clamped");
     }
@@ -305,7 +333,7 @@ mod tests {
 
     #[test]
     fn a_read_that_removed_nothing_clears_latest() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         clock.begin_at(base);
@@ -318,7 +346,7 @@ mod tests {
 
     #[test]
     fn an_unreported_read_trims_and_clears_latest() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         clock.begin_at(base);
@@ -330,7 +358,7 @@ mod tests {
 
     #[test]
     fn a_full_log_merges_its_two_oldest_entries() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         let merged_before = counter(crate::metrics::recv_arrival::MERGED);
@@ -344,14 +372,14 @@ mod tests {
         // Bytes 0 and 1 share the merged entry, which kept batch 0's time.
         log.settle_read(MAX_ENTRIES + 1, MAX_ENTRIES - 1, true);
         let a = log.latest().unwrap();
-        assert_eq!((a.first(), a.last()), (t(base, 0), t(base, 0)));
+        assert_eq!((a.first_ns(), a.last_ns()), (t(base, 0), t(base, 0)));
         log.settle_read(MAX_ENTRIES - 1, MAX_ENTRIES - 2, true);
-        assert_eq!(log.latest().unwrap().first(), t(base, 2));
+        assert_eq!(log.latest().unwrap().first_ns(), t(base, 2));
     }
 
     #[test]
     fn a_lookup_below_base_returns_the_oldest_time() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         clock.begin_at(t(base, 1));
@@ -369,12 +397,12 @@ mod tests {
         );
         assert_eq!(log.clamped, 1, "counted once");
         let a = log.latest().unwrap();
-        assert_eq!((a.first(), a.last()), (t(base, 2), t(base, 2)));
+        assert_eq!((a.first_ns(), a.last_ns()), (t(base, 2), t(base, 2)));
     }
 
     #[test]
     fn a_read_skips_entries_consumed_without_a_settle() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         for i in 1..=4 {
@@ -385,7 +413,7 @@ mod tests {
         // The read takes 8..14, which spans batches 3 and 4.
         log.settle_read(8, 2, true);
         let a = log.latest().unwrap();
-        assert_eq!((a.first(), a.last()), (t(base, 3), t(base, 4)));
+        assert_eq!((a.first_ns(), a.last_ns()), (t(base, 3), t(base, 4)));
         assert_eq!(log.len(), 1);
         assert_eq!(log.base, 12);
         assert_eq!(log.clamped, 0);
@@ -393,7 +421,7 @@ mod tests {
 
     #[test]
     fn a_range_past_delivered_takes_the_newest_time() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         clock.begin_at(t(base, 1));
@@ -409,7 +437,7 @@ mod tests {
         );
         assert_eq!(log.clamped, 1, "counted once");
         let a = log.latest().unwrap();
-        assert_eq!((a.first(), a.last()), (t(base, 1), t(base, 2)));
+        assert_eq!((a.first_ns(), a.last_ns()), (t(base, 1), t(base, 2)));
         assert_eq!(log.len(), 0);
     }
 
@@ -425,7 +453,7 @@ mod tests {
 
     #[test]
     fn trim_waits_for_the_log_to_double() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         for i in 0..=TRIM_MIN_ENTRIES as u64 {
@@ -450,7 +478,7 @@ mod tests {
 
     #[test]
     fn a_trim_threshold_above_the_cap_is_capped() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         for i in 0..600u64 {
@@ -468,7 +496,7 @@ mod tests {
 
     #[test]
     fn a_trim_to_a_small_log_shrinks_a_large_deque() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         for i in 0..MAX_ENTRIES as u64 {
@@ -483,7 +511,7 @@ mod tests {
 
     #[test]
     fn clear_resets_offsets_entries_and_latest() {
-        let base = Instant::now();
+        let base = monotonic_ns();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
         clock.begin_at(base);
