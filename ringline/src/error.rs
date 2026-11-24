@@ -15,7 +15,7 @@ use thiserror::Error;
 /// | `InvalidConnection` | Stale handle, connection closed | Re-establish connection; do not reuse the `Connection` |
 /// | `SendPoolExhausted` | All send buffer slots in use | Await pending sends to complete before sending more |
 /// | `InvalidRegion` | Region ID not registered | Check `MemoryRegion` registration; ensure region outlives usage |
-/// | `PointerOutOfRegion` | SendGuard pointer outside registered region | Verify pointer arithmetic; region boundaries are strict |
+/// | `PointerOutOfRegion` | The bytes `SendGuard::as_bytes` returns are outside the region `SendGuard::region` names | Return a slice inside the region, or `RegionId::UNREGISTERED`; region boundaries are strict |
 /// | `ResourceLimit` | `RLIMIT_NOFILE` or `RLIMIT_MEMLOCK` too low for the config | The message names the limit and the `ulimit` to run; checked before any worker starts |
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -116,10 +116,10 @@ pub enum Error {
     #[error("invalid memory region ID")]
     InvalidRegion,
 
-    /// Pointer not within the registered memory region.
+    /// Guard bytes not within the registered memory region.
     ///
-    /// `SendGuard` requires the pointer to be strictly within the bounds
-    /// of the registered region. This check prevents:
+    /// The bytes `SendGuard::as_bytes` returns must be strictly within the
+    /// bounds of the region `SendGuard::region` names. This check prevents:
     /// - Use-after-free (pointer to freed memory)
     /// - Buffer overflows (pointer past region end)
     ///

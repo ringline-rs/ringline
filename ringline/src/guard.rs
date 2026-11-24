@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 
 use crate::buffer::fixed::RegionId;
@@ -13,8 +15,8 @@ use crate::buffer::fixed::RegionId;
 /// The runtime reads [`as_bytes`](Self::as_bytes) for the kernel after the
 /// guard is stored where it stays until it is dropped, and does not move the
 /// guard, call it again, or give out `&mut` access to it until then. A guard
-/// whose bytes are inside the guard value itself, or that is moved between
-/// calls, is therefore sent from where it lives at the send.
+/// whose bytes are inside the guard value itself is therefore sent from where
+/// the runtime stores it.
 ///
 /// `as_bytes` must return the same bytes on every call. The runtime may call
 /// it more than once for one send, and the protocol clients encode the length
@@ -36,7 +38,9 @@ pub trait SendGuard: Send + 'static {
     /// registered region, the send may reference the region's slot until it
     /// completes; see
     /// [`Runtime::unregister_region`](crate::Runtime::unregister_region). A
-    /// send refuses a guard whose bytes are not inside the region it names.
+    /// zero-copy send on io_uring refuses a guard whose bytes are not inside
+    /// the region it names; a send that copies the guard (the mio backend,
+    /// TLS, or below `send_zc_threshold`) does not check the region.
     fn region(&self) -> RegionId;
 }
 
@@ -49,9 +53,13 @@ struct GuardVTable {
 
 /// Inline type-erased storage for a `SendGuard` (64 bytes max, 8-byte aligned).
 /// Avoids heap allocation for typical guards (~48 bytes).
+///
+/// `Send` but not `Sync`: a `SendGuard` need not be `Sync`, and `as_bytes`
+/// and `region` take `&self`.
 pub struct GuardBox {
     storage: [MaybeUninit<u64>; 8], // 64 bytes, 8-byte aligned
     vtable: &'static GuardVTable,
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 // Safety: GuardBox only stores `SendGuard: Send` types.
@@ -88,6 +96,7 @@ impl GuardBox {
         GuardBox {
             storage,
             vtable: vtable_for::<G>(),
+            _not_sync: PhantomData,
         }
     }
 

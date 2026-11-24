@@ -402,6 +402,17 @@ impl ConnSendState {
 }
 
 /// The error of a send or receive that `abort` ended.
+/// `len` as the `u32` a send completion reports, or `InvalidInput` when it
+/// does not fit.
+pub(crate) fn send_len(len: usize) -> io::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "send batch longer than u32::MAX bytes",
+        )
+    })
+}
+
 pub(crate) fn aborted_error() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, "connection aborted")
 }
@@ -2815,6 +2826,8 @@ impl<'a> DriverCtx<'a> {
         data: &[u8],
         id: Option<crate::runtime::send_completion::SendId>,
     ) -> io::Result<()> {
+        // A completion reports the length as `u32`.
+        let len = send_len(data.len())?;
         let conn_state = self
             .connections
             .get(conn.index)
@@ -2862,12 +2875,10 @@ impl<'a> DriverCtx<'a> {
         let entry = match id {
             // Nothing to write, so nothing will complete it: settle now.
             Some(id) if bytes.is_empty() => {
-                self.settled_sends.push_back((id, Ok(data.len() as u32)));
+                self.settled_sends.push_back((id, Ok(len)));
                 return Ok(());
             }
-            Some(id) => {
-                crate::backend::mio::driver::PendingSend::awaited(bytes, id, data.len() as u32)
-            }
+            Some(id) => crate::backend::mio::driver::PendingSend::awaited(bytes, id, len),
             None if tls && bytes.is_empty() => return Ok(()),
             None => crate::backend::mio::driver::PendingSend::plain(bytes),
         };
@@ -4040,12 +4051,22 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             ));
             return self;
         }
+        let Some(total_len) = u32::try_from(data.len())
+            .ok()
+            .and_then(|len| self.total_len.checked_add(len))
+        else {
+            self.error = Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send batch longer than u32::MAX bytes",
+            ));
+            return self;
+        };
         let idx = self.copy_count;
         self.copy_slices[idx as usize] = (data.as_ptr(), data.len());
         self.copy_count += 1;
         self.parts[self.part_count as usize] = PartSlot::Copy { slice_idx: idx };
         self.part_count += 1;
-        self.total_len += data.len() as u32;
+        self.total_len = total_len;
         self.total_copy_len += data.len();
         self
     }
@@ -4222,9 +4243,12 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         for g in self.guards.iter_mut() {
             *g = None;
         }
+        // A guard may return a different slice than `guard` measured; the
+        // completion reports the plaintext this send encrypts.
+        let len = send_len(plaintext.len())?;
         let sends = self.ctx.encrypt_tls_send(self.conn, &plaintext)?;
         if let Some(id) = self.send_id {
-            self.ctx.attach_send_id(sends.last(), id, self.total_len);
+            self.ctx.attach_send_id(sends.last(), id, len);
             self.ctx.parts_id_carried = true;
         }
         self.ctx.queue_built_sends(self.conn.index, sends);
@@ -4603,4 +4627,16 @@ pub(crate) enum DiskIoKind {
 enum DiskOrder {
     Write(crate::disk_order::OrderKey),
     Sync(crate::disk_order::OrderKey),
+}
+
+#[cfg(test)]
+mod send_len_tests {
+    use super::send_len;
+
+    #[test]
+    fn send_len_refuses_a_length_past_u32_max() {
+        assert_eq!(send_len(u32::MAX as usize).unwrap(), u32::MAX);
+        let err = send_len(u32::MAX as usize + 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }

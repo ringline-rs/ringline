@@ -1833,8 +1833,9 @@ impl AsyncSendBuilder {
             }
             let conn_index = self.token.index;
             let id = executor.register_send(conn_index);
-            // `submit` runs the guards' code: `SendGuard::region`, and each
-            // guard's `Drop` when the batch is refused.
+            // `submit` runs the guards' code: `SendGuard::as_bytes`,
+            // `SendGuard::region`, and each guard's `Drop` when the batch is
+            // refused.
             let unwinding = WithdrawUnlessDisarmed(Some(id));
             let mut ctx = send_ctx(driver, executor, conn_index);
             let mut builder = ctx.send_parts(self.token);

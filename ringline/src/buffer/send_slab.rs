@@ -397,15 +397,15 @@ impl InFlightSendSlab {
         *held += 1;
     }
 
-    /// Leak the guards of entries still in use. The kernel can read their
-    /// memory until a notification that has not arrived, so they must not be
-    /// dropped. Called at worker exit, when the bound on waiting has run out.
+    /// Leak the entries, with the guards of those still in use. The kernel
+    /// can read a guard's memory, which may be inside the guard where the
+    /// entry stores it, until a notification that has not arrived, so
+    /// neither the guards nor the entries may be dropped or freed. Called at
+    /// worker exit, when the bound on waiting has run out; the slab holds no
+    /// entries afterwards.
     pub fn leak_in_flight(&mut self) {
-        for entry in self.entries.iter_mut().filter(|entry| entry.in_use) {
-            for guard in entry.guards.iter_mut() {
-                std::mem::forget(guard.take());
-            }
-        }
+        std::mem::forget(std::mem::take(&mut self.entries));
+        self.free_list.clear();
     }
 
     /// Whether more than half the entries are in use.
@@ -860,6 +860,39 @@ mod tests {
         assert_eq!(slab.iovec(idx, 0).iov_base as *const u8, copy.as_ptr());
         slab.release(idx);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn leak_in_flight_keeps_an_inline_guard_where_the_kernel_reads_it() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let mut slab = InFlightSendSlab::new(2);
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }];
+        let mut guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
+        guards[0] = Some(GuardBox::new(TestGuard {
+            data: [0xCD; 10],
+            region: RegionId::UNREGISTERED,
+            drop_counter: counter.clone(),
+        }));
+        let (idx, _) = slab
+            .allocate(0, 0, &iovecs, u16::MAX, guards, 1, 0)
+            .unwrap();
+        let mut guard_iov = [u8::MAX; MAX_GUARDS];
+        guard_iov[0] = 0;
+        assert_eq!(slab.place_guards(idx, &guard_iov), 10);
+        let placed = slab.iovec(idx, 0);
+
+        slab.leak_in_flight();
+        assert!(slab.entries.is_empty());
+        assert!(!slab.has_in_flight());
+        drop(slab);
+
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        // SAFETY: `leak_in_flight` leaked the entry that stores the guard.
+        let sent = unsafe { std::slice::from_raw_parts(placed.iov_base as *const u8, 10) };
+        assert!(sent.iter().all(|&b| b == 0xCD));
     }
 
     /// A send that goes out in many short results owes one notification for
