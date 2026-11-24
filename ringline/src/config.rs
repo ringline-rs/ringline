@@ -931,7 +931,9 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable or disable CPU core pinning.
+    /// Pin worker `i` to the CPU that [`core_offset`](Self::core_offset)
+    /// `+ i` selects from the CPUs in the process's affinity mask. Default
+    /// on. Off, workers keep the launching thread's mask.
     pub fn pin_to_core(mut self, enable: bool) -> Self {
         self.config.worker.pin_to_core = enable;
         self
@@ -939,15 +941,18 @@ impl ConfigBuilder {
 
     /// Set the starting CPU core index for pinning.
     ///
-    /// Indexes count only the CPUs in the process's affinity mask, which
-    /// `taskset`, a cpuset cgroup and `isolcpus` restrict: under
-    /// `taskset -c 8-15` on a machine without SMT, `core_offset(0)` pins
-    /// worker 0 to CPU 8. When `core_offset + worker_threads` fits within
-    /// the physical cores the process may run on, this indexes those *physical*
-    /// cores and each worker is pinned to a distinct core's first allowed SMT
-    /// sibling (so hyperthread-adjacent CPU enumerations don't stack two
-    /// workers on one core). Larger offsets index the allowed logical CPUs,
-    /// which keeps deliberate hyperthread layouts expressible.
+    /// Indexes count only the CPUs in the process's affinity mask (the main
+    /// thread's, which `taskset`, a cpuset cgroup and `isolcpus` restrict):
+    /// under `taskset -c 8-15` on a machine without SMT, `core_offset(0)`
+    /// pins worker 0 to CPU 8. When `core_offset + worker_threads` fits
+    /// within the physical cores the process may run on, this indexes those
+    /// *physical* cores and each worker is pinned to a distinct core's first
+    /// allowed SMT sibling (so hyperthread-adjacent CPU enumerations don't
+    /// stack two workers on one core). Otherwise it indexes the allowed
+    /// logical CPUs, which keeps deliberate hyperthread layouts expressible,
+    /// and [`launch`](crate::RinglineBuilder::launch) fails with
+    /// `InvalidInput` when `core_offset + worker_threads` exceeds them. When
+    /// the mask cannot be read, it indexes logical CPU ids from 0.
     pub fn core_offset(mut self, offset: usize) -> Self {
         self.config.worker.core_offset = offset;
         self

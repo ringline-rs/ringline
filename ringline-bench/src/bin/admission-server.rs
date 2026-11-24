@@ -281,7 +281,8 @@ struct Args {
     /// TLS record.
     #[arg(long, default_value_t = 16384)]
     slot_size: u32,
-    /// Pin the worker to this CPU.
+    /// Pin the worker to this index into the physical cores the process may
+    /// run on (`ConfigBuilder::core_offset`).
     #[arg(long, default_value_t = 0)]
     cpu: usize,
     /// Serve TLS with a self-signed certificate for `localhost`, generated at

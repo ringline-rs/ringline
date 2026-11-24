@@ -2,14 +2,17 @@
 ///
 /// On Linux, reads `/sys/devices/system/cpu/cpu*/topology/physical_package_id`
 /// and `core_id` for each CPU in `/sys/devices/system/cpu/online` that is in
-/// the process's CPU affinity mask (`sched_getaffinity`), and counts unique
-/// (socket, core) pairs, counting hyperthreading siblings once. The affinity
-/// mask reflects `taskset`, a cpuset cgroup (`docker run --cpuset-cpus`) and
-/// `isolcpus`, so a core none of whose CPUs the process may use is not
-/// counted. Without a readable, well-formed `online` list, it counts up from
-/// cpu0 to the first CPU without topology. Falls back to the number of CPUs
-/// in the affinity mask when no allowed CPU's topology can be read, and to
-/// the online logical CPU count on non-Linux platforms.
+/// the process's CPU affinity mask, and counts unique (socket, core) pairs,
+/// counting hyperthreading siblings once. The mask is the main thread's
+/// (`sched_getaffinity(getpid())`): `taskset <command>`, a cpuset cgroup
+/// (`docker run --cpuset-cpus`) and `isolcpus` (with its default `domain`
+/// flag) restrict it, and ringline's worker pinning does not, so the count is
+/// the same from any thread. A core none of whose CPUs the process may use is
+/// not counted. Without a readable, well-formed `online` list, it counts up
+/// from cpu0 to the first CPU without topology. When the mask cannot be read,
+/// every online CPU counts. Falls back to the number of CPUs in the mask when
+/// no allowed CPU's topology can be read, and to the online logical CPU count
+/// on non-Linux platforms.
 ///
 /// # Why physical cores for thread-per-core
 ///
@@ -82,22 +85,42 @@ fn linux_first_siblings() -> Option<Vec<usize>> {
 
 /// The logical CPUs in the process's affinity mask, ascending, or `None` when
 /// it cannot be read (non-Linux, or `sched_getaffinity` failed).
+///
+/// The mask is the main thread's (`sched_getaffinity(getpid())`), which
+/// `taskset <command>`, a cpuset cgroup and `isolcpus` set and which ringline's
+/// worker pinning does not change, so the result does not depend on which
+/// thread calls it.
 pub(crate) fn allowed_cpus() -> Option<Vec<usize>> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: `set` is a zeroed `cpu_set_t` and the size passed is its own.
-        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        let ret =
-            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
-        if ret != 0 {
-            return None;
+        // `sched_getaffinity` refuses a buffer with fewer bits than the
+        // kernel's possible CPUs (`EINVAL`), so grow it from `cpu_set_t`'s
+        // 1024 bits.
+        let word_bits = 8 * std::mem::size_of::<libc::c_ulong>();
+        let mut words =
+            std::mem::size_of::<libc::cpu_set_t>() / std::mem::size_of::<libc::c_ulong>();
+        // SAFETY: `getpid` has no preconditions.
+        let pid = unsafe { libc::getpid() };
+        loop {
+            let mut mask: Vec<libc::c_ulong> = vec![0; words];
+            let bytes = words * std::mem::size_of::<libc::c_ulong>();
+            // SAFETY: `mask` holds `bytes` bytes, and the kernel writes at
+            // most that many.
+            let ret = unsafe {
+                libc::sched_getaffinity(pid, bytes, mask.as_mut_ptr() as *mut libc::cpu_set_t)
+            };
+            if ret == 0 {
+                let cpus: Vec<usize> = (0..words * word_bits)
+                    .filter(|&cpu| mask[cpu / word_bits] & (1 << (cpu % word_bits)) != 0)
+                    .collect();
+                return if cpus.is_empty() { None } else { Some(cpus) };
+            }
+            let einval = std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL);
+            if !einval || words * word_bits >= 1 << 16 {
+                return None;
+            }
+            words *= 2;
         }
-        let capacity = 8 * std::mem::size_of::<libc::cpu_set_t>();
-        // SAFETY: every index is below the set's capacity.
-        let cpus: Vec<usize> = (0..capacity)
-            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
-            .collect();
-        if cpus.is_empty() { None } else { Some(cpus) }
     }
     #[cfg(not(target_os = "linux"))]
     {
