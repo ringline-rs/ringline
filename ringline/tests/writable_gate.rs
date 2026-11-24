@@ -251,9 +251,38 @@ impl AsyncEventHandler for Gate {
 /// and check that it resolves.
 async fn full_then_drain(conn: &mut Connection) {
     first_send(conn).await;
-    fill(conn).await;
-    let mut gate = std::pin::pin!(conn.writable());
-    let early = ringline::timeout(Duration::from_millis(200), gate.as_mut()).await;
+    // On macOS, a full socket toward a peer that does not read can report
+    // room again about 100 ms later, most often when the peer has
+    // half-closed (#1002). The kernel takes the queued bytes, so the fill's
+    // last send settles. When the gate resolves early and that send has
+    // settled, fill again and look again, up to four fills, on every
+    // backend. An early `Ok` with the send unsettled, an error, or a gate
+    // that resolves after every fill fails.
+    const REFILL_ATTEMPTS: u32 = 4;
+    let mut attempts = 0;
+    let (early, gate) = loop {
+        attempts += 1;
+        let (_, _, mut last) = fill_keeping(conn).await;
+        let mut gate = Box::pin(conn.writable());
+        let early = ringline::timeout(Duration::from_millis(200), gate.as_mut()).await;
+        if !matches!(early, Ok(Ok(()))) || attempts == REFILL_ATTEMPTS {
+            break (early, gate);
+        }
+        // The completion reaches the task an iteration after the gate on
+        // the mio backend, so one poll is not enough.
+        let settled = ringline::timeout(Duration::from_millis(50), &mut last).await;
+        if !matches!(settled, Ok(Ok(_))) {
+            record(|s| {
+                s.note = Some(format!(
+                    "the gate resolved with the fill's last send unsettled: {settled:?}"
+                ))
+            });
+            break (early, gate);
+        }
+    };
+    if attempts > 1 {
+        eprintln!("full_then_drain: {attempts} fills");
+    }
     record(|s| {
         s.pending_while_full = Some(early.is_err());
         s.filled_at = Some(Instant::now());
@@ -591,7 +620,8 @@ fn a_full_socket_that_drains() {
     assert_eq!(
         seen.pending_while_full,
         Some(true),
-        "it resolved on a full socket"
+        "it resolved on a full socket: {:?}",
+        seen.note
     );
     assert_eq!(seen.gate, Some(Ok(())));
     assert_resolved_promptly(&seen);
@@ -612,7 +642,8 @@ fn a_half_closed_peer_with_a_full_socket() {
     assert_eq!(
         seen.pending_while_full,
         Some(true),
-        "it resolved on a full socket"
+        "it resolved on a full socket: {:?}",
+        seen.note
     );
     assert_eq!(seen.gate, Some(Ok(())));
     assert_resolved_promptly(&seen);
