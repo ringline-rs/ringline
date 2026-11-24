@@ -15,7 +15,7 @@ use thiserror::Error;
 /// | `InvalidConnection` | Stale handle, connection closed | Re-establish connection; do not reuse the `Connection` |
 /// | `SendPoolExhausted` | All send buffer slots in use | Await pending sends to complete before sending more |
 /// | `InvalidRegion` | Region ID not registered | Check `MemoryRegion` registration; ensure region outlives usage |
-/// | `PointerOutOfRegion` | The bytes `SendGuard::as_bytes` returns are outside the region `SendGuard::region` names | Return a slice inside the region, or `RegionId::UNREGISTERED`; region boundaries are strict |
+/// | `PointerOutOfRegion` | The bytes `SendGuard::as_bytes` returns are outside the region `SendGuard::region` names | Return a slice inside the region, or `RegionId::UNREGISTERED` |
 /// | `ResourceLimit` | `RLIMIT_NOFILE` or `RLIMIT_MEMLOCK` too low for the config | The message names the limit and the `ulimit` to run; checked before any worker starts |
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -116,11 +116,11 @@ pub enum Error {
     #[error("invalid memory region ID")]
     InvalidRegion,
 
-    /// Guard bytes not within the registered memory region.
+    /// Bytes not within the registered memory region they name.
     ///
-    /// The bytes `SendGuard::as_bytes` returns must be strictly within the
-    /// bounds of the region `SendGuard::region` names, since a zero-copy send
-    /// that names the region's registered buffer reads the bytes through it.
+    /// The bytes a send guard or a disk operation's buffer names must lie
+    /// inside the registered region it names, since an operation that uses
+    /// the region's registered buffer reads or writes through it.
     ///
     /// Debug by printing the slice's address and the region bounds.
     #[error("pointer not within registered region")]

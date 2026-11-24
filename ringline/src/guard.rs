@@ -38,9 +38,10 @@ pub trait SendGuard: Send + 'static {
     /// registered region, the send may reference the region's slot until it
     /// completes; see
     /// [`Runtime::unregister_region`](crate::Runtime::unregister_region). A
-    /// zero-copy send on io_uring refuses a guard whose bytes are not inside
-    /// the region it names; a send that copies the guard (the mio backend,
-    /// TLS, or below `send_zc_threshold`) does not check the region.
+    /// zero-copy send on io_uring, and a plaintext `submit_batch_admitted`
+    /// batch on io_uring, refuse a guard whose bytes are not inside the region
+    /// it names; other sends that copy the guard (the mio backend, TLS, or
+    /// below `send_zc_threshold`) do not check the region.
     fn region(&self) -> RegionId;
 }
 
