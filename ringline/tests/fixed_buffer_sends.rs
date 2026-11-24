@@ -44,8 +44,10 @@ struct RegionGuard {
 }
 
 impl SendGuard for RegionGuard {
-    fn as_ptr_len(&self) -> (*const u8, u32) {
-        (self.ptr as *const u8, PART as u32)
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the memory is leaked, so valid for the life of the process,
+        // and the test does not write it while it is sent.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, PART) }
     }
     fn region(&self) -> RegionId {
         self.region

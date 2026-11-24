@@ -946,17 +946,12 @@ impl Client {
         exptime: u32,
         user_data: u64,
     ) -> Result<(), Error> {
-        let (ptr, value_len) = guard.as_ptr_len();
+        let value_len = guard_len(&guard)?;
         // Small guard values: fold into the coalescing copy path (`fire_set`)
         // so they batch like plain SETs instead of taking the scatter-gather
         // guard path, which flushes every few ops.
         if self.zc_threshold != 0 && value_len < self.zc_threshold {
-            // SAFETY: `guard` is owned and live for the duration of this
-            // function, so `ptr`/`value_len` describe a valid byte range.
-            // `fire_set` copies those bytes into `write_buf`/`encode_buf`
-            // synchronously (no `.await` between this borrow and the copy),
-            // after which the guard `G` is dropped at the end of this call.
-            let value = unsafe { core::slice::from_raw_parts(ptr, value_len as usize) };
+            let value = guard.as_bytes();
             return self.fire_set(key, value, flags, exptime, user_data);
         }
         self.pre_flush_if_needed(true)?;
@@ -1609,7 +1604,7 @@ impl Client {
         exptime: u32,
     ) -> Result<(), Error> {
         if !self.is_instrumented() {
-            let (_, value_len) = guard.as_ptr_len();
+            let value_len = guard_len(&guard)?;
             self.encode_buf.clear();
             append_set_guard_prefix(
                 &mut self.encode_buf,
@@ -1630,7 +1625,7 @@ impl Client {
             };
         }
 
-        let (_, value_len) = guard.as_ptr_len();
+        let value_len = guard_len(&guard)?;
         self.encode_buf.clear();
         append_set_guard_prefix(
             &mut self.encode_buf,
@@ -2271,9 +2266,7 @@ async fn send_guarded(
     suffix: &[u8],
 ) -> io::Result<ringline::SendCompletion> {
     if tx.zero_copy_capped() {
-        let (ptr, len) = guard.as_ptr_len();
-        // SAFETY: the guard keeps its memory valid until it drops below.
-        let value = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let value = guard.as_bytes();
         let mut copy = Vec::with_capacity(prefix.len() + value.len() + suffix.len());
         copy.extend_from_slice(prefix);
         copy.extend_from_slice(value);
@@ -2285,6 +2278,17 @@ async fn send_guarded(
         .build(move |b| b.copy(prefix).guard(guard).copy(suffix).submit())
 }
 
+/// The length of `guard`'s bytes, which a request header carries: refused
+/// with `InvalidInput` past `u32::MAX`, as the send would refuse it.
+fn guard_len(guard: &impl SendGuard) -> Result<u32, Error> {
+    u32::try_from(guard.as_bytes().len()).map_err(|_| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guard longer than u32::MAX bytes",
+        ))
+    })
+}
+
 /// The bytes of `buf` with each guard's bytes inserted at its offset, for a
 /// flush that cannot be sent zero-copy (`SendHalf::zero_copy_capped`).
 fn copy_with_guards(buf: &[u8], guards: impl Iterator<Item = (usize, GuardBox)>) -> Vec<u8> {
@@ -2292,9 +2296,7 @@ fn copy_with_guards(buf: &[u8], guards: impl Iterator<Item = (usize, GuardBox)>)
     let mut pos = 0;
     for (offset, guard) in guards {
         copy.extend_from_slice(&buf[pos..offset]);
-        let (ptr, len) = guard.as_ptr_len();
-        // SAFETY: the guard keeps its memory valid while it is held here.
-        copy.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
+        copy.extend_from_slice(guard.as_bytes());
         pos = offset;
     }
     copy.extend_from_slice(&buf[pos..]);
@@ -2574,8 +2576,8 @@ mod zc_threshold_tests {
     struct VecGuard(Vec<u8>);
 
     impl SendGuard for VecGuard {
-        fn as_ptr_len(&self) -> (*const u8, u32) {
-            (self.0.as_ptr(), self.0.len() as u32)
+        fn as_bytes(&self) -> &[u8] {
+            &self.0
         }
         fn region(&self) -> RegionId {
             RegionId::UNREGISTERED
@@ -2695,8 +2697,8 @@ mod binary_tests {
     struct VecGuard(Vec<u8>);
 
     impl SendGuard for VecGuard {
-        fn as_ptr_len(&self) -> (*const u8, u32) {
-            (self.0.as_ptr(), self.0.len() as u32)
+        fn as_bytes(&self) -> &[u8] {
+            &self.0
         }
         fn region(&self) -> RegionId {
             RegionId::UNREGISTERED

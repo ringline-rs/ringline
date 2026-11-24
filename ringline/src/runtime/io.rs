@@ -1069,8 +1069,8 @@ struct AccumulatorGuard(bytes::Bytes);
 
 #[cfg(has_io_uring)]
 impl crate::guard::SendGuard for AccumulatorGuard {
-    fn as_ptr_len(&self) -> (*const u8, u32) {
-        (self.0.as_ptr(), self.0.len() as u32)
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
     fn region(&self) -> crate::buffer::fixed::RegionId {
         crate::buffer::fixed::RegionId::UNREGISTERED
@@ -1833,8 +1833,9 @@ impl AsyncSendBuilder {
             }
             let conn_index = self.token.index;
             let id = executor.register_send(conn_index);
-            // `submit` runs the guards' code: `SendGuard::region`, and each
-            // guard's `Drop` when the batch is refused.
+            // `submit` runs the guards' code: `SendGuard::as_bytes`,
+            // `SendGuard::region`, and each guard's `Drop` when the batch is
+            // refused.
             let unwinding = WithdrawUnlessDisarmed(Some(id));
             let mut ctx = send_ctx(driver, executor, conn_index);
             let mut builder = ctx.send_parts(self.token);
@@ -1913,7 +1914,7 @@ fn total_part_len(parts: &[crate::handler::SendPart<'_>]) -> usize {
         .iter()
         .map(|part| match part {
             SendPart::Copy(data) => data.len(),
-            SendPart::Guard(guard) => guard.as_ptr_len().1 as usize,
+            SendPart::Guard(guard) => guard.as_bytes().len(),
         })
         .sum()
 }
@@ -2019,11 +2020,7 @@ impl AsyncSendBuilder {
             for part in &parts {
                 match part {
                     SendPart::Copy(data) => buf.extend_from_slice(data),
-                    SendPart::Guard(guard) => {
-                        let (ptr, len) = guard.as_ptr_len();
-                        let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-                        buf.extend_from_slice(data);
-                    }
+                    SendPart::Guard(guard) => buf.extend_from_slice(guard.as_bytes()),
                 }
                 consumed += 1;
             }
@@ -2078,9 +2075,7 @@ impl<'a> MioSendBuilder<'a> {
 
     /// Add a guard part (copies the data on mio backend).
     pub fn guard(self, guard: crate::guard::GuardBox) -> Self {
-        let (ptr, len) = guard.as_ptr_len();
-        let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        self.buf.extend_from_slice(data);
+        self.buf.extend_from_slice(guard.as_bytes());
         self
     }
 
@@ -5193,7 +5188,7 @@ impl<'a> BatchAdmission<'a> {
         let submitted = {
             let mut ctx = driver.make_ctx();
             if passing.is_some() {
-                // The submit runs the guards' code (`SendGuard::as_ptr_len`
+                // The submit runs the guards' code (`SendGuard::as_bytes`
                 // and `region`). A panic there must not leave the pool
                 // marking every later allocation as passing, so marking ends
                 // before the panic continues.
@@ -5298,12 +5293,7 @@ fn submit_batch_parts(
     for part in parts.iter() {
         match part {
             SendPart::Copy(data) => buf.extend_from_slice(data),
-            SendPart::Guard(guard) => {
-                let (ptr, len) = guard.as_ptr_len();
-                // SAFETY: the guard owns this memory and is alive for the
-                // borrow; `SendGuard` promises the pointer is valid for `len`.
-                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
-            }
+            SendPart::Guard(guard) => buf.extend_from_slice(guard.as_bytes()),
         }
     }
     ctx.send_bounded(token, &buf, id)?;

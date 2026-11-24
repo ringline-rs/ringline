@@ -32,8 +32,8 @@ struct VecGuard {
 }
 
 impl SendGuard for VecGuard {
-    fn as_ptr_len(&self) -> (*const u8, u32) {
-        (self.data.as_ptr(), self.data.len() as u32)
+    fn as_bytes(&self) -> &[u8] {
+        &self.data
     }
     fn region(&self) -> RegionId {
         self.region
@@ -107,13 +107,13 @@ const PASS_PANIC: u8 = b'x';
 
 /// The idle peer the passing scenario connects to; it reads everything.
 static READER: Mutex<Option<std::net::SocketAddr>> = Mutex::new(None);
-/// Calls of `PanicGuard::as_ptr_len`.
+/// Calls of `PanicGuard::as_bytes`.
 static PANIC_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// What the passing scenario saw: whether the batch's task panicked, and B
 /// straight after a send admitted at the head once the panic was contained.
 static PANIC_SEEN: Mutex<Option<(bool, u64)>> = Mutex::new(None);
 
-/// A guard whose `as_ptr_len` panics from its third call on. Before the
+/// A guard whose `as_bytes` panics from its third call on. Before the
 /// admission decision a batch's first poll calls it once on mio
 /// (`total_part_len`) and twice on io_uring (`total_part_len`, then
 /// `batch_plain_slots`). The submit's first call is the second on mio (the
@@ -123,11 +123,11 @@ static PANIC_SEEN: Mutex<Option<(bool, u64)>> = Mutex::new(None);
 struct PanicGuard([u8; 64]);
 
 impl SendGuard for PanicGuard {
-    fn as_ptr_len(&self) -> (*const u8, u32) {
+    fn as_bytes(&self) -> &[u8] {
         if PANIC_CALLS.fetch_add(1, Ordering::SeqCst) >= 2 {
             panic!("guard code panicked");
         }
-        (self.0.as_ptr(), self.0.len() as u32)
+        &self.0
     }
     fn region(&self) -> RegionId {
         RegionId::UNREGISTERED
@@ -311,7 +311,7 @@ fn parts_outcome(refused: Option<io::ErrorKind>, parts: &[SendPart<'_>], waited:
     let guard_lens = parts
         .iter()
         .filter_map(|p| match p {
-            SendPart::Guard(g) => Some(g.as_ptr_len().1),
+            SendPart::Guard(g) => Some(g.as_bytes().len() as u32),
             SendPart::Copy(_) => None,
         })
         .collect();

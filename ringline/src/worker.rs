@@ -3998,8 +3998,8 @@ mod worker_exit_tests {
 
     #[cfg(has_io_uring)]
     impl crate::SendGuard for FlaggedGuard {
-        fn as_ptr_len(&self) -> (*const u8, u32) {
-            (self.0.as_ptr(), self.0.len() as u32)
+        fn as_bytes(&self) -> &[u8] {
+            &self.0
         }
         fn region(&self) -> crate::RegionId {
             crate::RegionId::UNREGISTERED

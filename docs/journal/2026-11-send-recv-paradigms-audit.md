@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send and receive paradigms
 
-- **Status:** open — 28 confirmed findings (F1 to F28), 10 plausible (PL1 to PL10), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18). Fixed, chosen by the owner from this record: F1 (#849), F2 (#850), PL10 (#886; its trailing open item closed by #903), and L18 answered with a handshake timeout (#868); F27, F28, L18 and PL10 were found while reviewing those fixes. Fixed by PRs that did not cite this record: F5 (#928), F8 (#857), F14 (#921), D4 (#965). No longer applies: D7 (`send_chain` removed, #986). Partly fixed or partly removed: F15 (#921, #925), F22 (#965, #986), F24 (#965), F26 (#952, #986), D19 (#952), PL6 (#954), D1 (#921, #925, #955), D5 (#986). Reconciled against `main` at 146025cc on 2026-11-15 and at 97597ea8 on 2026-11-22, by reading; everything else is open and no owner decision on L1 to L17 is recorded. The invariant list was confirmed by three agents, not agreed line by line with the owner
-- **Span:** 2026-11-09 to 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2), #868 (L18), #886 (PL10); without citing this record: #857 (F8), #921 (F14; F15 and D1 in part), #925 (F15 and D1 in part), #955 (D1 in part), #928 (F5), #952 (F26 and D19 in part), #954 (PL6 in part), #903 (PL10's open item), #965 (D4; F22 and F24 in part), #986 (D7; F22, F26 and D5 in part) · reconciled 2026-11-15 at 146025cc and 2026-11-22 at 97597ea8
+- **Status:** open — 28 confirmed findings (F1 to F28), 10 plausible (PL1 to PL10), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18). Fixed, chosen by the owner from this record: F1 (#849), F2 (#850), PL10 (#886; its trailing open item closed by #903), and L18 answered with a handshake timeout (#868); F27, F28, L18 and PL10 were found while reviewing those fixes. Fixed later, citing this record: F3 (#1010), F27 and F28 (#1012), F4 and L10 (0.7.0-alpha.189: `SendGuard::as_bytes` replaces `as_ptr_len`, read after the guard is stored in its slab entry). Fixed by PRs that did not cite this record: F5 (#928), F8 (#857), F14 (#921), D4 (#965). No longer applies: D7 (`send_chain` removed, #986). Partly fixed or partly removed: F15 (#921, #925), F22 (#965, #986), F24 (#965), F26 (#952, #986), D19 (#952), PL6 (#954), D1 (#921, #925, #955), D5 (#986). Reconciled against `main` at 146025cc on 2026-11-15, at 97597ea8 on 2026-11-22 and at 998a1e09 on 2026-11-24, by reading; everything else is open and no owner decision on L1 to L9 or L11 to L17 is recorded. The invariant list was confirmed by three agents, not agreed line by line with the owner
+- **Span:** 2026-11-09 to 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2), #868 (L18), #886 (PL10); without citing this record: #857 (F8), #921 (F14; F15 and D1 in part), #925 (F15 and D1 in part), #955 (D1 in part), #928 (F5), #952 (F26 and D19 in part), #954 (PL6 in part), #903 (PL10's open item), #965 (D4; F22 and F24 in part), #986 (D7; F22, F26 and D5 in part) · reconciled 2026-11-15 at 146025cc, 2026-11-22 at 97597ea8 and 2026-11-24 at 998a1e09
 
 ## Goal
 
@@ -2057,3 +2057,23 @@ Not settled by this pass:
 - whether a plaintext receive in flight still detaches the accumulator
   after #964 (D13);
 - the ringline-tls claim in F1, as at 146025cc.
+
+## Reconciliation, 2026-11-24
+
+F3 is fixed by #1010, and F27 and F28 by #1012. F4 and L10 are fixed in
+0.7.0-alpha.189. L10's answer is a safe trait: `SendGuard::as_bytes(&self)
+-> &[u8]` replaces `as_ptr_len`, so a safe implementation can only return
+memory it borrows, and a guard over memory Rust does not track builds the
+slice in its own `unsafe` block. On io_uring, `build_with_guards` reads each
+guard's bytes after the guard is stored in its `InFlightSendSlab` entry
+(`InFlightSendSlab::place_guards`), and `leak_in_flight` leaks the entries
+at worker exit with the guards in them. A send whose length is past `u32::MAX`
+is refused with `InvalidInput` on both backends: `send`, the bounded sends,
+`send_parts` and the protocol clients' guarded sets. `GuardBox` is no longer `Sync`.
+
+The question left open above, whether F4's pre-move read also occurred in
+the forward and `submit_batch` paths: on io_uring both build through
+`SendBuilder::guard` and `build_with_guards`, so they had it and the change
+covers them. The tests `an_inline_guard_is_sent_from_where_the_slab_entry_stores_it`
+and `place_guards_reads_an_inline_guard_where_the_entry_stores_it` fail when
+the guards are read before the move.
