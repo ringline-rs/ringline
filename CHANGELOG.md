@@ -572,6 +572,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** On Linux, the default worker count, `physical_core_count()`
+  and worker pinning count only the CPUs in the process's affinity mask,
+  which `taskset`, a cpuset cgroup (`docker run --cpuset-cpus`) and
+  `isolcpus` restrict. `core_offset` indexes the allowed cores: under
+  `taskset -c 8-15` on a machine without SMT, `core_offset(0)` pins worker 0
+  to CPU 8. Before, the count and the pins came from every online CPU: in a
+  container limited to some CPUs, `launch` started a worker per host core
+  and failed when it pinned one outside the cpuset (`EINVAL`), and under
+  `isolcpus` it pinned workers to the isolated CPUs. A process whose mask
+  allows every online CPU gets the same workers and pins as before. A
+  configuration that set `core_offset` to an absolute core number while
+  running under a restricted mask now pins elsewhere (#976).
 - On Linux, the blocking pool's threads (`spawn_blocking`) run at
   `SCHED_BATCH` instead of `SCHED_IDLE`. On a host whose CPUs are busy,
   `SCHED_IDLE` closures got almost no CPU, and a process could take seconds

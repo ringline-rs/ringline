@@ -1,13 +1,15 @@
-/// Returns the number of physical CPU cores among the online CPUs.
+/// Returns the number of physical CPU cores the process may run on.
 ///
 /// On Linux, reads `/sys/devices/system/cpu/cpu*/topology/physical_package_id`
-/// and `core_id` for each CPU in `/sys/devices/system/cpu/online` to count
-/// unique (socket, core) pairs, counting hyperthreading siblings once.
-/// Without a readable, well-formed `online` list, it counts up from cpu0 to
-/// the first CPU without topology. Falls back to the logical CPU count when
-/// no CPU's topology can be read, and on non-Linux platforms. The process's
-/// CPU affinity (`taskset`, a cpuset cgroup) and `isolcpus` are not taken
-/// into account.
+/// and `core_id` for each CPU in `/sys/devices/system/cpu/online` that is in
+/// the process's CPU affinity mask (`sched_getaffinity`), and counts unique
+/// (socket, core) pairs, counting hyperthreading siblings once. The affinity
+/// mask reflects `taskset`, a cpuset cgroup (`docker run --cpuset-cpus`) and
+/// `isolcpus`, so a core none of whose CPUs the process may use is not
+/// counted. Without a readable, well-formed `online` list, it counts up from
+/// cpu0 to the first CPU without topology. Falls back to the number of CPUs
+/// in the affinity mask when no allowed CPU's topology can be read, and to
+/// the online logical CPU count on non-Linux platforms.
 ///
 /// # Why physical cores for thread-per-core
 ///
@@ -34,6 +36,9 @@ pub fn physical_core_count() -> usize {
     if let Some(n) = linux_physical_cores() {
         return n;
     }
+    if let Some(cpus) = allowed_cpus() {
+        return cpus.len();
+    }
     // Fallback: logical CPU count (sysconf).
     #[cfg(not(target_os = "hermit"))]
     {
@@ -45,8 +50,8 @@ pub fn physical_core_count() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
-/// Logical CPU ids of the first SMT sibling of each physical core, in
-/// ascending logical-CPU order.
+/// Logical CPU ids of the first allowed SMT sibling of each physical core the
+/// process may run on, in ascending logical-CPU order.
 ///
 /// Used for SMT-aware worker pinning: indexing this list by a physical
 /// core number yields a logical CPU on a distinct physical core
@@ -69,19 +74,49 @@ pub(crate) fn physical_core_first_cpus() -> Option<Vec<usize>> {
 /// (physical_package_id, core_id) pair.
 #[cfg(target_os = "linux")]
 fn linux_first_siblings() -> Option<Vec<usize>> {
-    first_siblings_in(std::path::Path::new("/sys/devices/system/cpu"))
+    first_siblings_in(
+        std::path::Path::new("/sys/devices/system/cpu"),
+        allowed_cpus().as_deref(),
+    )
+}
+
+/// The logical CPUs in the process's affinity mask, ascending, or `None` when
+/// it cannot be read (non-Linux, or `sched_getaffinity` failed).
+pub(crate) fn allowed_cpus() -> Option<Vec<usize>> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `set` is a zeroed `cpu_set_t` and the size passed is its own.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let ret =
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+        if ret != 0 {
+            return None;
+        }
+        let capacity = 8 * std::mem::size_of::<libc::cpu_set_t>();
+        // SAFETY: every index is below the set's capacity.
+        let cpus: Vec<usize> = (0..capacity)
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .collect();
+        if cpus.is_empty() { None } else { Some(cpus) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// The first logical CPU of each unique (physical_package_id, core_id) pair
 /// under `root` (`/sys/devices/system/cpu` on Linux), in the order `online`
-/// lists them, which the kernel writes ascending.
+/// lists them, which the kernel writes ascending. With `allowed`, only CPUs
+/// in it are visited, so a core is represented by its first allowed CPU and
+/// a core with none is left out.
 ///
 /// Visits the CPUs in `root/online` and skips any whose topology cannot be
 /// read. An offline CPU has a `cpuN` directory and no `topology/`. Without a
 /// readable, well-formed `online` list it counts up from cpu0 and stops at
 /// the first CPU without topology. `None` when no CPU has readable topology.
 #[cfg(any(target_os = "linux", test))]
-fn first_siblings_in(root: &std::path::Path) -> Option<Vec<usize>> {
+fn first_siblings_in(root: &std::path::Path, allowed: Option<&[usize]>) -> Option<Vec<usize>> {
     use std::collections::HashSet;
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut firsts: Vec<usize> = Vec::new();
@@ -94,6 +129,10 @@ fn first_siblings_in(root: &std::path::Path) -> Option<Vec<usize>> {
         let (Ok(pkg), Ok(core)) = (read("physical_package_id"), read("core_id")) else {
             return false;
         };
+        if allowed.is_some_and(|allowed| allowed.binary_search(&cpu).is_err()) {
+            // Present, but not a CPU the process may run on.
+            return true;
+        }
         if seen.insert((pkg, core)) {
             firsts.push(cpu);
         }
@@ -219,7 +258,7 @@ mod tests {
                 (4, Some((0, 2))),
             ],
         );
-        assert_eq!(first_siblings_in(&root), Some(vec![0, 2, 4]));
+        assert_eq!(first_siblings_in(&root, None), Some(vec![0, 2, 4]));
         std::fs::remove_dir_all(&root).unwrap();
 
         // A CPU listed online without topology is skipped, not the end.
@@ -228,7 +267,7 @@ mod tests {
             Some("0,2,4"),
             &[(0, Some((0, 0))), (2, None), (4, Some((0, 2)))],
         );
-        assert_eq!(first_siblings_in(&root), Some(vec![0, 4]));
+        assert_eq!(first_siblings_in(&root, None), Some(vec![0, 4]));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -249,8 +288,50 @@ mod tests {
                 (7, Some((1, 1))),
             ],
         );
-        assert_eq!(first_siblings_in(&root), Some(vec![0, 2, 4, 6]));
+        assert_eq!(first_siblings_in(&root, None), Some(vec![0, 2, 4, 6]));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_allowed_cpus_represent_their_cores() {
+        // Two packages, siblings adjacent; the process may run on CPUs 3-6.
+        let cpus = [
+            (0, Some((0, 0))),
+            (1, Some((0, 0))),
+            (2, Some((0, 1))),
+            (3, Some((0, 1))),
+            (4, Some((1, 0))),
+            (5, Some((1, 0))),
+            (6, Some((1, 1))),
+            (7, Some((1, 1))),
+        ];
+        let root = fake_sysfs("allowed", Some("0-7"), &cpus);
+        // Core (0,0) has no allowed CPU; core (0,1) is represented by CPU 3,
+        // its allowed sibling, not CPU 2.
+        assert_eq!(
+            first_siblings_in(&root, Some(&[3, 4, 5, 6])),
+            Some(vec![3, 4, 6])
+        );
+        // An allowed set that names no online CPU leaves nothing.
+        assert_eq!(first_siblings_in(&root, Some(&[9])), None);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // Without an online list the walk still stops at the first CPU
+        // without topology, past a disallowed one.
+        let root = fake_sysfs("allowed-no-online", None, &cpus[..4]);
+        assert_eq!(first_siblings_in(&root, Some(&[1, 2])), Some(vec![1, 2]));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn allowed_cpus_agree_with_available_parallelism() {
+        // `available_parallelism` counts the affinity mask on Linux, but also
+        // applies a cgroup CPU quota, so it can only be lower.
+        if let Some(cpus) = allowed_cpus() {
+            assert!(cpus.windows(2).all(|w| w[0] < w[1]));
+            let parallelism = std::thread::available_parallelism().unwrap().get();
+            assert!(parallelism <= cpus.len());
+        }
     }
 
     #[test]
@@ -260,10 +341,10 @@ mod tests {
             None,
             &[(0, Some((0, 0))), (1, Some((0, 1))), (3, Some((0, 3)))],
         );
-        assert_eq!(first_siblings_in(&root), Some(vec![0, 1]));
+        assert_eq!(first_siblings_in(&root, None), Some(vec![0, 1]));
         std::fs::remove_dir_all(&root).unwrap();
         let root = fake_sysfs("empty", None, &[]);
-        assert_eq!(first_siblings_in(&root), None);
+        assert_eq!(first_siblings_in(&root, None), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

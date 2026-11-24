@@ -2116,13 +2116,18 @@ impl RinglineBuilder {
         let (startup_tx, startup_rx) = crossbeam_channel::bounded::<StartupResult>(num_threads);
 
         // SMT-aware pinning: when the requested worker range fits within
-        // the machine's physical cores, treat `core_offset + worker_id`
-        // as a physical-core index and pin to that core's first SMT
-        // sibling. On machines that enumerate hyperthread siblings
-        // adjacently (cpu0/cpu1 = one core), raw logical ids would stack
-        // two workers on one core. Ranges that don't fit fall back to
-        // raw logical ids so deliberate hyperthread layouts remain
-        // expressible.
+        // the physical cores the process may run on, treat
+        // `core_offset + worker_id` as an index into those cores and pin to
+        // each core's first allowed SMT sibling. On machines that enumerate
+        // hyperthread siblings adjacently (cpu0/cpu1 = one core), logical
+        // ids would stack two workers on one core. Ranges that don't fit
+        // index the allowed logical CPUs instead, so deliberate hyperthread
+        // layouts remain expressible.
+        let allowed_cpus: Option<Vec<usize>> = if self.config.worker.pin_to_core {
+            crate::topology::allowed_cpus()
+        } else {
+            None
+        };
         let physical_cpus: Option<Vec<usize>> = if self.config.worker.pin_to_core {
             crate::topology::physical_core_first_cpus()
                 .filter(|cpus| self.config.worker.core_offset + num_threads <= cpus.len())
@@ -2286,9 +2291,17 @@ impl RinglineBuilder {
                 .expect("region rx already consumed");
 
             let pin_cpu = {
-                let raw = self.config.worker.core_offset + worker_id;
-                physical_cpus.as_ref().map(|cpus| cpus[raw]).unwrap_or(raw)
+                let index = self.config.worker.core_offset + worker_id;
+                match (&physical_cpus, &allowed_cpus) {
+                    (Some(cpus), _) => cpus[index],
+                    (None, Some(cpus)) => cpus.get(index).copied().unwrap_or(index),
+                    (None, None) => index,
+                }
             };
+            let cpu_bound = allowed_cpus.as_ref().map_or_else(
+                || "the machine's CPU count".to_owned(),
+                |cpus| format!("the {} CPUs the process may run on", cpus.len()),
+            );
 
             let spawn_result = thread::Builder::new()
                 .name(format!("rl-work-{worker_id}"))
@@ -2312,8 +2325,9 @@ impl RinglineBuilder {
                                 format!(
                                     "failed to pin worker {worker_id} to logical CPU {core} \
                                      (core_offset {} + worker id): {detail}; check \
-                                     ConfigBuilder::core_offset against the machine's CPU count",
-                                    config.worker.core_offset
+                                     ConfigBuilder::core_offset and the worker count against \
+                                     {cpu_bound}",
+                                    config.worker.core_offset,
                                 ),
                             ));
                             crate::task_panic::log_guarded(|| log::error!("{e}"));
