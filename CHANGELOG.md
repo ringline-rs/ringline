@@ -586,9 +586,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   under `isolcpus` it pinned workers to the isolated CPUs. A process whose
   mask allows every online CPU gets the same workers and pins as before. A
   configuration that set `core_offset` to an absolute core number while
-  running under a restricted mask now pins elsewhere, and one whose main
-  thread an application pinned to fewer CPUs before `launch` now starts
-  fewer workers (#976).
+  running under a restricted mask now pins elsewhere. An application that
+  pins its main thread to fewer CPUs before `launch` now starts fewer
+  workers by default, and with `pin_to_core` on, `launch` refuses more
+  workers than the CPUs in that thread's mask; such an application can call
+  `launch` before pinning the main thread (#976).
 - On Linux, the blocking pool's threads (`spawn_blocking`) run at
   `SCHED_BATCH` instead of `SCHED_IDLE`. On a host whose CPUs are busy,
   `SCHED_IDLE` closures got almost no CPU, and a process could take seconds

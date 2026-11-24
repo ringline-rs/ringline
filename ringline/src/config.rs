@@ -952,7 +952,8 @@ impl ConfigBuilder {
     /// logical CPUs, which keeps deliberate hyperthread layouts expressible,
     /// and [`launch`](crate::RinglineBuilder::launch) fails with
     /// `InvalidInput` when `core_offset + worker_threads` exceeds them. When
-    /// the mask cannot be read, it indexes logical CPU ids from 0.
+    /// the mask cannot be read, every online CPU counts, and a range past the
+    /// physical cores indexes logical CPU ids from 0 without that check.
     pub fn core_offset(mut self, offset: usize) -> Self {
         self.config.worker.core_offset = offset;
         self

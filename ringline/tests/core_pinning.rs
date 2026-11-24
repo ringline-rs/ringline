@@ -1,7 +1,8 @@
-//! A `core_offset` that puts a worker beyond what an affinity mask can name
-//! fails `launch()` with an error.
+//! A `core_offset` that puts a worker beyond the CPUs the process may run on
+//! fails `launch()` with `InvalidInput` before any worker starts.
 //!
-//! Its own test binary: the failure this guards against aborts the process.
+//! Its own test binary: a pin past what an affinity mask can name aborts the
+//! process (`pin_to_core`'s own check is a unit test in `worker.rs`).
 //! Linux only: pinning is a no-op elsewhere.
 
 #![cfg(target_os = "linux")]
