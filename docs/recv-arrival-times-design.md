@@ -26,9 +26,9 @@ reached the host.
 ## Batch time
 
 The driver holds the batch state: a batch sequence number, incremented each
-time a batch begins, and an `Option<Instant>` that is `None` until a record in
+time a batch begins, and an `Option<u64>` that is `None` until a record in
 the batch needs it. The first record with `n > 0` in a batch reads
-`Instant::now()` into it, at step 2 of the record. Later records in the same
+`monotonic_ns()` into it, at step 2 of the record. Later records in the same
 batch reuse it. A batch with no such record reads no clock.
 
 A batch begins:
@@ -53,7 +53,7 @@ driver of each backend:
   connection. For TLS the offsets count plaintext.
 - `base: u64`, the end offset of the last entry dropped from the log. Offsets
   below it have no entry.
-- `entries: VecDeque<(u64, Instant)>`. Each entry is the end offset of a run
+- `entries: VecDeque<(u64, u64)>`. Each entry is the end offset of a run
   of bytes and the batch time at which the run was delivered. The run starts
   at the previous entry's end, or at `base` for the oldest entry.
 - `newest_batch: u64`, the batch sequence number of the newest entry.
@@ -213,7 +213,7 @@ the middle of a backlog return an earlier time than the batch that delivered
 those bytes.
 `metrics::recv_arrival::MERGED` counts merges.
 
-A log holds at most 1024 entries of 24 bytes, 24 KiB. After a trim that
+A log holds at most 1024 entries of 16 bytes, 16 KiB. After a trim that
 leaves fewer than 64 entries, a deque whose capacity exceeds 256 is shrunk
 to 64, so a long-lived connection does not keep a large log after one
 backlog.
@@ -226,14 +226,17 @@ Both counters go in a new metric group, `recv_arrival`.
 /// When the bytes consumed by the most recent reader call on a connection
 /// arrived.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecvArrival { /* first: Instant, last: Instant */ }
+pub struct RecvArrival { /* first: u64, last: u64 */ }
 
 impl RecvArrival {
-    /// Arrival time of the first byte the call consumed.
-    pub fn first(&self) -> Instant;
-    /// Arrival time of the last byte the call consumed.
-    pub fn last(&self) -> Instant;
+    /// Arrival time of the first byte the call consumed, in nanoseconds.
+    pub fn first_ns(&self) -> u64;
+    /// Arrival time of the last byte the call consumed, in nanoseconds.
+    pub fn last_ns(&self) -> u64;
 }
+
+/// Nanoseconds on the clock `Instant` reads, the clock of the arrival times.
+pub fn monotonic_ns() -> u64;
 
 impl Connection {
     pub fn recv_arrival(&self) -> Option<RecvArrival>;
@@ -244,8 +247,13 @@ impl RecvHalf {
 }
 ```
 
-`RecvArrival` is re-exported at the crate root. It is not `Copy`, so a later
-version can hold more than two times (see "Streaming clients"). `ConnCtx`,
+`RecvArrival` is not `Copy`, so a later version can hold more than two
+times (see "Streaming clients"). `RecvArrival` and `monotonic_ns` are
+re-exported at the crate root. The times are nanoseconds on the clock
+`std::time::Instant` reads, from `clock_gettime`: `CLOCK_MONOTONIC` on Linux
+and Hermit, `CLOCK_UPTIME_RAW` on macOS. A caller computes a duration from a
+start it stamped with `monotonic_ns()` by one subtraction ("Client cost"
+measures the difference from `Instant` arithmetic). `ConnCtx`,
 whose readers are `pub(crate)`, gets a `pub(crate)` `recv_arrival` that the
 `Connection` and `RecvHalf` methods call.
 
@@ -276,11 +284,12 @@ becomes `#[non_exhaustive]`, regains `ttfb_ns` (removed in #667) and gains
 - `ttfb_ns: Option<u64>`: `first` minus the operation's start time;
 - `ttlb_ns: Option<u64>`: `last` minus the operation's start time.
 
-Both use `Instant::checked_duration_since`, so a time earlier than the start
-gives `None`. That happens when the client reads the reply to an earlier,
-abandoned request.
+Both are a `checked_sub` of the start from the arrival time, so a time
+earlier than the start gives `None`. That happens when the client reads the
+reply to an earlier, abandoned request.
 
-The start time is the `Instant` the client already takes for `latency_ns`.
+The start time is the one the client takes for `latency_ns`, read with
+`ringline::monotonic_ns()`; `latency_ns` is a `saturating_sub` from it.
 On the fire/recv path it is taken after `send_nowait` or `flush` returns,
 before the worker submits the send. On the sequential path and in ping it is
 taken before the send call.
@@ -357,7 +366,8 @@ until the reading task is polled and parses, which `latency_ns` does.
 - mio: the batch time is read at the first record in the batch. Bytes read
   from later sockets in the same batch get that earlier time, including bytes
   that reached their socket while the batch ran.
-- The request side is the client's own `Instant` (see "Client crates").
+- The request side is the client's own `monotonic_ns()` stamp (see "Client
+  crates").
 
 I don't know how large the gap between receipt and batch time is under a
 loaded client. Measuring it needs a build used only for the measurement and
@@ -365,9 +375,8 @@ a bpftrace script. Neither exists yet; the rest of this section describes them
 as proposed.
 
 The build logs, per record, the connection's socket 4-tuple, the batch time
-and `delivered` after the record. The batch time is raw `CLOCK_MONOTONIC`
-nanoseconds, read with `clock_gettime` next to the `Instant::now()` call. The
-log goes into a preallocated in-memory buffer, dumped at exit.
+(already `CLOCK_MONOTONIC` nanoseconds on Linux) and `delivered` after the
+record. The log goes into a preallocated in-memory buffer, dumped at exit.
 
 A bpftrace script reads `tcp_sock::bytes_received`, the count of in-order
 bytes received, at `fentry:tcp_rcv_established`, keyed by socket. At
@@ -429,7 +438,7 @@ It is not part of this design.
 
 ## Cost
 
-- Per batch with a received byte: one `Instant::now()`.
+- Per batch with a received byte: one `monotonic_ns()`.
 - Per record: an add, a compare, and a `VecDeque` push when the batch changed.
   When a trim is due, one `buffered` sum. A log held at the 1024 cap (a
   backlog of more than 1024 batches) sums `buffered` on every record.
@@ -437,7 +446,7 @@ It is not part of this design.
 - Per poll of a reporting reader: one `buffered` sum, and on the resolving
   poll a second, and pops from the front of the log, one per entry dropped.
   `buffered` is a few lengths plus the entries of `segment_hold`.
-- Memory, fixed: about 96 bytes per connection slot (the deque header, four
+- Memory, fixed: about 88 bytes per connection slot (the deque header, four
   `u64`s and `latest`).
 - Allocation: the deque allocates at a connection's first record (capacity
   4) and reallocates as it doubles, which happens when more than four
@@ -445,13 +454,14 @@ It is not part of this design.
   not report. A trim shrinks a deque above 256 to 64, and teardown frees it.
   The A/B cells use long-lived connections and do not measure the first
   allocation.
-- Memory, per worker: about 1.5 MB at the default `max_connections` of
+- Memory, per worker: about 1.4 MB at the default `max_connections` of
   16,000.
-- Cache: per connection, the log (two lines: at a 96-byte stride every slot
-  spans two), the front of its deque, and the `segment_hold` header that
-  `recv_buffered` reads are touched per record and per read.
+- Cache: per connection, the log (at an 88-byte stride, a quarter of the
+  slots span three cache lines and the rest two), the front of its deque,
+  and the `segment_hold` header that `recv_buffered` reads are touched per
+  record and per read.
 - Memory, worst case: a connection whose peer sends more than 1024 small
-  segments while its parser returns `NeedMore` holds a 24 KiB log, six times
+  segments while its parser returns `NeedMore` holds a 16 KiB log, four times
   the accumulator's default initial capacity of 4 KiB.
 
 The log is always on. The arrival times were judged worth a cost estimated
@@ -531,6 +541,47 @@ profile the A-to-A variation is unknown. Misses the log causes in kernel
 code are not attributed to it. Only 64:16 was profiled. At 4,096
 connections each worker holds about 1,024 logs, where misses on
 per-connection data are more likely; that case has no profile.
+
+### Client cost
+
+The runs above measure the server. On a client that reads one response per
+reader call and reports both times, the log and the lookup run once per
+response, on the client's CPU.
+
+Measured with cachecannon, a memcache load generator built on
+`ringline-memcache` with an `on_result` callback, so every reply is read with
+`recv_arrival`. One guest on hv03 (16 vCPUs, Zen 4, Linux 6.18): 2 workers
+pinned to vCPUs 0-1, closed loop, 256 connections, pipeline depth 16, 80% get
+and 20% set, 64-byte values, 100,000 keys, 20 s measured; memcached with 12
+threads on vCPUs 4-15 over loopback. Every arm ran once per round in an
+order rotated per round, 5 rounds; ratios are paired by round, median [min,
+max]. User instructions were counted with `perf stat`. Arm P is ringline
+5b546b7 with `Instant` times; the other arms change only ringline. Two
+byte-identical builds of 5b546b7 from git, compared with each other, gave
+the noise floor; P, built from a local checkout of the same revision, was
+1.002 [0.987, 1.005] of the first git build's throughput.
+
+| Arm | Throughput / P | User instructions per response / P |
+|---|---|---|
+| Second git build of 5b546b7, against the first | 0.999 [0.983, 1.007] | 0.999 |
+| u64 times (4e860bfe: this design on 5b546b7, with `RecvArrival: Copy`) | 1.020 [1.016, 1.035] | 0.957 |
+| `Instant` times, `latest()` returning `None` (no lookup, no subtraction) | 1.016 [1.009, 1.045] | 0.964 |
+| `Instant` times, no records, no lookup | 1.022 [1.018, 1.056] | 0.931 |
+
+The last two rows are arms patched for the measurement only. With `Instant`
+times, reading the arrival and computing `ttfb_ns` and `ttlb_ns` cost 3.6%
+of the client's user instructions per response. Each duration was an
+`Instant::checked_duration_since`, a call into std's
+`Timespec::sub_timespec`, which is not `#[inline]` and appeared as its own
+symbol in the client's profile. With u64 times that cost is gone (u64
+against no lookup: throughput 1.000 [0.990, 1.011], instructions 0.994, the
+u64 build also dropping one `Instant` subtraction from `latency_ns`). The
+records and the log's upkeep cost about 2.7% of user instructions per
+response on top of that, and 0.5% of throughput (no records against u64:
+1.005 [0.998, 1.020]). An earlier run of the same configuration with
+`Instant` times gave larger throughput differences for the same instruction
+counts: 2.9% for the lookup and 2.1% for the upkeep; I don't know why the
+two runs differ in throughput.
 
 ## Tests
 

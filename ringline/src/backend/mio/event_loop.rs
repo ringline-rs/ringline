@@ -3125,8 +3125,8 @@ mod tests {
 
     // ── Receive arrival log ────────────────────────────────────────
 
-    fn at(base: Instant, ms: u64) -> Instant {
-        base + Duration::from_millis(ms)
+    fn at(base: u64, ms: u64) -> u64 {
+        base + ms * 1_000_000
     }
 
     /// Wait until the server side of `conn_index` holds at least `n` unread
@@ -3157,7 +3157,7 @@ mod tests {
         client: &mut std::net::TcpStream,
         conn_index: u32,
         data: &[u8],
-        time: Instant,
+        time: u64,
     ) {
         use std::io::Write;
         client.write_all(data).expect("client write");
@@ -3169,7 +3169,7 @@ mod tests {
 
     /// Read one `\n`-terminated line with `with_data` and return the
     /// connection's `recv_arrival` afterwards.
-    fn read_line(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> Option<(Instant, Instant)> {
+    fn read_line(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> Option<(u64, u64)> {
         let waker = std::task::Waker::noop();
         let mut fut = std::pin::pin!(ctx.with_data(|d| match d.iter().position(|&b| b == b'\n') {
             Some(i) => crate::ParseResult::Consumed(i + 1),
@@ -3181,7 +3181,7 @@ mod tests {
                 fut.as_mut().poll(&mut cx).is_ready(),
                 "the line is complete"
             );
-            ctx.recv_arrival().map(|a| (a.first(), a.last()))
+            ctx.recv_arrival().map(|a| (a.first_ns(), a.last_ns()))
         })
     }
 
@@ -3193,7 +3193,7 @@ mod tests {
         let (mut el, _wake) = test_loop(&config);
         let (conn_index, mut client) = attach_conn(&mut el.driver);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
 
         read_in_batch(&mut el, &mut client, conn_index, b"a\n", at(base, 1));
         assert_eq!(read_line(&mut el, ctx), Some((at(base, 1), at(base, 1))));
@@ -3280,7 +3280,13 @@ mod tests {
         let config = test_config();
         let (mut el, _wake) = test_loop(&config);
         let (conn_index, mut client) = attach_conn(&mut el.driver);
-        read_in_batch(&mut el, &mut client, conn_index, b"a\nb", Instant::now());
+        read_in_batch(
+            &mut el,
+            &mut client,
+            conn_index,
+            b"a\nb",
+            crate::recv::arrival::monotonic_ns(),
+        );
         assert_eq!(el.driver.arrival[conn_index as usize].delivered(), 3);
         el.driver.finish_close(conn_index);
         assert_eq!(el.driver.arrival[conn_index as usize].delivered(), 0);
@@ -3370,7 +3376,9 @@ mod tests {
                 forwarded: 0,
             });
         // A read in the loop's batch, before the tasks ran.
-        el.driver.recv_batch.begin_at(Instant::now());
+        el.driver
+            .recv_batch
+            .begin_at(crate::recv::arrival::monotonic_ns());
         el.driver.record_arrival(source, 1);
         client.write_all(b"x").expect("client write");
         wait_for_bytes(&el, source, 1);

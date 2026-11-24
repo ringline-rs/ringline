@@ -12943,8 +12943,8 @@ mod tests {
         }
     }
 
-    fn at(base: Instant, ms: u64) -> Instant {
-        base + std::time::Duration::from_millis(ms)
+    fn at(base: u64, ms: u64) -> u64 {
+        base + ms * 1_000_000
     }
 
     /// Deliver `data` as the first completion of a batch whose time is
@@ -12953,7 +12953,7 @@ mod tests {
         el: &mut AsyncEventLoop<NoopHandler>,
         conn_index: u32,
         data: &[u8],
-        time: Instant,
+        time: u64,
     ) {
         el.driver.recv_batch.begin_at(time);
         deliver_direct(el, conn_index, data);
@@ -12977,8 +12977,8 @@ mod tests {
         })
     }
 
-    fn times(a: Option<crate::RecvArrival>) -> Option<(Instant, Instant)> {
-        a.map(|a| (a.first(), a.last()))
+    fn times(a: Option<crate::RecvArrival>) -> Option<(u64, u64)> {
+        a.map(|a| (a.first_ns(), a.last_ns()))
     }
 
     /// Lines delivered in separate batches report their own batch's time;
@@ -12988,7 +12988,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
 
         deliver_in_batch(&mut el, conn_index, b"a\n", at(base, 1));
         let (n, a) = read_line(&mut el, ctx);
@@ -13015,7 +13015,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
         let waker = noop_waker();
         let mut fut = std::pin::pin!(ctx.with_data(arrival_line));
 
@@ -13041,7 +13041,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
 
         deliver_in_batch(&mut el, conn_index, b"a\nbb", at(base, 1));
         deliver_in_batch(&mut el, conn_index, b"b\n", at(base, 2));
@@ -13061,7 +13061,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
         // 65 one-byte batches, recorded and appended as a receive completion
         // does.
         for i in 0..65u64 {
@@ -13092,7 +13092,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let idx = conn_index as usize;
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
         for i in 0..600u64 {
             el.driver.recv_batch.begin_at(at(base, i));
             el.driver.record_arrival(conn_index, 1);
@@ -13124,7 +13124,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
         deliver_in_batch(&mut el, conn_index, b"ab\n", at(base, 1));
         let waker = noop_waker();
         let mut fut =
@@ -13147,13 +13147,15 @@ mod tests {
     fn an_adopted_connection_records_its_carried_bytes() {
         let mut el = make_test_loop();
         // The slot the adopt will take held another connection's log.
-        el.driver.recv_batch.begin_at(Instant::now());
+        el.driver
+            .recv_batch
+            .begin_at(crate::recv::arrival::monotonic_ns());
         el.driver.record_arrival(0, 100);
         let (tx, rx) = crate::handoff::bounded::<crate::park::ParkedFd>(4);
         el.driver.park_rx = Some(rx);
         tx.try_send(parked_entry(0, b"carried\n")).expect("queue");
         drop(tx);
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
         el.driver.recv_batch.begin_at(at(base, 1));
 
         el.drain_adopted();
@@ -13173,7 +13175,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let old = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
         // Leave an unread line behind.
         deliver_in_batch(&mut el, conn_index, b"a\nb\n", at(base, 1));
         let (_, a) = read_line(&mut el, old);
@@ -13225,7 +13227,9 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        el.driver.recv_batch.begin_at(Instant::now());
+        el.driver
+            .recv_batch
+            .begin_at(crate::recv::arrival::monotonic_ns());
         el.driver.record_arrival(conn_index, 2);
         el.driver.accumulators.append(conn_index, b"a\n");
         let (_, a) = read_line(&mut el, ctx);
@@ -13243,7 +13247,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
+        let base = crate::recv::arrival::monotonic_ns();
         el.driver.recv_batch.begin_at(at(base, 1));
         el.driver.record_arrival(conn_index, 4);
         el.driver.accumulators.append(conn_index, b"a\nbb");

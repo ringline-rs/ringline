@@ -19,7 +19,7 @@ use ringline::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
 /// One line the server read: its bytes and `recv_arrival` after the read.
-type Seen = (Vec<u8>, Option<(Instant, Instant)>);
+type Seen = (Vec<u8>, Option<(u64, u64)>);
 
 fn test_config() -> Config {
     ConfigBuilder::new()
@@ -62,7 +62,7 @@ async fn read_lines(conn: &mut Connection, seen: &Mutex<Vec<Seen>>) {
         if n == 0 {
             return;
         }
-        let arrival = conn.recv_arrival().map(|a| (a.first(), a.last()));
+        let arrival = conn.recv_arrival().map(|a| (a.first_ns(), a.last_ns()));
         seen.lock().unwrap().push((line, arrival));
     }
 }
@@ -84,14 +84,15 @@ fn wait_for_lines(seen: &Mutex<Vec<Seen>>, count: usize) -> Vec<Seen> {
     }
 }
 
-/// Write each chunk, `GAP` apart, and return the instant before each write.
-fn write_chunks(stream: &mut impl Write, chunks: &[&[u8]]) -> Vec<Instant> {
+/// Write each chunk, `GAP` apart, and return the `monotonic_ns` time before
+/// each write.
+fn write_chunks(stream: &mut impl Write, chunks: &[&[u8]]) -> Vec<u64> {
     let mut sent = Vec::new();
     for (i, chunk) in chunks.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(GAP);
         }
-        sent.push(Instant::now());
+        sent.push(ringline::monotonic_ns());
         stream.write_all(chunk).expect("client write");
         stream.flush().expect("client flush");
     }
@@ -102,11 +103,11 @@ fn write_chunks(stream: &mut impl Write, chunks: &[&[u8]]) -> Vec<Instant> {
 /// two pipelined lines in one write.
 const CHUNKS: [&[u8]; 4] = [b"one\n", b"tw", b"o\n", b"three\nfour\n"];
 
-/// Check the four lines of `CHUNKS` against the instants their writes began.
-fn check_lines(seen: &[Seen], sent: &[Instant]) {
+/// Check the four lines of `CHUNKS` against the times their writes began.
+fn check_lines(seen: &[Seen], sent: &[u64]) {
     let lines: Vec<&[u8]> = seen.iter().map(|(l, _)| l.as_slice()).collect();
     assert_eq!(lines, [&b"one\n"[..], b"two\n", b"three\n", b"four\n"]);
-    let times: Vec<(Instant, Instant)> = seen
+    let times: Vec<(u64, u64)> = seen
         .iter()
         .map(|(l, a)| a.unwrap_or_else(|| panic!("no arrival for {l:?}")))
         .collect();
