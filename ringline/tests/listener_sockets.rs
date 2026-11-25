@@ -94,9 +94,10 @@ fn join(handles: Handles) {
 
 /// A loopback port held by a socket that never listens and has
 /// `SO_REUSEADDR` and `SO_REUSEPORT` set, so a runtime can bind it explicitly.
-/// Drop the socket once the runtime holds the port: the runtime's sockets are
-/// then the only ones bound to it, and no other process can take it between
-/// the reservation and the launch.
+/// While it is bound, a port-0 bind or a `connect` in another process is not
+/// given the port. `launch_on_reserved_port` drops it after the launch;
+/// `launch_holding_port` returns it, so a caller can keep the port held across
+/// a shutdown.
 fn reserve_port() -> (OwnedFd, SocketAddr) {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
@@ -139,11 +140,20 @@ fn launch_on_reserved_port(
     mode: AcceptMode,
     defer: bool,
 ) -> (ringline::Runtime, Handles, SocketAddr) {
+    let (runtime, handles, addr, reservation) = launch_holding_port(mode, defer);
+    drop(reservation);
+    (runtime, handles, addr)
+}
+
+/// Launch on a reserved port and return the reservation still bound.
+fn launch_holding_port(
+    mode: AcceptMode,
+    defer: bool,
+) -> (ringline::Runtime, Handles, SocketAddr, OwnedFd) {
     let (reservation, addr) = reserve_port();
     let (runtime, handles) = launch(mode, addr, defer)
         .unwrap_or_else(|e| panic!("{mode:?} defer={defer}: launch on {addr}: {e}"));
-    drop(reservation);
-    (runtime, handles, addr)
+    (runtime, handles, addr, reservation)
 }
 
 /// Whether a plain socket, with neither `SO_REUSEADDR` nor `SO_REUSEPORT`, can
@@ -182,15 +192,17 @@ fn open_fds() -> usize {
 
 /// After `shutdown()`, a new runtime binds and serves the same port while the
 /// old `Runtime` and its workers are still alive.
+///
+/// The reservation stays bound until the new runtime serves. In pool mode, with
+/// or without `defer`, `shutdown()` returns with the old socket closed. Without
+/// the reservation, another test process's port-0 bind could take the port
+/// before the relaunch binds it.
 #[test]
 fn a_shut_down_runtime_frees_its_port() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    // A deferred listener that never opened has never listened, so `SHUT_RD`
-    // does nothing to it; the port is freed by the socket option `shut_down`
-    // sets.
     for (mode, defer) in cases() {
         {
-            let (old, old_handles, addr) = launch_on_reserved_port(mode, defer);
+            let (old, old_handles, addr, reservation) = launch_holding_port(mode, defer);
             old.shutdown();
 
             let (new, new_handles) = launch(mode, addr, false).unwrap_or_else(|e| {
@@ -201,6 +213,7 @@ fn a_shut_down_runtime_frees_its_port() {
             TcpStream::connect(addr).unwrap_or_else(|e| {
                 panic!("{mode:?} defer={defer}: connect to the new runtime: {e}")
             });
+            drop(reservation);
 
             drop(new);
             join(new_handles);
