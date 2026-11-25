@@ -628,9 +628,9 @@ is zeroed eagerly, which would make the whole ring resident at startup.
 3. `recv_zc_threshold`, its helper and metric.
 4. Release resp-proto and memcache-proto with `parse_segments`, and move
    ringline's workspace requirements and `Cargo.lock` on main to those
-   releases. The lock pins resp-proto 0.0.2 and memcache-proto 0.0.5, which
-   do not have `parse_segments`, and resp-proto's unreleased main also
-   rewrites the parser `with_bytes` uses.
+   releases. memcache-proto 0.0.6 has `parse_segments`, and the lock pins it.
+   The lock pins resp-proto 0.0.2, which does not, and resp-proto's
+   unreleased main also rewrites the parser `with_bytes` uses.
 5. Measure two builds that differ only in the client read path: main after
    step 4, and a branch from it where ringline-redis and ringline-memcache
    read with `with_bytes_segments`, `parse_segments` and the helper. The

@@ -1046,9 +1046,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "memcache-proto"
-version = "0.0.5"
+version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bc235782fb39adfbf6629e80cd16bb5fe09c88081a6d7b3ffe8487c6ddbde5d"
+checksum = "955c8158e0f3979ceeafd26bb3458a44d70d891843692f3340fb3a14b2922ab6"
 dependencies = [
  "bytes",
  "itoa",
