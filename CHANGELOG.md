@@ -570,6 +570,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   64-byte messages and 1.2% at 16 KiB. `ringline/recv_direct` `op=poll_first`
   counts these receives.
 
+- `ringline-memcache`: `memcache-proto` 0.0.6 finds the end of each ASCII
+  response line with `memchr` for the first `\n` instead of
+  `memchr::memmem::find`, which builds a searcher for each buffer of 64 bytes
+  or more. Finding each line end while walking a pipelined buffer of GET hits
+  and STORED replies took 4.05 ns per line instead of 16.4 on an AMD Ryzen 7
+  7840HS (Zen 4) and 9.86 instead of 12.06 on AWS Graviton4.
+
 ### Changed
 
 - **Breaking:** On Linux, the default worker count, `physical_core_count()`
