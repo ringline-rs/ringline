@@ -43,11 +43,15 @@ cargo run --example echo_tls_server
 Tests that open a socket bind port 0 and read the address back:
 `Runtime::bound_addr` / `bound_addrs` for TCP listeners, `bound_udp_addr` /
 `bound_udp_addrs` for UDP, `local_addr()` for a test's own `std` socket. Do not
-choose a port and bind it later. Ringline binds with `SO_REUSEPORT`, so two test
-processes given the same port both bind it and the kernel splits traffic between
-their servers. A test that needs a port with nothing listening uses `refusing_port` in
-`tests/common/mod.rs`, which holds the client end of an established loopback
-connection. A bound socket that never listens refuses on Linux but not on macOS.
+choose a port and bind it later: another test process can bind it in between.
+A pool-mode TCP listener, which on mio includes merged mode, binds with
+`SO_REUSEADDR` only, so its bind or its `listen(2)` then fails with
+`EADDRINUSE`. A merged-mode listener on io_uring and a UDP socket on a fixed
+port also set `SO_REUSEPORT`, so two test processes given the same port both
+bind it and can receive each other's traffic. A test that needs a port with
+nothing listening uses `refusing_port` in `tests/common/mod.rs`, which holds
+the client end of an established loopback connection. A bound socket that
+never listens refuses on Linux but not on macOS.
 
 A test whose handler requests its own shutdown joins the workers with
 `common::join_workers`, not a bare `h.join()`. The helper is in
