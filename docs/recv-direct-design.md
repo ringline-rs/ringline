@@ -717,7 +717,7 @@ checked whether the cancel can still be pending after 10 s.
 - The client methods that read with segments were removed (decision 12):
   ringline-redis `get_stream`, `recv_get_discard` and `recv_get_segments`,
   and ringline-memcache `get_stream` and `get_cas`. ringline-redis
-  `recv_meta` drains a GET reply through `with_bytes` on every connection.
+  `recv_meta` drains a GET reply through `with_data` on every connection.
 
 ## Metrics
 
