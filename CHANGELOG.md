@@ -577,6 +577,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and STORED replies took 4.05 ns per line instead of 16.4 on an AMD Ryzen 7
   7840HS (Zen 4) and 9.86 instead of 12.06 on AWS Graviton4.
 
+- `ringline-redis`: on mio, the GET reply drain behind `Client::recv_meta`
+  reads the accumulator through `with_data` instead of `with_bytes`, which
+  detached the accumulator as a `Bytes` and cloned and dropped it, several
+  atomic refcount operations per GET reply. No mio run has measured it.
+
 ### Changed
 
 - **Breaking:** On Linux, the default worker count, `physical_core_count()`
@@ -1624,10 +1629,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ringline-memcache `Client::get_stream` (and `StreamValue`),
   `Client::get_cas` (and `CasStreamValue`). Use `get`, or `recv_meta` in
   ringline-redis to read a GET reply without keeping the value; for a CAS
-  token, ringline-memcache `gets`. ringline-redis `recv_meta` reads a GET
-  reply through `with_bytes` on every connection, as it already did on
-  mio. No remaining method hands a caller a value's bytes in pieces as
-  they arrive; `get` and `gets` return the whole value.
+  token, ringline-memcache `gets`. ringline-redis `recv_meta` drains a GET
+  reply through `with_data` on every connection. No remaining method hands
+  a caller a value's bytes in pieces as they arrive; `get` and `gets`
+  return the whole value.
 - **Breaking:** the TCP kernel receive-timestamp mode is removed: the
   `timestamps` cargo features of `ringline`, `ringline-memcache`,
   `ringline-redis` and `ringline-ping`, `ConfigBuilder::timestamps`,

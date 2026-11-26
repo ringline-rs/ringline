@@ -1392,13 +1392,13 @@ impl Client {
     }
 
     /// Runs the RESP GET reply state machine on an already-popped GET `pending`
-    /// over the accumulator (`with_bytes`): parses the header, then drains the
+    /// over the accumulator (`with_data`): parses the header, then drains the
     /// value body incrementally so the accumulator stays bounded (about one
     /// receive), never materializing the value.
     ///
     /// Returns `(outcome, total_consumed, latency_ns)`; a desync
     /// (`UnexpectedResponse`) poisons; a short FIN returns `ConnectionClosed`.
-    async fn run_get_drain_bytes(
+    async fn run_get_drain(
         &mut self,
         pending: &PendingOp,
     ) -> Result<(Result<Option<usize>, Error>, usize, u64), Error> {
@@ -1422,7 +1422,7 @@ impl Client {
         loop {
             let n = self
                 .rx
-                .with_bytes(|bytes| {
+                .with_data(|bytes| {
                     let mut consumed = 0usize;
                     let mut pos = 0usize;
                     while pos < bytes.len() {
@@ -1544,16 +1544,16 @@ impl Client {
     /// inspect it (e.g. cluster redirects). `Err` is reserved for
     /// connection/desync failures — a GET desync poisons the connection.
     ///
-    /// A GET's value is drained through `with_bytes`.
+    /// A GET's value is drained through `with_data`.
     pub async fn recv_meta(&mut self) -> Result<RespMeta, Error> {
         self.flush()?;
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
         self.flushed_count = self.flushed_count.saturating_sub(1);
         match pending.kind {
             PendingOpKind::Get => {
-                // Header parse, then a streaming drain over `with_bytes`: the
+                // Header parse, then a streaming drain over `with_data`: the
                 // value is never materialized.
-                let (outcome, _consumed, latency_ns) = self.run_get_drain_bytes(&pending).await?;
+                let (outcome, _consumed, latency_ns) = self.run_get_drain(&pending).await?;
                 let meta = match outcome {
                     Ok(value_len) => RespMeta {
                         kind: OpKind::Get,
@@ -3877,7 +3877,7 @@ mod audit_tests {
 }
 
 /// Locks the `parse_get_header` contract that `recv_meta`'s poison decision
-/// depends on. The GET drain (`run_get_drain_bytes`) feeds the header **one byte at
+/// depends on. The GET drain (`run_get_drain`) feeds the header **one byte at
 /// a time** and stops the instant `parse_get_header` returns non-`Ok(None)`, so:
 ///
 /// - An unexpected reply type (`:`/`+`/`*`, …) errors on the **first byte** with

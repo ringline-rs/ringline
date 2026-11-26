@@ -195,7 +195,7 @@ async fn run_recv_meta(addr: SocketAddr) -> Result<(), String> {
     }
 
     // (c) GET large — value body spans many recv bursts; the drain must stay
-    // bounded and report the exact length (mio `run_get_drain_mio` path).
+    // bounded and report the exact length (`run_get_drain` path).
     {
         let mut client = connect(addr).await?;
         client
